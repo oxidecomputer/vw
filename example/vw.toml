@@ -1,0 +1,13 @@
+[workspace]
+name = "example"
+version = "0.1.0"
+
+[dependencies.quartz-common]
+repo = "https://github.com/oxidecomputer/quartz"
+branch = "main"
+src = "hdl/ip/vhd/common"
+
+[dependencies.quartz]
+repo = "https://github.com/oxidecomputer/quartz"
+branch = "main"
+src = "hdl/ip/vhd"
