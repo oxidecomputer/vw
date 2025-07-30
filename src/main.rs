@@ -49,6 +49,8 @@ enum Commands {
     },
     #[command(about = "Clear all cached repositories")]
     Clear,
+    #[command(about = "List workspace dependencies")]
+    List,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -146,6 +148,12 @@ async fn main() {
         }
         Commands::Clear => {
             if let Err(e) = clear_cache() {
+                eprintln!("{} {e}", "Error:".bright_red());
+                process::exit(1);
+            }
+        }
+        Commands::List => {
+            if let Err(e) = list_dependencies() {
                 eprintln!("{} {e}", "Error:".bright_red());
                 process::exit(1);
             }
@@ -359,6 +367,53 @@ fn clear_cache() -> Result<()> {
     Ok(())
 }
 
+fn list_dependencies() -> Result<()> {
+    let config = load_workspace_config()?;
+    
+    if config.dependencies.is_empty() {
+        println!("No dependencies found in workspace");
+        return Ok(());
+    }
+
+    // Try to load lock file to get resolved versions
+    let lock_file = load_lock_file().ok();
+
+    println!("Dependencies:");
+    for (name, dep) in &config.dependencies {
+        let version_info = match &lock_file {
+            Some(lock) => {
+                if let Some(locked_dep) = lock.dependencies.get(name) {
+                    format!(" ({})", &locked_dep.commit[..8])
+                } else {
+                    // Not yet resolved, show branch/commit from config
+                    match (&dep.branch, &dep.commit) {
+                        (Some(branch), None) => format!(" (branch: {branch})"),
+                        (None, Some(commit)) => format!(" ({})", &commit[..8]),
+                        _ => String::new(),
+                    }
+                }
+            }
+            None => {
+                // No lock file, show branch/commit from config
+                match (&dep.branch, &dep.commit) {
+                    (Some(branch), None) => format!(" (branch: {branch})"),
+                    (None, Some(commit)) => format!(" ({})", &commit[..8]),
+                    _ => String::new(),
+                }
+            }
+        };
+
+        println!(
+            "  {} - {}{}", 
+            name.cyan(), 
+            dep.repo, 
+            version_info.bright_black()
+        );
+    }
+
+    Ok(())
+}
+
 fn make_path_portable(path: PathBuf) -> PathBuf {
     if let Some(home_dir) = dirs::home_dir() {
         if let Ok(relative_path) = path.strip_prefix(&home_dir) {
@@ -403,6 +458,21 @@ fn load_workspace_config() -> Result<WorkspaceConfig> {
         toml::from_str(&config_content).context("Failed to parse vw.toml")?;
 
     Ok(config)
+}
+
+fn load_lock_file() -> Result<LockFile> {
+    let lock_path = Path::new("vw.lock");
+    if !lock_path.exists() {
+        return Err(anyhow!("No vw.lock file found"));
+    }
+
+    let lock_content = fs::read_to_string(lock_path)
+        .context("Failed to read vw.lock")?;
+
+    let lock_file: LockFile = toml::from_str(&lock_content)
+        .context("Failed to parse vw.lock")?;
+
+    Ok(lock_file)
 }
 
 fn get_deps_directory() -> Result<PathBuf> {
