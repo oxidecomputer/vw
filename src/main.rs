@@ -419,7 +419,6 @@ fn clear_cache() -> Result<()> {
 
 fn list_dependencies() -> Result<()> {
     let config = load_workspace_config()?;
-
     if config.dependencies.is_empty() {
         println!("No dependencies found in workspace");
         return Ok(());
