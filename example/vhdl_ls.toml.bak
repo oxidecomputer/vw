@@ -1,6 +1,0 @@
-standard = "2019"
-
-[libraries.defaultlib]
-files = [
-    "src/widget.vhd"
-]
