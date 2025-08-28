@@ -1,11 +1,5 @@
-[dependencies.quartz-common]
-repo = "https://github.com/oxidecomputer/quartz"
-commit = "3084a34e3c83f8b45cda7ea428f8fcc8f17484c2"
-src = "hdl/ip/vhd/common"
-path = "/home/ry/.vw/deps/quartz-common-3084a34e3c83f8b45cda7ea428f8fcc8f17484c2"
-
 [dependencies.quartz]
 repo = "https://github.com/oxidecomputer/quartz"
-commit = "3084a34e3c83f8b45cda7ea428f8fcc8f17484c2"
+commit = "bdc5fb31e1905a1b66c19647fe2d156dd1b97b7b"
 src = "hdl/ip/vhd"
-path = "/home/ry/.vw/deps/quartz-3084a34e3c83f8b45cda7ea428f8fcc8f17484c2"
+path = "/home/ry/.vw/deps/quartz-bdc5fb31e1905a1b66c19647fe2d156dd1b97b7b"
