@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -719,17 +719,17 @@ fn topological_sort(
     }
 
     // Kahn's algorithm
-    let mut queue = Vec::new();
+    let mut queue = VecDeque::new();
     let mut result = Vec::new();
 
     // Add all nodes with in-degree 0 to queue
     for (file, &degree) in &in_degree {
         if degree == 0 {
-            queue.push(file.clone());
+            queue.push_back(file.clone());
         }
     }
 
-    while let Some(current) = queue.pop() {
+    while let Some(current) = queue.pop_front() {
         result.push(current.clone());
 
         // For each neighbor of current
@@ -737,7 +737,7 @@ fn topological_sort(
             for neighbor in neighbors {
                 *in_degree.get_mut(neighbor).unwrap() -= 1;
                 if in_degree[neighbor] == 0 {
-                    queue.push(neighbor.clone());
+                    queue.push_back(neighbor.clone());
                 }
             }
         }
@@ -798,8 +798,16 @@ async fn run_testbench(
                 } else {
                     PathBuf::from(file_path)
                 };
-                files.push(expanded_path.to_string_lossy().to_string());
+                files.push(expanded_path);
             }
+
+            // Sort files in dependency order (dependencies first)
+            sort_files_by_dependencies(&mut files)?;
+
+            let file_strings: Vec<String> = files
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
 
             let mut nvc_cmd = tokio::process::Command::new("nvc");
             nvc_cmd
@@ -809,7 +817,7 @@ async fn run_testbench(
                 .arg("256m")
                 .arg("-a");
 
-            for file in &files {
+            for file in &file_strings {
                 nvc_cmd.arg(file);
             }
 
@@ -824,7 +832,7 @@ async fn run_testbench(
                     "nvc --std={} --work={} -M 256m -a {}",
                     vhdl_std,
                     nvc_lib_name,
-                    files.join(" ")
+                    file_strings.join(" ")
                 );
                 return Err(anyhow!("NVC analysis failed for library {}:\nCommand: {}\nError: {}", 
                     lib_name, cmd_str, stderr));
