@@ -6,3 +6,4 @@ version = "0.1.0"
 repo = "https://github.com/oxidecomputer/quartz"
 branch = "main"
 src = "hdl/ip/vhd"
+recursive = true
