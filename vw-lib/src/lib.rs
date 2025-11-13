@@ -25,10 +25,11 @@
 //! ```
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::fmt;
 
+use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -202,11 +203,11 @@ pub struct VhdlLsLibrary {
 // ============================================================================
 
 /// Initialize a new workspace with the given name.
-pub fn init_workspace(name: String) -> Result<()> {
-    let config_path = Path::new("vw.toml");
+pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
+    let config_path = workspace_dir.join("vw.toml");
     if config_path.exists() {
         return Err(VwError::Config {
-            message: "vw.toml already exists in current directory".to_string(),
+            message: format!("vw.toml already exists in {}", workspace_dir),
         });
     }
 
@@ -218,7 +219,7 @@ pub fn init_workspace(name: String) -> Result<()> {
         dependencies: HashMap::new(),
     };
 
-    save_workspace_config(&config)?;
+    save_workspace_config(workspace_dir, &config)?;
     Ok(())
 }
 
@@ -235,8 +236,10 @@ pub struct DependencyUpdateInfo {
 }
 
 /// Update workspace dependencies by downloading them and generating configuration files.
-pub async fn update_workspace() -> Result<UpdateResult> {
-    let config = load_workspace_config()?;
+pub async fn update_workspace(
+    workspace_dir: &Utf8Path,
+) -> Result<UpdateResult> {
+    let config = load_workspace_config(workspace_dir)?;
     let deps_dir = get_deps_directory()?;
 
     let mut lock_file = LockFile {
@@ -305,8 +308,8 @@ pub async fn update_workspace() -> Result<UpdateResult> {
         }
     }
 
-    write_lock_file(&lock_file)?;
-    write_vhdl_ls_config(&vhdl_ls_config)?;
+    write_lock_file(workspace_dir, &lock_file)?;
+    write_vhdl_ls_config(workspace_dir, &vhdl_ls_config)?;
 
     Ok(UpdateResult {
         dependencies: update_info,
@@ -315,6 +318,7 @@ pub async fn update_workspace() -> Result<UpdateResult> {
 
 /// Add a new dependency to the workspace configuration.
 pub async fn add_dependency(
+    workspace_dir: &Utf8Path,
     repo: String,
     branch: Option<String>,
     commit: Option<String>,
@@ -322,12 +326,14 @@ pub async fn add_dependency(
     name: Option<String>,
 ) -> Result<()> {
     let mut config =
-        load_workspace_config().unwrap_or_else(|_| WorkspaceConfig {
-            workspace: WorkspaceInfo {
-                name: "workspace".to_string(),
-                version: "0.1.0".to_string(),
-            },
-            dependencies: HashMap::new(),
+        load_workspace_config(workspace_dir).unwrap_or_else(|_| {
+            WorkspaceConfig {
+                workspace: WorkspaceInfo {
+                    name: "workspace".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                dependencies: HashMap::new(),
+            }
         });
 
     // Validate that either branch or commit is provided
@@ -348,17 +354,17 @@ pub async fn add_dependency(
     };
 
     config.dependencies.insert(dep_name.clone(), dependency);
-    save_workspace_config(&config)?;
+    save_workspace_config(workspace_dir, &config)?;
 
     Ok(())
 }
 
 /// Remove a dependency from the workspace configuration.
-pub fn remove_dependency(name: String) -> Result<()> {
-    let mut config = load_workspace_config()?;
+pub fn remove_dependency(workspace_dir: &Utf8Path, name: String) -> Result<()> {
+    let mut config = load_workspace_config(workspace_dir)?;
 
     if config.dependencies.remove(&name).is_some() {
-        save_workspace_config(&config)?;
+        save_workspace_config(workspace_dir, &config)?;
         Ok(())
     } else {
         Err(VwError::Config {
@@ -368,8 +374,8 @@ pub fn remove_dependency(name: String) -> Result<()> {
 }
 
 /// Clear all cached repositories for the current workspace.
-pub fn clear_cache() -> Result<Vec<String>> {
-    let config = load_workspace_config()?;
+pub fn clear_cache(workspace_dir: &Utf8Path) -> Result<Vec<String>> {
+    let config = load_workspace_config(workspace_dir)?;
     let deps_dir = get_deps_directory()?;
 
     let mut cleared = Vec::new();
@@ -399,14 +405,16 @@ pub fn clear_cache() -> Result<Vec<String>> {
 }
 
 /// List all dependencies in the workspace.
-pub fn list_dependencies() -> Result<Vec<DependencyInfo>> {
-    let config = load_workspace_config()?;
+pub fn list_dependencies(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<DependencyInfo>> {
+    let config = load_workspace_config(workspace_dir)?;
     if config.dependencies.is_empty() {
         return Ok(Vec::new());
     }
 
     // Try to load lock file to get resolved versions
-    let lock_file = load_lock_file().ok();
+    let lock_file = load_lock_file(workspace_dir).ok();
 
     let mut deps = Vec::new();
     for (name, dep) in &config.dependencies {
@@ -468,13 +476,57 @@ pub enum VersionInfo {
     Unknown,
 }
 
+/// Generate a TCL file containing all dependency VHDL files.
+pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
+    let lock_file = load_lock_file(workspace_dir)?;
+
+    let mut all_vhdl_files = Vec::new();
+
+    // Collect all VHDL files from all dependencies
+    for locked_dep in lock_file.dependencies.values() {
+        let vhdl_files = find_vhdl_files(&locked_dep.path)?;
+        all_vhdl_files.extend(vhdl_files);
+    }
+
+    // Generate TCL content
+    let mut tcl_content = String::from("# Auto-generated by vw\n");
+    tcl_content.push_str("# List of all dependency VHDL files\n\n");
+    tcl_content.push_str("set dep_files [list");
+
+    if !all_vhdl_files.is_empty() {
+        tcl_content.push_str(" \\\n");
+        for (i, file) in all_vhdl_files.iter().enumerate() {
+            let path_str = file.to_string_lossy();
+            tcl_content.push_str(&format!("    {}", path_str));
+
+            // Add backslash continuation for all but the last item
+            if i < all_vhdl_files.len() - 1 {
+                tcl_content.push_str(" \\");
+            }
+            tcl_content.push('\n');
+        }
+    }
+
+    tcl_content.push_str("]\n");
+
+    // Write to deps.tcl
+    let tcl_path = workspace_dir.join("deps.tcl");
+    fs::write(&tcl_path, tcl_content).map_err(|e| VwError::FileSystem {
+        message: format!("Failed to write deps.tcl file: {e}"),
+    })?;
+
+    Ok(())
+}
+
 // ============================================================================
 // Public API - Testbench Management
 // ============================================================================
 
 /// List all available testbenches in the workspace.
-pub fn list_testbenches() -> Result<Vec<TestbenchInfo>> {
-    let bench_dir = Path::new("bench");
+pub fn list_testbenches(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<TestbenchInfo>> {
+    let bench_dir = workspace_dir.join("bench");
     if !bench_dir.exists() {
         return Ok(Vec::new());
     }
@@ -515,10 +567,11 @@ pub struct TestbenchInfo {
 
 /// Run a testbench using NVC simulator.
 pub async fn run_testbench(
+    workspace_dir: &Utf8Path,
     testbench_name: String,
     vhdl_std: VhdlStandard,
 ) -> Result<()> {
-    let vhdl_ls_config = load_existing_vhdl_ls_config()?;
+    let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
 
     // First, analyze all non-defaultlib libraries
     for (lib_name, library) in &vhdl_ls_config.libraries {
@@ -593,31 +646,29 @@ pub async fn run_testbench(
         .unwrap_or_default();
 
     // Look for the testbench file in bench folder
-    let bench_dir = Path::new("bench");
+    let bench_dir = workspace_dir.join("bench");
     if !bench_dir.exists() {
         return Err(VwError::Testbench {
-            message: "No 'bench' directory found in current workspace"
-                .to_string(),
+            message: format!("No 'bench' directory found in {}", workspace_dir),
         });
     }
 
-    let testbench_file = find_testbench_file(&testbench_name, bench_dir)?;
+    let testbench_file = find_testbench_file(&testbench_name, &bench_dir)?;
 
     // Filter defaultlib files to exclude OTHER testbenches but allow common bench code
+    let bench_dir_abs = workspace_dir.as_std_path().join("bench");
     let filtered_defaultlib_files: Vec<PathBuf> = defaultlib_files
         .into_iter()
         .filter(|file_path| {
             // Convert to absolute path for comparison
             let absolute_path = if file_path.is_relative() {
-                std::env::current_dir().unwrap_or_default().join(file_path)
+                workspace_dir.as_std_path().join(file_path)
             } else {
                 file_path.clone()
             };
 
             // If it's not in the bench directory, include it
-            if !absolute_path.starts_with(
-                std::env::current_dir().unwrap_or_default().join("bench"),
-            ) {
+            if !absolute_path.starts_with(&bench_dir_abs) {
                 return true;
             }
 
@@ -980,7 +1031,7 @@ fn find_entities_in_file(file_path: &Path) -> Result<Vec<String>> {
 
 fn find_testbench_file(
     testbench_name: &str,
-    bench_dir: &Path,
+    bench_dir: &Utf8Path,
 ) -> Result<PathBuf> {
     let mut found_files = Vec::new();
 
@@ -1048,26 +1099,32 @@ fn extract_repo_name(repo_url: &str) -> String {
         .to_string()
 }
 
-fn save_workspace_config(config: &WorkspaceConfig) -> Result<()> {
+fn save_workspace_config(
+    workspace_dir: &Utf8Path,
+    config: &WorkspaceConfig,
+) -> Result<()> {
     let toml_content = toml::to_string_pretty(config)?;
+    let config_path = workspace_dir.join("vw.toml");
 
-    fs::write("vw.toml", toml_content).map_err(|e| VwError::FileSystem {
+    fs::write(&config_path, toml_content).map_err(|e| VwError::FileSystem {
         message: format!("Failed to write vw.toml file: {e}"),
     })?;
 
     Ok(())
 }
 
-pub fn load_workspace_config() -> Result<WorkspaceConfig> {
-    let config_path = Path::new("vw.toml");
+pub fn load_workspace_config(
+    workspace_dir: &Utf8Path,
+) -> Result<WorkspaceConfig> {
+    let config_path = workspace_dir.join("vw.toml");
     if !config_path.exists() {
         return Err(VwError::Config {
-            message: "No vw.toml file found in current directory".to_string(),
+            message: format!("No vw.toml file found in {}", workspace_dir),
         });
     }
 
     let config_content =
-        fs::read_to_string(config_path).map_err(|e| VwError::FileSystem {
+        fs::read_to_string(&config_path).map_err(|e| VwError::FileSystem {
             message: format!("Failed to read vw.toml: {e}"),
         })?;
 
@@ -1076,16 +1133,16 @@ pub fn load_workspace_config() -> Result<WorkspaceConfig> {
     Ok(config)
 }
 
-fn load_lock_file() -> Result<LockFile> {
-    let lock_path = Path::new("vw.lock");
+fn load_lock_file(workspace_dir: &Utf8Path) -> Result<LockFile> {
+    let lock_path = workspace_dir.join("vw.lock");
     if !lock_path.exists() {
         return Err(VwError::Config {
-            message: "No vw.lock file found".to_string(),
+            message: format!("No vw.lock file found in {}", workspace_dir),
         });
     }
 
     let lock_content =
-        fs::read_to_string(lock_path).map_err(|e| VwError::FileSystem {
+        fs::read_to_string(&lock_path).map_err(|e| VwError::FileSystem {
             message: format!("Failed to read vw.lock: {e}"),
         })?;
 
@@ -1146,11 +1203,13 @@ async fn get_branch_head_commit(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let commit = stdout.split_whitespace().next().ok_or_else(|| {
-        VwError::Git {
-            message: "Could not parse git ls-remote output".to_string(),
-        }
-    })?;
+    let commit =
+        stdout
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| VwError::Git {
+                message: "Could not parse git ls-remote output".to_string(),
+            })?;
 
     Ok(commit.to_string())
 }
@@ -1199,7 +1258,9 @@ async fn download_dependency(
     let src_dir = temp_dir.path().join(src_path);
     if !src_dir.exists() {
         return Err(VwError::Dependency {
-            message: format!("Source path '{src_path}' does not exist in repository"),
+            message: format!(
+                "Source path '{src_path}' does not exist in repository"
+            ),
         });
     }
 
@@ -1274,18 +1335,25 @@ fn find_vhdl_files_recursive(
     Ok(())
 }
 
-fn write_lock_file(lock_file: &LockFile) -> Result<()> {
+fn write_lock_file(
+    workspace_dir: &Utf8Path,
+    lock_file: &LockFile,
+) -> Result<()> {
     let toml_content = toml::to_string_pretty(lock_file)?;
+    let lock_path = workspace_dir.join("vw.lock");
 
-    fs::write("vw.lock", toml_content).map_err(|e| VwError::FileSystem {
+    fs::write(&lock_path, toml_content).map_err(|e| VwError::FileSystem {
         message: format!("Failed to write vw.lock file: {e}"),
     })?;
 
     Ok(())
 }
 
-fn write_vhdl_ls_config(managed_config: &VhdlLsConfig) -> Result<()> {
-    let mut existing_config = load_existing_vhdl_ls_config()?;
+fn write_vhdl_ls_config(
+    workspace_dir: &Utf8Path,
+    managed_config: &VhdlLsConfig,
+) -> Result<()> {
+    let mut existing_config = load_existing_vhdl_ls_config(workspace_dir)?;
 
     // Remove any existing managed dependencies and add the new ones
     for (name, library) in &managed_config.libraries {
@@ -1295,20 +1363,21 @@ fn write_vhdl_ls_config(managed_config: &VhdlLsConfig) -> Result<()> {
     }
 
     let toml_content = toml::to_string_pretty(&existing_config)?;
+    let config_path = workspace_dir.join("vhdl_ls.toml");
 
-    fs::write("vhdl_ls.toml", toml_content).map_err(|e| {
-        VwError::FileSystem {
-            message: format!("Failed to write vhdl_ls.toml file: {e}"),
-        }
+    fs::write(&config_path, toml_content).map_err(|e| VwError::FileSystem {
+        message: format!("Failed to write vhdl_ls.toml file: {e}"),
     })?;
 
     Ok(())
 }
 
-fn load_existing_vhdl_ls_config() -> Result<VhdlLsConfig> {
-    let config_path = Path::new("vhdl_ls.toml");
+fn load_existing_vhdl_ls_config(
+    workspace_dir: &Utf8Path,
+) -> Result<VhdlLsConfig> {
+    let config_path = workspace_dir.join("vhdl_ls.toml");
     if config_path.exists() {
-        let config_content = fs::read_to_string(config_path).map_err(|e| {
+        let config_content = fs::read_to_string(&config_path).map_err(|e| {
             VwError::FileSystem {
                 message: format!("Failed to read existing vhdl_ls.toml: {e}"),
             }

@@ -17,3 +17,4 @@ vw-lib = { path = "../vw-lib" }
 clap = { version = "4.0", features = ["derive"] }
 colored = "2.0"
 tokio.workspace = true
+camino.workspace = true
