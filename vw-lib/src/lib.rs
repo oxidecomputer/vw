@@ -165,6 +165,8 @@ pub struct Dependency {
     #[serde(default)]
     pub commit: Option<String>,
     pub src: String,
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -178,6 +180,8 @@ pub struct LockedDependency {
     pub commit: String,
     pub src: String,
     pub path: PathBuf,
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -269,11 +273,17 @@ pub async fn update_workspace(
         let was_cached = dep_path.exists();
 
         if !was_cached {
-            download_dependency(&dep.repo, &commit_sha, &dep.src, &dep_path)
-                .await
-                .map_err(|_| VwError::Dependency {
-                    message: format!("Failed to download dependency '{name}'"),
-                })?;
+            download_dependency(
+                &dep.repo,
+                &commit_sha,
+                &dep.src,
+                &dep_path,
+                dep.recursive,
+            )
+            .await
+            .map_err(|_| VwError::Dependency {
+                message: format!("Failed to download dependency '{name}'"),
+            })?;
         }
 
         update_info.push(DependencyUpdateInfo {
@@ -289,11 +299,12 @@ pub async fn update_workspace(
                 commit: commit_sha.clone(),
                 src: dep.src.clone(),
                 path: dep_path.clone(),
+                recursive: dep.recursive,
             },
         );
 
         // Find VHDL files in the cached dependency directory
-        let vhdl_files = find_vhdl_files(&dep_path)?;
+        let vhdl_files = find_vhdl_files(&dep_path, dep.recursive)?;
         if !vhdl_files.is_empty() {
             let portable_files =
                 vhdl_files.into_iter().map(make_path_portable).collect();
@@ -324,6 +335,7 @@ pub async fn add_dependency(
     commit: Option<String>,
     src: Option<String>,
     name: Option<String>,
+    recursive: bool,
 ) -> Result<()> {
     let mut config =
         load_workspace_config(workspace_dir).unwrap_or_else(|_| {
@@ -351,6 +363,7 @@ pub async fn add_dependency(
         branch,
         commit,
         src: src_path,
+        recursive,
     };
 
     config.dependencies.insert(dep_name.clone(), dependency);
@@ -484,7 +497,8 @@ pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
 
     // Collect all VHDL files from all dependencies
     for locked_dep in lock_file.dependencies.values() {
-        let vhdl_files = find_vhdl_files(&locked_dep.path)?;
+        let vhdl_files =
+            find_vhdl_files(&locked_dep.path, locked_dep.recursive)?;
         all_vhdl_files.extend(vhdl_files);
     }
 
@@ -1219,6 +1233,7 @@ async fn download_dependency(
     commit: &str,
     src_path: &str,
     dest_path: &Path,
+    recursive: bool,
 ) -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| VwError::FileSystem {
         message: format!("Failed to create temporary directory: {e}"),
@@ -1268,12 +1283,12 @@ async fn download_dependency(
         message: format!("Failed to create destination directory: {e}"),
     })?;
 
-    copy_vhdl_files(&src_dir, dest_path)?;
+    copy_vhdl_files(&src_dir, dest_path, recursive)?;
 
     Ok(())
 }
 
-fn copy_vhdl_files(src: &Path, dest: &Path) -> Result<()> {
+fn copy_vhdl_files(src: &Path, dest: &Path, recursive: bool) -> Result<()> {
     for entry in fs::read_dir(src).map_err(|e| VwError::FileSystem {
         message: format!("Failed to read source directory: {e}"),
     })? {
@@ -1283,13 +1298,15 @@ fn copy_vhdl_files(src: &Path, dest: &Path) -> Result<()> {
         let path = entry.path();
 
         if path.is_dir() {
-            let dest_subdir = dest.join(entry.file_name());
-            fs::create_dir_all(&dest_subdir).map_err(|e| {
-                VwError::FileSystem {
-                    message: format!("Failed to create subdirectory: {e}"),
-                }
-            })?;
-            copy_vhdl_files(&path, &dest_subdir)?;
+            if recursive {
+                let dest_subdir = dest.join(entry.file_name());
+                fs::create_dir_all(&dest_subdir).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to create subdirectory: {e}"),
+                    }
+                })?;
+                copy_vhdl_files(&path, &dest_subdir, recursive)?;
+            }
         } else if let Some(ext) = path.extension() {
             if ext == "vhd" || ext == "vhdl" {
                 let dest_file = dest.join(entry.file_name());
@@ -1304,15 +1321,16 @@ fn copy_vhdl_files(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn find_vhdl_files(dir: &Path) -> Result<Vec<PathBuf>> {
+fn find_vhdl_files(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
     let mut vhdl_files = Vec::new();
-    find_vhdl_files_recursive(dir, &mut vhdl_files)?;
+    find_vhdl_files_impl(dir, &mut vhdl_files, recursive)?;
     Ok(vhdl_files)
 }
 
-fn find_vhdl_files_recursive(
+fn find_vhdl_files_impl(
     dir: &Path,
     vhdl_files: &mut Vec<PathBuf>,
+    recursive: bool,
 ) -> Result<()> {
     for entry in fs::read_dir(dir).map_err(|e| VwError::FileSystem {
         message: format!("Failed to read directory: {e}"),
@@ -1323,7 +1341,9 @@ fn find_vhdl_files_recursive(
         let path = entry.path();
 
         if path.is_dir() {
-            find_vhdl_files_recursive(&path, vhdl_files)?;
+            if recursive {
+                find_vhdl_files_impl(&path, vhdl_files, recursive)?;
+            }
         } else if let Some(extension) =
             path.extension().and_then(|ext| ext.to_str())
         {

@@ -69,6 +69,11 @@ enum Commands {
         src: Option<String>,
         #[arg(long, help = "Dependency name (defaults to repository name)")]
         name: Option<String>,
+        #[arg(
+            long,
+            help = "Recursively include VHDL files from subdirectories"
+        )]
+        recursive: bool,
     },
     #[command(about = "Remove a dependency")]
     Remove {
@@ -159,6 +164,7 @@ async fn main() {
             commit,
             src,
             name,
+            recursive,
         } => {
             match add_dependency(
                 &cwd,
@@ -167,6 +173,7 @@ async fn main() {
                 commit,
                 src,
                 name.clone(),
+                recursive,
             )
             .await
             {
