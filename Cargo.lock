@@ -1224,6 +1224,14 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "colored",
+ "tokio",
+ "vw-lib",
+]
+
+[[package]]
+name = "vw-lib"
+version = "0.1.0"
+dependencies = [
  "dirs",
  "git2",
  "regex",
