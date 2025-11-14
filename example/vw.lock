@@ -1,5 +1,6 @@
 [dependencies.quartz]
 repo = "https://github.com/oxidecomputer/quartz"
-commit = "bdc5fb31e1905a1b66c19647fe2d156dd1b97b7b"
+commit = "09a412a5746785ff467040c57328911fb4aeb0ed"
 src = "hdl/ip/vhd"
-path = "/home/ry/.vw/deps/quartz-bdc5fb31e1905a1b66c19647fe2d156dd1b97b7b"
+path = "/home/ry/.vw/deps/quartz-09a412a5746785ff467040c57328911fb4aeb0ed"
+recursive = true

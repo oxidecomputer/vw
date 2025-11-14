@@ -1,0 +1,20 @@
+[package]
+name = "vw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A VHDL workspace management tool"
+keywords = ["vhdl", "workspace", "dependency-management"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "vw"
+path = "src/main.rs"
+
+[dependencies]
+vw-lib = { path = "../vw-lib" }
+clap = { version = "4.0", features = ["derive"] }
+colored = "2.0"
+tokio.workspace = true
+camino.workspace = true

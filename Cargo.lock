@@ -110,6 +110,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
+name = "camino"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "276a59bf2b2c967788139340c9f0c5b12d7fd6630315c15c217e559de85d2609"
+
+[[package]]
 name = "cc"
 version = "1.2.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1222,8 +1228,18 @@ dependencies = [
 name = "vw"
 version = "0.1.0"
 dependencies = [
+ "camino",
  "clap",
  "colored",
+ "tokio",
+ "vw-lib",
+]
+
+[[package]]
+name = "vw-lib"
+version = "0.1.0"
+dependencies = [
+ "camino",
  "dirs",
  "git2",
  "regex",
