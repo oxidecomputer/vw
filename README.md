@@ -10,7 +10,7 @@ integration, and intelligent testbench simulation using NVC.
 - **Smart Caching**: Dependencies are cached locally to avoid repeated downloads
 - **Language Server Integration**: Automatically generates `vhdl_ls.toml` configuration
 - **Testbench Execution**: Intelligent NVC-based testbench simulation with dependency analysis
-- **Flexible Source Paths**: Specify subdirectories within repositories as source paths
+- **Flexible Source Paths**: Specify directories, individual files, or glob patterns to select VHDL sources
 - **Lock File Support**: Tracks exact dependency versions with `vw.lock`
 
 ## Installation
@@ -59,11 +59,30 @@ Example workspace configuration file:
 name = "my-project"
 version = "0.1.0"
 
+# Directory-based dependency (with optional recursive flag)
 [dependencies.quartz]
 repo = "https://github.com/oxidecomputer/quartz"
 branch = "main"
 src = "hdl/ip/vhd"
+recursive = true  # Include subdirectories (default: false)
+
+# Single file dependency
+[dependencies.uart-lib]
+repo = "https://github.com/user/vhdl-libs"
+commit = "abc123..."
+src = "src/uart_pkg.vhd"
+
+# Glob pattern dependency (matches multiple files/directories)
+[dependencies.common-utils]
+repo = "https://github.com/user/common"
+branch = "main"
+src = "lib/**/*_pkg.vhd"  # All package files in lib/ subdirectories
 ```
+
+The `src` property supports three formats:
+- **Directory**: `"hdl/src"` - All VHDL files in the directory (use `recursive = true` for subdirectories)
+- **Single file**: `"hdl/src/uart.vhd"` - One specific file
+- **Glob pattern**: `"hdl/**/*.vhd"` or `"src/*_pkg.vhd"` - Pattern matching files
 
 ### `vw.lock`
 Lock file tracking exact dependency versions:
@@ -93,8 +112,19 @@ files = [
 
 1. **Dependency Resolution**: When you run `vw update`, the tool resolves branch names to specific commit hashes
 2. **Caching**: Dependencies are downloaded to `$HOME/.vw/deps/<name>-<commit>/`
-3. **File Filtering**: Only VHDL files (`.vhd` and `.vhdl`) from the specified `src` path are cached
+3. **File Filtering**: Only VHDL files (`.vhd` and `.vhdl`) matching the `src` pattern are cached
+   - Directories: All VHDL files in the directory (optionally recursive)
+   - Single files: Just that specific file
+   - Glob patterns: All files matching the pattern (e.g., `hdl/**/*.vhd`, `src/*_pkg.vhd`)
 4. **Language Server Config**: The tool merges dependency information with any existing `vhdl_ls.toml` configuration
+
+#### Common Glob Patterns
+
+- `"hdl/**/*.vhd"` - All `.vhd` files recursively under `hdl/`
+- `"src/*_pkg.vhd"` - All package files directly in `src/`
+- `"lib/**/{uart,spi}*.vhd"` - UART and SPI files anywhere under `lib/`
+- `"*.vhd"` - All `.vhd` files in the repository root
+- `"hdl/*/pkg/*.vhd"` - Package files in any subdirectory of `hdl/*/pkg/`
 
 ### Testbench Execution
 

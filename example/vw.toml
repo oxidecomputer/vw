@@ -2,8 +2,19 @@
 name = "example"
 version = "0.1.0"
 
+# Example: Directory-based dependency (with recursive flag)
 [dependencies.quartz]
 repo = "https://github.com/oxidecomputer/quartz"
 branch = "main"
 src = "hdl/ip/vhd"
 recursive = true
+
+# Additional examples:
+# Single file:
+# src = "hdl/ip/vhd/uart_pkg.vhd"
+
+# Glob pattern (automatic recursion):
+# src = "hdl/ip/vhd/**/*.vhd"
+
+# Specific files by pattern:
+# src = "hdl/**/pkg_*.vhd"

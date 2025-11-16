@@ -1248,6 +1248,7 @@ dependencies = [
  "camino",
  "dirs",
  "git2",
+ "glob",
  "netrc",
  "regex",
  "serde",
