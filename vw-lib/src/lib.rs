@@ -1395,7 +1395,7 @@ async fn get_branch_head_commit(
         let mut callbacks = git2::RemoteCallbacks::new();
         let attempt_count = RefCell::new(0);
 
-        callbacks.credentials(move |_url, username_from_url, allowed_types| {
+        callbacks.credentials(move |url, username_from_url, allowed_types| {
             let mut attempts = attempt_count.borrow_mut();
             *attempts += 1;
 
@@ -1420,7 +1420,12 @@ async fn get_branch_head_commit(
                 }
             }
 
-            git2::Cred::default()
+            // Fall back to git2's credential helper system (includes netrc)
+            git2::Cred::credential_helper(
+                &git2::Config::open_default().unwrap(),
+                url,
+                username_from_url,
+            )
         });
 
         remote
@@ -1484,7 +1489,7 @@ async fn download_dependency(
         let mut callbacks = git2::RemoteCallbacks::new();
         let attempt_count = RefCell::new(0);
 
-        callbacks.credentials(move |_url, username_from_url, allowed_types| {
+        callbacks.credentials(move |url, username_from_url, allowed_types| {
             let mut attempts = attempt_count.borrow_mut();
             *attempts += 1;
 
@@ -1509,7 +1514,12 @@ async fn download_dependency(
                 }
             }
 
-            git2::Cred::default()
+            // Fall back to git2's credential helper system (includes netrc)
+            git2::Cred::credential_helper(
+                &git2::Config::open_default().unwrap(),
+                url,
+                username_from_url,
+            )
         });
 
         let mut fetch_options = git2::FetchOptions::new();
