@@ -1392,44 +1392,52 @@ async fn get_branch_head_commit(
             })?;
 
         // Connect and list references
-        let mut callbacks = git2::RemoteCallbacks::new();
-        let attempt_count = RefCell::new(0);
+        // Only set a credentials callback if we have explicit credentials to provide.
+        // Otherwise, let git2/libcurl use default mechanisms (including .netrc files).
+        let callbacks_opt = if credentials.is_some() {
+            let mut callbacks = git2::RemoteCallbacks::new();
+            let attempt_count = RefCell::new(0);
 
-        callbacks.credentials(move |url, username_from_url, allowed_types| {
-            let mut attempts = attempt_count.borrow_mut();
-            *attempts += 1;
+            callbacks.credentials(
+                move |_url, username_from_url, allowed_types| {
+                    let mut attempts = attempt_count.borrow_mut();
+                    *attempts += 1;
 
-            // Limit attempts to prevent infinite loops
-            if *attempts > 1 {
-                return git2::Cred::default();
-            }
+                    // Limit attempts to prevent infinite loops
+                    if *attempts > 1 {
+                        return git2::Cred::default();
+                    }
 
-            // Use credentials from netrc if available
-            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
-            {
-                if let Some((ref _username, ref password)) = credentials {
-                    // For GitHub, use the token as username with empty password
-                    return git2::Cred::userpass_plaintext(password, "");
-                }
-            }
+                    // Use credentials from netrc if available
+                    if allowed_types
+                        .contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+                    {
+                        if let Some((ref _username, ref password)) = credentials
+                        {
+                            // For GitHub, use the token as username with empty password
+                            return git2::Cred::userpass_plaintext(
+                                password, "",
+                            );
+                        }
+                    }
 
-            // Try SSH key if available
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                if let Some(username) = username_from_url {
-                    return git2::Cred::ssh_key_from_agent(username);
-                }
-            }
+                    // Try SSH key if available
+                    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                        if let Some(username) = username_from_url {
+                            return git2::Cred::ssh_key_from_agent(username);
+                        }
+                    }
 
-            // Fall back to git2's credential helper system (includes netrc)
-            git2::Cred::credential_helper(
-                &git2::Config::open_default().unwrap(),
-                url,
-                username_from_url,
-            )
-        });
+                    git2::Cred::default()
+                },
+            );
+            Some(callbacks)
+        } else {
+            None
+        };
 
         remote
-            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
+            .connect_auth(git2::Direction::Fetch, callbacks_opt, None)
             .map_err(|e| VwError::Git {
                 message: format!("Failed to connect to remote: {e}"),
             })?;
@@ -1486,45 +1494,51 @@ async fn download_dependency(
     tokio::task::spawn_blocking(move || {
         // Set up clone options with authentication
         let mut builder = git2::build::RepoBuilder::new();
-        let mut callbacks = git2::RemoteCallbacks::new();
-        let attempt_count = RefCell::new(0);
 
-        callbacks.credentials(move |url, username_from_url, allowed_types| {
-            let mut attempts = attempt_count.borrow_mut();
-            *attempts += 1;
+        // Only set a credentials callback if we have explicit credentials to provide.
+        // Otherwise, let git2/libcurl use default mechanisms (including .netrc files).
+        if credentials.is_some() {
+            let mut callbacks = git2::RemoteCallbacks::new();
+            let attempt_count = RefCell::new(0);
 
-            // Limit attempts to prevent infinite loops
-            if *attempts > 1 {
-                return git2::Cred::default();
-            }
+            callbacks.credentials(
+                move |_url, username_from_url, allowed_types| {
+                    let mut attempts = attempt_count.borrow_mut();
+                    *attempts += 1;
 
-            // Use credentials from netrc if available
-            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
-            {
-                if let Some((ref _username, ref password)) = credentials {
-                    // For GitHub, use the token as username with empty password
-                    return git2::Cred::userpass_plaintext(password, "");
-                }
-            }
+                    // Limit attempts to prevent infinite loops
+                    if *attempts > 1 {
+                        return git2::Cred::default();
+                    }
 
-            // Try SSH key if available
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                if let Some(username) = username_from_url {
-                    return git2::Cred::ssh_key_from_agent(username);
-                }
-            }
+                    // Use credentials from netrc if available
+                    if allowed_types
+                        .contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+                    {
+                        if let Some((ref _username, ref password)) = credentials
+                        {
+                            // For GitHub, use the token as username with empty password
+                            return git2::Cred::userpass_plaintext(
+                                password, "",
+                            );
+                        }
+                    }
 
-            // Fall back to git2's credential helper system (includes netrc)
-            git2::Cred::credential_helper(
-                &git2::Config::open_default().unwrap(),
-                url,
-                username_from_url,
-            )
-        });
+                    // Try SSH key if available
+                    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                        if let Some(username) = username_from_url {
+                            return git2::Cred::ssh_key_from_agent(username);
+                        }
+                    }
 
-        let mut fetch_options = git2::FetchOptions::new();
-        fetch_options.remote_callbacks(callbacks);
-        builder.fetch_options(fetch_options);
+                    git2::Cred::default()
+                },
+            );
+
+            let mut fetch_options = git2::FetchOptions::new();
+            fetch_options.remote_callbacks(callbacks);
+            builder.fetch_options(fetch_options);
+        }
 
         // Clone the repository
         let repo =
