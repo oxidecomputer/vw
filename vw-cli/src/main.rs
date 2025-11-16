@@ -9,9 +9,11 @@ use std::fmt;
 use std::process;
 
 use vw_lib::{
-    add_dependency, clear_cache, generate_deps_tcl, init_workspace,
-    list_dependencies, list_testbenches, remove_dependency, run_testbench,
-    update_workspace, VersionInfo, VhdlStandard,
+    add_dependency_with_token, clear_cache, extract_hostname_from_repo_url,
+    generate_deps_tcl, get_access_credentials_from_netrc, init_workspace,
+    list_dependencies, list_testbenches, load_workspace_config,
+    remove_dependency, run_testbench, update_workspace_with_token, VersionInfo,
+    VhdlStandard,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -97,6 +99,37 @@ enum Commands {
     },
 }
 
+/// Helper function to get access credentials for a repository URL from netrc if available
+async fn get_access_credentials_for_repo(
+    repo_url: &str,
+) -> Option<(String, String)> {
+    if let Ok(hostname) = extract_hostname_from_repo_url(repo_url) {
+        if let Ok(Some((username, password))) =
+            get_access_credentials_from_netrc(&hostname)
+        {
+            return Some((username, password));
+        }
+    }
+    None
+}
+
+/// Helper function to get access credentials for workspace dependencies from netrc
+async fn get_access_credentials_for_workspace(
+    workspace_dir: &camino::Utf8Path,
+) -> Option<(String, String)> {
+    // Load workspace config and check if any dependencies might need authentication
+    if let Ok(config) = load_workspace_config(workspace_dir) {
+        for dep in config.dependencies.values() {
+            if let Some(creds) =
+                get_access_credentials_for_repo(&dep.repo).await
+            {
+                return Some(creds);
+            }
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -130,34 +163,39 @@ async fn main() {
                 name.cyan()
             );
         }
-        Commands::Update => match update_workspace(&cwd).await {
-            Ok(result) => {
-                for dep in result.dependencies {
-                    println!("Processing dependency: {}", dep.name.cyan());
-                    if dep.was_cached {
-                        println!(
-                            "Using cached version of {} at {}",
-                            dep.name.cyan(),
-                            dep.commit.cyan()
-                        );
-                    } else {
-                        println!(
-                            "Downloaded {} at {}",
-                            dep.name.cyan(),
-                            dep.commit.cyan()
-                        );
+        Commands::Update => {
+            let access_creds = get_access_credentials_for_workspace(&cwd).await;
+            let access_token =
+                access_creds.as_ref().map(|(_, password)| password.clone());
+            match update_workspace_with_token(&cwd, access_token).await {
+                Ok(result) => {
+                    for dep in result.dependencies {
+                        println!("Processing dependency: {}", dep.name.cyan());
+                        if dep.was_cached {
+                            println!(
+                                "Using cached version of {} at {}",
+                                dep.name.cyan(),
+                                dep.commit.cyan()
+                            );
+                        } else {
+                            println!(
+                                "Downloaded {} at {}",
+                                dep.name.cyan(),
+                                dep.commit.cyan()
+                            );
+                        }
                     }
+                    println!(
+                        "{} Workspace updated successfully!",
+                        "✓".bright_green()
+                    );
                 }
-                println!(
-                    "{} Workspace updated successfully!",
-                    "✓".bright_green()
-                );
+                Err(e) => {
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("{} {e}", "error:".bright_red());
-                process::exit(1);
-            }
-        },
+        }
         Commands::Add {
             repo,
             branch,
@@ -166,7 +204,10 @@ async fn main() {
             name,
             recursive,
         } => {
-            match add_dependency(
+            let access_creds = get_access_credentials_for_repo(&repo).await;
+            let access_token =
+                access_creds.as_ref().map(|(_, password)| password.clone());
+            match add_dependency_with_token(
                 &cwd,
                 repo.clone(),
                 branch,
@@ -174,6 +215,7 @@ async fn main() {
                 src,
                 name.clone(),
                 recursive,
+                access_token,
             )
             .await
             {

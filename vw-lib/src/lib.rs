@@ -13,17 +13,21 @@
 //!
 //! ```no_run
 //! use vw_lib::{init_workspace, update_workspace};
+//! use camino::Utf8Path;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let workspace_dir = Utf8Path::new(".");
+//!
 //! // Initialize a new workspace
-//! init_workspace("my_project".to_string())?;
+//! init_workspace(workspace_dir, "my_project".to_string())?;
 //!
 //! // Update dependencies
-//! update_workspace().await?;
+//! update_workspace(workspace_dir).await?;
 //! # Ok(())
 //! # }
 //! ```
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
@@ -203,6 +207,96 @@ pub struct VhdlLsLibrary {
 }
 
 // ============================================================================
+// Authentication Helpers
+// ============================================================================
+
+/// Get access token for a given host from the netrc file.
+///
+/// This function reads the user's .netrc file and looks for credentials
+/// for the specified host. For GitHub, it returns the password field
+/// which should contain the personal access token.
+/// Get access credentials (username, password) for a given host from the netrc file.
+pub fn get_access_credentials_from_netrc(
+    host: &str,
+) -> Result<Option<(String, String)>> {
+    let home_dir = dirs::home_dir().ok_or_else(|| VwError::FileSystem {
+        message: "Could not determine home directory".to_string(),
+    })?;
+
+    let netrc_path = home_dir.join(".netrc");
+    if !netrc_path.exists() {
+        return Ok(None);
+    }
+
+    let netrc_content = std::fs::read_to_string(&netrc_path).map_err(|e| {
+        VwError::FileSystem {
+            message: format!("Failed to read .netrc file: {e}"),
+        }
+    })?;
+
+    let netrc = netrc::Netrc::parse(netrc_content.as_bytes()).map_err(|e| {
+        VwError::FileSystem {
+            message: format!("Failed to parse .netrc file: {e:?}"),
+        }
+    })?;
+
+    // netrc.hosts is a Vec<(String, Machine)>, so we need to iterate
+    for (hostname, machine) in &netrc.hosts {
+        if hostname == host {
+            // Return both login and password if both are present
+            if let Some(password) = &machine.password {
+                let login = machine.login.clone();
+                return Ok(Some((login, password.clone())));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Get access token for a given host from the netrc file.
+///
+/// This function reads the user's .netrc file and looks for credentials
+/// for the specified host. For GitHub, it returns the password field
+/// which should contain the personal access token.
+pub fn get_access_token_from_netrc(host: &str) -> Result<Option<String>> {
+    if let Some((_login, password)) = get_access_credentials_from_netrc(host)? {
+        Ok(Some(password))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Extract hostname from a git repository URL.
+///
+/// Supports both HTTPS and SSH URLs:
+/// - https://github.com/user/repo.git -> github.com
+/// - git@github.com:user/repo.git -> github.com
+pub fn extract_hostname_from_repo_url(repo_url: &str) -> Result<String> {
+    if repo_url.starts_with("https://") {
+        let url = url::Url::parse(repo_url).map_err(|e| VwError::Config {
+            message: format!("Invalid repository URL '{repo_url}': {e}"),
+        })?;
+        Ok(url.host_str().unwrap_or("").to_string())
+    } else if repo_url.starts_with("git@") {
+        // Parse SSH format: git@hostname:path
+        if let Some(at_pos) = repo_url.find('@') {
+            if let Some(colon_pos) = repo_url[at_pos..].find(':') {
+                let hostname = &repo_url[at_pos + 1..at_pos + colon_pos];
+                return Ok(hostname.to_string());
+            }
+        }
+        Err(VwError::Config {
+            message: format!("Invalid SSH repository URL format: {repo_url}"),
+        })
+    } else {
+        Err(VwError::Config {
+            message: format!("Unsupported repository URL format: {repo_url}"),
+        })
+    }
+}
+
+// ============================================================================
 // Public API - Workspace Management
 // ============================================================================
 
@@ -211,7 +305,7 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
     let config_path = workspace_dir.join("vw.toml");
     if config_path.exists() {
         return Err(VwError::Config {
-            message: format!("vw.toml already exists in {}", workspace_dir),
+            message: format!("vw.toml already exists in {workspace_dir}"),
         });
     }
 
@@ -243,6 +337,14 @@ pub struct DependencyUpdateInfo {
 pub async fn update_workspace(
     workspace_dir: &Utf8Path,
 ) -> Result<UpdateResult> {
+    update_workspace_with_token(workspace_dir, None).await
+}
+
+/// Update workspace dependencies with an optional access token for private repositories.
+pub async fn update_workspace_with_token(
+    workspace_dir: &Utf8Path,
+    _access_token: Option<String>,
+) -> Result<UpdateResult> {
     let config = load_workspace_config(workspace_dir)?;
     let deps_dir = get_deps_directory()?;
 
@@ -259,14 +361,30 @@ pub async fn update_workspace(
     let mut update_info = Vec::new();
 
     for (name, dep) in &config.dependencies {
-        let commit_sha =
-            resolve_dependency_commit(&dep.repo, &dep.branch, &dep.commit)
-                .await
-                .map_err(|_| VwError::Dependency {
-                    message: format!(
-                        "Failed to resolve commit for dependency '{name}'"
-                    ),
-                })?;
+        // Get actual netrc credentials for this repository
+        let hostname = match extract_hostname_from_repo_url(&dep.repo) {
+            Ok(h) => h,
+            Err(_) => "".to_string(),
+        };
+        let netrc_creds = if !hostname.is_empty() {
+            get_access_credentials_from_netrc(&hostname).unwrap_or(None)
+        } else {
+            None
+        };
+        let creds = netrc_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+
+        let commit_sha = resolve_dependency_commit(
+            &dep.repo,
+            &dep.branch,
+            &dep.commit,
+            creds,
+        )
+        .await
+        .map_err(|e| VwError::Dependency {
+            message: format!(
+                "Failed to resolve commit for dependency '{name}': {e}"
+            ),
+        })?;
 
         let dep_path = deps_dir.join(format!("{name}-{commit_sha}"));
 
@@ -279,10 +397,11 @@ pub async fn update_workspace(
                 &dep.src,
                 &dep_path,
                 dep.recursive,
+                creds,
             )
             .await
-            .map_err(|_| VwError::Dependency {
-                message: format!("Failed to download dependency '{name}'"),
+            .map_err(|e| VwError::Dependency {
+                message: format!("Failed to download dependency '{name}': {e}"),
             })?;
         }
 
@@ -336,6 +455,31 @@ pub async fn add_dependency(
     src: Option<String>,
     name: Option<String>,
     recursive: bool,
+) -> Result<()> {
+    add_dependency_with_token(
+        workspace_dir,
+        repo,
+        branch,
+        commit,
+        src,
+        name,
+        recursive,
+        None,
+    )
+    .await
+}
+
+/// Add a new dependency with an optional access token for private repositories.
+#[allow(clippy::too_many_arguments)]
+pub async fn add_dependency_with_token(
+    workspace_dir: &Utf8Path,
+    repo: String,
+    branch: Option<String>,
+    commit: Option<String>,
+    src: Option<String>,
+    name: Option<String>,
+    recursive: bool,
+    _access_token: Option<String>,
 ) -> Result<()> {
     let mut config =
         load_workspace_config(workspace_dir).unwrap_or_else(|_| {
@@ -510,13 +654,13 @@ pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
             find_vhdl_files(&locked_dep.path, locked_dep.recursive)?;
 
         // Create array entry for this library
-        tcl_content.push_str(&format!("set dep_files({}) [list", dep_name));
+        tcl_content.push_str(&format!("set dep_files({dep_name}) [list"));
 
         if !vhdl_files.is_empty() {
             tcl_content.push_str(" \\\n");
             for (i, file) in vhdl_files.iter().enumerate() {
                 let path_str = file.to_string_lossy();
-                tcl_content.push_str(&format!("    {}", path_str));
+                tcl_content.push_str(&format!("    {path_str}"));
 
                 // Add backslash continuation for all but the last item
                 if i < vhdl_files.len() - 1 {
@@ -669,7 +813,7 @@ pub async fn run_testbench(
     let bench_dir = workspace_dir.join("bench");
     if !bench_dir.exists() {
         return Err(VwError::Testbench {
-            message: format!("No 'bench' directory found in {}", workspace_dir),
+            message: format!("No 'bench' directory found in {workspace_dir}"),
         });
     }
 
@@ -1139,7 +1283,7 @@ pub fn load_workspace_config(
     let config_path = workspace_dir.join("vw.toml");
     if !config_path.exists() {
         return Err(VwError::Config {
-            message: format!("No vw.toml file found in {}", workspace_dir),
+            message: format!("No vw.toml file found in {workspace_dir}"),
         });
     }
 
@@ -1157,7 +1301,7 @@ fn load_lock_file(workspace_dir: &Utf8Path) -> Result<LockFile> {
     let lock_path = workspace_dir.join("vw.lock");
     if !lock_path.exists() {
         return Err(VwError::Config {
-            message: format!("No vw.lock file found in {}", workspace_dir),
+            message: format!("No vw.lock file found in {workspace_dir}"),
         });
     }
 
@@ -1188,6 +1332,7 @@ async fn resolve_dependency_commit(
     repo_url: &str,
     branch: &Option<String>,
     commit: &Option<String>,
+    credentials: Option<(&str, &str)>, // (username, password)
 ) -> Result<String> {
     match (branch, commit) {
         (Some(_), Some(_)) => Err(VwError::Config {
@@ -1199,39 +1344,113 @@ async fn resolve_dependency_commit(
                 .to_string(),
         }),
         (None, Some(commit)) => Ok(commit.clone()),
-        (Some(branch), None) => get_branch_head_commit(repo_url, branch).await,
+        (Some(branch), None) => {
+            get_branch_head_commit(repo_url, branch, credentials).await
+        }
     }
 }
 
 async fn get_branch_head_commit(
     repo_url: &str,
     branch: &str,
+    credentials: Option<(&str, &str)>, // (username, password)
 ) -> Result<String> {
-    let output = tokio::process::Command::new("git")
-        .args(["ls-remote", repo_url, branch])
-        .output()
-        .await
-        .map_err(|e| VwError::Git {
-            message: format!("Failed to execute git ls-remote: {e}"),
-        })?;
+    // Normalize repository URL to ensure it ends with .git for GitHub
+    let normalized_repo_url =
+        if repo_url.contains("github.com") && !repo_url.ends_with(".git") {
+            format!("{repo_url}.git")
+        } else {
+            repo_url.to_string()
+        };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VwError::Git {
-            message: format!("Git ls-remote failed: {stderr}"),
-        });
-    }
+    let branch = branch.to_string();
+    let credentials = credentials.map(|(u, p)| (u.to_string(), p.to_string()));
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let commit =
-        stdout
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| VwError::Git {
-                message: "Could not parse git ls-remote output".to_string(),
+    tokio::task::spawn_blocking(move || {
+        // Create a temporary directory for the operation
+        let temp_dir =
+            tempfile::tempdir().map_err(|e| VwError::FileSystem {
+                message: format!("Failed to create temporary directory: {e}"),
             })?;
 
-    Ok(commit.to_string())
+        // Create an empty repository to work with remotes
+        let repo =
+            git2::Repository::init_bare(temp_dir.path()).map_err(|e| {
+                VwError::Git {
+                    message: format!(
+                        "Failed to initialize temporary repository: {e}"
+                    ),
+                }
+            })?;
+
+        // Create a remote
+        let mut remote =
+            repo.remote_anonymous(&normalized_repo_url).map_err(|e| {
+                VwError::Git {
+                    message: format!("Failed to create remote: {e}"),
+                }
+            })?;
+
+        // Connect and list references
+        let mut callbacks = git2::RemoteCallbacks::new();
+        let attempt_count = RefCell::new(0);
+
+        callbacks.credentials(move |_url, username_from_url, allowed_types| {
+            let mut attempts = attempt_count.borrow_mut();
+            *attempts += 1;
+
+            // Limit attempts to prevent infinite loops
+            if *attempts > 1 {
+                return git2::Cred::default();
+            }
+
+            // Use credentials from netrc if available
+            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+            {
+                if let Some((ref _username, ref password)) = credentials {
+                    // For GitHub, use the token as username with empty password
+                    return git2::Cred::userpass_plaintext(password, "");
+                }
+            }
+
+            // Try SSH key if available
+            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                if let Some(username) = username_from_url {
+                    return git2::Cred::ssh_key_from_agent(username);
+                }
+            }
+
+            git2::Cred::default()
+        });
+
+        remote
+            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
+            .map_err(|e| VwError::Git {
+                message: format!("Failed to connect to remote: {e}"),
+            })?;
+
+        let refs = remote.list().map_err(|e| VwError::Git {
+            message: format!("Failed to list remote references: {e}"),
+        })?;
+
+        // Look for the specific branch reference
+        let ref_name = format!("refs/heads/{branch}");
+        for remote_head in refs {
+            if remote_head.name() == ref_name {
+                return Ok(remote_head.oid().to_string());
+            }
+        }
+
+        Err(VwError::Git {
+            message: format!(
+                "Branch '{branch}' not found in remote repository"
+            ),
+        })
+    })
+    .await
+    .map_err(|e| VwError::Git {
+        message: format!("Failed to execute git ls-remote task: {e}"),
+    })?
 }
 
 async fn download_dependency(
@@ -1240,43 +1459,105 @@ async fn download_dependency(
     src_path: &str,
     dest_path: &Path,
     recursive: bool,
+    credentials: Option<(&str, &str)>, // (username, password)
 ) -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| VwError::FileSystem {
         message: format!("Failed to create temporary directory: {e}"),
     })?;
 
-    let clone_output = tokio::process::Command::new("git")
-        .args(["clone", repo_url, temp_dir.path().to_str().unwrap()])
-        .output()
-        .await
-        .map_err(|e| VwError::Git {
-            message: format!("Failed to execute git clone: {e}"),
-        })?;
+    // Normalize repository URL to ensure it ends with .git for GitHub
+    let normalized_repo_url =
+        if repo_url.contains("github.com") && !repo_url.ends_with(".git") {
+            format!("{repo_url}.git")
+        } else {
+            repo_url.to_string()
+        };
 
-    if !clone_output.status.success() {
-        let stderr = String::from_utf8_lossy(&clone_output.stderr);
-        return Err(VwError::Git {
-            message: format!("Git clone failed: {stderr}"),
+    let commit = commit.to_string();
+    let temp_path = temp_dir.path().to_path_buf();
+    let src_path = src_path.to_string();
+    let credentials = credentials.map(|(u, p)| (u.to_string(), p.to_string()));
+
+    tokio::task::spawn_blocking(move || {
+        // Set up clone options with authentication
+        let mut builder = git2::build::RepoBuilder::new();
+        let mut callbacks = git2::RemoteCallbacks::new();
+        let attempt_count = RefCell::new(0);
+
+        callbacks.credentials(move |_url, username_from_url, allowed_types| {
+            let mut attempts = attempt_count.borrow_mut();
+            *attempts += 1;
+
+            // Limit attempts to prevent infinite loops
+            if *attempts > 1 {
+                return git2::Cred::default();
+            }
+
+            // Use credentials from netrc if available
+            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+            {
+                if let Some((ref _username, ref password)) = credentials {
+                    // For GitHub, use the token as username with empty password
+                    return git2::Cred::userpass_plaintext(password, "");
+                }
+            }
+
+            // Try SSH key if available
+            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                if let Some(username) = username_from_url {
+                    return git2::Cred::ssh_key_from_agent(username);
+                }
+            }
+
+            git2::Cred::default()
         });
-    }
 
-    let checkout_output = tokio::process::Command::new("git")
-        .current_dir(temp_dir.path())
-        .args(["checkout", commit])
-        .output()
-        .await
-        .map_err(|e| VwError::Git {
-            message: format!("Failed to execute git checkout: {e}"),
-        })?;
+        let mut fetch_options = git2::FetchOptions::new();
+        fetch_options.remote_callbacks(callbacks);
+        builder.fetch_options(fetch_options);
 
-    if !checkout_output.status.success() {
-        let stderr = String::from_utf8_lossy(&checkout_output.stderr);
-        return Err(VwError::Git {
-            message: format!("Git checkout failed: {stderr}"),
-        });
-    }
+        // Clone the repository
+        let repo =
+            builder
+                .clone(&normalized_repo_url, &temp_path)
+                .map_err(|e| VwError::Git {
+                    message: format!("Failed to clone repository: {e}"),
+                })?;
 
-    let src_dir = temp_dir.path().join(src_path);
+        // Parse the commit SHA
+        let commit_oid =
+            git2::Oid::from_str(&commit).map_err(|e| VwError::Git {
+                message: format!("Invalid commit SHA '{commit}': {e}"),
+            })?;
+
+        // Find the commit object
+        let commit_obj =
+            repo.find_commit(commit_oid).map_err(|e| VwError::Git {
+                message: format!("Commit '{commit}' not found: {e}"),
+            })?;
+
+        // Checkout the specific commit
+        repo.checkout_tree(commit_obj.as_object(), None)
+            .map_err(|e| VwError::Git {
+                message: format!("Failed to checkout commit '{commit}': {e}"),
+            })?;
+
+        // Set HEAD to the commit
+        repo.set_head_detached(commit_oid)
+            .map_err(|e| VwError::Git {
+                message: format!(
+                    "Failed to set HEAD to commit '{commit}': {e}"
+                ),
+            })?;
+
+        Ok::<(), VwError>(())
+    })
+    .await
+    .map_err(|e| VwError::Git {
+        message: format!("Failed to execute git operations: {e}"),
+    })??;
+
+    let src_dir = temp_dir.path().join(&src_path);
     if !src_dir.exists() {
         return Err(VwError::Dependency {
             message: format!(

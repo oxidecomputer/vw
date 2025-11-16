@@ -652,6 +652,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "netrc"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9a91b326434fca226707ed8ec1fd22d4e1c96801abdf10c412afdc7d97116e0"
+
+[[package]]
 name = "object"
 version = "0.36.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1242,6 +1248,7 @@ dependencies = [
  "camino",
  "dirs",
  "git2",
+ "netrc",
  "regex",
  "serde",
  "serde_json",
@@ -1249,6 +1256,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "url",
  "vhdl_lang",
 ]
 
