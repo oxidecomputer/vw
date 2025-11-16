@@ -207,6 +207,24 @@ pub struct VhdlLsLibrary {
 }
 
 // ============================================================================
+// Credentials
+// ============================================================================
+
+/// Credentials for authenticating with git repositories.
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl Credentials {
+    /// Create new credentials from username and password.
+    pub fn new(username: String, password: String) -> Self {
+        Self { username, password }
+    }
+}
+
+// ============================================================================
 // Authentication Helpers
 // ============================================================================
 
@@ -218,7 +236,7 @@ pub struct VhdlLsLibrary {
 /// Get access credentials (username, password) for a given host from the netrc file.
 pub fn get_access_credentials_from_netrc(
     host: &str,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<Credentials>> {
     let home_dir = dirs::home_dir().ok_or_else(|| VwError::FileSystem {
         message: "Could not determine home directory".to_string(),
     })?;
@@ -246,7 +264,7 @@ pub fn get_access_credentials_from_netrc(
             // Return both login and password if both are present
             if let Some(password) = &machine.password {
                 let login = machine.login.clone();
-                return Ok(Some((login, password.clone())));
+                return Ok(Some(Credentials::new(login, password.clone())));
             }
         }
     }
@@ -260,8 +278,8 @@ pub fn get_access_credentials_from_netrc(
 /// for the specified host. For GitHub, it returns the password field
 /// which should contain the personal access token.
 pub fn get_access_token_from_netrc(host: &str) -> Result<Option<String>> {
-    if let Some((_login, password)) = get_access_credentials_from_netrc(host)? {
-        Ok(Some(password))
+    if let Some(creds) = get_access_credentials_from_netrc(host)? {
+        Ok(Some(creds.password))
     } else {
         Ok(None)
     }
@@ -340,10 +358,14 @@ pub async fn update_workspace(
     update_workspace_with_token(workspace_dir, None).await
 }
 
-/// Update workspace dependencies with an optional access token for private repositories.
+/// Update workspace dependencies with optional credentials for private repositories.
+///
+/// # Arguments
+/// * `workspace_dir` - Path to the workspace directory
+/// * `credentials` - Optional credentials for authentication
 pub async fn update_workspace_with_token(
     workspace_dir: &Utf8Path,
-    _access_token: Option<String>,
+    credentials: Option<Credentials>,
 ) -> Result<UpdateResult> {
     let config = load_workspace_config(workspace_dir)?;
     let deps_dir = get_deps_directory()?;
@@ -361,17 +383,10 @@ pub async fn update_workspace_with_token(
     let mut update_info = Vec::new();
 
     for (name, dep) in &config.dependencies {
-        // Get actual netrc credentials for this repository
-        let hostname = match extract_hostname_from_repo_url(&dep.repo) {
-            Ok(h) => h,
-            Err(_) => "".to_string(),
-        };
-        let netrc_creds = if !hostname.is_empty() {
-            get_access_credentials_from_netrc(&hostname).unwrap_or(None)
-        } else {
-            None
-        };
-        let creds = netrc_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        // Use credentials passed from caller
+        let creds = credentials
+            .as_ref()
+            .map(|c| (c.username.as_str(), c.password.as_str()));
 
         let commit_sha = resolve_dependency_commit(
             &dep.repo,
@@ -469,7 +484,17 @@ pub async fn add_dependency(
     .await
 }
 
-/// Add a new dependency with an optional access token for private repositories.
+/// Add a new dependency with optional credentials for private repositories.
+///
+/// # Arguments
+/// * `workspace_dir` - Path to the workspace directory
+/// * `repo` - Git repository URL
+/// * `branch` - Optional branch name
+/// * `commit` - Optional commit hash
+/// * `src` - Optional source path within the repository
+/// * `name` - Optional dependency name
+/// * `recursive` - Whether to recursively include VHDL files
+/// * `credentials` - Optional credentials for authentication
 #[allow(clippy::too_many_arguments)]
 pub async fn add_dependency_with_token(
     workspace_dir: &Utf8Path,
@@ -479,7 +504,7 @@ pub async fn add_dependency_with_token(
     src: Option<String>,
     name: Option<String>,
     recursive: bool,
-    _access_token: Option<String>,
+    _credentials: Option<Credentials>,
 ) -> Result<()> {
     let mut config =
         load_workspace_config(workspace_dir).unwrap_or_else(|_| {
