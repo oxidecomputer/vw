@@ -1422,11 +1422,16 @@ async fn get_branch_head_commit(
         let attempt_count = RefCell::new(0);
 
         callbacks.credentials(move |url, username_from_url, allowed_types| {
+            eprintln!("DEBUG: Credentials callback invoked for URL: {}", url);
+            eprintln!("DEBUG: Allowed types: {:?}", allowed_types);
+            eprintln!("DEBUG: Has credentials: {}", credentials.is_some());
+
             let mut attempts = attempt_count.borrow_mut();
             *attempts += 1;
 
             // Limit attempts to prevent infinite loops
             if *attempts > 1 {
+                eprintln!("DEBUG: Too many attempts, returning default");
                 return git2::Cred::default();
             }
 
@@ -1434,9 +1439,18 @@ async fn get_branch_head_commit(
             if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
             {
                 if let Some((ref _username, ref password)) = credentials {
+                    eprintln!(
+                        "DEBUG: Using userpass_plaintext for authentication"
+                    );
                     // For GitHub, use the token as username with empty password
                     return git2::Cred::userpass_plaintext(password, "");
+                } else {
+                    eprintln!(
+                        "DEBUG: No credentials despite has_credentials check"
+                    );
                 }
+            } else {
+                eprintln!("DEBUG: USER_PASS_PLAINTEXT not in allowed types");
             }
 
             // Try SSH key if available
@@ -1528,11 +1542,16 @@ async fn download_dependency(
         let attempt_count = RefCell::new(0);
 
         callbacks.credentials(move |url, username_from_url, allowed_types| {
+            eprintln!("DEBUG: Credentials callback invoked for URL: {}", url);
+            eprintln!("DEBUG: Allowed types: {:?}", allowed_types);
+            eprintln!("DEBUG: Has credentials: {}", credentials.is_some());
+
             let mut attempts = attempt_count.borrow_mut();
             *attempts += 1;
 
             // Limit attempts to prevent infinite loops
             if *attempts > 1 {
+                eprintln!("DEBUG: Too many attempts, returning default");
                 return git2::Cred::default();
             }
 
@@ -1540,9 +1559,18 @@ async fn download_dependency(
             if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
             {
                 if let Some((ref _username, ref password)) = credentials {
+                    eprintln!(
+                        "DEBUG: Using userpass_plaintext for authentication"
+                    );
                     // For GitHub, use the token as username with empty password
                     return git2::Cred::userpass_plaintext(password, "");
+                } else {
+                    eprintln!(
+                        "DEBUG: No credentials despite has_credentials check"
+                    );
                 }
+            } else {
+                eprintln!("DEBUG: USER_PASS_PLAINTEXT not in allowed types");
             }
 
             // Try SSH key if available
