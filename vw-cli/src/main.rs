@@ -12,8 +12,8 @@ use vw_lib::{
     add_dependency_with_token, clear_cache, extract_hostname_from_repo_url,
     generate_deps_tcl, get_access_credentials_from_netrc, init_workspace,
     list_dependencies, list_testbenches, load_workspace_config,
-    remove_dependency, run_testbench, update_workspace_with_token, VersionInfo,
-    VhdlStandard,
+    remove_dependency, run_testbench, update_workspace_with_token, Credentials,
+    VersionInfo, VhdlStandard,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -102,12 +102,10 @@ enum Commands {
 /// Helper function to get access credentials for a repository URL from netrc if available
 async fn get_access_credentials_for_repo(
     repo_url: &str,
-) -> Option<(String, String)> {
+) -> Option<Credentials> {
     if let Ok(hostname) = extract_hostname_from_repo_url(repo_url) {
-        if let Ok(Some((username, password))) =
-            get_access_credentials_from_netrc(&hostname)
-        {
-            return Some((username, password));
+        if let Ok(Some(creds)) = get_access_credentials_from_netrc(&hostname) {
+            return Some(creds);
         }
     }
     None
@@ -116,7 +114,7 @@ async fn get_access_credentials_for_repo(
 /// Helper function to get access credentials for workspace dependencies from netrc
 async fn get_access_credentials_for_workspace(
     workspace_dir: &camino::Utf8Path,
-) -> Option<(String, String)> {
+) -> Option<Credentials> {
     // Load workspace config and check if any dependencies might need authentication
     if let Ok(config) = load_workspace_config(workspace_dir) {
         for dep in config.dependencies.values() {
@@ -165,9 +163,7 @@ async fn main() {
         }
         Commands::Update => {
             let access_creds = get_access_credentials_for_workspace(&cwd).await;
-            let access_token =
-                access_creds.as_ref().map(|(_, password)| password.clone());
-            match update_workspace_with_token(&cwd, access_token).await {
+            match update_workspace_with_token(&cwd, access_creds).await {
                 Ok(result) => {
                     for dep in result.dependencies {
                         println!("Processing dependency: {}", dep.name.cyan());
@@ -205,8 +201,6 @@ async fn main() {
             recursive,
         } => {
             let access_creds = get_access_credentials_for_repo(&repo).await;
-            let access_token =
-                access_creds.as_ref().map(|(_, password)| password.clone());
             match add_dependency_with_token(
                 &cwd,
                 repo.clone(),
@@ -215,7 +209,7 @@ async fn main() {
                 src,
                 name.clone(),
                 recursive,
-                access_token,
+                access_creds,
             )
             .await
             {
