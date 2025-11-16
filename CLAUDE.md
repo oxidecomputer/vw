@@ -11,6 +11,11 @@ property or a `commit` property that specifies either a branch or commit within
 that repository to use and a `src` property that describes where to find the
 VHDL code.
 
+The `src` property supports multiple formats:
+- **Directory path**: A path to a directory containing VHDL files (e.g., `"hdl/ip/vhd"`). Use the `recursive` flag to include subdirectories.
+- **Single file**: A path to a specific VHDL file (e.g., `"hdl/ip/vhd/uart_pkg.vhd"`).
+- **Glob pattern**: A glob pattern to match specific files (e.g., `"hdl/ip/vhd/**/*.vhd"` or `"hdl/**/pkg_*.vhd"`). The `recursive` flag is ignored for glob patterns as they handle their own path traversal.
+
 ## Dependency Management
 
 Executing `vw update` will do a few things:

@@ -1557,54 +1557,137 @@ async fn download_dependency(
         message: format!("Failed to execute git operations: {e}"),
     })??;
 
-    let src_dir = temp_dir.path().join(&src_path);
-    if !src_dir.exists() {
-        return Err(VwError::Dependency {
-            message: format!(
-                "Source path '{src_path}' does not exist in repository"
-            ),
-        });
-    }
-
     fs::create_dir_all(dest_path).map_err(|e| VwError::FileSystem {
         message: format!("Failed to create destination directory: {e}"),
     })?;
 
-    copy_vhdl_files(&src_dir, dest_path, recursive)?;
+    // Treat all src values as globs (handles files, directories, and patterns)
+    copy_vhdl_files_glob(temp_dir.path(), &src_path, dest_path, recursive)?;
 
     Ok(())
 }
 
-fn copy_vhdl_files(src: &Path, dest: &Path, recursive: bool) -> Result<()> {
-    for entry in fs::read_dir(src).map_err(|e| VwError::FileSystem {
-        message: format!("Failed to read source directory: {e}"),
-    })? {
-        let entry = entry.map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read directory entry: {e}"),
-        })?;
-        let path = entry.path();
+fn copy_vhdl_files_glob(
+    repo_root: &Path,
+    src_pattern: &str,
+    dest: &Path,
+    recursive: bool,
+) -> Result<()> {
+    // Build patterns to match
+    let src_path = repo_root.join(src_pattern);
+    let mut patterns = Vec::new();
+    let strip_prefix: PathBuf;
 
-        if path.is_dir() {
-            if recursive {
-                let dest_subdir = dest.join(entry.file_name());
-                fs::create_dir_all(&dest_subdir).map_err(|e| {
-                    VwError::FileSystem {
-                        message: format!("Failed to create subdirectory: {e}"),
+    // Check if src_pattern points to a directory
+    if src_path.is_dir() {
+        // It's a directory - create appropriate glob patterns
+        let base_pattern =
+            src_path.to_str().ok_or_else(|| VwError::FileSystem {
+                message: "Invalid UTF-8 in path".to_string(),
+            })?;
+
+        if recursive {
+            // Recursively find all VHDL files
+            patterns.push(format!("{base_pattern}/**/*.vhd"));
+            patterns.push(format!("{base_pattern}/**/*.vhdl"));
+        } else {
+            // Only files directly in the directory
+            patterns.push(format!("{base_pattern}/*.vhd"));
+            patterns.push(format!("{base_pattern}/*.vhdl"));
+        }
+        // For directories, strip the src directory from paths
+        strip_prefix = src_path;
+    } else if src_path.is_file() {
+        // It's a single file - use as-is
+        patterns.push(
+            src_path
+                .to_str()
+                .ok_or_else(|| VwError::FileSystem {
+                    message: "Invalid UTF-8 in path".to_string(),
+                })?
+                .to_string(),
+        );
+        // For single files, strip the parent directory
+        strip_prefix = src_path
+            .parent()
+            .ok_or_else(|| VwError::FileSystem {
+                message: "File has no parent directory".to_string(),
+            })?
+            .to_path_buf();
+    } else {
+        // It's a glob pattern or doesn't exist yet - use as-is
+        patterns.push(
+            src_path
+                .to_str()
+                .ok_or_else(|| VwError::FileSystem {
+                    message: "Invalid UTF-8 in glob pattern path".to_string(),
+                })?
+                .to_string(),
+        );
+        // For glob patterns, strip the repo root to preserve relative structure
+        strip_prefix = repo_root.to_path_buf();
+    }
+
+    let mut copied_count = 0;
+    for pattern_str in &patterns {
+        // Use glob to find matching files
+        let entries =
+            glob::glob(pattern_str).map_err(|e| VwError::FileSystem {
+                message: format!("Invalid glob pattern '{pattern_str}': {e}"),
+            })?;
+
+        for entry in entries {
+            let path = entry.map_err(|e| VwError::FileSystem {
+                message: format!("Error reading glob entry: {e}"),
+            })?;
+
+            // Only copy VHDL files
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "vhd" || ext == "vhdl" {
+                        // Compute relative path based on strip_prefix
+                        let relative_path =
+                            path.strip_prefix(&strip_prefix).map_err(|e| {
+                                VwError::FileSystem {
+                                    message: format!(
+                                    "Failed to compute relative path for {path:?}: {e}"
+                                ),
+                                }
+                            })?;
+
+                        let dest_file = dest.join(relative_path);
+
+                        // Create parent directories if needed
+                        if let Some(parent) = dest_file.parent() {
+                            fs::create_dir_all(parent).map_err(|e| {
+                                VwError::FileSystem {
+                                    message: format!(
+                                        "Failed to create directory {parent:?}: {e}"
+                                    ),
+                                }
+                            })?;
+                        }
+
+                        fs::copy(&path, &dest_file).map_err(|e| {
+                            VwError::FileSystem {
+                                message: format!(
+                                    "Failed to copy file {path:?}: {e}"
+                                ),
+                            }
+                        })?;
+                        copied_count += 1;
                     }
-                })?;
-                copy_vhdl_files(&path, &dest_subdir, recursive)?;
-            }
-        } else if let Some(ext) = path.extension() {
-            if ext == "vhd" || ext == "vhdl" {
-                let dest_file = dest.join(entry.file_name());
-                fs::copy(&path, &dest_file).map_err(|e| {
-                    VwError::FileSystem {
-                        message: format!("Failed to copy file {path:?}: {e}"),
-                    }
-                })?;
+                }
             }
         }
     }
+
+    if copied_count == 0 {
+        return Err(VwError::Dependency {
+            message: format!("No VHDL files matched pattern '{src_pattern}'"),
+        });
+    }
+
     Ok(())
 }
 
