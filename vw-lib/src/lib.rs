@@ -367,8 +367,31 @@ pub async fn update_workspace_with_token(
             Err(_) => "".to_string(),
         };
         let netrc_creds = if !hostname.is_empty() {
-            get_access_credentials_from_netrc(&hostname).unwrap_or(None)
+            match get_access_credentials_from_netrc(&hostname) {
+                Ok(Some((u, p))) => {
+                    eprintln!(
+                        "DEBUG: Found netrc credentials for {}",
+                        hostname
+                    );
+                    Some((u, p))
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "DEBUG: No netrc credentials found for {}",
+                        hostname
+                    );
+                    None
+                }
+                Err(e) => {
+                    eprintln!(
+                        "DEBUG: Error reading netrc for {}: {}",
+                        hostname, e
+                    );
+                    None
+                }
+            }
         } else {
+            eprintln!("DEBUG: Empty hostname for repo: {}", dep.repo);
             None
         };
         let creds = netrc_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
