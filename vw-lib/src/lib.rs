@@ -1438,12 +1438,12 @@ async fn get_branch_head_commit(
             // First, try explicit credentials from netrc if available
             if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
             {
-                if let Some((ref _username, ref password)) = credentials {
+                if let Some((ref username, ref password)) = credentials {
                     eprintln!(
-                        "DEBUG: Using userpass_plaintext for authentication"
+                        "DEBUG: Using userpass_plaintext with netrc credentials"
                     );
-                    // For GitHub, use the token as username with empty password
-                    return git2::Cred::userpass_plaintext(password, "");
+                    // Use both username and password from netrc
+                    return git2::Cred::userpass_plaintext(username, password);
                 } else {
                     eprintln!(
                         "DEBUG: No credentials despite has_credentials check"
@@ -1558,12 +1558,12 @@ async fn download_dependency(
             // First, try explicit credentials from netrc if available
             if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
             {
-                if let Some((ref _username, ref password)) = credentials {
+                if let Some((ref username, ref password)) = credentials {
                     eprintln!(
-                        "DEBUG: Using userpass_plaintext for authentication"
+                        "DEBUG: Using userpass_plaintext with netrc credentials"
                     );
-                    // For GitHub, use the token as username with empty password
-                    return git2::Cred::userpass_plaintext(password, "");
+                    // Use both username and password from netrc
+                    return git2::Cred::userpass_plaintext(username, password);
                 } else {
                     eprintln!(
                         "DEBUG: No credentials despite has_credentials check"
