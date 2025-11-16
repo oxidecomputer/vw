@@ -367,31 +367,8 @@ pub async fn update_workspace_with_token(
             Err(_) => "".to_string(),
         };
         let netrc_creds = if !hostname.is_empty() {
-            match get_access_credentials_from_netrc(&hostname) {
-                Ok(Some((u, p))) => {
-                    eprintln!(
-                        "DEBUG: Found netrc credentials for {}",
-                        hostname
-                    );
-                    Some((u, p))
-                }
-                Ok(None) => {
-                    eprintln!(
-                        "DEBUG: No netrc credentials found for {}",
-                        hostname
-                    );
-                    None
-                }
-                Err(e) => {
-                    eprintln!(
-                        "DEBUG: Error reading netrc for {}: {}",
-                        hostname, e
-                    );
-                    None
-                }
-            }
+            get_access_credentials_from_netrc(&hostname).unwrap_or(None)
         } else {
-            eprintln!("DEBUG: Empty hostname for repo: {}", dep.repo);
             None
         };
         let creds = netrc_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
@@ -1422,16 +1399,11 @@ async fn get_branch_head_commit(
         let attempt_count = RefCell::new(0);
 
         callbacks.credentials(move |url, username_from_url, allowed_types| {
-            eprintln!("DEBUG: Credentials callback invoked for URL: {}", url);
-            eprintln!("DEBUG: Allowed types: {:?}", allowed_types);
-            eprintln!("DEBUG: Has credentials: {}", credentials.is_some());
-
             let mut attempts = attempt_count.borrow_mut();
             *attempts += 1;
 
             // Limit attempts to prevent infinite loops
             if *attempts > 1 {
-                eprintln!("DEBUG: Too many attempts, returning default");
                 return git2::Cred::default();
             }
 
@@ -1439,18 +1411,9 @@ async fn get_branch_head_commit(
             if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
             {
                 if let Some((ref username, ref password)) = credentials {
-                    eprintln!(
-                        "DEBUG: Using userpass_plaintext with netrc credentials"
-                    );
                     // Use both username and password from netrc
                     return git2::Cred::userpass_plaintext(username, password);
-                } else {
-                    eprintln!(
-                        "DEBUG: No credentials despite has_credentials check"
-                    );
                 }
-            } else {
-                eprintln!("DEBUG: USER_PASS_PLAINTEXT not in allowed types");
             }
 
             // Try SSH key if available
@@ -1542,16 +1505,11 @@ async fn download_dependency(
         let attempt_count = RefCell::new(0);
 
         callbacks.credentials(move |url, username_from_url, allowed_types| {
-            eprintln!("DEBUG: Credentials callback invoked for URL: {}", url);
-            eprintln!("DEBUG: Allowed types: {:?}", allowed_types);
-            eprintln!("DEBUG: Has credentials: {}", credentials.is_some());
-
             let mut attempts = attempt_count.borrow_mut();
             *attempts += 1;
 
             // Limit attempts to prevent infinite loops
             if *attempts > 1 {
-                eprintln!("DEBUG: Too many attempts, returning default");
                 return git2::Cred::default();
             }
 
@@ -1559,18 +1517,9 @@ async fn download_dependency(
             if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
             {
                 if let Some((ref username, ref password)) = credentials {
-                    eprintln!(
-                        "DEBUG: Using userpass_plaintext with netrc credentials"
-                    );
                     // Use both username and password from netrc
                     return git2::Cred::userpass_plaintext(username, password);
-                } else {
-                    eprintln!(
-                        "DEBUG: No credentials despite has_credentials check"
-                    );
                 }
-            } else {
-                eprintln!("DEBUG: USER_PASS_PLAINTEXT not in allowed types");
             }
 
             // Try SSH key if available
