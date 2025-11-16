@@ -18,5 +18,7 @@ dirs.workspace = true
 tempfile.workspace = true
 regex.workspace = true
 camino.workspace = true
+netrc.workspace = true
+url.workspace = true
 git2 = "0.18"
 vhdl_lang = "0.83"
