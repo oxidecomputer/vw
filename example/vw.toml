@@ -18,3 +18,6 @@ recursive = true
 
 # Specific files by pattern:
 # src = "hdl/**/pkg_*.vhd"
+
+# Simulation-only dependency (excluded from deps.tcl):
+# sim_only = true
