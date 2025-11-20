@@ -76,6 +76,8 @@ enum Commands {
             help = "Recursively include VHDL files from subdirectories"
         )]
         recursive: bool,
+        #[arg(long, help = "Mark as simulation-only (excluded from deps.tcl)")]
+        sim_only: bool,
     },
     #[command(about = "Remove a dependency")]
     Remove {
@@ -199,6 +201,7 @@ async fn main() {
             src,
             name,
             recursive,
+            sim_only,
         } => {
             let access_creds = get_access_credentials_for_repo(&repo).await;
             match add_dependency_with_token(
@@ -209,6 +212,7 @@ async fn main() {
                 src,
                 name.clone(),
                 recursive,
+                sim_only,
                 access_creds,
             )
             .await
