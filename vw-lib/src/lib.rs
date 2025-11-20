@@ -171,6 +171,8 @@ pub struct Dependency {
     pub src: String,
     #[serde(default)]
     pub recursive: bool,
+    #[serde(default)]
+    pub sim_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -186,6 +188,8 @@ pub struct LockedDependency {
     pub path: PathBuf,
     #[serde(default)]
     pub recursive: bool,
+    #[serde(default)]
+    pub sim_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -434,6 +438,7 @@ pub async fn update_workspace_with_token(
                 src: dep.src.clone(),
                 path: dep_path.clone(),
                 recursive: dep.recursive,
+                sim_only: dep.sim_only,
             },
         );
 
@@ -462,6 +467,7 @@ pub async fn update_workspace_with_token(
 }
 
 /// Add a new dependency to the workspace configuration.
+#[allow(clippy::too_many_arguments)]
 pub async fn add_dependency(
     workspace_dir: &Utf8Path,
     repo: String,
@@ -470,6 +476,7 @@ pub async fn add_dependency(
     src: Option<String>,
     name: Option<String>,
     recursive: bool,
+    sim_only: bool,
 ) -> Result<()> {
     add_dependency_with_token(
         workspace_dir,
@@ -479,6 +486,7 @@ pub async fn add_dependency(
         src,
         name,
         recursive,
+        sim_only,
         None,
     )
     .await
@@ -494,6 +502,7 @@ pub async fn add_dependency(
 /// * `src` - Optional source path within the repository
 /// * `name` - Optional dependency name
 /// * `recursive` - Whether to recursively include VHDL files
+/// * `sim_only` - Whether this dependency is only for simulation (excluded from deps.tcl)
 /// * `credentials` - Optional credentials for authentication
 #[allow(clippy::too_many_arguments)]
 pub async fn add_dependency_with_token(
@@ -504,6 +513,7 @@ pub async fn add_dependency_with_token(
     src: Option<String>,
     name: Option<String>,
     recursive: bool,
+    sim_only: bool,
     _credentials: Option<Credentials>,
 ) -> Result<()> {
     let mut config =
@@ -533,6 +543,7 @@ pub async fn add_dependency_with_token(
         commit,
         src: src_path,
         recursive,
+        sim_only,
     };
 
     config.dependencies.insert(dep_name.clone(), dependency);
@@ -675,6 +686,12 @@ pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
 
     for dep_name in dep_names {
         let locked_dep = &lock_file.dependencies[dep_name];
+
+        // Skip sim-only dependencies
+        if locked_dep.sim_only {
+            continue;
+        }
+
         let vhdl_files =
             find_vhdl_files(&locked_dep.path, locked_dep.recursive)?;
 
