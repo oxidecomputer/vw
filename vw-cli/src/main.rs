@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
 use std::fmt;
 use std::process;
+use std::collections::HashSet;
 
 use vw_lib::{
     add_dependency_with_token, clear_cache, extract_hostname_from_repo_url,
@@ -96,6 +97,14 @@ enum Commands {
         std: CliVhdlStandard,
         #[arg(long, help = "List all available testbenches")]
         list: bool,
+        #[arg(long, help = "Enable recursive search when looking for testbenches")]
+        recurse: bool,
+        #[arg(long, value_delimiter = ',', help = "Ignore directories matching these names (comma-separated or use multiple times)")]
+        ignore: Vec<String>,
+        #[arg(long, value_delimiter = ',', help = "Runtime flags to pass to NVC (comma-separated or use multiple times)", requires = "testbench")]
+        runtime_flags: Vec<String>,
+        #[arg(long, help = "Build Rust library for testbench before running", requires = "testbench")]
+        build_rust: bool,
     },
 }
 
@@ -131,7 +140,6 @@ async fn get_access_credentials_for_workspace(
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-
     // Get current working directory
     let cwd =
         Utf8PathBuf::try_from(std::env::current_dir().unwrap_or_else(|e| {
@@ -318,34 +326,50 @@ async fn main() {
             testbench,
             std,
             list,
+            recurse,
+            ignore,
+            runtime_flags,
+            build_rust,
         } => {
             if list {
-                match list_testbenches(&cwd) {
-                    Ok(testbenches) => {
-                        if testbenches.is_empty() {
-                            println!("No testbenches found in bench directory");
-                        } else {
-                            println!("Available testbenches:");
-                            for tb in testbenches {
-                                println!(
-                                    "  {} - {}",
-                                    tb.name.cyan(),
-                                    tb.path
-                                        .display()
-                                        .to_string()
-                                        .bright_black()
-                                );
+                let bench_dir = cwd.join("bench");
+                if !bench_dir.exists() {
+                    println!("No bench dir found in {:}", bench_dir.as_str());
+                }
+                else {
+                    let mut ignore_set : HashSet<String> = HashSet::new();
+                    for ignore_pattern in ignore {
+                        ignore_set.insert(ignore_pattern);
+                    }
+
+                    match list_testbenches(&bench_dir, &ignore_set, recurse) {
+                        Ok(testbenches) => {
+                            if testbenches.is_empty() {
+                                println!("No testbenches found in bench directory");
+                            } else {
+                                println!("Available testbenches:");
+                                for tb in testbenches {
+                                    println!(
+                                        "  {} - {}",
+                                        tb.name.cyan(),
+                                        tb.path
+                                            .display()
+                                            .to_string()
+                                            .bright_black()
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("{} {e}", "error:".bright_red());
-                        process::exit(1);
+                        Err(e) => {
+                            eprintln!("{} {e}", "error:".bright_red());
+                            process::exit(1);
+                        }
                     }
                 }
+
             } else if let Some(testbench_name) = testbench {
                 println!("Running testbench: {}", testbench_name.cyan());
-                match run_testbench(&cwd, testbench_name.clone(), std.into())
+                match run_testbench(&cwd, testbench_name.clone(), std.into(), recurse, &runtime_flags, build_rust)
                     .await
                 {
                     Ok(()) => {

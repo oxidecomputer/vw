@@ -33,7 +33,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -195,6 +195,16 @@ pub struct VhdlLsConfig {
     pub libraries: HashMap<String, VhdlLsLibrary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lint: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct CargoToml {
+    package: CargoPackage,
+}
+
+#[derive(Deserialize, Debug)]
+struct CargoPackage {
+    name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -713,13 +723,10 @@ pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
 
 /// List all available testbenches in the workspace.
 pub fn list_testbenches(
-    workspace_dir: &Utf8Path,
+    bench_dir: &Utf8Path,
+    ignore_dirs : &HashSet<String>,
+    recurse : bool
 ) -> Result<Vec<TestbenchInfo>> {
-    let bench_dir = workspace_dir.join("bench");
-    if !bench_dir.exists() {
-        return Ok(Vec::new());
-    }
-
     let mut testbenches = Vec::new();
 
     for entry in fs::read_dir(bench_dir).map_err(|e| VwError::FileSystem {
@@ -743,6 +750,17 @@ pub fn list_testbenches(
                 }
             }
         }
+        else if recurse {
+            let dir_path: Utf8PathBuf = path.try_into().map_err(|e| VwError::FileSystem { 
+                message: format!("Failed to get dir path: {e}"),
+            })?;
+            if let Some(file_name) = dir_path.file_name() {
+                if !ignore_dirs.contains(file_name) {
+                    let mut lower_testbenches = list_testbenches(&dir_path, ignore_dirs, recurse)?;
+                    testbenches.append(&mut lower_testbenches);
+                }
+            }
+        }
     }
 
     Ok(testbenches)
@@ -759,6 +777,9 @@ pub async fn run_testbench(
     workspace_dir: &Utf8Path,
     testbench_name: String,
     vhdl_std: VhdlStandard,
+    recurse: bool,
+    runtime_flags: &[String],
+    build_rust: bool,
 ) -> Result<()> {
     let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
 
@@ -842,7 +863,14 @@ pub async fn run_testbench(
         });
     }
 
-    let testbench_file = find_testbench_file(&testbench_name, &bench_dir)?;
+    let testbench_file = find_testbench_file(&testbench_name, &bench_dir, recurse)?;
+
+    // Build Rust library if requested
+    let rust_lib_path = if build_rust {
+        Some(build_rust_library(&testbench_file).await?)
+    } else {
+        None
+    };
 
     // Filter defaultlib files to exclude OTHER testbenches but allow common bench code
     let bench_dir_abs = workspace_dir.as_std_path().join("bench");
@@ -887,6 +915,12 @@ pub async fn run_testbench(
 
     // Run NVC simulation
     let mut nvc_cmd = tokio::process::Command::new("nvc");
+
+    // Set GPI_USERS environment variable if we have a Rust library
+    if let Some(lib_path) = &rust_lib_path {
+        nvc_cmd.env("GPI_USERS", lib_path.to_string_lossy().as_ref());
+    }
+
     nvc_cmd
         .arg(format!("--std={vhdl_std}"))
         .arg("-M")
@@ -909,7 +943,19 @@ pub async fn run_testbench(
         .arg("-e")
         .arg(&testbench_name)
         .arg("-r")
-        .arg(&testbench_name)
+        .arg(&testbench_name);
+
+    // Add user-provided runtime flags
+    for flag in runtime_flags {
+        nvc_cmd.arg(flag);
+    }
+
+    // Add Rust library if built
+    if let Some(lib_path) = &rust_lib_path {
+        nvc_cmd.arg(format!("--load={}", lib_path.display()));
+    }
+
+    nvc_cmd
         .arg("--dump-arrays")
         .arg("--format=fst")
         .arg(format!("--wave={testbench_name}.fst"));
@@ -920,7 +966,14 @@ pub async fn run_testbench(
 
     if !status.success() {
         // Build command string for display
-        let mut cmd_parts = vec!["nvc".to_string()];
+        let mut cmd_parts = Vec::new();
+
+        // Add environment variable if present
+        if let Some(lib_path) = &rust_lib_path {
+            cmd_parts.push(format!("GPI_USERS={}", lib_path.display()));
+        }
+
+        cmd_parts.push("nvc".to_string());
         cmd_parts.push(format!("--std={vhdl_std}"));
         cmd_parts.push("-M".to_string());
         cmd_parts.push("256m".to_string());
@@ -937,6 +990,17 @@ pub async fn run_testbench(
         cmd_parts.push(testbench_name.clone());
         cmd_parts.push("-r".to_string());
         cmd_parts.push(testbench_name.clone());
+
+        // Add runtime flags to error message
+        for flag in runtime_flags {
+            cmd_parts.push(flag.clone());
+        }
+
+        // Add Rust library to error message
+        if let Some(lib_path) = &rust_lib_path {
+            cmd_parts.push(format!("--load={}", lib_path.display()));
+        }
+
         cmd_parts.push("--dump-arrays".to_string());
         cmd_parts.push("--format=fst".to_string());
         cmd_parts.push(format!("--wave={testbench_name}.fst"));
@@ -1218,12 +1282,13 @@ fn find_entities_in_file(file_path: &Path) -> Result<Vec<String>> {
     Ok(entities)
 }
 
-fn find_testbench_file(
+fn find_testbench_file_recurse(
     testbench_name: &str,
     bench_dir: &Utf8Path,
-) -> Result<PathBuf> {
+    recurse : bool
+) -> Result<Vec<PathBuf>> {
     let mut found_files = Vec::new();
-
+    
     for entry in fs::read_dir(bench_dir).map_err(|e| VwError::FileSystem {
         message: format!("Failed to read bench directory: {e}"),
     })? {
@@ -1242,7 +1307,24 @@ fn find_testbench_file(
                 }
             }
         }
+        else if recurse {
+            let dir_path: Utf8PathBuf = path.try_into().map_err(|e| VwError::FileSystem { 
+                message: format!("Failed to get dir path: {e}"),
+            })?;
+            let mut lower_testbenches = find_testbench_file_recurse(testbench_name, &dir_path, recurse)?;
+            found_files.append(&mut lower_testbenches);
+        }
     }
+    Ok(found_files)
+}
+
+fn find_testbench_file(
+    testbench_name: &str,
+    bench_dir: &Utf8Path,
+    recurse : bool
+) -> Result<PathBuf> {
+    let found_files = find_testbench_file_recurse(testbench_name, bench_dir, recurse)?;
+
 
     match found_files.len() {
         0 => Err(VwError::Testbench {
@@ -1841,4 +1923,83 @@ fn load_existing_vhdl_ls_config(
             lint: None,
         })
     }
+}
+
+/// Build a Rust library for a testbench.
+/// Looks for Cargo.toml in the testbench directory, builds it, and returns the path to the .so file.
+async fn build_rust_library(testbench_file: &Path) -> Result<PathBuf> {
+    // Get the testbench directory
+    let testbench_dir = testbench_file.parent().ok_or_else(|| VwError::Testbench {
+        message: format!("Testbench file {:?} has no parent directory???", testbench_file),
+    })?;
+
+    // Look for Cargo.toml in the testbench directory
+    let cargo_toml_path = testbench_dir.join("Cargo.toml");
+    if !cargo_toml_path.exists() {
+        return Err(VwError::Testbench {
+            message: format!(
+                "Cargo.toml not found in testbench directory: {:?}",
+                testbench_dir
+            ),
+        });
+    }
+
+    // Parse Cargo.toml to get the package name
+    let cargo_toml_content = fs::read_to_string(&cargo_toml_path).map_err(|e| {
+        VwError::FileSystem {
+            message: format!("Failed to read Cargo.toml: {e}"),
+        }
+    })?;
+
+
+    let cargo_toml: CargoToml = toml::from_str(&cargo_toml_content)?;
+    let package_name = cargo_toml.package.name;
+
+    // Run cargo build in the testbench directory
+    let testbench_dir_owned = testbench_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("cargo")
+            .arg("build")
+            .current_dir(&testbench_dir_owned)
+            .output()
+            .map_err(|e| VwError::Testbench {
+                message: format!("Failed to execute cargo build: {e}"),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(VwError::Testbench {
+                message: format!("cargo build failed:\n{stderr}"),
+            });
+        }
+
+        Ok::<(), VwError>(())
+    })
+    .await
+    .map_err(|e| VwError::Testbench {
+        message: format!("Failed to execute cargo build task: {e}"),
+    })??;
+
+    // Find the .so file in the workspace target directory (parent of testbench dir)
+    let lib_name = format!("lib{}.so", package_name.replace('-', "_"));
+    let workspace_target = testbench_dir
+        .parent()
+        .ok_or_else(|| VwError::Testbench {
+            message: format!("Testbench directory {:?} has no parent", testbench_dir),
+        })?
+        .join("target")
+        .join("debug");
+
+    let lib_path = workspace_target.join(&lib_name);
+
+    if !lib_path.exists() {
+        return Err(VwError::Testbench {
+            message: format!(
+                "Built Rust library not found at expected path: {:?}",
+                lib_path
+            ),
+        });
+    }
+
+    Ok(lib_path)
 }
