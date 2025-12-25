@@ -22,4 +22,4 @@ netrc.workspace = true
 url.workspace = true
 glob.workspace = true
 git2 = "0.18"
-vhdl_lang = "0.83"
+vhdl_lang = "0.86"

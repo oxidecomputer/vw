@@ -29,12 +29,20 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
-use std::fs;
+use std::hash::Hash;
+use std::os::unix::process;
+use std::{fmt, fs};
 use std::path::{Path, PathBuf};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
+use vhdl_lang::{VHDLParser, VHDLStandard};
+
+use crate::mapping::{RecordData, VwSymbol, VwSymbolFinder};
+use crate::visitor::walk_design_file;
+
+pub mod mapping;
+pub mod visitor;
 
 // ============================================================================
 // Error Types
@@ -56,7 +64,6 @@ pub enum VwError {
 }
 
 impl std::error::Error for VwError {}
-
 impl From<std::io::Error> for VwError {
     fn from(err: std::io::Error) -> Self {
         VwError::Io(err)
@@ -131,6 +138,15 @@ impl fmt::Display for VwError {
 pub enum VhdlStandard {
     Vhdl2008,
     Vhdl2019,
+}
+
+impl Into<VHDLStandard> for VhdlStandard {
+    fn into(self) -> VHDLStandard {
+        match self {
+            VhdlStandard::Vhdl2008 => VHDLStandard::VHDL2008,
+            VhdlStandard::Vhdl2019 => VHDLStandard::VHDL2019,
+        } 
+    }
 }
 
 impl fmt::Display for VhdlStandard {
@@ -772,6 +788,31 @@ pub struct TestbenchInfo {
     pub path: PathBuf,
 }
 
+pub struct RecordProcessEntry {
+    record_data : RecordData,
+    file_name : PathBuf
+}
+
+pub struct RecordProcessor {
+    vhdl_std : VhdlStandard,
+    records : HashMap<String, RecordProcessEntry>,
+    tagged_names : HashSet<String>,
+    file_to_package : HashMap<PathBuf, Vec<String>>,
+    target_attr : String,
+}
+
+impl RecordProcessor {
+    pub fn new(std : VhdlStandard) -> Self {
+        Self {
+            vhdl_std : std,
+            records: HashMap::new(),
+            tagged_names: HashSet::new(),
+            file_to_package : HashMap::new(),
+            target_attr : "rust_me".to_string()
+        }
+    }
+}
+
 /// Run a testbench using NVC simulator.
 pub async fn run_testbench(
     workspace_dir: &Utf8Path,
@@ -782,7 +823,9 @@ pub async fn run_testbench(
     build_rust: bool,
 ) -> Result<()> {
     let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
+    let mut processor = RecordProcessor::new(vhdl_std);
 
+    println!("Processing external libs");
     // First, analyze all non-defaultlib libraries
     for (lib_name, library) in &vhdl_ls_config.libraries {
         if lib_name != "defaultlib" {
@@ -809,7 +852,7 @@ pub async fn run_testbench(
             }
 
             // Sort files in dependency order (dependencies first)
-            sort_files_by_dependencies(&mut files)?;
+            sort_files_by_dependencies(&mut processor, &mut files)?;
 
             let file_strings: Vec<String> = files
                 .iter()
@@ -863,14 +906,8 @@ pub async fn run_testbench(
         });
     }
 
+    println!("Finding testbench files");
     let testbench_file = find_testbench_file(&testbench_name, &bench_dir, recurse)?;
-
-    // Build Rust library if requested
-    let rust_lib_path = if build_rust {
-        Some(build_rust_library(&testbench_file).await?)
-    } else {
-        None
-    };
 
     // Filter defaultlib files to exclude OTHER testbenches but allow common bench code
     let bench_dir_abs = workspace_dir.as_std_path().join("bench");
@@ -906,12 +943,21 @@ pub async fn run_testbench(
         })
         .collect();
 
+    println!("Analyzing referenced files");
     // Find only the defaultlib files that are actually referenced by this testbench
     let mut referenced_files =
         find_referenced_files(&testbench_file, &filtered_defaultlib_files)?;
 
+    println!("Putting files in order");
     // Sort files in dependency order (dependencies first)
-    sort_files_by_dependencies(&mut referenced_files)?;
+    sort_files_by_dependencies(&mut processor, &mut referenced_files)?;
+    
+    // Build Rust library if requested
+    let rust_lib_path = if build_rust {
+        Some(build_rust_library(&testbench_file).await?)
+    } else {
+        None
+    };
 
     // Run NVC simulation
     let mut nvc_cmd = tokio::process::Command::new("nvc");
@@ -1023,6 +1069,7 @@ fn find_referenced_files(
     let mut referenced_files = Vec::new();
     let mut processed_files = HashSet::new();
     let mut files_to_process = vec![testbench_file.to_path_buf()];
+    println!("Finding referenced files");
 
     while let Some(current_file) = files_to_process.pop() {
         if processed_files.contains(&current_file) {
@@ -1036,23 +1083,41 @@ fn find_referenced_files(
             referenced_files.push(current_file.clone());
         }
 
-        // Parse the file to find dependencies
+    
         let dependencies = find_file_dependencies(&current_file)?;
 
         // Find corresponding files for each dependency
         for dep in dependencies {
             for available_file in available_files {
+                println!("Does file provide symbol?");
                 if file_provides_symbol(available_file, &dep)? {
+                    println!("Yes?");
                     if !processed_files.contains(available_file) {
                         files_to_process.push(available_file.clone());
                     }
                     break;
                 }
+                println!("No?");
             }
         }
     }
 
+    println!("Found referenced files");
     Ok(referenced_files)
+}
+
+fn get_package_imports(content : &str) -> Result<Vec<String>> {
+    // Find 'use work.package_name' statements
+    let use_work_pattern = r"(?i)use\s+work\.(\w+)";
+    let use_work_re = regex::Regex::new(use_work_pattern)?;
+    let mut imports = Vec::new();
+
+    for captures in use_work_re.captures_iter(&content) {
+        if let Some(package_name) = captures.get(1) {
+            imports.push(package_name.as_str().to_string());
+        }
+    }
+    Ok(imports)
 }
 
 fn find_file_dependencies(file_path: &Path) -> Result<Vec<String>> {
@@ -1063,15 +1128,9 @@ fn find_file_dependencies(file_path: &Path) -> Result<Vec<String>> {
 
     let mut dependencies = HashSet::new();
 
-    // Find 'use work.package_name' statements
-    let use_work_pattern = r"(?i)use\s+work\.(\w+)";
-    let use_work_re = regex::Regex::new(use_work_pattern)?;
+    let imports = get_package_imports(&content)?;
+    dependencies.extend(imports);
 
-    for captures in use_work_re.captures_iter(&content) {
-        if let Some(package_name) = captures.get(1) {
-            dependencies.insert(package_name.as_str().to_string());
-        }
-    }
 
     // Find direct entity instantiations (instance_name: entity work.entity_name)
     let entity_inst_pattern = r"(?i)\w+\s*:\s*entity\s+work\.(\w+)";
@@ -1136,16 +1195,48 @@ fn file_provides_symbol(file_path: &Path, symbol: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn sort_files_by_dependencies(files: &mut Vec<PathBuf>) -> Result<()> {
+fn analyze_file(processor : &mut RecordProcessor, file: &PathBuf) -> Result<Vec<VwSymbol>> {
+    let parser = VHDLParser::new(processor.vhdl_std.into());
+    let mut diagnostics = Vec::new();
+    let (_, design_file) = parser.parse_design_file(file, &mut diagnostics)?;
+
+    let mut file_finder = VwSymbolFinder::new(&processor.target_attr);
+    walk_design_file(&mut file_finder, &design_file);
+
+    for record in file_finder.get_records() {
+        processor.records.insert(record.get_name().to_string(), 
+            RecordProcessEntry { record_data: record.clone(), file_name: file.clone() });
+    }
+
+    for tagged_type in file_finder.get_tagged_types() {
+        processor.tagged_names.insert(tagged_type.clone());
+    }
+
+    Ok(file_finder.get_symbols().clone())
+}
+
+fn sort_files_by_dependencies(
+    processor : &mut RecordProcessor,
+    files: &mut Vec<PathBuf>
+) -> Result<()> {
     // Build dependency graph
     let mut dependencies: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     let mut all_symbols: HashMap<String, PathBuf> = HashMap::new();
 
     // First pass: collect all symbols provided by each file
     for file in files.iter() {
-        let symbols = get_file_symbols(file)?;
+        let symbols = analyze_file(processor, file)?;
         for symbol in symbols {
-            all_symbols.insert(symbol, file.clone());
+            match symbol {
+                VwSymbol::Package(name) => {
+                    all_symbols.insert(name.clone(), file.clone());
+                    processor.file_to_package.entry(file.clone()).or_default().push(name);
+                }
+                VwSymbol::Entity(name) => {
+                    all_symbols.insert(name, file.clone());
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1172,7 +1263,7 @@ fn sort_files_by_dependencies(files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn get_file_symbols(file_path: &Path) -> Result<Vec<String>> {
+fn get_file_symbols(file_path: &Path) -> Result<Vec<VwSymbol>> {
     let content =
         fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
             message: format!("Failed to read file {file_path:?}: {e}"),
@@ -1186,7 +1277,7 @@ fn get_file_symbols(file_path: &Path) -> Result<Vec<String>> {
 
     for captures in package_re.captures_iter(&content) {
         if let Some(package_name) = captures.get(1) {
-            symbols.push(package_name.as_str().to_string());
+            symbols.push(VwSymbol::Package(package_name.as_str().to_string()));
         }
     }
 
@@ -1196,7 +1287,7 @@ fn get_file_symbols(file_path: &Path) -> Result<Vec<String>> {
 
     for captures in entity_re.captures_iter(&content) {
         if let Some(entity_name) = captures.get(1) {
-            symbols.push(entity_name.as_str().to_string());
+            symbols.push(VwSymbol::Entity(entity_name.as_str().to_string()));
         }
     }
 
