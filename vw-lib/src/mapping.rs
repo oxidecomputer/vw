@@ -1,13 +1,9 @@
 use vhdl_lang::ast::{
-    AttributeSpecification, Designator, DiscreteRange, ElementDeclaration,
-    EntityClass, EntityDeclaration, EntityName, Name, PackageDeclaration,
-    Range, RangeConstraint, SubtypeConstraint, TypeDeclaration,
-    TypeDefinition::Record,
+    AnyDesignUnit, AnyPrimaryUnit, AttributeSpecification, Designator, DiscreteRange, ElementDeclaration, EntityClass, EntityDeclaration, EntityName, Name, PackageDeclaration, Range, RangeConstraint, SubtypeConstraint, TypeDeclaration, TypeDefinition::Record
 };
 
 use crate::visitor::{Visitor, VisitorResult};
 
-const RECORD_PARSE_ATTRIBUTE: &str = "rust_me";
 
 #[derive(Debug,Clone)]
 pub enum VwSymbol {
@@ -19,17 +15,25 @@ pub enum VwSymbol {
 
 #[derive(Debug, Clone)]
 pub struct RecordData {
+    containing_pkg : Option<String>,
     name: String,
     fields: Vec<FieldData>,
-    tagged: bool,
 }
 impl RecordData {
-    pub fn new(name: &str) -> Self {
+    pub fn new(containing_pkg : Option<String>, name: &str) -> Self {
         Self {
+            containing_pkg : containing_pkg,
             name: String::from(name),
             fields: Vec::new(),
-            tagged: false,
         }
+    }
+
+    pub fn get_pkg_name(&self) -> Option<&String> {
+        self.containing_pkg.as_ref()
+    }
+    
+    pub fn get_fields(&self) -> &Vec<FieldData> {
+        &self.fields
     }
 
     pub fn get_name(&self) -> &str {
@@ -79,10 +83,15 @@ impl Visitor for VwSymbolFinder {
     fn visit_attribute_specification(
         &mut self,
         spec: &AttributeSpecification,
+        _unit: &AnyDesignUnit,
     ) -> VisitorResult {
+        // if we found the attribute with the right name
         if spec.ident.item.item.name_utf8() == self.target_attr {
+            // if we tagged a type (like a record)
             if let EntityClass::Type = spec.entity_class {
+                // get the entity name
                 if let EntityName::Name(tag) = &spec.entity_name {
+                    // get the identifier
                     if let Designator::Identifier(id) =
                         &tag.designator.item.item
                     {
@@ -98,10 +107,24 @@ impl Visitor for VwSymbolFinder {
     fn visit_type_declaration(
         &mut self,
         decl: &TypeDeclaration,
+        unit: &AnyDesignUnit,
     ) -> VisitorResult {
         if let Record(elements) = &decl.def {
             let name = decl.ident.tree.item.name_utf8();
-            let mut record_struct = RecordData::new(&name);
+            //figure out where this package was defined
+            let defining_pkg_name = if let AnyDesignUnit::Primary(primary_unit) = unit {
+                if let AnyPrimaryUnit::Package(package) = primary_unit {
+                    Some(package.ident.tree.item.name_utf8())
+                }
+                else {
+                    None
+                }
+            }
+            else {
+                None
+            };
+            
+            let mut record_struct = RecordData::new(defining_pkg_name, &name);
             let fields = get_fields(elements);
             record_struct.fields = fields;
             self.records.push(record_struct);

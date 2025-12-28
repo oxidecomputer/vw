@@ -13,9 +13,10 @@
 //! }
 //!
 //! impl Visitor for MyVisitor {
-//!     fn visit_type_declaration(&mut self, decl: &TypeDeclaration) -> VisitorResult {
+//!     fn visit_type_declaration(&mut self, decl: &TypeDeclaration, unit: &AnyDesignUnit) -> VisitorResult {
 //!         if matches!(&decl.def, TypeDefinition::Record(_)) {
 //!             self.record_count += 1;
+//!             println!("Found record type in unit: {:?}", unit);
 //!         }
 //!         VisitorResult::Continue
 //!     }
@@ -118,32 +119,32 @@ pub trait Visitor {
     // ========================================================================
 
     /// Called for each declaration (before dispatching to specific type)
-    fn visit_declaration(&mut self, decl: &Declaration) -> VisitorResult {
+    fn visit_declaration(&mut self, decl: &Declaration, unit: &AnyDesignUnit) -> VisitorResult {
         VisitorResult::Continue
     }
 
     /// Called for type declarations
-    fn visit_type_declaration(&mut self, decl: &TypeDeclaration) -> VisitorResult {
+    fn visit_type_declaration(&mut self, decl: &TypeDeclaration, unit: &AnyDesignUnit) -> VisitorResult {
         VisitorResult::Continue
     }
 
     /// Called for component declarations
-    fn visit_component(&mut self, comp: &ComponentDeclaration) -> VisitorResult {
+    fn visit_component(&mut self, comp: &ComponentDeclaration, unit: &AnyDesignUnit) -> VisitorResult {
         VisitorResult::Continue
     }
 
     /// Called for subprogram declarations (function/procedure specs)
-    fn visit_subprogram_declaration(&mut self, decl: &SubprogramDeclaration) -> VisitorResult {
+    fn visit_subprogram_declaration(&mut self, decl: &SubprogramDeclaration, unit: &AnyDesignUnit) -> VisitorResult {
         VisitorResult::Continue
     }
 
     /// Called for subprogram bodies (function/procedure implementations)
-    fn visit_subprogram_body(&mut self, body: &SubprogramBody) -> VisitorResult {
+    fn visit_subprogram_body(&mut self, body: &SubprogramBody, unit: &AnyDesignUnit) -> VisitorResult {
         VisitorResult::Continue
     }
 
     /// Called for subprogram instantiations
-    fn visit_subprogram_instantiation(&mut self, inst: &SubprogramInstantiation) -> VisitorResult {
+    fn visit_subprogram_instantiation(&mut self, inst: &SubprogramInstantiation, unit: &AnyDesignUnit) -> VisitorResult {
         VisitorResult::Continue
     }
 
@@ -152,12 +153,12 @@ pub trait Visitor {
     // ------------------------------------------------------------------------
 
     /// Called for attribute declarations (attribute X : type)
-    fn visit_attribute_declaration(&mut self, decl: &AttributeDeclaration) -> VisitorResult {
+    fn visit_attribute_declaration(&mut self, decl: &AttributeDeclaration, unit: &AnyDesignUnit) -> VisitorResult {
         VisitorResult::Continue
     }
 
     /// Called for attribute specifications (attribute X of Y : class is value)
-    fn visit_attribute_specification(&mut self, spec: &AttributeSpecification) -> VisitorResult {
+    fn visit_attribute_specification(&mut self, spec: &AttributeSpecification, unit: &AnyDesignUnit) -> VisitorResult {
         VisitorResult::Continue
     }
 }
@@ -184,25 +185,25 @@ pub fn walk_design_unit<V: Visitor>(visitor: &mut V, unit: &AnyDesignUnit) -> Vi
     }
 
     match unit {
-        AnyDesignUnit::Primary(primary) => walk_primary_unit(visitor, primary),
-        AnyDesignUnit::Secondary(secondary) => walk_secondary_unit(visitor, secondary),
+        AnyDesignUnit::Primary(primary) => walk_primary_unit(visitor, primary, unit),
+        AnyDesignUnit::Secondary(secondary) => walk_secondary_unit(visitor, secondary, unit),
     }
 }
 
 /// Walk a primary unit.
-fn walk_primary_unit<V: Visitor>(visitor: &mut V, unit: &AnyPrimaryUnit) -> VisitorResult {
+fn walk_primary_unit<V: Visitor>(visitor: &mut V, unit: &AnyPrimaryUnit, design_unit: &AnyDesignUnit) -> VisitorResult {
     match unit {
         AnyPrimaryUnit::Entity(entity) => {
             if !visitor.visit_entity(entity).should_continue() {
                 return VisitorResult::Stop;
             }
-            walk_declarations(visitor, &entity.decl)
+            walk_declarations(visitor, &entity.decl, design_unit)
         }
         AnyPrimaryUnit::Package(package) => {
             if !visitor.visit_package(package).should_continue() {
                 return VisitorResult::Stop;
             }
-            walk_declarations(visitor, &package.decl)
+            walk_declarations(visitor, &package.decl, design_unit)
         }
         AnyPrimaryUnit::PackageInstance(instance) => {
             visitor.visit_package_instance(instance)
@@ -217,19 +218,19 @@ fn walk_primary_unit<V: Visitor>(visitor: &mut V, unit: &AnyPrimaryUnit) -> Visi
 }
 
 /// Walk a secondary unit.
-fn walk_secondary_unit<V: Visitor>(visitor: &mut V, unit: &AnySecondaryUnit) -> VisitorResult {
+fn walk_secondary_unit<V: Visitor>(visitor: &mut V, unit: &AnySecondaryUnit, design_unit: &AnyDesignUnit) -> VisitorResult {
     match unit {
         AnySecondaryUnit::Architecture(arch) => {
             if !visitor.visit_architecture(arch).should_continue() {
                 return VisitorResult::Stop;
             }
-            walk_declarations(visitor, &arch.decl)
+            walk_declarations(visitor, &arch.decl, design_unit)
         }
         AnySecondaryUnit::PackageBody(body) => {
             if !visitor.visit_package_body(body).should_continue() {
                 return VisitorResult::Stop;
             }
-            walk_declarations(visitor, &body.decl)
+            walk_declarations(visitor, &body.decl, design_unit)
         }
     }
 }
@@ -238,9 +239,10 @@ fn walk_secondary_unit<V: Visitor>(visitor: &mut V, unit: &AnySecondaryUnit) -> 
 fn walk_declarations<V: Visitor>(
     visitor: &mut V,
     decls: &[vhdl_lang::ast::token_range::WithTokenSpan<Declaration>],
+    unit: &AnyDesignUnit,
 ) -> VisitorResult {
     for decl in decls {
-        if !walk_declaration(visitor, &decl.item).should_continue() {
+        if !walk_declaration(visitor, &decl.item, unit).should_continue() {
             return VisitorResult::Stop;
         }
     }
@@ -248,42 +250,42 @@ fn walk_declarations<V: Visitor>(
 }
 
 /// Walk a single declaration.
-fn walk_declaration<V: Visitor>(visitor: &mut V, decl: &Declaration) -> VisitorResult {
+fn walk_declaration<V: Visitor>(visitor: &mut V, decl: &Declaration, unit: &AnyDesignUnit) -> VisitorResult {
     // First call the generic declaration visitor
-    if !visitor.visit_declaration(decl).should_continue() {
+    if !visitor.visit_declaration(decl, unit).should_continue() {
         return VisitorResult::Stop;
     }
 
     // Then dispatch to specific visitors
     match decl {
         Declaration::Type(type_decl) => {
-            visitor.visit_type_declaration(type_decl)
+            visitor.visit_type_declaration(type_decl, unit)
         }
         Declaration::Component(comp) => {
-            visitor.visit_component(comp)
+            visitor.visit_component(comp, unit)
         }
         Declaration::Attribute(attr) => {
             match attr {
                 Attribute::Declaration(decl) => {
-                    visitor.visit_attribute_declaration(decl)
+                    visitor.visit_attribute_declaration(decl, unit)
                 }
                 Attribute::Specification(spec) => {
-                    visitor.visit_attribute_specification(spec)
+                    visitor.visit_attribute_specification(spec, unit)
                 }
             }
         }
         Declaration::SubprogramDeclaration(decl) => {
-            visitor.visit_subprogram_declaration(decl)
+            visitor.visit_subprogram_declaration(decl, unit)
         }
         Declaration::SubprogramBody(body) => {
-            if !visitor.visit_subprogram_body(body).should_continue() {
+            if !visitor.visit_subprogram_body(body, unit).should_continue() {
                 return VisitorResult::Stop;
             }
             // Recurse into subprogram body declarations
-            walk_declarations(visitor, &body.declarations)
+            walk_declarations(visitor, &body.declarations, unit)
         }
         Declaration::SubprogramInstantiation(inst) => {
-            visitor.visit_subprogram_instantiation(inst)
+            visitor.visit_subprogram_instantiation(inst, unit)
         }
         // For other declaration types, just continue
         _ => VisitorResult::Continue,
@@ -323,12 +325,12 @@ mod tests {
             VisitorResult::Continue
         }
 
-        fn visit_type_declaration(&mut self, _: &TypeDeclaration) -> VisitorResult {
+        fn visit_type_declaration(&mut self, _: &TypeDeclaration, _: &AnyDesignUnit) -> VisitorResult {
             self.types += 1;
             VisitorResult::Continue
         }
 
-        fn visit_attribute_specification(&mut self, _: &AttributeSpecification) -> VisitorResult {
+        fn visit_attribute_specification(&mut self, _: &AttributeSpecification, _: &AnyDesignUnit) -> VisitorResult {
             self.attr_specs += 1;
             VisitorResult::Continue
         }

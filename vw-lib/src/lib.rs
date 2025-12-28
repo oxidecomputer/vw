@@ -29,8 +29,6 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::Hash;
-use std::os::unix::process;
 use std::{fmt, fs};
 use std::path::{Path, PathBuf};
 
@@ -39,10 +37,17 @@ use serde::{Deserialize, Serialize};
 use vhdl_lang::{VHDLParser, VHDLStandard};
 
 use crate::mapping::{RecordData, VwSymbol, VwSymbolFinder};
+use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
 use crate::visitor::walk_design_file;
 
 pub mod mapping;
 pub mod visitor;
+pub mod anodizer;
+pub mod vhdl_printer;
+pub mod nvc_helpers;
+
+// TODO: make this a flag
+const BUILD_DIR : &str = "vw_build";
 
 // ============================================================================
 // Error Types
@@ -56,7 +61,9 @@ pub enum VwError {
     FileSystem { message: String },
     Testbench { message: String },
     NvcSimulation { command: String },
+    NvcElab {command: String},
     NvcAnalysis { library: String, command: String },
+    CodeGen {message: String},
     Io(std::io::Error),
     Serialization(toml::ser::Error),
     Deserialization(toml::de::Error),
@@ -99,11 +106,20 @@ impl fmt::Display for VwError {
                 writeln!(f, "{command}")?;
                 Ok(())
             }
+            VwError::NvcElab { command } => {
+                writeln!(f, "NVC elaboration failed")?;
+                writeln!(f, "command:")?;
+                writeln!(f, "{command}")?;
+                Ok(())
+            }
             VwError::NvcAnalysis { library, command } => {
                 writeln!(f, "NVC analysis failed for library '{library}'")?;
                 writeln!(f, "command:")?;
                 writeln!(f, "{command}")?;
                 Ok(())
+            }
+            VwError::CodeGen { message } => {
+                write!(f, "Code generation failed: {message}")
             }
             VwError::Config { message } => {
                 write!(f, "Configuration error: {message}")
@@ -788,19 +804,16 @@ pub struct TestbenchInfo {
     pub path: PathBuf,
 }
 
-pub struct RecordProcessEntry {
-    record_data : RecordData,
-    file_name : PathBuf
-}
 
 pub struct RecordProcessor {
     vhdl_std : VhdlStandard,
-    records : HashMap<String, RecordProcessEntry>,
+    records : HashMap<String, RecordData>,
     tagged_names : HashSet<String>,
     file_to_package : HashMap<PathBuf, Vec<String>>,
     target_attr : String,
 }
 
+const RECORD_PARSE_ATTRIBUTE: &str = "serialize_rust";
 impl RecordProcessor {
     pub fn new(std : VhdlStandard) -> Self {
         Self {
@@ -808,7 +821,7 @@ impl RecordProcessor {
             records: HashMap::new(),
             tagged_names: HashSet::new(),
             file_to_package : HashMap::new(),
-            target_attr : "rust_me".to_string()
+            target_attr : RECORD_PARSE_ATTRIBUTE.to_string()
         }
     }
 }
@@ -825,7 +838,8 @@ pub async fn run_testbench(
     let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
     let mut processor = RecordProcessor::new(vhdl_std);
 
-    println!("Processing external libs");
+    fs::create_dir_all(BUILD_DIR)?;
+
     // First, analyze all non-defaultlib libraries
     for (lib_name, library) in &vhdl_ls_config.libraries {
         if lib_name != "defaultlib" {
@@ -859,35 +873,13 @@ pub async fn run_testbench(
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
 
-            let mut nvc_cmd = tokio::process::Command::new("nvc");
-            nvc_cmd
-                .arg(format!("--std={vhdl_std}"))
-                .arg(format!("--work={nvc_lib_name}"))
-                .arg("-M")
-                .arg("256m")
-                .arg("-a");
+            run_nvc_analysis(
+                vhdl_std, 
+                &BUILD_DIR.to_string(), 
+                &nvc_lib_name, 
+                &file_strings,
+            ).await?;
 
-            for file in &file_strings {
-                nvc_cmd.arg(file);
-            }
-
-            let status =
-                nvc_cmd.status().await.map_err(|e| VwError::Testbench {
-                    message: format!("Failed to execute NVC analysis: {e}"),
-                })?;
-
-            if !status.success() {
-                let cmd_str = format!(
-                    "nvc --std={} --work={} -M 256m -a {}",
-                    vhdl_std,
-                    nvc_lib_name,
-                    file_strings.join(" ")
-                );
-                return Err(VwError::NvcAnalysis {
-                    library: lib_name.clone(),
-                    command: cmd_str,
-                });
-            }
         }
     }
 
@@ -906,7 +898,6 @@ pub async fn run_testbench(
         });
     }
 
-    println!("Finding testbench files");
     let testbench_file = find_testbench_file(&testbench_name, &bench_dir, recurse)?;
 
     // Filter defaultlib files to exclude OTHER testbenches but allow common bench code
@@ -943,120 +934,58 @@ pub async fn run_testbench(
         })
         .collect();
 
-    println!("Analyzing referenced files");
     // Find only the defaultlib files that are actually referenced by this testbench
     let mut referenced_files =
         find_referenced_files(&testbench_file, &filtered_defaultlib_files)?;
 
-    println!("Putting files in order");
     // Sort files in dependency order (dependencies first)
     sort_files_by_dependencies(&mut processor, &mut referenced_files)?;
+
+    let mut files : Vec<String> = referenced_files.iter()
+        .map(|s| s.to_string_lossy().to_string())
+        .collect();
+
+    files.push(testbench_file.to_string_lossy().to_string());
+   
+    run_nvc_analysis(
+        vhdl_std, 
+        &BUILD_DIR.to_string(), 
+        &"work".to_string(), 
+        &files
+    ).await?;
+
+    run_nvc_elab(
+        vhdl_std, 
+        &BUILD_DIR.to_string(), 
+        &"work".to_string(), 
+        &testbench_name
+    ).await?;
+
     
     // Build Rust library if requested
     let rust_lib_path = if build_rust {
-        Some(build_rust_library(&testbench_file).await?)
+        // generate any structs that have to be generated
+        Some(build_rust_library(&testbench_file).await?
+            .to_string_lossy()
+            .to_string())
     } else {
         None
     };
-
+    
     // Run NVC simulation
-    let mut nvc_cmd = tokio::process::Command::new("nvc");
+    run_nvc_sim(
+        vhdl_std, 
+        &BUILD_DIR.to_string(), 
+        &"work".to_string(), 
+        &testbench_name,
+        rust_lib_path,
+        &runtime_flags.to_vec()
+    ).await?;
 
-    // Set GPI_USERS environment variable if we have a Rust library
-    if let Some(lib_path) = &rust_lib_path {
-        nvc_cmd.env("GPI_USERS", lib_path.to_string_lossy().as_ref());
-    }
-
-    nvc_cmd
-        .arg(format!("--std={vhdl_std}"))
-        .arg("-M")
-        .arg("256m")
-        .arg("-L")
-        .arg(".")
-        .arg("-a")
-        .arg("--check-synthesis");
-
-    // Add only the defaultlib files that are referenced by this testbench
-    for file_path in &referenced_files {
-        nvc_cmd.arg(file_path.to_string_lossy().as_ref());
-    }
-
-    // Add testbench file
-    nvc_cmd.arg(testbench_file.to_string_lossy().as_ref());
-
-    // Elaborate and run
-    nvc_cmd
-        .arg("-e")
-        .arg(&testbench_name)
-        .arg("-r")
-        .arg(&testbench_name);
-
-    // Add user-provided runtime flags
-    for flag in runtime_flags {
-        nvc_cmd.arg(flag);
-    }
-
-    // Add Rust library if built
-    if let Some(lib_path) = &rust_lib_path {
-        nvc_cmd.arg(format!("--load={}", lib_path.display()));
-    }
-
-    nvc_cmd
-        .arg("--dump-arrays")
-        .arg("--format=fst")
-        .arg(format!("--wave={testbench_name}.fst"));
-
-    let status = nvc_cmd.status().await.map_err(|e| VwError::Testbench {
-        message: format!("Failed to execute NVC simulation: {e}"),
-    })?;
-
-    if !status.success() {
-        // Build command string for display
-        let mut cmd_parts = Vec::new();
-
-        // Add environment variable if present
-        if let Some(lib_path) = &rust_lib_path {
-            cmd_parts.push(format!("GPI_USERS={}", lib_path.display()));
-        }
-
-        cmd_parts.push("nvc".to_string());
-        cmd_parts.push(format!("--std={vhdl_std}"));
-        cmd_parts.push("-M".to_string());
-        cmd_parts.push("256m".to_string());
-        cmd_parts.push("-L".to_string());
-        cmd_parts.push(".".to_string());
-        cmd_parts.push("-a".to_string());
-        cmd_parts.push("--check-synthesis".to_string());
-
-        for file_path in &referenced_files {
-            cmd_parts.push(file_path.to_string_lossy().to_string());
-        }
-        cmd_parts.push(testbench_file.to_string_lossy().to_string());
-        cmd_parts.push("-e".to_string());
-        cmd_parts.push(testbench_name.clone());
-        cmd_parts.push("-r".to_string());
-        cmd_parts.push(testbench_name.clone());
-
-        // Add runtime flags to error message
-        for flag in runtime_flags {
-            cmd_parts.push(flag.clone());
-        }
-
-        // Add Rust library to error message
-        if let Some(lib_path) = &rust_lib_path {
-            cmd_parts.push(format!("--load={}", lib_path.display()));
-        }
-
-        cmd_parts.push("--dump-arrays".to_string());
-        cmd_parts.push("--format=fst".to_string());
-        cmd_parts.push(format!("--wave={testbench_name}.fst"));
-
-        let cmd_str = cmd_parts.join(" ");
-        return Err(VwError::NvcSimulation { command: cmd_str });
-    }
 
     Ok(())
 }
+
 
 // ============================================================================
 // Internal Helper Functions
@@ -1069,7 +998,6 @@ fn find_referenced_files(
     let mut referenced_files = Vec::new();
     let mut processed_files = HashSet::new();
     let mut files_to_process = vec![testbench_file.to_path_buf()];
-    println!("Finding referenced files");
 
     while let Some(current_file) = files_to_process.pop() {
         if processed_files.contains(&current_file) {
@@ -1089,20 +1017,16 @@ fn find_referenced_files(
         // Find corresponding files for each dependency
         for dep in dependencies {
             for available_file in available_files {
-                println!("Does file provide symbol?");
                 if file_provides_symbol(available_file, &dep)? {
-                    println!("Yes?");
                     if !processed_files.contains(available_file) {
                         files_to_process.push(available_file.clone());
                     }
                     break;
                 }
-                println!("No?");
             }
         }
     }
 
-    println!("Found referenced files");
     Ok(referenced_files)
 }
 
@@ -1204,8 +1128,7 @@ fn analyze_file(processor : &mut RecordProcessor, file: &PathBuf) -> Result<Vec<
     walk_design_file(&mut file_finder, &design_file);
 
     for record in file_finder.get_records() {
-        processor.records.insert(record.get_name().to_string(), 
-            RecordProcessEntry { record_data: record.clone(), file_name: file.clone() });
+        processor.records.insert(record.get_name().to_string(), record.clone());
     }
 
     for tagged_type in file_finder.get_tagged_types() {
