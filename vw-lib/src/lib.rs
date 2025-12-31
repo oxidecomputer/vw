@@ -36,6 +36,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use vhdl_lang::{VHDLParser, VHDLStandard};
 
+use crate::anodizer::anodize_records;
 use crate::mapping::{RecordData, VwSymbol, VwSymbolFinder};
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
 use crate::visitor::walk_design_file;
@@ -48,6 +49,7 @@ pub mod nvc_helpers;
 
 // TODO: make this a flag
 const BUILD_DIR : &str = "vw_build";
+const RUST_GEN_DIR : &str = "bench/test_utils/src";
 
 // ============================================================================
 // Error Types
@@ -826,20 +828,68 @@ impl RecordProcessor {
     }
 }
 
-/// Run a testbench using NVC simulator.
-pub async fn run_testbench(
+pub async fn anodize_only(
     workspace_dir: &Utf8Path,
-    testbench_name: String,
-    vhdl_std: VhdlStandard,
-    recurse: bool,
-    runtime_flags: &[String],
-    build_rust: bool,
+    vhdl_std: VhdlStandard
 ) -> Result<()> {
     let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
     let mut processor = RecordProcessor::new(vhdl_std);
-
+    
     fs::create_dir_all(BUILD_DIR)?;
 
+    analyze_ext_libraries(&vhdl_ls_config, &mut processor, vhdl_std).await?;
+
+    // alright...now we need to find packages and search them for records
+    let defaultlib_files = vhdl_ls_config
+        .libraries
+        .get("defaultlib")
+        .map(|lib| lib.files.clone())
+        .unwrap_or_default();
+
+    let mut relevant_files = HashSet::new();
+
+
+    for file in &defaultlib_files {
+        let content =
+            fs::read_to_string(file).map_err(|e| VwError::FileSystem {
+                message: format!("Failed to read file {file:?}: {e}"),
+            })?;
+        let package_re = regex::Regex::new(r"(?i)\bpackage\s+\w+\s+is\b")?;
+
+        if package_re.is_match(&content) {
+            relevant_files.insert(file.clone());
+            // ok it is a package...figure out which files it brings in
+            let referenced_files = find_referenced_files(file, &defaultlib_files)?;
+            relevant_files.extend(referenced_files.iter().cloned());
+        }
+    }
+
+    let mut files_vec : Vec<PathBuf> = relevant_files.iter().cloned().collect();
+
+    // with all the relevant files, sort them and then anodize them
+    sort_files_by_dependencies(&mut processor, &mut files_vec)?;
+    
+    let files : Vec<String> = files_vec.iter()
+        .map(|s| s.to_string_lossy().to_string())
+        .collect();
+
+    anodize_records(
+        &processor, 
+        &files, 
+        "generate".to_string(), 
+        BUILD_DIR.to_string(),
+        RUST_GEN_DIR.to_string()
+    ).await?;
+
+    Ok(())
+}
+
+
+async fn analyze_ext_libraries(
+    vhdl_ls_config : &VhdlLsConfig,
+    processor : &mut RecordProcessor,
+    vhdl_std : VhdlStandard
+) -> Result<()> {
     // First, analyze all non-defaultlib libraries
     for (lib_name, library) in &vhdl_ls_config.libraries {
         if lib_name != "defaultlib" {
@@ -866,7 +916,7 @@ pub async fn run_testbench(
             }
 
             // Sort files in dependency order (dependencies first)
-            sort_files_by_dependencies(&mut processor, &mut files)?;
+            sort_files_by_dependencies(processor, &mut files)?;
 
             let file_strings: Vec<String> = files
                 .iter()
@@ -878,10 +928,31 @@ pub async fn run_testbench(
                 &BUILD_DIR.to_string(), 
                 &nvc_lib_name, 
                 &file_strings,
+                false
             ).await?;
 
         }
     }
+
+    Ok(())
+}
+
+/// Run a testbench using NVC simulator.
+pub async fn run_testbench(
+    workspace_dir: &Utf8Path,
+    testbench_name: String,
+    vhdl_std: VhdlStandard,
+    recurse: bool,
+    runtime_flags: &[String],
+    build_rust: bool,
+) -> Result<()> {
+    let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
+    let mut processor = RecordProcessor::new(vhdl_std);
+
+    fs::create_dir_all(BUILD_DIR)?;
+
+    // First, analyze all non-defaultlib libraries
+    analyze_ext_libraries(&vhdl_ls_config, &mut processor, vhdl_std).await?;
 
     // Get defaultlib files for later use
     let defaultlib_files = vhdl_ls_config
@@ -951,20 +1022,31 @@ pub async fn run_testbench(
         vhdl_std, 
         &BUILD_DIR.to_string(), 
         &"work".to_string(), 
-        &files
+        &files,
+        false
     ).await?;
 
     run_nvc_elab(
         vhdl_std, 
         &BUILD_DIR.to_string(), 
         &"work".to_string(), 
-        &testbench_name
+        &testbench_name,
+        false
     ).await?;
 
     
     // Build Rust library if requested
     let rust_lib_path = if build_rust {
+        let testbench_dir = testbench_file.parent().ok_or_else(|| VwError::Testbench {
+            message: format!("Testbench file {:?} has no parent directory???", testbench_file),
+        })?;
         // generate any structs that have to be generated
+        anodize_records(&processor, 
+            &files, 
+            "generate".to_string(), 
+            BUILD_DIR.to_string(),
+            format!("{}/src", testbench_dir.to_string_lossy().to_string())
+        ).await?;
         Some(build_rust_library(&testbench_file).await?
             .to_string_lossy()
             .to_string())
@@ -979,7 +1061,8 @@ pub async fn run_testbench(
         &"work".to_string(), 
         &testbench_name,
         rust_lib_path,
-        &runtime_flags.to_vec()
+        &runtime_flags.to_vec(),
+        false
     ).await?;
 
 
@@ -1186,36 +1269,36 @@ fn sort_files_by_dependencies(
     Ok(())
 }
 
-fn get_file_symbols(file_path: &Path) -> Result<Vec<VwSymbol>> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
-        })?;
-
-    let mut symbols = Vec::new();
-
-    // Find package declarations
-    let package_pattern = r"(?i)\bpackage\s+(\w+)\s+is\b";
-    let package_re = regex::Regex::new(package_pattern)?;
-
-    for captures in package_re.captures_iter(&content) {
-        if let Some(package_name) = captures.get(1) {
-            symbols.push(VwSymbol::Package(package_name.as_str().to_string()));
-        }
-    }
-
-    // Find entity declarations
-    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
-    let entity_re = regex::Regex::new(entity_pattern)?;
-
-    for captures in entity_re.captures_iter(&content) {
-        if let Some(entity_name) = captures.get(1) {
-            symbols.push(VwSymbol::Entity(entity_name.as_str().to_string()));
-        }
-    }
-
-    Ok(symbols)
-}
+//fn get_file_symbols(file_path: &Path) -> Result<Vec<VwSymbol>> {
+//    let content =
+//        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
+//            message: format!("Failed to read file {file_path:?}: {e}"),
+//        })?;
+//
+//    let mut symbols = Vec::new();
+//
+//    // Find package declarations
+//    let package_pattern = r"(?i)\bpackage\s+(\w+)\s+is\b";
+//    let package_re = regex::Regex::new(package_pattern)?;
+//
+//    for captures in package_re.captures_iter(&content) {
+//        if let Some(package_name) = captures.get(1) {
+//            symbols.push(VwSymbol::Package(package_name.as_str().to_string()));
+//        }
+//    }
+//
+//    // Find entity declarations
+//    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
+//    let entity_re = regex::Regex::new(entity_pattern)?;
+//
+//    for captures in entity_re.captures_iter(&content) {
+//        if let Some(entity_name) = captures.get(1) {
+//            symbols.push(VwSymbol::Entity(entity_name.as_str().to_string()));
+//        }
+//    }
+//
+//    Ok(symbols)
+//}
 
 fn topological_sort(
     files: Vec<PathBuf>,
