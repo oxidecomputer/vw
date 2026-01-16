@@ -1,11 +1,13 @@
 use vhdl_lang::ast::{
-    AnyDesignUnit, AnyPrimaryUnit, AttributeSpecification, Designator, DiscreteRange, ElementDeclaration, EntityClass, EntityDeclaration, EntityName, Name, PackageDeclaration, Range, RangeConstraint, SubtypeConstraint, TypeDeclaration, TypeDefinition::Record
+    AnyDesignUnit, AnyPrimaryUnit, AttributeSpecification, Designator,
+    DiscreteRange, ElementDeclaration, EntityClass, EntityDeclaration,
+    EntityName, Name, PackageDeclaration, Range, RangeConstraint,
+    SubtypeConstraint, TypeDeclaration, TypeDefinition::Record,
 };
 
 use crate::visitor::{Visitor, VisitorResult};
 
-
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub enum VwSymbol {
     Package(String),
     Entity(String),
@@ -15,14 +17,41 @@ pub enum VwSymbol {
 
 #[derive(Debug, Clone)]
 pub struct RecordData {
-    containing_pkg : Option<String>,
+    containing_pkg: Option<String>,
     name: String,
     fields: Vec<FieldData>,
 }
-impl RecordData {
-    pub fn new(containing_pkg : Option<String>, name: &str) -> Self {
+
+pub struct FileData {
+    defined_pkgs: Vec<String>,
+    imported_pkgs: Vec<String>,
+}
+
+impl FileData {
+    pub fn new() -> Self {
         Self {
-            containing_pkg : containing_pkg,
+            defined_pkgs : Vec::new(),
+            imported_pkgs : Vec::new()
+        }
+    }
+
+    pub fn add_defined_pkg(&mut self, pkg_name : &str) {
+        self.defined_pkgs.push(pkg_name.to_string());
+    }
+
+    pub fn add_imported_pkg(&mut self, pkg_name : &str) {
+        self.imported_pkgs.push(pkg_name.to_string());
+    }
+
+    pub fn get_imported_pkgs(&self) -> &Vec<String> {
+        &self.imported_pkgs
+    }
+}
+
+impl RecordData {
+    pub fn new(containing_pkg: Option<String>, name: &str) -> Self {
+        Self {
+            containing_pkg: containing_pkg,
             name: String::from(name),
             fields: Vec::new(),
         }
@@ -31,7 +60,7 @@ impl RecordData {
     pub fn get_pkg_name(&self) -> Option<&String> {
         self.containing_pkg.as_ref()
     }
-    
+
     pub fn get_fields(&self) -> &Vec<FieldData> {
         &self.fields
     }
@@ -39,6 +68,7 @@ impl RecordData {
     pub fn get_name(&self) -> &str {
         &self.name
     }
+
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +103,7 @@ impl VwSymbolFinder {
     pub fn get_records(&self) -> &Vec<RecordData> {
         &self.records
     }
-    
+
     pub fn get_tagged_types(&self) -> &Vec<String> {
         &self.tagged_types
     }
@@ -112,18 +142,17 @@ impl Visitor for VwSymbolFinder {
         if let Record(elements) = &decl.def {
             let name = decl.ident.tree.item.name_utf8();
             //figure out where this package was defined
-            let defining_pkg_name = if let AnyDesignUnit::Primary(primary_unit) = unit {
-                if let AnyPrimaryUnit::Package(package) = primary_unit {
-                    Some(package.ident.tree.item.name_utf8())
-                }
-                else {
+            let defining_pkg_name =
+                if let AnyDesignUnit::Primary(primary_unit) = unit {
+                    if let AnyPrimaryUnit::Package(package) = primary_unit {
+                        Some(package.ident.tree.item.name_utf8())
+                    } else {
+                        None
+                    }
+                } else {
                     None
-                }
-            }
-            else {
-                None
-            };
-            
+                };
+
             let mut record_struct = RecordData::new(defining_pkg_name, &name);
             let fields = get_fields(elements);
             record_struct.fields = fields;

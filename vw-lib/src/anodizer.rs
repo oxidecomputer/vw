@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    collections::HashSet,
     fs,
 };
 
@@ -77,7 +78,7 @@ pub async fn anodize_records(
     rust_out_dir : String
 ) -> Result<(), VwError>{
     let mut tagged_records = Vec::new();
-    let mut packages_needed = Vec::new();
+    let mut packages_set = HashSet::new();
     for name in &processor.tagged_names {
         match processor.records.get(name) {
             Some(record) => {
@@ -90,7 +91,21 @@ pub async fn anodize_records(
                         )
                     }
                 )?;
-                packages_needed.push(pkg_name.clone());
+                packages_set.insert(pkg_name.clone());
+
+                // get the imported packages for the file
+                let record_filename = processor.record_to_file.get(name)
+                    .ok_or(
+                        VwError::CodeGen { 
+                            message: format!("Somehow couldn't find the containing file for record {:}", name) 
+                    })?;
+                let file_data = processor.file_info.get(record_filename)
+                    .ok_or(
+                        VwError::CodeGen { 
+                            message: format!("Somehow couldn't find information for file {:}", record_filename)
+                    })?;  
+                let imports = file_data.get_imported_pkgs();
+                packages_set.extend(imports.iter().cloned());
             }
             None => {
                 return Err(VwError::CodeGen { 
@@ -196,6 +211,7 @@ pub async fn anodize_records(
     }
 
 
+    let packages_needed : Vec<String> = packages_set.iter().cloned().collect();
     // alright, we've collected all the expressions that need resolving...create a testbench
     let exprs = expr_to_resolve.keys().cloned().collect();
     let testbench = create_testbench(&exprs, &packages_needed);
