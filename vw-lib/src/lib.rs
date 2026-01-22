@@ -1044,7 +1044,7 @@ pub async fn run_testbench(
     // Build Rust library if requested
     let rust_lib_path = if build_rust {
         Some(
-            build_rust_library(&testbench_file)
+            build_rust_library(&bench_dir, &testbench_file)
                 .await?
                 .to_string_lossy()
                 .to_string(),
@@ -2049,7 +2049,7 @@ fn load_existing_vhdl_ls_config(
 
 /// Build a Rust library for a testbench.
 /// Looks for Cargo.toml in the testbench directory, builds it, and returns the path to the .so file.
-async fn build_rust_library(testbench_file: &Path) -> Result<PathBuf> {
+async fn build_rust_library(bench_dir: &Utf8Path, testbench_file: &Path) -> Result<PathBuf> {
     // Get the testbench directory
     let testbench_dir =
         testbench_file.parent().ok_or_else(|| VwError::Testbench {
@@ -2108,14 +2108,7 @@ async fn build_rust_library(testbench_file: &Path) -> Result<PathBuf> {
 
     // Find the .so file in the workspace target directory (parent of testbench dir)
     let lib_name = format!("lib{}.so", package_name.replace('-', "_"));
-    let workspace_target = testbench_dir
-        .parent()
-        .ok_or_else(|| VwError::Testbench {
-            message: format!(
-                "Testbench directory {:?} has no parent",
-                testbench_dir
-            ),
-        })?
+    let workspace_target = bench_dir
         .join("target")
         .join("debug");
 
@@ -2130,5 +2123,5 @@ async fn build_rust_library(testbench_file: &Path) -> Result<PathBuf> {
         });
     }
 
-    Ok(lib_path)
+    Ok(lib_path.into())
 }
