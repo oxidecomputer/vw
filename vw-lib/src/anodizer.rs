@@ -6,6 +6,7 @@ use std::{
 
 use crate::{RecordProcessor, VhdlStandard, nvc_helpers::{run_nvc_elab, run_nvc_sim}};
 use crate::VwError;
+use crate::mapping::VwSymbol;
 use crate::vhdl_printer::expr_to_string;
 use crate::nvc_helpers::run_nvc_analysis;
 
@@ -28,7 +29,7 @@ enum Side {
 struct ConstraintID {
     record_index : usize,
     field_index : usize,
-    side : Side
+    side : Option<Side>,  // None for enum size (single value), Some(Left/Right) for range constraints
 }
 
 
@@ -80,12 +81,12 @@ pub async fn anodize_records(
     let mut tagged_records = Vec::new();
     let mut packages_set = HashSet::new();
     for name in &processor.tagged_names {
-        match processor.records.get(name) {
-            Some(record) => {
+        match processor.symbols.get(name) {
+            Some(VwSymbol::Record(record)) => {
                 tagged_records.push(record);
                 let pkg_name = record.get_pkg_name()
                     .ok_or_else(||
-                    VwError::CodeGen { 
+                    VwError::CodeGen {
                         message: format!("Serialization not supported for \
                         records not in packages. Record : {:}", record.get_name()
                         )
@@ -94,22 +95,27 @@ pub async fn anodize_records(
                 packages_set.insert(pkg_name.clone());
 
                 // get the imported packages for the file
-                let record_filename = processor.record_to_file.get(name)
+                let record_filename = processor.symbol_to_file.get(name)
                     .ok_or(
-                        VwError::CodeGen { 
-                            message: format!("Somehow couldn't find the containing file for record {:}", name) 
+                        VwError::CodeGen {
+                            message: format!("Somehow couldn't find the containing file for record {:}", name)
                     })?;
                 let file_data = processor.file_info.get(record_filename)
                     .ok_or(
-                        VwError::CodeGen { 
+                        VwError::CodeGen {
                             message: format!("Somehow couldn't find information for file {:}", record_filename)
-                    })?;  
+                    })?;
                 let imports = file_data.get_imported_pkgs();
                 packages_set.extend(imports.iter().cloned());
             }
+            Some(_) => {
+                return Err(VwError::CodeGen {
+                    message: format!("Tagged type {:} is not a record", name)
+                })
+            }
             None => {
-                return Err(VwError::CodeGen { 
-                    message: format!("Tagged type with name {:} not supported", name) 
+                return Err(VwError::CodeGen {
+                    message: format!("Tagged type with name {:} not found", name)
                 })
             }
         }
@@ -140,10 +146,10 @@ pub async fn anodize_records(
                     else {
                         let expr_str = expr_to_string(&range.left_expr.item);
                         expr_to_resolve.entry(expr_str).or_default().push(
-                            ConstraintID { 
+                            ConstraintID {
                                 record_index: i,
                                 field_index: j,
-                                side: Side::Left 
+                                side: Some(Side::Left)
                             }
                         );
                     }
@@ -159,10 +165,10 @@ pub async fn anodize_records(
                         expr_to_resolve.entry(
                             expr_str
                         ).or_default().push(
-                            ConstraintID { 
+                            ConstraintID {
                                 record_index: i,
-                                field_index: j, 
-                                side: Side::Right
+                                field_index: j,
+                                side: Some(Side::Right)
                             }
                         );
                     }
@@ -191,19 +197,51 @@ pub async fn anodize_records(
                     Some(range)
                 )); 
             }
-            // make sure the subtype struct is captured too
+            // Check if subtype is an enum or a record
             else {
-                if !processor.tagged_names.contains(&field.subtype_name) {
-                    return Err(VwError::CodeGen { 
-                        message: format!("Subtype {:} not tagged for serialization. Please tag it", field.subtype_name)
-                    });
-                }
-                else {
-                    record_resolution.fields.push(ResolvedField::new(
-                        &field.name,
-                        &field.subtype_name,
-                    None
-                    ));
+                match processor.symbols.get(&field.subtype_name) {
+                    Some(VwSymbol::Enum(enum_data)) => {
+                        // Check if enum has custom encoding
+                        if enum_data.has_custom_encoding {
+                            return Err(VwError::CodeGen {
+                                message: format!("Enum {:} has custom encoding and cannot be serialized",
+                                    field.subtype_name)
+                            });
+                        }
+                        // Enum field - need to resolve its size via testbench
+                        let expr_str = format!("{}'pos({}'high)",
+                            field.subtype_name, field.subtype_name);
+                        expr_to_resolve.entry(expr_str).or_default().push(
+                            ConstraintID {
+                                record_index: i,
+                                field_index: j,
+                                side: None,  // Enum size, not left/right range
+                            }
+                        );
+                        record_resolution.fields.push(ResolvedField::new(
+                            &field.name,
+                            &field.subtype_name,
+                            Some(ResolvedRange::default())
+                        ));
+                    }
+                    Some(VwSymbol::Record(_)) => {
+                        // Nested record - must be tagged for serialization
+                        if !processor.tagged_names.contains(&field.subtype_name) {
+                            return Err(VwError::CodeGen {
+                                message: format!("Subtype {:} not tagged for serialization. Please tag it", field.subtype_name)
+                            });
+                        }
+                        record_resolution.fields.push(ResolvedField::new(
+                            &field.name,
+                            &field.subtype_name,
+                            None
+                        ));
+                    }
+                    _ => {
+                        return Err(VwError::CodeGen {
+                            message: format!("Subtype {:} is not a known record or enum type", field.subtype_name)
+                        });
+                    }
                 }
             }
         }
@@ -397,12 +435,19 @@ fn process_sim_output(
             let field = &mut (record.fields[id.field_index]);
             if let Some(bitfield) = &mut field.bit_width {
                 match id.side {
-                    Side::Left => bitfield.left = Some(value),
-                    Side::Right => bitfield.right = Some(value)
+                    Some(Side::Left) => bitfield.left = Some(value),
+                    Some(Side::Right) => bitfield.right = Some(value),
+                    None => {
+                        // Enum size - value is max position (0-indexed), so count = value + 1
+                        let count = value + 1;
+                        let bits = if count <= 1 { 1 } else { (count as f64).log2().ceil() as usize };
+                        bitfield.left = Some(bits - 1);
+                        bitfield.right = Some(0);
+                    }
                 }
             }
             else {
-                return Err(VwError::CodeGen { message: 
+                return Err(VwError::CodeGen { message:
                     format!("Somehow tried to generate an expression for \
                         field {:} in record {:} which has no expression",
                     field.name, record.name)

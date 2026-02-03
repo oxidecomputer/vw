@@ -2,7 +2,7 @@ use vhdl_lang::ast::{
     AnyDesignUnit, AnyPrimaryUnit, AttributeSpecification, Designator,
     DiscreteRange, ElementDeclaration, EntityClass, EntityDeclaration,
     EntityName, Name, PackageDeclaration, Range, RangeConstraint,
-    SubtypeConstraint, TypeDeclaration, TypeDefinition::Record,
+    SubtypeConstraint, TypeDeclaration, TypeDefinition,
 };
 
 use crate::visitor::{Visitor, VisitorResult};
@@ -13,6 +13,32 @@ pub enum VwSymbol {
     Entity(String),
     Constant(String),
     Record(RecordData),
+    Enum(EnumData),
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumData {
+    pub containing_pkg: Option<String>,
+    pub name: String,
+    pub has_custom_encoding: bool,
+}
+
+impl EnumData {
+    pub fn new(containing_pkg: Option<String>, name: &str) -> Self {
+        Self {
+            containing_pkg,
+            name: String::from(name),
+            has_custom_encoding: false,
+        }
+    }
+
+    pub fn get_pkg_name(&self) -> Option<&String> {
+        self.containing_pkg.as_ref()
+    }
+
+    pub fn get_name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -115,8 +141,30 @@ impl Visitor for VwSymbolFinder {
         spec: &AttributeSpecification,
         _unit: &AnyDesignUnit,
     ) -> VisitorResult {
+        let attr_name = spec.ident.item.item.name_utf8();
+
+        // Check for custom enum encoding
+        if attr_name == "enum_encoding" {
+            if let EntityClass::Type = spec.entity_class {
+                if let EntityName::Name(tag) = &spec.entity_name {
+                    if let Designator::Identifier(id) = &tag.designator.item.item {
+                        let type_name = id.name_utf8();
+                        // Find the enum and set its flag
+                        for symbol in &mut self.symbols {
+                            if let VwSymbol::Enum(enum_data) = symbol {
+                                if enum_data.name == type_name {
+                                    enum_data.has_custom_encoding = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // if we found the attribute with the right name
-        if spec.ident.item.item.name_utf8() == self.target_attr {
+        if attr_name == self.target_attr {
             // if we tagged a type (like a record)
             if let EntityClass::Type = spec.entity_class {
                 // get the entity name
@@ -139,24 +187,32 @@ impl Visitor for VwSymbolFinder {
         decl: &TypeDeclaration,
         unit: &AnyDesignUnit,
     ) -> VisitorResult {
-        if let Record(elements) = &decl.def {
-            let name = decl.ident.tree.item.name_utf8();
-            //figure out where this package was defined
-            let defining_pkg_name =
-                if let AnyDesignUnit::Primary(primary_unit) = unit {
-                    if let AnyPrimaryUnit::Package(package) = primary_unit {
-                        Some(package.ident.tree.item.name_utf8())
-                    } else {
-                        None
-                    }
+        let name = decl.ident.tree.item.name_utf8();
+
+        // Figure out where this type was defined (containing package)
+        let defining_pkg_name =
+            if let AnyDesignUnit::Primary(primary_unit) = unit {
+                if let AnyPrimaryUnit::Package(package) = primary_unit {
+                    Some(package.ident.tree.item.name_utf8())
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
 
-            let mut record_struct = RecordData::new(defining_pkg_name, &name);
-            let fields = get_fields(elements);
-            record_struct.fields = fields;
-            self.records.push(record_struct);
+        match &decl.def {
+            TypeDefinition::Record(elements) => {
+                let mut record_struct = RecordData::new(defining_pkg_name, &name);
+                let fields = get_fields(elements);
+                record_struct.fields = fields;
+                self.records.push(record_struct);
+            }
+            TypeDefinition::Enumeration(_) => {
+                let enum_data = EnumData::new(defining_pkg_name, &name);
+                self.symbols.push(VwSymbol::Enum(enum_data));
+            }
+            _ => {}
         }
         VisitorResult::Continue
     }

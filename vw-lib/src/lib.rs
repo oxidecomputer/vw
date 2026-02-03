@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use vhdl_lang::{VHDLParser, VHDLStandard};
 
 use crate::anodizer::anodize_records;
-use crate::mapping::{FileData, RecordData, VwSymbol, VwSymbolFinder};
+use crate::mapping::{FileData, VwSymbol, VwSymbolFinder};
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
 use crate::visitor::walk_design_file;
 
@@ -761,6 +761,16 @@ pub fn list_testbenches(
     ignore_dirs: &HashSet<String>,
     recurse: bool,
 ) -> Result<Vec<TestbenchInfo>> {
+    let mut entities_cache = HashMap::new();
+    list_testbenches_impl(bench_dir, ignore_dirs, recurse, &mut entities_cache)
+}
+
+fn list_testbenches_impl(
+    bench_dir: &Utf8Path,
+    ignore_dirs: &HashSet<String>,
+    recurse: bool,
+    entities_cache: &mut HashMap<PathBuf, Vec<String>>,
+) -> Result<Vec<TestbenchInfo>> {
     let mut testbenches = Vec::new();
 
     for entry in fs::read_dir(bench_dir).map_err(|e| VwError::FileSystem {
@@ -774,10 +784,10 @@ pub fn list_testbenches(
         if path.is_file() {
             if let Some(extension) = path.extension() {
                 if extension == "vhd" || extension == "vhdl" {
-                    let entities = find_entities_in_file(&path)?;
+                    let entities = get_cached_entities(&path, entities_cache)?;
                     for entity in entities {
                         testbenches.push(TestbenchInfo {
-                            name: entity,
+                            name: entity.clone(),
                             path: path.clone(),
                         });
                     }
@@ -791,7 +801,7 @@ pub fn list_testbenches(
             if let Some(file_name) = dir_path.file_name() {
                 if !ignore_dirs.contains(file_name) {
                     let mut lower_testbenches =
-                        list_testbenches(&dir_path, ignore_dirs, recurse)?;
+                        list_testbenches_impl(&dir_path, ignore_dirs, recurse, entities_cache)?;
                     testbenches.append(&mut lower_testbenches);
                 }
             }
@@ -809,8 +819,8 @@ pub struct TestbenchInfo {
 
 pub struct RecordProcessor {
     vhdl_std: VhdlStandard,
-    records: HashMap<String, RecordData>,
-    record_to_file: HashMap<String, String>,
+    symbols: HashMap<String, VwSymbol>,
+    symbol_to_file: HashMap<String, String>,
     tagged_names: HashSet<String>,
     file_info: HashMap<String, FileData>,
     target_attr: String,
@@ -821,13 +831,176 @@ impl RecordProcessor {
     pub fn new(std: VhdlStandard) -> Self {
         Self {
             vhdl_std: std,
-            records: HashMap::new(),
-            record_to_file: HashMap::new(),
+            symbols: HashMap::new(),
+            symbol_to_file: HashMap::new(),
             tagged_names: HashSet::new(),
             file_info: HashMap::new(),
             target_attr: RECORD_PARSE_ATTRIBUTE.to_string(),
         }
     }
+}
+
+// ============================================================================
+// File Cache - Reduces redundant file reads during build
+// ============================================================================
+
+/// Cache for parsed file data to avoid redundant parsing during builds.
+/// Only caches parsed results, not raw file contents.
+pub struct FileCache {
+    dependencies: HashMap<PathBuf, Vec<VwSymbol>>,
+    provided_symbols: HashMap<PathBuf, Vec<VwSymbol>>,
+    entities: HashMap<PathBuf, Vec<String>>,
+}
+
+impl FileCache {
+    pub fn new() -> Self {
+        Self {
+            dependencies: HashMap::new(),
+            provided_symbols: HashMap::new(),
+            entities: HashMap::new(),
+        }
+    }
+
+    /// Get cached file dependencies, reading and parsing file if not cached.
+    pub fn get_dependencies(&mut self, path: &Path) -> Result<&Vec<VwSymbol>> {
+        if !self.dependencies.contains_key(path) {
+            let content =
+                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
+                    message: format!("Failed to read file {path:?}: {e}"),
+                })?;
+            let deps = parse_file_dependencies(&content)?;
+            self.dependencies.insert(path.to_path_buf(), deps);
+        }
+        Ok(self.dependencies.get(path).unwrap())
+    }
+
+    /// Get cached provided symbols (packages and entities), reading and parsing if not cached.
+    pub fn get_provided_symbols(
+        &mut self,
+        path: &Path,
+    ) -> Result<&Vec<VwSymbol>> {
+        if !self.provided_symbols.contains_key(path) {
+            let content =
+                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
+                    message: format!("Failed to read file {path:?}: {e}"),
+                })?;
+            let symbols = parse_provided_symbols(&content)?;
+            self.provided_symbols.insert(path.to_path_buf(), symbols);
+        }
+        Ok(self.provided_symbols.get(path).unwrap())
+    }
+
+    /// Get cached entities in file, reading and parsing if not cached.
+    pub fn get_entities(&mut self, path: &Path) -> Result<&Vec<String>> {
+        if !self.entities.contains_key(path) {
+            let content =
+                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
+                    message: format!("Failed to read file {path:?}: {e}"),
+                })?;
+            let entities = parse_entities(&content)?;
+            self.entities.insert(path.to_path_buf(), entities);
+        }
+        Ok(self.entities.get(path).unwrap())
+    }
+
+    /// Get mutable access to the entities cache for functions that only need entity lookups.
+    pub fn entities_cache_mut(&mut self) -> &mut HashMap<PathBuf, Vec<String>> {
+        &mut self.entities
+    }
+}
+
+impl Default for FileCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parse dependencies from file content (extracted for use by FileCache).
+fn parse_file_dependencies(content: &str) -> Result<Vec<VwSymbol>> {
+    let mut dependencies = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Package imports from "use work.package_name"
+    let imports = get_package_imports(content)?;
+    for pkg in imports {
+        let key = format!("pkg:{}", pkg.to_lowercase());
+        if seen.insert(key) {
+            dependencies.push(VwSymbol::Package(pkg));
+        }
+    }
+
+    // Find direct entity instantiations (instance_name: entity work.entity_name)
+    let entity_inst_pattern = r"(?i)\w+\s*:\s*entity\s+work\.(\w+)";
+    let entity_inst_re = regex::Regex::new(entity_inst_pattern)?;
+
+    for captures in entity_inst_re.captures_iter(content) {
+        if let Some(entity_name) = captures.get(1) {
+            let name = entity_name.as_str().to_string();
+            let key = format!("ent:{}", name.to_lowercase());
+            if seen.insert(key) {
+                dependencies.push(VwSymbol::Entity(name));
+            }
+        }
+    }
+
+    // Find component declarations
+    let comp_decl_pattern = r"(?i)component\s+(\w+)";
+    let comp_decl_re = regex::Regex::new(comp_decl_pattern)?;
+
+    for captures in comp_decl_re.captures_iter(content) {
+        if let Some(comp_name) = captures.get(1) {
+            let name = comp_name.as_str().to_string();
+            let key = format!("ent:{}", name.to_lowercase());
+            if seen.insert(key) {
+                dependencies.push(VwSymbol::Entity(name));
+            }
+        }
+    }
+
+    Ok(dependencies)
+}
+
+/// Parse provided symbols (packages and entities) from file content.
+fn parse_provided_symbols(content: &str) -> Result<Vec<VwSymbol>> {
+    let mut symbols = Vec::new();
+
+    // Find package declarations
+    let package_pattern = r"(?i)\bpackage\s+(\w+)\s+is\b";
+    let package_re = regex::Regex::new(package_pattern)?;
+
+    for captures in package_re.captures_iter(content) {
+        if let Some(package_name) = captures.get(1) {
+            symbols.push(VwSymbol::Package(package_name.as_str().to_string()));
+        }
+    }
+
+    // Find entity declarations
+    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
+    let entity_re = regex::Regex::new(entity_pattern)?;
+
+    for captures in entity_re.captures_iter(content) {
+        if let Some(entity_name) = captures.get(1) {
+            symbols.push(VwSymbol::Entity(entity_name.as_str().to_string()));
+        }
+    }
+
+    Ok(symbols)
+}
+
+/// Parse entity declarations from file content.
+fn parse_entities(content: &str) -> Result<Vec<String>> {
+    let mut entities = Vec::new();
+
+    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
+    let re = regex::Regex::new(entity_pattern)?;
+
+    for captures in re.captures_iter(content) {
+        if let Some(entity_name) = captures.get(1) {
+            entities.push(entity_name.as_str().to_string());
+        }
+    }
+
+    Ok(entities)
 }
 
 pub async fn anodize_only(
@@ -836,10 +1009,12 @@ pub async fn anodize_only(
 ) -> Result<()> {
     let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
     let mut processor = RecordProcessor::new(vhdl_std);
+    let mut cache = FileCache::new();
 
     fs::create_dir_all(BUILD_DIR)?;
 
-    analyze_ext_libraries(&vhdl_ls_config, &mut processor, vhdl_std).await?;
+    analyze_ext_libraries(&vhdl_ls_config, &mut processor, vhdl_std, &mut cache)
+        .await?;
 
     // alright...now we need to find packages and search them for records
     let defaultlib_files = vhdl_ls_config
@@ -851,17 +1026,17 @@ pub async fn anodize_only(
     let mut relevant_files = HashSet::new();
 
     for file in &defaultlib_files {
-        let content =
-            fs::read_to_string(file).map_err(|e| VwError::FileSystem {
-                message: format!("Failed to read file {file:?}: {e}"),
-            })?;
-        let package_re = regex::Regex::new(r"(?i)\bpackage\s+\w+\s+is\b")?;
-
-        if package_re.is_match(&content) {
+        // Use cache to check for package declarations
+        let provided = cache.get_provided_symbols(file)?;
+        // Check if file contains any package declarations
+        let has_package = provided
+            .iter()
+            .any(|s| matches!(s, VwSymbol::Package(_)));
+        if has_package {
             relevant_files.insert(file.clone());
             // ok it is a package...figure out which files it brings in
             let referenced_files =
-                find_referenced_files(file, &defaultlib_files)?;
+                find_referenced_files(file, &defaultlib_files, &mut cache)?;
             relevant_files.extend(referenced_files.iter().cloned());
         }
     }
@@ -869,7 +1044,7 @@ pub async fn anodize_only(
     let mut files_vec: Vec<PathBuf> = relevant_files.iter().cloned().collect();
 
     // with all the relevant files, sort them and then anodize them
-    sort_files_by_dependencies(&mut processor, &mut files_vec)?;
+    sort_files_by_dependencies(&mut processor, &mut files_vec, &mut cache)?;
 
     let files: Vec<String> = files_vec
         .iter()
@@ -892,6 +1067,7 @@ async fn analyze_ext_libraries(
     vhdl_ls_config: &VhdlLsConfig,
     processor: &mut RecordProcessor,
     vhdl_std: VhdlStandard,
+    cache: &mut FileCache,
 ) -> Result<()> {
     // First, analyze all non-defaultlib libraries
     for (lib_name, library) in &vhdl_ls_config.libraries {
@@ -919,7 +1095,7 @@ async fn analyze_ext_libraries(
             }
 
             // Sort files in dependency order (dependencies first)
-            sort_files_by_dependencies(processor, &mut files)?;
+            sort_files_by_dependencies(processor, &mut files, cache)?;
 
             let file_strings: Vec<String> = files
                 .iter()
@@ -951,11 +1127,13 @@ pub async fn run_testbench(
 ) -> Result<()> {
     let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
     let mut processor = RecordProcessor::new(vhdl_std);
+    let mut cache = FileCache::new();
 
     fs::create_dir_all(BUILD_DIR)?;
 
     // First, analyze all non-defaultlib libraries
-    analyze_ext_libraries(&vhdl_ls_config, &mut processor, vhdl_std).await?;
+    analyze_ext_libraries(&vhdl_ls_config, &mut processor, vhdl_std, &mut cache)
+        .await?;
 
     // Get defaultlib files for later use
     let defaultlib_files = vhdl_ls_config
@@ -973,10 +1151,26 @@ pub async fn run_testbench(
     }
 
     let testbench_file =
-        find_testbench_file(&testbench_name, &bench_dir, recurse)?;
+        find_testbench_file(&testbench_name, &bench_dir, recurse, cache.entities_cache_mut())?;
 
     // Filter defaultlib files to exclude OTHER testbenches but allow common bench code
     let bench_dir_abs = workspace_dir.as_std_path().join("bench");
+
+    // Pre-compute entities for bench files to avoid mutable borrow in closure
+    let mut bench_file_entities: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for file_path in &defaultlib_files {
+        let absolute_path = if file_path.is_relative() {
+            workspace_dir.as_std_path().join(file_path)
+        } else {
+            file_path.clone()
+        };
+        if absolute_path.starts_with(&bench_dir_abs) {
+            if let Ok(entities) = cache.get_entities(&absolute_path) {
+                bench_file_entities.insert(absolute_path, entities.clone());
+            }
+        }
+    }
+
     let filtered_defaultlib_files: Vec<PathBuf> = defaultlib_files
         .into_iter()
         .filter(|file_path| {
@@ -993,11 +1187,11 @@ pub async fn run_testbench(
             }
 
             // If it's in the bench directory, check if it's a different testbench
-            if let Ok(entities) = find_entities_in_file(&absolute_path) {
+            if let Some(entities) = bench_file_entities.get(&absolute_path) {
                 // Exclude files that contain testbench entities other than the one we're running
                 for entity in entities {
                     if entity.to_lowercase().ends_with("_tb")
-                        && entity != testbench_name
+                        && entity != &testbench_name
                     {
                         return false; // This is a different testbench, exclude it
                     }
@@ -1011,10 +1205,10 @@ pub async fn run_testbench(
 
     // Find only the defaultlib files that are actually referenced by this testbench
     let mut referenced_files =
-        find_referenced_files(&testbench_file, &filtered_defaultlib_files)?;
+        find_referenced_files(&testbench_file, &filtered_defaultlib_files, &mut cache)?;
 
     // Sort files in dependency order (dependencies first)
-    sort_files_by_dependencies(&mut processor, &mut referenced_files)?;
+    sort_files_by_dependencies(&mut processor, &mut referenced_files, &mut cache)?;
 
     let mut files: Vec<String> = referenced_files
         .iter()
@@ -1075,6 +1269,7 @@ pub async fn run_testbench(
 fn find_referenced_files(
     testbench_file: &Path,
     available_files: &[PathBuf],
+    cache: &mut FileCache,
 ) -> Result<Vec<PathBuf>> {
     let mut referenced_files = Vec::new();
     let mut processed_files = HashSet::new();
@@ -1092,12 +1287,12 @@ fn find_referenced_files(
             referenced_files.push(current_file.clone());
         }
 
-        let dependencies = find_file_dependencies(&current_file)?;
+        let dependencies = cache.get_dependencies(&current_file)?.clone();
 
         // Find corresponding files for each dependency
         for dep in dependencies {
             for available_file in available_files {
-                if file_provides_symbol(available_file, &dep)? {
+                if file_provides_symbol(available_file, &dep, cache)? {
                     if !processed_files.contains(available_file) {
                         files_to_process.push(available_file.clone());
                     }
@@ -1124,78 +1319,23 @@ fn get_package_imports(content: &str) -> Result<Vec<String>> {
     Ok(imports)
 }
 
-fn find_file_dependencies(file_path: &Path) -> Result<Vec<String>> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
-        })?;
-
-    let mut dependencies = HashSet::new();
-
-    let imports = get_package_imports(&content)?;
-    dependencies.extend(imports);
-
-    // Find direct entity instantiations (instance_name: entity work.entity_name)
-    let entity_inst_pattern = r"(?i)\w+\s*:\s*entity\s+work\.(\w+)";
-    let entity_inst_re = regex::Regex::new(entity_inst_pattern)?;
-
-    for captures in entity_inst_re.captures_iter(&content) {
-        if let Some(entity_name) = captures.get(1) {
-            dependencies.insert(entity_name.as_str().to_string());
+fn file_provides_symbol(
+    file_path: &Path,
+    needed: &VwSymbol,
+    cache: &mut FileCache,
+) -> Result<bool> {
+    let provided = cache.get_provided_symbols(file_path)?;
+    Ok(provided.iter().any(|s| match (needed, s) {
+        // Package dependency matches package declaration
+        (VwSymbol::Package(need), VwSymbol::Package(have)) => {
+            need.eq_ignore_ascii_case(have)
         }
-    }
-
-    // Find component instantiations (component_name : entity_name)
-    let component_pattern = r"(?i)(\w+)\s*:\s*(\w+)";
-    let component_re = regex::Regex::new(component_pattern)?;
-
-    for captures in component_re.captures_iter(&content) {
-        if let Some(entity_name) = captures.get(2) {
-            // Skip if this looks like an entity instantiation (already handled above)
-            if !entity_name.as_str().eq_ignore_ascii_case("entity") {
-                dependencies.insert(entity_name.as_str().to_string());
-            }
+        // Entity dependency matches entity declaration
+        (VwSymbol::Entity(need), VwSymbol::Entity(have)) => {
+            need.eq_ignore_ascii_case(have)
         }
-    }
-
-    // Find component declarations
-    let comp_decl_pattern = r"(?i)component\s+(\w+)";
-    let comp_decl_re = regex::Regex::new(comp_decl_pattern)?;
-
-    for captures in comp_decl_re.captures_iter(&content) {
-        if let Some(comp_name) = captures.get(1) {
-            dependencies.insert(comp_name.as_str().to_string());
-        }
-    }
-
-    Ok(dependencies.into_iter().collect())
-}
-
-fn file_provides_symbol(file_path: &Path, symbol: &str) -> Result<bool> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
-        })?;
-
-    // Check for package declaration
-    let package_pattern =
-        format!(r"(?i)\bpackage\s+{}\s+is\b", regex::escape(symbol));
-    let package_re = regex::Regex::new(&package_pattern)?;
-
-    if package_re.is_match(&content) {
-        return Ok(true);
-    }
-
-    // Check for entity declaration
-    let entity_pattern =
-        format!(r"(?i)\bentity\s+{}\s+is\b", regex::escape(symbol));
-    let entity_re = regex::Regex::new(&entity_pattern)?;
-
-    if entity_re.is_match(&content) {
-        return Ok(true);
-    }
-
-    Ok(false)
+        _ => false,
+    }))
 }
 
 fn analyze_file(
@@ -1209,14 +1349,22 @@ fn analyze_file(
     let mut file_finder = VwSymbolFinder::new(&processor.target_attr);
     walk_design_file(&mut file_finder, &design_file);
 
+    let file_str = file.to_string_lossy().to_string();
+
+    // Add records to symbols map
     for record in file_finder.get_records() {
-        processor
-            .records
-            .insert(record.get_name().to_string(), record.clone());
-        processor.record_to_file.insert(
-            record.get_name().to_string(),
-            file.to_string_lossy().to_string(),
-        );
+        let name = record.get_name().to_string();
+        processor.symbols.insert(name.clone(), VwSymbol::Record(record.clone()));
+        processor.symbol_to_file.insert(name, file_str.clone());
+    }
+
+    // Add enums from symbols (they're already VwSymbol::Enum)
+    for symbol in file_finder.get_symbols() {
+        if let VwSymbol::Enum(enum_data) = symbol {
+            let name = enum_data.get_name().to_string();
+            processor.symbols.insert(name.clone(), symbol.clone());
+            processor.symbol_to_file.insert(name, file_str.clone());
+        }
     }
 
     for tagged_type in file_finder.get_tagged_types() {
@@ -1229,6 +1377,7 @@ fn analyze_file(
 fn sort_files_by_dependencies(
     processor: &mut RecordProcessor,
     files: &mut Vec<PathBuf>,
+    cache: &mut FileCache,
 ) -> Result<()> {
     // Build dependency graph
     let mut dependencies: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -1247,16 +1396,12 @@ fn sort_files_by_dependencies(
                         .or_insert_with(|| FileData::new());
                     entry.add_defined_pkg(&name);
 
-                    let content = fs::read_to_string(file).map_err(|e| {
-                        VwError::FileSystem {
-                            message: format!(
-                                "Failed to read file {file:?}: {e}"
-                            ),
+                    // Use cache to get package imports only
+                    let deps = cache.get_dependencies(file)?;
+                    for dep in deps {
+                        if let VwSymbol::Package(pkg_name) = dep {
+                            entry.add_imported_pkg(pkg_name);
                         }
-                    })?;
-                    let package_names = get_package_imports(&content)?;
-                    for pkg in package_names {
-                        entry.add_imported_pkg(&pkg);
                     }
                 }
                 VwSymbol::Entity(name) => {
@@ -1269,11 +1414,15 @@ fn sort_files_by_dependencies(
 
     // Second pass: find dependencies for each file
     for file in files.iter() {
-        let deps = find_file_dependencies(file)?;
+        let deps = cache.get_dependencies(file)?.clone();
         let mut file_deps = Vec::new();
 
         for dep in deps {
-            if let Some(provider_file) = all_symbols.get(&dep) {
+            let dep_name = match &dep {
+                VwSymbol::Package(name) | VwSymbol::Entity(name) => name,
+                _ => continue,
+            };
+            if let Some(provider_file) = all_symbols.get(dep_name) {
                 if provider_file != file {
                     file_deps.push(provider_file.clone());
                 }
@@ -1379,31 +1528,11 @@ fn topological_sort(
     Ok(result)
 }
 
-fn find_entities_in_file(file_path: &Path) -> Result<Vec<String>> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
-        })?;
-
-    let mut entities = Vec::new();
-
-    // Regex to find entity declarations
-    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
-    let re = regex::Regex::new(entity_pattern)?;
-
-    for captures in re.captures_iter(&content) {
-        if let Some(entity_name) = captures.get(1) {
-            entities.push(entity_name.as_str().to_string());
-        }
-    }
-
-    Ok(entities)
-}
-
 fn find_testbench_file_recurse(
     testbench_name: &str,
     bench_dir: &Utf8Path,
     recurse: bool,
+    entities_cache: &mut HashMap<PathBuf, Vec<String>>,
 ) -> Result<Vec<PathBuf>> {
     let mut found_files = Vec::new();
 
@@ -1419,7 +1548,7 @@ fn find_testbench_file_recurse(
             if let Some(extension) = path.extension() {
                 if extension == "vhd" || extension == "vhdl" {
                     // Check if this file contains the entity we're looking for
-                    if file_contains_entity(&path, testbench_name)? {
+                    if file_contains_entity(&path, testbench_name, entities_cache)? {
                         found_files.push(path);
                     }
                 }
@@ -1433,6 +1562,7 @@ fn find_testbench_file_recurse(
                 testbench_name,
                 &dir_path,
                 recurse,
+                entities_cache,
             )?;
             found_files.append(&mut lower_testbenches);
         }
@@ -1444,9 +1574,10 @@ fn find_testbench_file(
     testbench_name: &str,
     bench_dir: &Utf8Path,
     recurse: bool,
+    entities_cache: &mut HashMap<PathBuf, Vec<String>>,
 ) -> Result<PathBuf> {
     let found_files =
-        find_testbench_file_recurse(testbench_name, bench_dir, recurse)?;
+        find_testbench_file_recurse(testbench_name, bench_dir, recurse, entities_cache)?;
 
     match found_files.len() {
         0 => Err(VwError::Testbench {
@@ -1459,19 +1590,31 @@ fn find_testbench_file(
     }
 }
 
-fn file_contains_entity(file_path: &Path, entity_name: &str) -> Result<bool> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
-        })?;
+fn file_contains_entity(
+    file_path: &Path,
+    entity_name: &str,
+    entities_cache: &mut HashMap<PathBuf, Vec<String>>,
+) -> Result<bool> {
+    let entities = get_cached_entities(file_path, entities_cache)?;
+    Ok(entities
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(entity_name)))
+}
 
-    // Simple regex to find entity declarations
-    // This is a basic implementation that looks for "entity <name> is"
-    let entity_pattern =
-        format!(r"(?i)\bentity\s+{}\s+is\b", regex::escape(entity_name));
-    let re = regex::Regex::new(&entity_pattern)?;
-
-    Ok(re.is_match(&content))
+/// Get entities from cache, parsing and caching if not present.
+fn get_cached_entities<'a>(
+    path: &Path,
+    entities_cache: &'a mut HashMap<PathBuf, Vec<String>>,
+) -> Result<&'a Vec<String>> {
+    if !entities_cache.contains_key(path) {
+        let content =
+            fs::read_to_string(path).map_err(|e| VwError::FileSystem {
+                message: format!("Failed to read file {path:?}: {e}"),
+            })?;
+        let entities = parse_entities(&content)?;
+        entities_cache.insert(path.to_path_buf(), entities);
+    }
+    Ok(entities_cache.get(path).unwrap())
 }
 
 fn make_path_portable(path: PathBuf) -> PathBuf {
