@@ -131,6 +131,13 @@ enum Commands {
     Anodize {
         #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
         std: CliVhdlStandard,
+        #[arg(
+            long,
+            short,
+            help = "Output directory for generated Rust structs",
+            default_value = "bench/test_utils/src"
+        )]
+        output: String,
     },
 }
 
@@ -431,9 +438,9 @@ async fn main() {
                 process::exit(1);
             }
         }
-        Commands::Anodize { std } => {
+        Commands::Anodize { std, output } => {
             println!("Generating Rust structs from VHDL records...");
-            match anodize_only(&cwd, std.into()).await {
+            match anodize_only(&cwd, std.into(), &output).await {
                 Ok(()) => {
                     println!(
                         "{} Generated Rust structs successfully!",

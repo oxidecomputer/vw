@@ -47,9 +47,7 @@ pub mod nvc_helpers;
 pub mod vhdl_printer;
 pub mod visitor;
 
-// TODO: make this a flag
 const BUILD_DIR: &str = "vw_build";
-const RUST_GEN_DIR: &str = "bench/test_utils/src";
 
 // ============================================================================
 // Error Types
@@ -1027,6 +1025,7 @@ fn parse_entities(content: &str) -> Result<Vec<String>> {
 pub async fn anodize_only(
     workspace_dir: &Utf8Path,
     vhdl_std: VhdlStandard,
+    rust_out_dir: &str,
 ) -> Result<()> {
     let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
     let mut processor = RecordProcessor::new(vhdl_std);
@@ -1081,7 +1080,7 @@ pub async fn anodize_only(
         &files,
         "generate".to_string(),
         BUILD_DIR.to_string(),
-        RUST_GEN_DIR.to_string(),
+        rust_out_dir.to_string(),
     )
     .await?;
 
