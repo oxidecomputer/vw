@@ -156,9 +156,9 @@ pub enum VhdlStandard {
     Vhdl2019,
 }
 
-impl Into<VHDLStandard> for VhdlStandard {
-    fn into(self) -> VHDLStandard {
-        match self {
+impl From<VhdlStandard> for VHDLStandard {
+    fn from(val: VhdlStandard) -> Self {
+        match val {
             VhdlStandard::Vhdl2008 => VHDLStandard::VHDL2008,
             VhdlStandard::Vhdl2019 => VHDLStandard::VHDL2019,
         }
@@ -1128,7 +1128,7 @@ async fn analyze_ext_libraries(
 
             run_nvc_analysis(
                 vhdl_std,
-                &BUILD_DIR.to_string(),
+                BUILD_DIR,
                 &nvc_lib_name,
                 &file_strings,
                 false,
@@ -1257,23 +1257,9 @@ pub async fn run_testbench(
 
     files.push(testbench_file.to_string_lossy().to_string());
 
-    run_nvc_analysis(
-        vhdl_std,
-        &BUILD_DIR.to_string(),
-        &"work".to_string(),
-        &files,
-        false,
-    )
-    .await?;
+    run_nvc_analysis(vhdl_std, BUILD_DIR, "work", &files, false).await?;
 
-    run_nvc_elab(
-        vhdl_std,
-        &BUILD_DIR.to_string(),
-        &"work".to_string(),
-        &testbench_name,
-        false,
-    )
-    .await?;
+    run_nvc_elab(vhdl_std, BUILD_DIR, "work", &testbench_name, false).await?;
 
     // Build Rust library if requested
     let rust_lib_path = if build_rust {
@@ -1290,8 +1276,8 @@ pub async fn run_testbench(
     // Run NVC simulation
     run_nvc_sim(
         vhdl_std,
-        &BUILD_DIR.to_string(),
-        &"work".to_string(),
+        BUILD_DIR,
+        "work",
         &testbench_name,
         rust_lib_path,
         &runtime_flags.to_vec(),
@@ -1351,7 +1337,7 @@ fn get_package_imports(content: &str) -> Result<Vec<String>> {
     let use_work_re = regex::Regex::new(use_work_pattern)?;
     let mut imports = Vec::new();
 
-    for captures in use_work_re.captures_iter(&content) {
+    for captures in use_work_re.captures_iter(content) {
         if let Some(package_name) = captures.get(1) {
             imports.push(package_name.as_str().to_string());
         }
@@ -1380,7 +1366,7 @@ fn file_provides_symbol(
 
 fn analyze_file(
     processor: &mut RecordProcessor,
-    file: &PathBuf,
+    file: &Path,
 ) -> Result<Vec<VwSymbol>> {
     let parser = VHDLParser::new(processor.vhdl_std.into());
     let mut diagnostics = Vec::new();
@@ -1435,7 +1421,7 @@ fn sort_files_by_dependencies(
                     let entry = processor
                         .file_info
                         .entry(file.to_string_lossy().to_string())
-                        .or_insert_with(|| FileData::new());
+                        .or_default();
                     entry.add_defined_pkg(&name);
 
                     // Use cache to get package imports only

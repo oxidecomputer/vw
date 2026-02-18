@@ -9,17 +9,17 @@ use std::{
 
 fn get_base_nvc_cmd_args(
     std: VhdlStandard,
-    build_dir: &String,
-    lib_name: &String,
+    build_dir: &str,
+    lib_name: &str,
 ) -> Vec<String> {
-    let lib_dir = build_dir.clone() + "/" + lib_name;
+    let lib_dir = build_dir.to_owned() + "/" + lib_name;
     let args = vec![
         format!("--std={std}"),
         format!("--work={lib_dir}"),
         "-M".to_string(),
         "256m".to_string(),
         "-L".to_string(),
-        build_dir.clone(),
+        build_dir.to_owned(),
     ];
     args
 }
@@ -66,8 +66,8 @@ async fn run_cmd(
 
 pub async fn run_nvc_analysis(
     std: VhdlStandard,
-    build_dir: &String,
-    lib_name: &String,
+    build_dir: &str,
+    lib_name: &str,
     referenced_files: &Vec<String>,
     capture_output: bool,
 ) -> Result<Option<(Vec<u8>, Vec<u8>)>, VwError> {
@@ -86,7 +86,7 @@ pub async fn run_nvc_analysis(
             std::io::stdout().write_all(&output.stdout)?;
             std::io::stderr().write_all(&output.stderr)?;
             return Err(VwError::NvcAnalysis {
-                library: lib_name.clone(),
+                library: lib_name.to_owned(),
                 command: cmd_str,
             });
         }
@@ -97,7 +97,7 @@ pub async fn run_nvc_analysis(
         if !status.success() {
             let cmd_str = format!("nvc {}", args.join(" "));
             return Err(VwError::NvcAnalysis {
-                library: lib_name.clone(),
+                library: lib_name.to_owned(),
                 command: cmd_str,
             });
         }
@@ -107,14 +107,14 @@ pub async fn run_nvc_analysis(
 
 pub async fn run_nvc_elab(
     std: VhdlStandard,
-    build_dir: &String,
-    lib_name: &String,
-    testbench_name: &String,
+    build_dir: &str,
+    lib_name: &str,
+    testbench_name: &str,
     capture_output: bool,
 ) -> Result<Option<(Vec<u8>, Vec<u8>)>, VwError> {
     let mut args = get_base_nvc_cmd_args(std, build_dir, lib_name);
     args.push("-e".to_string());
-    args.push(testbench_name.clone());
+    args.push(testbench_name.to_owned());
 
     if capture_output {
         let output = run_cmd_w_output(&args, None).await?;
@@ -140,8 +140,8 @@ pub async fn run_nvc_elab(
 
 pub async fn run_nvc_sim(
     std: VhdlStandard,
-    build_dir: &String,
-    lib_name: &String,
+    build_dir: &str,
+    lib_name: &str,
     testbench_name: &String,
     rust_lib_path: Option<String>,
     runtime_flags: &Vec<String>,

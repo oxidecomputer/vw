@@ -71,7 +71,7 @@ impl ResolvedRecord {
 
 pub async fn anodize_records(
     processor: &RecordProcessor,
-    referenced_files: &Vec<String>,
+    referenced_files: &[String],
     generate_dir: String,
     build_dir: String,
     rust_out_dir: String,
@@ -189,9 +189,10 @@ pub async fn anodize_records(
                     });
                 }
             } else if field.subtype_name.eq_ignore_ascii_case("std_logic") {
-                let mut range = ResolvedRange::default();
-                range.left = Some(0);
-                range.right = Some(0);
+                let range = ResolvedRange {
+                    left: Some(0),
+                    right: Some(0),
+                };
                 record_resolution.fields.push(ResolvedField::new(
                     &field.name,
                     &field.subtype_name,
@@ -254,7 +255,7 @@ pub async fn anodize_records(
 
     let packages_needed: Vec<String> = packages_set.iter().cloned().collect();
     // alright, we've collected all the expressions that need resolving...create a testbench
-    let exprs = expr_to_resolve.keys().cloned().collect();
+    let exprs: Vec<String> = expr_to_resolve.keys().cloned().collect();
     let testbench = create_testbench(&exprs, &packages_needed);
 
     let generate_path = format!("{}/{}", build_dir, generate_dir);
@@ -276,7 +277,7 @@ pub async fn anodize_records(
     let (std_out_analysis, std_err_analysis) = run_nvc_analysis(
         VhdlStandard::Vhdl2019,
         &build_dir,
-        &"generated".to_string(),
+        "generated",
         &tb_files,
         true,
     )
@@ -292,8 +293,8 @@ pub async fn anodize_records(
     let (stdout_elab, stderr_elab) = run_nvc_elab(
         VhdlStandard::Vhdl2019,
         &build_dir,
-        &"generated".to_string(),
-        &"constraint_evaluator".to_string(),
+        "generated",
+        "constraint_evaluator",
         true,
     )
     .await?
@@ -309,7 +310,7 @@ pub async fn anodize_records(
     let (stdout_sim, stderr_sim) = run_nvc_sim(
         VhdlStandard::Vhdl2019,
         &build_dir,
-        &"generated".to_string(),
+        "generated",
         &"constraint_evaluator".to_string(),
         None,
         &Vec::new(),
@@ -341,7 +342,7 @@ pub async fn anodize_records(
 }
 
 fn generate_rust_structs(
-    resolved_recs: &Vec<ResolvedRecord>,
+    resolved_recs: &[ResolvedRecord],
 ) -> Result<String, VwError> {
     let structs: Result<Vec<TokenStream>, VwError> = resolved_recs.iter().map(|record| {
         let struct_name = format_ident!("{}", record.name);
@@ -373,7 +374,7 @@ fn generate_rust_structs(
 
         let constructor_inners = record.fields.iter().map(|field| {
             let field_name = format_ident!("{}", field.name);
-            if let Some(_) = &field.bit_width {
+            if field.bit_width.is_some() {
                 quote!{
                     #field_name : BitSet::default()
                 }
@@ -420,10 +421,10 @@ fn generate_rust_structs(
 }
 
 fn process_sim_output(
-    expr_keys: &Vec<String>,
+    expr_keys: &[String],
     exprs_to_resolve: HashMap<String, Vec<ConstraintID>>,
-    records: &mut Vec<ResolvedRecord>,
-    sim_out: &Vec<u8>,
+    records: &mut [ResolvedRecord],
+    sim_out: &[u8],
 ) -> Result<(), VwError> {
     let stdout_str = String::from_utf8_lossy(sim_out);
 
@@ -487,8 +488,8 @@ fn process_sim_output(
 }
 
 fn create_testbench(
-    exprs_to_resolve: &Vec<String>,
-    packages_needed: &Vec<String>,
+    exprs_to_resolve: &[String],
+    packages_needed: &[String],
 ) -> String {
     let mut testbench = Vec::new();
 
@@ -527,8 +528,9 @@ end architecture behavior;
     testbench.join("")
 }
 
+#[allow(clippy::vec_init_then_push)]
 /// Generate VHDL package use statements for a testbench
-pub fn generate_testbench_imports(packages_needed: &Vec<String>) -> String {
+pub fn generate_testbench_imports(packages_needed: &[String]) -> String {
     let mut imports = Vec::new();
 
     imports.push(String::from("-- Required packages\n"));

@@ -10,7 +10,7 @@ use vhdl_lang::ast::{Designator, Expression, Literal, Name, Operator};
 pub fn expr_to_string(expr: &Expression) -> String {
     match expr {
         Expression::Literal(lit) => literal_to_string(lit),
-        Expression::Name(name) => name_to_string(&**name),
+        Expression::Name(name) => name_to_string(name),
         Expression::Binary(op, left, right) => {
             // Match on the binary operator enum directly - inline to avoid exposing private types
             let op_str = match &op.item.item {
@@ -115,12 +115,8 @@ fn name_to_string(name: &Name) -> String {
         }
         Name::CallOrIndexed(fcall) => {
             // For function calls like get_eth_hdr_bits(x)
-            format!(
-                "{}",
-                expr_to_string(&Expression::Name(Box::new(
-                    fcall.name.item.clone()
-                )))
-            )
+            expr_to_string(&Expression::Name(Box::new(fcall.name.item.clone())))
+                .to_string()
         }
         _ => "complex_name".to_string(),
     }

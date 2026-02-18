@@ -48,6 +48,7 @@ pub struct RecordData {
     fields: Vec<FieldData>,
 }
 
+#[derive(Debug, Default)]
 pub struct FileData {
     defined_pkgs: Vec<String>,
     imported_pkgs: Vec<String>,
@@ -77,7 +78,7 @@ impl FileData {
 impl RecordData {
     pub fn new(containing_pkg: Option<String>, name: &str) -> Self {
         Self {
-            containing_pkg: containing_pkg,
+            containing_pkg,
             name: String::from(name),
             fields: Vec::new(),
         }
@@ -183,6 +184,7 @@ impl Visitor for VwSymbolFinder {
         VisitorResult::Continue
     }
 
+    #[allow(clippy::collapsible_match)]
     fn visit_type_declaration(
         &mut self,
         decl: &TypeDeclaration,
@@ -252,12 +254,11 @@ fn get_fields(elements: &Vec<ElementDeclaration>) -> Vec<FieldData> {
         }
         .unwrap();
 
-        let element_constraint =
-            if let Some(constraint) = &element.subtype.constraint {
-                Some(get_range_constraint(&constraint.item))
-            } else {
-                None
-            };
+        let element_constraint = element
+            .subtype
+            .constraint
+            .as_ref()
+            .map(|constraint| get_range_constraint(&constraint.item));
 
         fields.push(FieldData {
             name: element_name,
@@ -273,7 +274,7 @@ fn get_range_constraint(constraint: &SubtypeConstraint) -> RangeConstraint {
     if let SubtypeConstraint::Array(array_range, _) = constraint {
         if let DiscreteRange::Range(discrete_range) = &array_range[0].item {
             if let Range::Range(constraint) = discrete_range {
-                return constraint.clone();
+                constraint.clone()
             } else {
                 panic!("We don't handle other range types")
             }

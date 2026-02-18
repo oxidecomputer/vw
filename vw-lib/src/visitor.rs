@@ -347,53 +347,53 @@ fn walk_declaration<V: Visitor>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    //use super::*;
 
-    struct CountingVisitor {
-        entities: usize,
-        packages: usize,
-        types: usize,
-        attr_specs: usize,
-    }
+    //struct CountingVisitor {
+    //    entities: usize,
+    //    packages: usize,
+    //    types: usize,
+    //    attr_specs: usize,
+    //}
 
-    impl CountingVisitor {
-        fn new() -> Self {
-            Self {
-                entities: 0,
-                packages: 0,
-                types: 0,
-                attr_specs: 0,
-            }
-        }
-    }
+    //impl CountingVisitor {
+    //    fn new() -> Self {
+    //        Self {
+    //            entities: 0,
+    //            packages: 0,
+    //            types: 0,
+    //            attr_specs: 0,
+    //        }
+    //    }
+    //}
 
-    impl Visitor for CountingVisitor {
-        fn visit_entity(&mut self, _: &EntityDeclaration) -> VisitorResult {
-            self.entities += 1;
-            VisitorResult::Continue
-        }
+    //impl Visitor for CountingVisitor {
+    //    fn visit_entity(&mut self, _: &EntityDeclaration) -> VisitorResult {
+    //        self.entities += 1;
+    //        VisitorResult::Continue
+    //    }
 
-        fn visit_package(&mut self, _: &PackageDeclaration) -> VisitorResult {
-            self.packages += 1;
-            VisitorResult::Continue
-        }
+    //    fn visit_package(&mut self, _: &PackageDeclaration) -> VisitorResult {
+    //        self.packages += 1;
+    //        VisitorResult::Continue
+    //    }
 
-        fn visit_type_declaration(
-            &mut self,
-            _: &TypeDeclaration,
-            _: &AnyDesignUnit,
-        ) -> VisitorResult {
-            self.types += 1;
-            VisitorResult::Continue
-        }
+    //    fn visit_type_declaration(
+    //        &mut self,
+    //        _: &TypeDeclaration,
+    //        _: &AnyDesignUnit,
+    //    ) -> VisitorResult {
+    //        self.types += 1;
+    //        VisitorResult::Continue
+    //    }
 
-        fn visit_attribute_specification(
-            &mut self,
-            _: &AttributeSpecification,
-            _: &AnyDesignUnit,
-        ) -> VisitorResult {
-            self.attr_specs += 1;
-            VisitorResult::Continue
-        }
-    }
+    //    fn visit_attribute_specification(
+    //        &mut self,
+    //        _: &AttributeSpecification,
+    //        _: &AnyDesignUnit,
+    //    ) -> VisitorResult {
+    //        self.attr_specs += 1;
+    //        VisitorResult::Continue
+    //    }
+    //}
 }
