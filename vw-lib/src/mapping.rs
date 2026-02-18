@@ -56,16 +56,16 @@ pub struct FileData {
 impl FileData {
     pub fn new() -> Self {
         Self {
-            defined_pkgs : Vec::new(),
-            imported_pkgs : Vec::new()
+            defined_pkgs: Vec::new(),
+            imported_pkgs: Vec::new(),
         }
     }
 
-    pub fn add_defined_pkg(&mut self, pkg_name : &str) {
+    pub fn add_defined_pkg(&mut self, pkg_name: &str) {
         self.defined_pkgs.push(pkg_name.to_string());
     }
 
-    pub fn add_imported_pkg(&mut self, pkg_name : &str) {
+    pub fn add_imported_pkg(&mut self, pkg_name: &str) {
         self.imported_pkgs.push(pkg_name.to_string());
     }
 
@@ -94,7 +94,6 @@ impl RecordData {
     pub fn get_name(&self) -> &str {
         &self.name
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +146,9 @@ impl Visitor for VwSymbolFinder {
         if attr_name == "enum_encoding" {
             if let EntityClass::Type = spec.entity_class {
                 if let EntityName::Name(tag) = &spec.entity_name {
-                    if let Designator::Identifier(id) = &tag.designator.item.item {
+                    if let Designator::Identifier(id) =
+                        &tag.designator.item.item
+                    {
                         let type_name = id.name_utf8();
                         // Find the enum and set its flag
                         for symbol in &mut self.symbols {
@@ -203,7 +204,8 @@ impl Visitor for VwSymbolFinder {
 
         match &decl.def {
             TypeDefinition::Record(elements) => {
-                let mut record_struct = RecordData::new(defining_pkg_name, &name);
+                let mut record_struct =
+                    RecordData::new(defining_pkg_name, &name);
                 let fields = get_fields(elements);
                 record_struct.fields = fields;
                 self.records.push(record_struct);

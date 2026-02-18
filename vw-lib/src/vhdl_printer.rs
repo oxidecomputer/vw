@@ -4,7 +4,7 @@
 // Note: vhdl_lang provides VHDLFormatter, but its Buffer type is private,
 // so we manually reconstruct expressions from the AST instead.
 
-use vhdl_lang::ast::{Expression, Name, Designator, Literal, Operator};
+use vhdl_lang::ast::{Designator, Expression, Literal, Name, Operator};
 
 /// Convert an Expression AST node to a VHDL string
 pub fn expr_to_string(expr: &Expression) -> String {
@@ -48,8 +48,13 @@ pub fn expr_to_string(expr: &Expression) -> String {
                 Operator::Concat => "&",
                 _ => " ? ", // Catch-all for unexpected operators
             };
-            format!("{} {} {}", expr_to_string(&left.item), op_str, expr_to_string(&right.item))
-        },
+            format!(
+                "{} {} {}",
+                expr_to_string(&left.item),
+                op_str,
+                expr_to_string(&right.item)
+            )
+        }
         Expression::Unary(op, operand) => {
             let op_str = match &op.item.item {
                 Operator::Plus => "+",
@@ -60,10 +65,10 @@ pub fn expr_to_string(expr: &Expression) -> String {
                 _ => "unary_op ",
             };
             format!("{}{}", op_str, expr_to_string(&operand.item))
-        },
+        }
         Expression::Parenthesized(inner) => {
             format!("({})", expr_to_string(&inner.item))
-        },
+        }
         _ => "complex_expr".to_string(),
     }
 }
@@ -81,28 +86,42 @@ fn literal_to_string(lit: &Literal) -> String {
 
 fn name_to_string(name: &Name) -> String {
     match name {
-        Name::Designator(des) => {
-            match &des.item {
-                Designator::Identifier(sym) => sym.name_utf8(),
-                Designator::OperatorSymbol(_) => "operator".to_string(),
-                Designator::Character(c) => format!("'{}'", c),
-                Designator::Anonymous(_) => "anonymous".to_string(),
-            }
+        Name::Designator(des) => match &des.item {
+            Designator::Identifier(sym) => sym.name_utf8(),
+            Designator::OperatorSymbol(_) => "operator".to_string(),
+            Designator::Character(c) => format!("'{}'", c),
+            Designator::Anonymous(_) => "anonymous".to_string(),
         },
         Name::Selected(prefix, suffix) => {
             let suffix_name = match &suffix.item.item {
                 Designator::Identifier(sym) => sym.name_utf8(),
                 _ => "suffix".to_string(),
             };
-            format!("{}.{}", expr_to_string(&Expression::Name(Box::new(prefix.item.clone()))), suffix_name)
-        },
+            format!(
+                "{}.{}",
+                expr_to_string(&Expression::Name(Box::new(
+                    prefix.item.clone()
+                ))),
+                suffix_name
+            )
+        }
         Name::SelectedAll(prefix) => {
-            format!("{}.all", expr_to_string(&Expression::Name(Box::new(prefix.item.clone()))))
-        },
+            format!(
+                "{}.all",
+                expr_to_string(&Expression::Name(Box::new(
+                    prefix.item.clone()
+                )))
+            )
+        }
         Name::CallOrIndexed(fcall) => {
             // For function calls like get_eth_hdr_bits(x)
-            format!("{}", expr_to_string(&Expression::Name(Box::new(fcall.name.item.clone()))))
-        },
+            format!(
+                "{}",
+                expr_to_string(&Expression::Name(Box::new(
+                    fcall.name.item.clone()
+                )))
+            )
+        }
         _ => "complex_name".to_string(),
     }
 }

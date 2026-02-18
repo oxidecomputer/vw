@@ -5,16 +5,16 @@
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
+use std::collections::HashSet;
 use std::fmt;
 use std::process;
-use std::collections::HashSet;
 
 use vw_lib::{
-    add_dependency_with_token, anodize_only, clear_cache, extract_hostname_from_repo_url,
-    generate_deps_tcl, get_access_credentials_from_netrc, init_workspace,
-    list_dependencies, list_testbenches, load_workspace_config,
-    remove_dependency, run_testbench, update_workspace_with_token, Credentials,
-    VersionInfo, VhdlStandard,
+    add_dependency_with_token, anodize_only, clear_cache,
+    extract_hostname_from_repo_url, generate_deps_tcl,
+    get_access_credentials_from_netrc, init_workspace, list_dependencies,
+    list_testbenches, load_workspace_config, remove_dependency, run_testbench,
+    update_workspace_with_token, Credentials, VersionInfo, VhdlStandard,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -99,16 +99,35 @@ enum Commands {
         std: CliVhdlStandard,
         #[arg(long, help = "List all available testbenches")]
         list: bool,
-        #[arg(long, help = "Enable recursive search when looking for testbenches")]
+        #[arg(
+            long,
+            help = "Enable recursive search when looking for testbenches"
+        )]
         recurse: bool,
-        #[arg(long, value_delimiter = ',', help = "Ignore directories matching these names (comma-separated or use multiple times)")]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Ignore directories matching these names (comma-separated or use multiple times)"
+        )]
         ignore: Vec<String>,
-        #[arg(long, value_delimiter = ',', help = "Runtime flags to pass to NVC (comma-separated or use multiple times)", requires = "testbench")]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Runtime flags to pass to NVC (comma-separated or use multiple times)",
+            requires = "testbench"
+        )]
         runtime_flags: Vec<String>,
-        #[arg(long, help = "Build Rust library for testbench before running", requires = "testbench")]
+        #[arg(
+            long,
+            help = "Build Rust library for testbench before running",
+            requires = "testbench"
+        )]
         build_rust: bool,
     },
-    #[command(name = "anodize", about = "Generate Rust structs from VHDL records tagged with serialize_rust attribute")]
+    #[command(
+        name = "anodize",
+        about = "Generate Rust structs from VHDL records tagged with serialize_rust attribute"
+    )]
     Anodize {
         #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
         std: CliVhdlStandard,
@@ -344,9 +363,8 @@ async fn main() {
                 let bench_dir = cwd.join("bench");
                 if !bench_dir.exists() {
                     println!("No bench dir found in {:}", bench_dir.as_str());
-                }
-                else {
-                    let mut ignore_set : HashSet<String> = HashSet::new();
+                } else {
+                    let mut ignore_set: HashSet<String> = HashSet::new();
                     for ignore_pattern in ignore {
                         ignore_set.insert(ignore_pattern);
                     }
@@ -354,7 +372,9 @@ async fn main() {
                     match list_testbenches(&bench_dir, &ignore_set, recurse) {
                         Ok(testbenches) => {
                             if testbenches.is_empty() {
-                                println!("No testbenches found in bench directory");
+                                println!(
+                                    "No testbenches found in bench directory"
+                                );
                             } else {
                                 println!("Available testbenches:");
                                 for tb in testbenches {
@@ -375,11 +395,17 @@ async fn main() {
                         }
                     }
                 }
-
             } else if let Some(testbench_name) = testbench {
                 println!("Running testbench: {}", testbench_name.cyan());
-                match run_testbench(&cwd, testbench_name.clone(), std.into(), recurse, &runtime_flags, build_rust)
-                    .await
+                match run_testbench(
+                    &cwd,
+                    testbench_name.clone(),
+                    std.into(),
+                    recurse,
+                    &runtime_flags,
+                    build_rust,
+                )
+                .await
                 {
                     Ok(()) => {
                         println!(

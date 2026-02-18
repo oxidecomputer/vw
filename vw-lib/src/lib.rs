@@ -817,8 +817,12 @@ fn list_testbenches_impl(
                 })?;
             if let Some(file_name) = dir_path.file_name() {
                 if !ignore_dirs.contains(file_name) {
-                    let mut lower_testbenches =
-                        list_testbenches_impl(&dir_path, ignore_dirs, recurse, entities_cache)?;
+                    let mut lower_testbenches = list_testbenches_impl(
+                        &dir_path,
+                        ignore_dirs,
+                        recurse,
+                        entities_cache,
+                    )?;
                     testbenches.append(&mut lower_testbenches);
                 }
             }
@@ -1030,8 +1034,13 @@ pub async fn anodize_only(
 
     fs::create_dir_all(BUILD_DIR)?;
 
-    analyze_ext_libraries(&vhdl_ls_config, &mut processor, vhdl_std, &mut cache)
-        .await?;
+    analyze_ext_libraries(
+        &vhdl_ls_config,
+        &mut processor,
+        vhdl_std,
+        &mut cache,
+    )
+    .await?;
 
     // alright...now we need to find packages and search them for records
     let defaultlib_files = vhdl_ls_config
@@ -1046,9 +1055,8 @@ pub async fn anodize_only(
         // Use cache to check for package declarations
         let provided = cache.get_provided_symbols(file)?;
         // Check if file contains any package declarations
-        let has_package = provided
-            .iter()
-            .any(|s| matches!(s, VwSymbol::Package(_)));
+        let has_package =
+            provided.iter().any(|s| matches!(s, VwSymbol::Package(_)));
         if has_package {
             relevant_files.insert(file.clone());
             // ok it is a package...figure out which files it brings in
@@ -1149,8 +1157,13 @@ pub async fn run_testbench(
     fs::create_dir_all(BUILD_DIR)?;
 
     // First, analyze all non-defaultlib libraries
-    analyze_ext_libraries(&vhdl_ls_config, &mut processor, vhdl_std, &mut cache)
-        .await?;
+    analyze_ext_libraries(
+        &vhdl_ls_config,
+        &mut processor,
+        vhdl_std,
+        &mut cache,
+    )
+    .await?;
 
     // Get defaultlib files for later use
     let defaultlib_files = vhdl_ls_config
@@ -1167,8 +1180,12 @@ pub async fn run_testbench(
         });
     }
 
-    let testbench_file =
-        find_testbench_file(&testbench_name, &bench_dir, recurse, cache.entities_cache_mut())?;
+    let testbench_file = find_testbench_file(
+        &testbench_name,
+        &bench_dir,
+        recurse,
+        cache.entities_cache_mut(),
+    )?;
 
     // Filter defaultlib files to exclude OTHER testbenches but allow common bench code
     let bench_dir_abs = workspace_dir.as_std_path().join("bench");
@@ -1221,11 +1238,18 @@ pub async fn run_testbench(
         .collect();
 
     // Find only the defaultlib files that are actually referenced by this testbench
-    let mut referenced_files =
-        find_referenced_files(&testbench_file, &filtered_defaultlib_files, &mut cache)?;
+    let mut referenced_files = find_referenced_files(
+        &testbench_file,
+        &filtered_defaultlib_files,
+        &mut cache,
+    )?;
 
     // Sort files in dependency order (dependencies first)
-    sort_files_by_dependencies(&mut processor, &mut referenced_files, &mut cache)?;
+    sort_files_by_dependencies(
+        &mut processor,
+        &mut referenced_files,
+        &mut cache,
+    )?;
 
     let mut files: Vec<String> = referenced_files
         .iter()
@@ -1371,7 +1395,9 @@ fn analyze_file(
     // Add records to symbols map
     for record in file_finder.get_records() {
         let name = record.get_name().to_string();
-        processor.symbols.insert(name.clone(), VwSymbol::Record(record.clone()));
+        processor
+            .symbols
+            .insert(name.clone(), VwSymbol::Record(record.clone()));
         processor.symbol_to_file.insert(name, file_str.clone());
     }
 
@@ -1565,7 +1591,11 @@ fn find_testbench_file_recurse(
             if let Some(extension) = path.extension() {
                 if extension == "vhd" || extension == "vhdl" {
                     // Check if this file contains the entity we're looking for
-                    if file_contains_entity(&path, testbench_name, entities_cache)? {
+                    if file_contains_entity(
+                        &path,
+                        testbench_name,
+                        entities_cache,
+                    )? {
                         found_files.push(path);
                     }
                 }
@@ -1593,8 +1623,12 @@ fn find_testbench_file(
     recurse: bool,
     entities_cache: &mut HashMap<PathBuf, Vec<String>>,
 ) -> Result<PathBuf> {
-    let found_files =
-        find_testbench_file_recurse(testbench_name, bench_dir, recurse, entities_cache)?;
+    let found_files = find_testbench_file_recurse(
+        testbench_name,
+        bench_dir,
+        recurse,
+        entities_cache,
+    )?;
 
     match found_files.len() {
         0 => Err(VwError::Testbench {
@@ -1613,9 +1647,7 @@ fn file_contains_entity(
     entities_cache: &mut HashMap<PathBuf, Vec<String>>,
 ) -> Result<bool> {
     let entities = get_cached_entities(file_path, entities_cache)?;
-    Ok(entities
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case(entity_name)))
+    Ok(entities.iter().any(|e| e.eq_ignore_ascii_case(entity_name)))
 }
 
 /// Get entities from cache, parsing and caching if not present.
@@ -2209,7 +2241,10 @@ fn load_existing_vhdl_ls_config(
 
 /// Build a Rust library for a testbench.
 /// Looks for Cargo.toml in the testbench directory, builds it, and returns the path to the .so file.
-async fn build_rust_library(bench_dir: &Utf8Path, testbench_file: &Path) -> Result<PathBuf> {
+async fn build_rust_library(
+    bench_dir: &Utf8Path,
+    testbench_file: &Path,
+) -> Result<PathBuf> {
     // Get the testbench directory
     let testbench_dir =
         testbench_file.parent().ok_or_else(|| VwError::Testbench {
@@ -2268,9 +2303,7 @@ async fn build_rust_library(bench_dir: &Utf8Path, testbench_file: &Path) -> Resu
 
     // Find the .so file in the workspace target directory (parent of testbench dir)
     let lib_name = format!("lib{}.so", package_name.replace('-', "_"));
-    let workspace_target = bench_dir
-        .join("target")
-        .join("debug");
+    let workspace_target = bench_dir.join("target").join("debug");
 
     let lib_path = workspace_target.join(&lib_name);
 
