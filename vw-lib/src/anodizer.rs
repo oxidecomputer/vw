@@ -344,7 +344,7 @@ fn generate_rust_structs(resolved_recs: &Vec<ResolvedRecord>) -> Result<String, 
                 let bitwidth = left - right + 1;
 
                 Ok(quote! {
-                    pub #field_name: BitfieldWrap<#bitwidth>
+                    pub #field_name: BitSet<#bitwidth>
                 })
             } else {
                 let subtype = format_ident!("{}", field.subtype_name);
@@ -360,7 +360,7 @@ fn generate_rust_structs(resolved_recs: &Vec<ResolvedRecord>) -> Result<String, 
             let field_name = format_ident!("{}", field.name);
             if let Some(_) = &field.bit_width {
                 quote!{
-                    #field_name : BitfieldWrap::new()
+                    #field_name : BitSet::default()
                 }
             }
             else {
@@ -392,7 +392,8 @@ fn generate_rust_structs(resolved_recs: &Vec<ResolvedRecord>) -> Result<String, 
 
     let output = quote! {
         use bitfield_derive::BitStructSerial;
-        use bitfield_struct::{BitStructSerial, BitfieldError, BitfieldWrap};
+        use bitfield_struct::{BitStructSerial, BitfieldError};
+        use bitset::BitSet;
 
         #(#structs)*
     };
