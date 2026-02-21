@@ -190,6 +190,44 @@ pub struct WorkspaceInfo {
     pub version: String,
 }
 
+/// Helper to deserialize a field that can be either a string or array of strings
+fn string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+
+    struct StringOrVec;
+
+    impl<'de> Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("string or array of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Vec<String>, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value.to_owned()])
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> std::result::Result<Vec<String>, S::Error>
+        where
+            S: SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while let Some(value) = seq.next_element()? {
+                vec.push(value);
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Dependency {
     pub repo: String,
@@ -197,11 +235,16 @@ pub struct Dependency {
     pub branch: Option<String>,
     #[serde(default)]
     pub commit: Option<String>,
-    pub src: String,
+    #[serde(deserialize_with = "string_or_vec")]
+    pub src: Vec<String>,
     #[serde(default)]
     pub recursive: bool,
     #[serde(default)]
     pub sim_only: bool,
+    #[serde(default)]
+    pub submodules: bool,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -213,12 +256,17 @@ pub struct LockFile {
 pub struct LockedDependency {
     pub repo: String,
     pub commit: String,
-    pub src: String,
+    #[serde(deserialize_with = "string_or_vec")]
+    pub src: Vec<String>,
     pub path: PathBuf,
     #[serde(default)]
     pub recursive: bool,
     #[serde(default)]
     pub sim_only: bool,
+    #[serde(default)]
+    pub submodules: bool,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -455,6 +503,8 @@ pub async fn update_workspace_with_token(
                 &dep.src,
                 &dep_path,
                 dep.recursive,
+                &dep.exclude,
+                dep.submodules,
                 creds,
             )
             .await
@@ -478,11 +528,13 @@ pub async fn update_workspace_with_token(
                 path: dep_path.clone(),
                 recursive: dep.recursive,
                 sim_only: dep.sim_only,
+                submodules: dep.submodules,
+                exclude: dep.exclude.clone(),
             },
         );
 
         // Find VHDL files in the cached dependency directory
-        let vhdl_files = find_vhdl_files(&dep_path, dep.recursive)?;
+        let vhdl_files = find_vhdl_files(&dep_path, dep.recursive, &dep.exclude)?;
         if !vhdl_files.is_empty() {
             let portable_files =
                 vhdl_files.into_iter().map(make_path_portable).collect();
@@ -574,15 +626,17 @@ pub async fn add_dependency_with_token(
     }
 
     let dep_name = name.unwrap_or_else(|| extract_repo_name(&repo));
-    let src_path = src.unwrap_or_else(|| ".".to_string());
+    let src_paths = vec![src.unwrap_or_else(|| ".".to_string())];
 
     let dependency = Dependency {
         repo: repo.clone(),
         branch,
         commit,
-        src: src_path,
+        src: src_paths,
         recursive,
         sim_only,
+        submodules: false,
+        exclude: Vec::new(),
     };
 
     config.dependencies.insert(dep_name.clone(), dependency);
@@ -732,7 +786,7 @@ pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
         }
 
         let vhdl_files =
-            find_vhdl_files(&locked_dep.path, locked_dep.recursive)?;
+            find_vhdl_files(&locked_dep.path, locked_dep.recursive, &locked_dep.exclude)?;
 
         // Create array entry for this library
         tcl_content.push_str(&format!("set dep_files({dep_name}) [list"));
@@ -1799,12 +1853,15 @@ async fn get_branch_head_commit(
     })?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_dependency(
     repo_url: &str,
     commit: &str,
-    src_path: &str,
+    src_paths: &[String],
     dest_path: &Path,
     recursive: bool,
+    exclude: &[String],
+    submodules: bool,
     credentials: Option<(&str, &str)>, // (username, password)
 ) -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| VwError::FileSystem {
@@ -1821,7 +1878,7 @@ async fn download_dependency(
 
     let commit = commit.to_string();
     let temp_path = temp_dir.path().to_path_buf();
-    let src_path = src_path.to_string();
+    let src_paths = src_paths.to_vec();
     let credentials = credentials.map(|(u, p)| (u.to_string(), p.to_string()));
 
     tokio::task::spawn_blocking(move || {
@@ -1913,6 +1970,26 @@ async fn download_dependency(
                 ),
             })?;
 
+        // Initialize and update submodules if requested
+        if submodules {
+            for mut submodule in repo.submodules().map_err(|e| VwError::Git {
+                message: format!("Failed to list submodules: {e}"),
+            })? {
+                submodule.init(false).map_err(|e| VwError::Git {
+                    message: format!(
+                        "Failed to init submodule '{}': {e}",
+                        submodule.name().unwrap_or("unknown")
+                    ),
+                })?;
+                submodule.update(true, None).map_err(|e| VwError::Git {
+                    message: format!(
+                        "Failed to update submodule '{}': {e}",
+                        submodule.name().unwrap_or("unknown")
+                    ),
+                })?;
+            }
+        }
+
         Ok::<(), VwError>(())
     })
     .await
@@ -1925,7 +2002,9 @@ async fn download_dependency(
     })?;
 
     // Treat all src values as globs (handles files, directories, and patterns)
-    copy_vhdl_files_glob(temp_dir.path(), &src_path, dest_path, recursive)?;
+    for src_path in &src_paths {
+        copy_vhdl_files_glob(temp_dir.path(), src_path, dest_path, recursive, exclude)?;
+    }
 
     Ok(())
 }
@@ -1935,11 +2014,18 @@ fn copy_vhdl_files_glob(
     src_pattern: &str,
     dest: &Path,
     recursive: bool,
+    exclude: &[String],
 ) -> Result<()> {
     // Build patterns to match
     let src_path = repo_root.join(src_pattern);
     let mut patterns = Vec::new();
     let strip_prefix: PathBuf;
+
+    // Compile exclude patterns
+    let exclude_patterns: Vec<glob::Pattern> = exclude
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
 
     // Check if src_pattern points to a directory
     if src_path.is_dir() {
@@ -2018,6 +2104,12 @@ fn copy_vhdl_files_glob(
                                 }
                             })?;
 
+                        // Check if file matches any exclude pattern
+                        let path_str = relative_path.to_string_lossy();
+                        if exclude_patterns.iter().any(|p| p.matches(&path_str)) {
+                            continue; // Skip excluded files
+                        }
+
                         let dest_file = dest.join(relative_path);
 
                         // Create parent directories if needed
@@ -2054,9 +2146,25 @@ fn copy_vhdl_files_glob(
     Ok(())
 }
 
-fn find_vhdl_files(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+fn find_vhdl_files(dir: &Path, recursive: bool, exclude: &[String]) -> Result<Vec<PathBuf>> {
     let mut vhdl_files = Vec::new();
     find_vhdl_files_impl(dir, &mut vhdl_files, recursive)?;
+
+    // Filter out excluded files
+    if !exclude.is_empty() {
+        let exclude_patterns: Vec<glob::Pattern> = exclude
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
+
+        vhdl_files.retain(|file| {
+            // Match against path relative to the base directory
+            let relative = file.strip_prefix(dir).unwrap_or(file);
+            let path_str = relative.to_string_lossy();
+            !exclude_patterns.iter().any(|pattern| pattern.matches(&path_str))
+        });
+    }
+
     Ok(vhdl_files)
 }
 
