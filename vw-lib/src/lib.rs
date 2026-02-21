@@ -1079,9 +1079,94 @@ pub async fn analyze_ext_libraries(
     vhdl_std: VhdlStandard,
     cache: &mut FileCache,
 ) -> Result<()> {
-    // First, analyze all non-defaultlib libraries
-    for (lib_name, library) in &vhdl_ls_config.libraries {
-        if lib_name != "defaultlib" {
+    // Collect non-defaultlib library names
+    let ext_lib_names: Vec<String> = vhdl_ls_config
+        .libraries
+        .keys()
+        .filter(|k| k.as_str() != "defaultlib")
+        .cloned()
+        .collect();
+
+    // Build inter-library dependency graph by scanning for `library <name>;`
+    let ext_lib_set: HashSet<String> = ext_lib_names.iter().cloned().collect();
+    let mut lib_deps: HashMap<String, Vec<String>> = HashMap::new();
+    for lib_name in &ext_lib_names {
+        let mut deps = Vec::new();
+        if let Some(library) = vhdl_ls_config.libraries.get(lib_name) {
+            for file_path in &library.files {
+                let expanded = if file_path.starts_with("$HOME") {
+                    if let Some(home) = dirs::home_dir() {
+                        home.join(
+                            file_path
+                                .strip_prefix("$HOME/")
+                                .unwrap_or(file_path),
+                        )
+                    } else {
+                        PathBuf::from(file_path)
+                    }
+                } else {
+                    PathBuf::from(file_path)
+                };
+                if let Ok(contents) = fs::read_to_string(&expanded) {
+                    for line in contents.lines() {
+                        let trimmed = line.trim().to_lowercase();
+                        if let Some(rest) = trimmed.strip_prefix("library ") {
+                            let dep_lib = rest.trim_end_matches(';').trim();
+                            if ext_lib_set.contains(dep_lib)
+                                && dep_lib != lib_name.to_lowercase()
+                            {
+                                deps.push(dep_lib.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lib_deps.insert(lib_name.clone(), deps);
+    }
+
+    // Topological sort of library names (Kahn's algorithm)
+    let mut in_degree: HashMap<String, usize> =
+        ext_lib_names.iter().map(|n| (n.clone(), 0)).collect();
+    let mut adj: HashMap<String, Vec<String>> =
+        ext_lib_names.iter().map(|n| (n.clone(), Vec::new())).collect();
+    for (lib, deps) in &lib_deps {
+        for dep in deps {
+            if let Some(neighbors) = adj.get_mut(dep) {
+                neighbors.push(lib.clone());
+            }
+            if let Some(deg) = in_degree.get_mut(lib) {
+                *deg += 1;
+            }
+        }
+    }
+    let mut queue: VecDeque<String> = in_degree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let mut sorted_libs = Vec::new();
+    while let Some(current) = queue.pop_front() {
+        sorted_libs.push(current.clone());
+        if let Some(neighbors) = adj.get(&current) {
+            for neighbor in neighbors {
+                if let Some(deg) = in_degree.get_mut(neighbor) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to unsorted if cycle detected
+    if sorted_libs.len() != ext_lib_names.len() {
+        sorted_libs = ext_lib_names;
+    }
+
+    // Analyze libraries in dependency order
+    for lib_name in &sorted_libs {
+        if let Some(library) = vhdl_ls_config.libraries.get(lib_name) {
             // Convert library name to be NVC-compatible (no hyphens)
             let nvc_lib_name = lib_name.replace('-', "_");
 
