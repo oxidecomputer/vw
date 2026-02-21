@@ -10,11 +10,11 @@ use std::fmt;
 use std::process;
 
 use vw_lib::{
-    add_dependency_with_token, anodize_only, clear_cache,
-    extract_hostname_from_repo_url, generate_deps_tcl,
-    get_access_credentials_from_netrc, init_workspace, list_dependencies,
-    list_testbenches, load_workspace_config, remove_dependency, run_testbench,
-    update_workspace_with_token, Credentials, VersionInfo, VhdlStandard,
+    add_dependency_with_token, clear_cache, extract_hostname_from_repo_url,
+    generate_deps_tcl, get_access_credentials_from_netrc, init_workspace,
+    list_dependencies, list_testbenches, load_workspace_config,
+    remove_dependency, run_testbench, update_workspace_with_token, Credentials,
+    VersionInfo, VhdlStandard,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -123,21 +123,6 @@ enum Commands {
             requires = "testbench"
         )]
         build_rust: bool,
-    },
-    #[command(
-        name = "anodize",
-        about = "Generate Rust structs from VHDL records tagged with serialize_rust attribute"
-    )]
-    Anodize {
-        #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
-        std: CliVhdlStandard,
-        #[arg(
-            long,
-            short,
-            help = "Output directory for generated Rust structs",
-            default_value = "bench/test_utils/src"
-        )]
-        output: String,
     },
 }
 
@@ -436,21 +421,6 @@ async fn main() {
                     "error:".bright_red()
                 );
                 process::exit(1);
-            }
-        }
-        Commands::Anodize { std, output } => {
-            println!("Generating Rust structs from VHDL records...");
-            match anodize_only(&cwd, std.into(), &output).await {
-                Ok(()) => {
-                    println!(
-                        "{} Generated Rust structs successfully!",
-                        "✓".bright_green()
-                    );
-                }
-                Err(e) => {
-                    eprintln!("{} {e}", "error:".bright_red());
-                    process::exit(1);
-                }
             }
         }
     }

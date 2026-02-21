@@ -36,15 +36,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use vhdl_lang::{VHDLParser, VHDLStandard};
 
-use crate::anodizer::anodize_records;
 use crate::mapping::{FileData, VwSymbol, VwSymbolFinder};
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
 use crate::visitor::walk_design_file;
 
-pub mod anodizer;
 pub mod mapping;
 pub mod nvc_helpers;
-pub mod vhdl_printer;
 pub mod visitor;
 
 const BUILD_DIR: &str = "vw_build";
@@ -837,12 +834,12 @@ pub struct TestbenchInfo {
 }
 
 pub struct RecordProcessor {
-    vhdl_std: VhdlStandard,
-    symbols: HashMap<String, VwSymbol>,
-    symbol_to_file: HashMap<String, String>,
-    tagged_names: HashSet<String>,
-    file_info: HashMap<String, FileData>,
-    target_attr: String,
+    pub vhdl_std: VhdlStandard,
+    pub symbols: HashMap<String, VwSymbol>,
+    pub symbol_to_file: HashMap<String, String>,
+    pub tagged_names: HashSet<String>,
+    pub file_info: HashMap<String, FileData>,
+    pub target_attr: String,
 }
 
 const RECORD_PARSE_ATTRIBUTE: &str = "serialize_rust";
@@ -1022,72 +1019,7 @@ fn parse_entities(content: &str) -> Result<Vec<String>> {
     Ok(entities)
 }
 
-pub async fn anodize_only(
-    workspace_dir: &Utf8Path,
-    vhdl_std: VhdlStandard,
-    rust_out_dir: &str,
-) -> Result<()> {
-    let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
-    let mut processor = RecordProcessor::new(vhdl_std);
-    let mut cache = FileCache::new();
-
-    fs::create_dir_all(BUILD_DIR)?;
-
-    analyze_ext_libraries(
-        &vhdl_ls_config,
-        &mut processor,
-        vhdl_std,
-        &mut cache,
-    )
-    .await?;
-
-    // alright...now we need to find packages and search them for records
-    let defaultlib_files = vhdl_ls_config
-        .libraries
-        .get("defaultlib")
-        .map(|lib| lib.files.clone())
-        .unwrap_or_default();
-
-    let mut relevant_files = HashSet::new();
-
-    for file in &defaultlib_files {
-        // Use cache to check for package declarations
-        let provided = cache.get_provided_symbols(file)?;
-        // Check if file contains any package declarations
-        let has_package =
-            provided.iter().any(|s| matches!(s, VwSymbol::Package(_)));
-        if has_package {
-            relevant_files.insert(file.clone());
-            // ok it is a package...figure out which files it brings in
-            let referenced_files =
-                find_referenced_files(file, &defaultlib_files, &mut cache)?;
-            relevant_files.extend(referenced_files.iter().cloned());
-        }
-    }
-
-    let mut files_vec: Vec<PathBuf> = relevant_files.iter().cloned().collect();
-
-    // with all the relevant files, sort them and then anodize them
-    sort_files_by_dependencies(&mut processor, &mut files_vec, &mut cache)?;
-
-    let files: Vec<String> = files_vec
-        .iter()
-        .map(|s| s.to_string_lossy().to_string())
-        .collect();
-
-    anodize_records(
-        &processor,
-        &files,
-        "generate".to_string(),
-        BUILD_DIR.to_string(),
-        rust_out_dir.to_string(),
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn analyze_ext_libraries(
+pub async fn analyze_ext_libraries(
     vhdl_ls_config: &VhdlLsConfig,
     processor: &mut RecordProcessor,
     vhdl_std: VhdlStandard,
@@ -1288,11 +1220,7 @@ pub async fn run_testbench(
     Ok(())
 }
 
-// ============================================================================
-// Internal Helper Functions
-// ============================================================================
-
-fn find_referenced_files(
+pub fn find_referenced_files(
     testbench_file: &Path,
     available_files: &[PathBuf],
     cache: &mut FileCache,
@@ -1330,6 +1258,98 @@ fn find_referenced_files(
 
     Ok(referenced_files)
 }
+
+pub fn sort_files_by_dependencies(
+    processor: &mut RecordProcessor,
+    files: &mut Vec<PathBuf>,
+    cache: &mut FileCache,
+) -> Result<()> {
+    // Build dependency graph
+    let mut dependencies: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut all_symbols: HashMap<String, PathBuf> = HashMap::new();
+
+    // First pass: collect all symbols provided by each file
+    for file in files.iter() {
+        let symbols = analyze_file(processor, file)?;
+        for symbol in symbols {
+            match symbol {
+                VwSymbol::Package(name) => {
+                    all_symbols.insert(name.clone(), file.clone());
+                    let entry = processor
+                        .file_info
+                        .entry(file.to_string_lossy().to_string())
+                        .or_default();
+                    entry.add_defined_pkg(&name);
+
+                    // Use cache to get package imports only
+                    let deps = cache.get_dependencies(file)?;
+                    for dep in deps {
+                        if let VwSymbol::Package(pkg_name) = dep {
+                            entry.add_imported_pkg(pkg_name);
+                        }
+                    }
+                }
+                VwSymbol::Entity(name) => {
+                    all_symbols.insert(name, file.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Second pass: find dependencies for each file
+    for file in files.iter() {
+        let deps = cache.get_dependencies(file)?.clone();
+        let mut file_deps = Vec::new();
+
+        for dep in deps {
+            let dep_name = match &dep {
+                VwSymbol::Package(name) | VwSymbol::Entity(name) => name,
+                _ => continue,
+            };
+            if let Some(provider_file) = all_symbols.get(dep_name) {
+                if provider_file != file {
+                    file_deps.push(provider_file.clone());
+                }
+            }
+        }
+
+        dependencies.insert(file.clone(), file_deps);
+    }
+
+    // Topological sort using Kahn's algorithm
+    let sorted = topological_sort(files.clone(), dependencies)?;
+    *files = sorted;
+
+    Ok(())
+}
+
+pub fn load_existing_vhdl_ls_config(
+    workspace_dir: &Utf8Path,
+) -> Result<VhdlLsConfig> {
+    let config_path = workspace_dir.join("vhdl_ls.toml");
+    if config_path.exists() {
+        let config_content = fs::read_to_string(&config_path).map_err(|e| {
+            VwError::FileSystem {
+                message: format!("Failed to read existing vhdl_ls.toml: {e}"),
+            }
+        })?;
+
+        let config: VhdlLsConfig = toml::from_str(&config_content)?;
+
+        Ok(config)
+    } else {
+        Ok(VhdlLsConfig {
+            standard: None,
+            libraries: HashMap::new(),
+            lint: None,
+        })
+    }
+}
+
+// ============================================================================
+// Internal Helper Functions
+// ============================================================================
 
 fn get_package_imports(content: &str) -> Result<Vec<String>> {
     // Find 'use work.package_name' statements
@@ -1401,102 +1421,6 @@ fn analyze_file(
 
     Ok(file_finder.get_symbols().clone())
 }
-
-fn sort_files_by_dependencies(
-    processor: &mut RecordProcessor,
-    files: &mut Vec<PathBuf>,
-    cache: &mut FileCache,
-) -> Result<()> {
-    // Build dependency graph
-    let mut dependencies: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-    let mut all_symbols: HashMap<String, PathBuf> = HashMap::new();
-
-    // First pass: collect all symbols provided by each file
-    for file in files.iter() {
-        let symbols = analyze_file(processor, file)?;
-        for symbol in symbols {
-            match symbol {
-                VwSymbol::Package(name) => {
-                    all_symbols.insert(name.clone(), file.clone());
-                    let entry = processor
-                        .file_info
-                        .entry(file.to_string_lossy().to_string())
-                        .or_default();
-                    entry.add_defined_pkg(&name);
-
-                    // Use cache to get package imports only
-                    let deps = cache.get_dependencies(file)?;
-                    for dep in deps {
-                        if let VwSymbol::Package(pkg_name) = dep {
-                            entry.add_imported_pkg(pkg_name);
-                        }
-                    }
-                }
-                VwSymbol::Entity(name) => {
-                    all_symbols.insert(name, file.clone());
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Second pass: find dependencies for each file
-    for file in files.iter() {
-        let deps = cache.get_dependencies(file)?.clone();
-        let mut file_deps = Vec::new();
-
-        for dep in deps {
-            let dep_name = match &dep {
-                VwSymbol::Package(name) | VwSymbol::Entity(name) => name,
-                _ => continue,
-            };
-            if let Some(provider_file) = all_symbols.get(dep_name) {
-                if provider_file != file {
-                    file_deps.push(provider_file.clone());
-                }
-            }
-        }
-
-        dependencies.insert(file.clone(), file_deps);
-    }
-
-    // Topological sort using Kahn's algorithm
-    let sorted = topological_sort(files.clone(), dependencies)?;
-    *files = sorted;
-
-    Ok(())
-}
-
-//fn get_file_symbols(file_path: &Path) -> Result<Vec<VwSymbol>> {
-//    let content =
-//        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-//            message: format!("Failed to read file {file_path:?}: {e}"),
-//        })?;
-//
-//    let mut symbols = Vec::new();
-//
-//    // Find package declarations
-//    let package_pattern = r"(?i)\bpackage\s+(\w+)\s+is\b";
-//    let package_re = regex::Regex::new(package_pattern)?;
-//
-//    for captures in package_re.captures_iter(&content) {
-//        if let Some(package_name) = captures.get(1) {
-//            symbols.push(VwSymbol::Package(package_name.as_str().to_string()));
-//        }
-//    }
-//
-//    // Find entity declarations
-//    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
-//    let entity_re = regex::Regex::new(entity_pattern)?;
-//
-//    for captures in entity_re.captures_iter(&content) {
-//        if let Some(entity_name) = captures.get(1) {
-//            symbols.push(VwSymbol::Entity(entity_name.as_str().to_string()));
-//        }
-//    }
-//
-//    Ok(symbols)
-//}
 
 fn topological_sort(
     files: Vec<PathBuf>,
@@ -2199,29 +2123,6 @@ fn write_vhdl_ls_config(
     })?;
 
     Ok(())
-}
-
-fn load_existing_vhdl_ls_config(
-    workspace_dir: &Utf8Path,
-) -> Result<VhdlLsConfig> {
-    let config_path = workspace_dir.join("vhdl_ls.toml");
-    if config_path.exists() {
-        let config_content = fs::read_to_string(&config_path).map_err(|e| {
-            VwError::FileSystem {
-                message: format!("Failed to read existing vhdl_ls.toml: {e}"),
-            }
-        })?;
-
-        let config: VhdlLsConfig = toml::from_str(&config_content)?;
-
-        Ok(config)
-    } else {
-        Ok(VhdlLsConfig {
-            standard: None,
-            libraries: HashMap::new(),
-            lint: None,
-        })
-    }
 }
 
 /// Build a Rust library for a testbench.
