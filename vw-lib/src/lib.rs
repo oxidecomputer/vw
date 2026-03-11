@@ -1849,7 +1849,9 @@ async fn get_branch_head_commit(
     let branch = branch.to_string();
     let credentials = credentials.map(|(u, p)| (u.to_string(), p.to_string()));
 
-    tokio::task::spawn_blocking(move || {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
         // Create a temporary directory for the operation
         let temp_dir =
             tempfile::tempdir().map_err(|e| VwError::FileSystem {
@@ -1945,8 +1947,12 @@ async fn get_branch_head_commit(
                 "Branch '{branch}' not found in remote repository"
             ),
         })
-    })
+    }),
+    )
     .await
+    .map_err(|_| VwError::Git {
+        message: "Git ls-remote timed out after 30 seconds".to_string(),
+    })?
     .map_err(|e| VwError::Git {
         message: format!("Failed to execute git ls-remote task: {e}"),
     })?
@@ -1980,7 +1986,9 @@ async fn download_dependency(
     let src_paths = src_paths.to_vec();
     let credentials = credentials.map(|(u, p)| (u.to_string(), p.to_string()));
 
-    tokio::task::spawn_blocking(move || {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::task::spawn_blocking(move || {
         // Set up clone options with authentication
         let mut builder = git2::build::RepoBuilder::new();
 
@@ -2032,6 +2040,7 @@ async fn download_dependency(
         });
 
         let mut fetch_options = git2::FetchOptions::new();
+        fetch_options.depth(1); // shallow clone — only need one commit
         fetch_options.remote_callbacks(callbacks);
         builder.fetch_options(fetch_options);
 
@@ -2092,8 +2101,12 @@ async fn download_dependency(
         }
 
         Ok::<(), VwError>(())
-    })
+    }),
+    )
     .await
+    .map_err(|_| VwError::Git {
+        message: "Git clone timed out after 120 seconds".to_string(),
+    })?
     .map_err(|e| VwError::Git {
         message: format!("Failed to execute git operations: {e}"),
     })??;
