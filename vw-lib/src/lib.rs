@@ -1852,102 +1852,111 @@ async fn get_branch_head_commit(
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
-        // Create a temporary directory for the operation
-        let temp_dir =
-            tempfile::tempdir().map_err(|e| VwError::FileSystem {
-                message: format!("Failed to create temporary directory: {e}"),
-            })?;
-
-        // Create an empty repository to work with remotes
-        let repo =
-            git2::Repository::init_bare(temp_dir.path()).map_err(|e| {
-                VwError::Git {
+            // Create a temporary directory for the operation
+            let temp_dir =
+                tempfile::tempdir().map_err(|e| VwError::FileSystem {
                     message: format!(
-                        "Failed to initialize temporary repository: {e}"
+                        "Failed to create temporary directory: {e}"
                     ),
-                }
-            })?;
+                })?;
 
-        // Create a remote
-        let mut remote =
-            repo.remote_anonymous(&normalized_repo_url).map_err(|e| {
-                VwError::Git {
-                    message: format!("Failed to create remote: {e}"),
-                }
-            })?;
-
-        // Connect and list references
-        // Always set a credentials callback so git2 doesn't fail with "no callback set".
-        // The callback will try explicit credentials first, then fall back to git's
-        // credential helper system (which includes .netrc support).
-        let mut callbacks = git2::RemoteCallbacks::new();
-        let attempt_count = RefCell::new(0);
-
-        callbacks.credentials(move |url, username_from_url, allowed_types| {
-            let mut attempts = attempt_count.borrow_mut();
-            *attempts += 1;
-
-            // Limit attempts to prevent infinite loops
-            if *attempts > 1 {
-                return git2::Cred::default();
-            }
-
-            // First, try explicit credentials from netrc if available
-            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
-            {
-                if let Some((ref username, ref password)) = credentials {
-                    // Use both username and password from netrc
-                    return git2::Cred::userpass_plaintext(username, password);
-                }
-            }
-
-            // Try SSH key if available
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                if let Some(username) = username_from_url {
-                    if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
-                        return Ok(cred);
+            // Create an empty repository to work with remotes
+            let repo =
+                git2::Repository::init_bare(temp_dir.path()).map_err(|e| {
+                    VwError::Git {
+                        message: format!(
+                            "Failed to initialize temporary repository: {e}"
+                        ),
                     }
-                }
-            }
+                })?;
 
-            // Fall back to git's credential helper system (includes .netrc)
-            if let Ok(config) = git2::Config::open_default() {
-                if let Ok(cred) = git2::Cred::credential_helper(
-                    &config,
-                    url,
-                    username_from_url,
-                ) {
-                    return Ok(cred);
-                }
-            }
+            // Create a remote
+            let mut remote = repo
+                .remote_anonymous(&normalized_repo_url)
+                .map_err(|e| VwError::Git {
+                    message: format!("Failed to create remote: {e}"),
+                })?;
 
-            git2::Cred::default()
-        });
+            // Connect and list references
+            // Always set a credentials callback so git2 doesn't fail with "no callback set".
+            // The callback will try explicit credentials first, then fall back to git's
+            // credential helper system (which includes .netrc support).
+            let mut callbacks = git2::RemoteCallbacks::new();
+            let attempt_count = RefCell::new(0);
 
-        remote
-            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
-            .map_err(|e| VwError::Git {
-                message: format!("Failed to connect to remote: {e}"),
+            callbacks.credentials(
+                move |url, username_from_url, allowed_types| {
+                    let mut attempts = attempt_count.borrow_mut();
+                    *attempts += 1;
+
+                    // Limit attempts to prevent infinite loops
+                    if *attempts > 1 {
+                        return git2::Cred::default();
+                    }
+
+                    // First, try explicit credentials from netrc if available
+                    if allowed_types
+                        .contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+                    {
+                        if let Some((ref username, ref password)) = credentials
+                        {
+                            // Use both username and password from netrc
+                            return git2::Cred::userpass_plaintext(
+                                username, password,
+                            );
+                        }
+                    }
+
+                    // Try SSH key if available
+                    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                        if let Some(username) = username_from_url {
+                            if let Ok(cred) =
+                                git2::Cred::ssh_key_from_agent(username)
+                            {
+                                return Ok(cred);
+                            }
+                        }
+                    }
+
+                    // Fall back to git's credential helper system (includes .netrc)
+                    if let Ok(config) = git2::Config::open_default() {
+                        if let Ok(cred) = git2::Cred::credential_helper(
+                            &config,
+                            url,
+                            username_from_url,
+                        ) {
+                            return Ok(cred);
+                        }
+                    }
+
+                    git2::Cred::default()
+                },
+            );
+
+            remote
+                .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
+                .map_err(|e| VwError::Git {
+                    message: format!("Failed to connect to remote: {e}"),
+                })?;
+
+            let refs = remote.list().map_err(|e| VwError::Git {
+                message: format!("Failed to list remote references: {e}"),
             })?;
 
-        let refs = remote.list().map_err(|e| VwError::Git {
-            message: format!("Failed to list remote references: {e}"),
-        })?;
-
-        // Look for the specific branch reference
-        let ref_name = format!("refs/heads/{branch}");
-        for remote_head in refs {
-            if remote_head.name() == ref_name {
-                return Ok(remote_head.oid().to_string());
+            // Look for the specific branch reference
+            let ref_name = format!("refs/heads/{branch}");
+            for remote_head in refs {
+                if remote_head.name() == ref_name {
+                    return Ok(remote_head.oid().to_string());
+                }
             }
-        }
 
-        Err(VwError::Git {
-            message: format!(
-                "Branch '{branch}' not found in remote repository"
-            ),
-        })
-    }),
+            Err(VwError::Git {
+                message: format!(
+                    "Branch '{branch}' not found in remote repository"
+                ),
+            })
+        }),
     )
     .await
     .map_err(|_| VwError::Git {
@@ -1989,119 +1998,128 @@ async fn download_dependency(
     tokio::time::timeout(
         std::time::Duration::from_secs(120),
         tokio::task::spawn_blocking(move || {
-        // Set up clone options with authentication
-        let mut builder = git2::build::RepoBuilder::new();
+            // Set up clone options with authentication
+            let mut builder = git2::build::RepoBuilder::new();
 
-        // Always set a credentials callback so git2 doesn't fail with "no callback set".
-        // The callback will try explicit credentials first, then fall back to git's
-        // credential helper system (which includes .netrc support).
-        let mut callbacks = git2::RemoteCallbacks::new();
-        let attempt_count = RefCell::new(0);
+            // Always set a credentials callback so git2 doesn't fail with "no callback set".
+            // The callback will try explicit credentials first, then fall back to git's
+            // credential helper system (which includes .netrc support).
+            let mut callbacks = git2::RemoteCallbacks::new();
+            let attempt_count = RefCell::new(0);
 
-        callbacks.credentials(move |url, username_from_url, allowed_types| {
-            let mut attempts = attempt_count.borrow_mut();
-            *attempts += 1;
+            callbacks.credentials(
+                move |url, username_from_url, allowed_types| {
+                    let mut attempts = attempt_count.borrow_mut();
+                    *attempts += 1;
 
-            // Limit attempts to prevent infinite loops
-            if *attempts > 1 {
-                return git2::Cred::default();
-            }
-
-            // First, try explicit credentials from netrc if available
-            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
-            {
-                if let Some((ref username, ref password)) = credentials {
-                    // Use both username and password from netrc
-                    return git2::Cred::userpass_plaintext(username, password);
-                }
-            }
-
-            // Try SSH key if available
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                if let Some(username) = username_from_url {
-                    if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
-                        return Ok(cred);
+                    // Limit attempts to prevent infinite loops
+                    if *attempts > 1 {
+                        return git2::Cred::default();
                     }
-                }
-            }
 
-            // Fall back to git's credential helper system (includes .netrc)
-            if let Ok(config) = git2::Config::open_default() {
-                if let Ok(cred) = git2::Cred::credential_helper(
-                    &config,
-                    url,
-                    username_from_url,
-                ) {
-                    return Ok(cred);
-                }
-            }
+                    // First, try explicit credentials from netrc if available
+                    if allowed_types
+                        .contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+                    {
+                        if let Some((ref username, ref password)) = credentials
+                        {
+                            // Use both username and password from netrc
+                            return git2::Cred::userpass_plaintext(
+                                username, password,
+                            );
+                        }
+                    }
 
-            git2::Cred::default()
-        });
+                    // Try SSH key if available
+                    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                        if let Some(username) = username_from_url {
+                            if let Ok(cred) =
+                                git2::Cred::ssh_key_from_agent(username)
+                            {
+                                return Ok(cred);
+                            }
+                        }
+                    }
 
-        let mut fetch_options = git2::FetchOptions::new();
-        fetch_options.depth(1); // shallow clone — only need one commit
-        fetch_options.remote_callbacks(callbacks);
-        builder.fetch_options(fetch_options);
+                    // Fall back to git's credential helper system (includes .netrc)
+                    if let Ok(config) = git2::Config::open_default() {
+                        if let Ok(cred) = git2::Cred::credential_helper(
+                            &config,
+                            url,
+                            username_from_url,
+                        ) {
+                            return Ok(cred);
+                        }
+                    }
 
-        // Clone the repository
-        let repo =
-            builder
+                    git2::Cred::default()
+                },
+            );
+
+            let mut fetch_options = git2::FetchOptions::new();
+            fetch_options.depth(1); // shallow clone — only need one commit
+            fetch_options.remote_callbacks(callbacks);
+            builder.fetch_options(fetch_options);
+
+            // Clone the repository
+            let repo = builder
                 .clone(&normalized_repo_url, &temp_path)
                 .map_err(|e| VwError::Git {
                     message: format!("Failed to clone repository: {e}"),
                 })?;
 
-        // Parse the commit SHA
-        let commit_oid =
-            git2::Oid::from_str(&commit).map_err(|e| VwError::Git {
-                message: format!("Invalid commit SHA '{commit}': {e}"),
-            })?;
+            // Parse the commit SHA
+            let commit_oid =
+                git2::Oid::from_str(&commit).map_err(|e| VwError::Git {
+                    message: format!("Invalid commit SHA '{commit}': {e}"),
+                })?;
 
-        // Find the commit object
-        let commit_obj =
-            repo.find_commit(commit_oid).map_err(|e| VwError::Git {
-                message: format!("Commit '{commit}' not found: {e}"),
-            })?;
+            // Find the commit object
+            let commit_obj =
+                repo.find_commit(commit_oid).map_err(|e| VwError::Git {
+                    message: format!("Commit '{commit}' not found: {e}"),
+                })?;
 
-        // Checkout the specific commit
-        repo.checkout_tree(commit_obj.as_object(), None)
-            .map_err(|e| VwError::Git {
-                message: format!("Failed to checkout commit '{commit}': {e}"),
-            })?;
-
-        // Set HEAD to the commit
-        repo.set_head_detached(commit_oid)
-            .map_err(|e| VwError::Git {
-                message: format!(
-                    "Failed to set HEAD to commit '{commit}': {e}"
-                ),
-            })?;
-
-        // Initialize and update submodules if requested
-        if submodules {
-            for mut submodule in
-                repo.submodules().map_err(|e| VwError::Git {
-                    message: format!("Failed to list submodules: {e}"),
-                })?
-            {
-                submodule.init(false).map_err(|e| VwError::Git {
+            // Checkout the specific commit
+            repo.checkout_tree(commit_obj.as_object(), None)
+                .map_err(|e| VwError::Git {
                     message: format!(
-                        "Failed to init submodule '{}': {e}",
-                        submodule.name().unwrap_or("unknown")
+                        "Failed to checkout commit '{commit}': {e}"
                     ),
                 })?;
-                submodule.update(true, None).map_err(|e| VwError::Git {
+
+            // Set HEAD to the commit
+            repo.set_head_detached(commit_oid)
+                .map_err(|e| VwError::Git {
                     message: format!(
-                        "Failed to update submodule '{}': {e}",
-                        submodule.name().unwrap_or("unknown")
+                        "Failed to set HEAD to commit '{commit}': {e}"
                     ),
                 })?;
+
+            // Initialize and update submodules if requested
+            if submodules {
+                for mut submodule in
+                    repo.submodules().map_err(|e| VwError::Git {
+                        message: format!("Failed to list submodules: {e}"),
+                    })?
+                {
+                    submodule.init(false).map_err(|e| VwError::Git {
+                        message: format!(
+                            "Failed to init submodule '{}': {e}",
+                            submodule.name().unwrap_or("unknown")
+                        ),
+                    })?;
+                    submodule.update(true, None).map_err(|e| VwError::Git {
+                        message: format!(
+                            "Failed to update submodule '{}': {e}",
+                            submodule.name().unwrap_or("unknown")
+                        ),
+                    })?;
+                }
             }
-        }
 
-        Ok::<(), VwError>(())
-    }),
+            Ok::<(), VwError>(())
+        }),
     )
     .await
     .map_err(|_| VwError::Git {
