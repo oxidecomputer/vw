@@ -191,7 +191,9 @@ pub struct WorkspaceInfo {
 }
 
 /// Helper to deserialize a field that can be either a string or array of strings
-fn string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+fn string_or_vec<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -206,14 +208,20 @@ where
             formatter.write_str("string or array of strings")
         }
 
-        fn visit_str<E>(self, value: &str) -> std::result::Result<Vec<String>, E>
+        fn visit_str<E>(
+            self,
+            value: &str,
+        ) -> std::result::Result<Vec<String>, E>
         where
             E: de::Error,
         {
             Ok(vec![value.to_owned()])
         }
 
-        fn visit_seq<S>(self, mut seq: S) -> std::result::Result<Vec<String>, S::Error>
+        fn visit_seq<S>(
+            self,
+            mut seq: S,
+        ) -> std::result::Result<Vec<String>, S::Error>
         where
             S: SeqAccess<'de>,
         {
@@ -534,7 +542,8 @@ pub async fn update_workspace_with_token(
         );
 
         // Find VHDL files in the cached dependency directory
-        let vhdl_files = find_vhdl_files(&dep_path, dep.recursive, &dep.exclude)?;
+        let vhdl_files =
+            find_vhdl_files(&dep_path, dep.recursive, &dep.exclude)?;
         if !vhdl_files.is_empty() {
             let portable_files =
                 vhdl_files.into_iter().map(make_path_portable).collect();
@@ -785,8 +794,11 @@ pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
             continue;
         }
 
-        let vhdl_files =
-            find_vhdl_files(&locked_dep.path, locked_dep.recursive, &locked_dep.exclude)?;
+        let vhdl_files = find_vhdl_files(
+            &locked_dep.path,
+            locked_dep.recursive,
+            &locked_dep.exclude,
+        )?;
 
         // Create array entry for this library
         tcl_content.push_str(&format!("set dep_files({dep_name}) [list"));
@@ -1128,8 +1140,10 @@ pub async fn analyze_ext_libraries(
     // Topological sort of library names (Kahn's algorithm)
     let mut in_degree: HashMap<String, usize> =
         ext_lib_names.iter().map(|n| (n.clone(), 0)).collect();
-    let mut adj: HashMap<String, Vec<String>> =
-        ext_lib_names.iter().map(|n| (n.clone(), Vec::new())).collect();
+    let mut adj: HashMap<String, Vec<String>> = ext_lib_names
+        .iter()
+        .map(|n| (n.clone(), Vec::new()))
+        .collect();
     for (lib, deps) in &lib_deps {
         for dep in deps {
             if let Some(neighbors) = adj.get_mut(dep) {
@@ -2057,9 +2071,11 @@ async fn download_dependency(
 
         // Initialize and update submodules if requested
         if submodules {
-            for mut submodule in repo.submodules().map_err(|e| VwError::Git {
-                message: format!("Failed to list submodules: {e}"),
-            })? {
+            for mut submodule in
+                repo.submodules().map_err(|e| VwError::Git {
+                    message: format!("Failed to list submodules: {e}"),
+                })?
+            {
                 submodule.init(false).map_err(|e| VwError::Git {
                     message: format!(
                         "Failed to init submodule '{}': {e}",
@@ -2088,7 +2104,13 @@ async fn download_dependency(
 
     // Treat all src values as globs (handles files, directories, and patterns)
     for src_path in &src_paths {
-        copy_vhdl_files_glob(temp_dir.path(), src_path, dest_path, recursive, exclude)?;
+        copy_vhdl_files_glob(
+            temp_dir.path(),
+            src_path,
+            dest_path,
+            recursive,
+            exclude,
+        )?;
     }
 
     Ok(())
@@ -2191,7 +2213,8 @@ fn copy_vhdl_files_glob(
 
                         // Check if file matches any exclude pattern
                         let path_str = relative_path.to_string_lossy();
-                        if exclude_patterns.iter().any(|p| p.matches(&path_str)) {
+                        if exclude_patterns.iter().any(|p| p.matches(&path_str))
+                        {
                             continue; // Skip excluded files
                         }
 
@@ -2231,7 +2254,11 @@ fn copy_vhdl_files_glob(
     Ok(())
 }
 
-fn find_vhdl_files(dir: &Path, recursive: bool, exclude: &[String]) -> Result<Vec<PathBuf>> {
+fn find_vhdl_files(
+    dir: &Path,
+    recursive: bool,
+    exclude: &[String],
+) -> Result<Vec<PathBuf>> {
     let mut vhdl_files = Vec::new();
     find_vhdl_files_impl(dir, &mut vhdl_files, recursive)?;
 
@@ -2246,7 +2273,9 @@ fn find_vhdl_files(dir: &Path, recursive: bool, exclude: &[String]) -> Result<Ve
             // Match against path relative to the base directory
             let relative = file.strip_prefix(dir).unwrap_or(file);
             let path_str = relative.to_string_lossy();
-            !exclude_patterns.iter().any(|pattern| pattern.matches(&path_str))
+            !exclude_patterns
+                .iter()
+                .any(|pattern| pattern.matches(&path_str))
         });
     }
 
