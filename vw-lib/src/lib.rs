@@ -190,52 +190,6 @@ pub struct WorkspaceInfo {
     pub version: String,
 }
 
-/// Helper to deserialize a field that can be either a string or array of strings
-fn string_or_vec<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::{self, SeqAccess, Visitor};
-
-    struct StringOrVec;
-
-    impl<'de> Visitor<'de> for StringOrVec {
-        type Value = Vec<String>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("string or array of strings")
-        }
-
-        fn visit_str<E>(
-            self,
-            value: &str,
-        ) -> std::result::Result<Vec<String>, E>
-        where
-            E: de::Error,
-        {
-            Ok(vec![value.to_owned()])
-        }
-
-        fn visit_seq<S>(
-            self,
-            mut seq: S,
-        ) -> std::result::Result<Vec<String>, S::Error>
-        where
-            S: SeqAccess<'de>,
-        {
-            let mut vec = Vec::new();
-            while let Some(value) = seq.next_element()? {
-                vec.push(value);
-            }
-            Ok(vec)
-        }
-    }
-
-    deserializer.deserialize_any(StringOrVec)
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Dependency {
     pub repo: String,
@@ -243,7 +197,7 @@ pub struct Dependency {
     pub branch: Option<String>,
     #[serde(default)]
     pub commit: Option<String>,
-    #[serde(deserialize_with = "string_or_vec")]
+    #[serde(default)]
     pub src: Vec<String>,
     #[serde(default)]
     pub recursive: bool,
@@ -264,7 +218,7 @@ pub struct LockFile {
 pub struct LockedDependency {
     pub repo: String,
     pub commit: String,
-    #[serde(deserialize_with = "string_or_vec")]
+    #[serde(default)]
     pub src: Vec<String>,
     pub path: PathBuf,
     #[serde(default)]
