@@ -28,7 +28,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::{fmt, fs};
 
@@ -899,15 +899,18 @@ impl FileCache {
 
     /// Get cached file dependencies, reading and parsing file if not cached.
     pub fn get_dependencies(&mut self, path: &Path) -> Result<&Vec<VwSymbol>> {
-        if !self.dependencies.contains_key(path) {
-            let content =
-                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
-                    message: format!("Failed to read file {path:?}: {e}"),
+        match self.dependencies.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to read file {path:?}: {e}"),
+                    }
                 })?;
-            let deps = parse_file_dependencies(&content)?;
-            self.dependencies.insert(path.to_path_buf(), deps);
+                let deps = parse_file_dependencies(&content)?;
+                Ok(e.insert(deps))
+            }
         }
-        Ok(self.dependencies.get(path).unwrap())
     }
 
     /// Get cached provided symbols (packages and entities), reading and parsing if not cached.
@@ -915,28 +918,34 @@ impl FileCache {
         &mut self,
         path: &Path,
     ) -> Result<&Vec<VwSymbol>> {
-        if !self.provided_symbols.contains_key(path) {
-            let content =
-                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
-                    message: format!("Failed to read file {path:?}: {e}"),
+        match self.provided_symbols.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to read file {path:?}: {e}"),
+                    }
                 })?;
-            let symbols = parse_provided_symbols(&content)?;
-            self.provided_symbols.insert(path.to_path_buf(), symbols);
+                let symbols = parse_provided_symbols(&content)?;
+                Ok(e.insert(symbols))
+            }
         }
-        Ok(self.provided_symbols.get(path).unwrap())
     }
 
     /// Get cached entities in file, reading and parsing if not cached.
     pub fn get_entities(&mut self, path: &Path) -> Result<&Vec<String>> {
-        if !self.entities.contains_key(path) {
-            let content =
-                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
-                    message: format!("Failed to read file {path:?}: {e}"),
+        match self.entities.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to read file {path:?}: {e}"),
+                    }
                 })?;
-            let entities = parse_entities(&content)?;
-            self.entities.insert(path.to_path_buf(), entities);
+                let entities = parse_entities(&content)?;
+                Ok(e.insert(entities))
+            }
         }
-        Ok(self.entities.get(path).unwrap())
     }
 
     /// Get mutable access to the entities cache for functions that only need entity lookups.
@@ -1546,8 +1555,22 @@ fn topological_sort(
     for (file, deps) in &dependencies {
         for dep in deps {
             if files.contains(dep) {
-                adj_list.get_mut(dep).unwrap().push(file.clone());
-                *in_degree.get_mut(file).unwrap() += 1;
+                adj_list
+                    .get_mut(dep)
+                    .ok_or(VwError::Dependency {
+                        message: format!(
+                            "Somehow adj list didn't contain dep {:?}",
+                            dep
+                        ),
+                    })?
+                    .push(file.clone());
+                *in_degree.get_mut(file).ok_or(VwError::Dependency {
+                    message: format!(
+                        "Somehow in_degree didn't
+                        contain {:?}",
+                        file
+                    ),
+                })? += 1;
             }
         }
     }
@@ -1569,7 +1592,13 @@ fn topological_sort(
         // For each neighbor of current
         if let Some(neighbors) = adj_list.get(&current) {
             for neighbor in neighbors {
-                *in_degree.get_mut(neighbor).unwrap() -= 1;
+                *in_degree.get_mut(neighbor).ok_or(VwError::Dependency {
+                    message: format!(
+                        "Somehow in_degree doesn't have neighbor {:?}",
+                        neighbor
+                    ),
+                })? -= 1;
+
                 if in_degree[neighbor] == 0 {
                     queue.push_back(neighbor.clone());
                 }
@@ -1671,15 +1700,17 @@ fn get_cached_entities<'a>(
     path: &Path,
     entities_cache: &'a mut HashMap<PathBuf, Vec<String>>,
 ) -> Result<&'a Vec<String>> {
-    if !entities_cache.contains_key(path) {
-        let content =
-            fs::read_to_string(path).map_err(|e| VwError::FileSystem {
-                message: format!("Failed to read file {path:?}: {e}"),
-            })?;
-        let entities = parse_entities(&content)?;
-        entities_cache.insert(path.to_path_buf(), entities);
+    match entities_cache.entry(path.to_path_buf()) {
+        Entry::Occupied(e) => Ok(e.into_mut()),
+        Entry::Vacant(e) => {
+            let content =
+                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
+                    message: format!("Failed to read file {path:?}: {e}"),
+                })?;
+            let entities = parse_entities(&content)?;
+            Ok(e.insert(entities))
+        }
     }
-    Ok(entities_cache.get(path).unwrap())
 }
 
 fn make_path_portable(path: PathBuf) -> PathBuf {
