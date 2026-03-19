@@ -21,6 +21,7 @@ camino.workspace = true
 netrc.workspace = true
 url.workspace = true
 glob.workspace = true
+petgraph.workspace = true
 git2 = "0.18"
 vhdl_lang = "0.86"
 quote = "1"

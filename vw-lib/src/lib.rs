@@ -36,6 +36,11 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use vhdl_lang::{VHDLParser, VHDLStandard};
 
+use petgraph::{
+    algo::toposort,
+    graph::{DiGraph, NodeIndex},
+};
+
 use crate::mapping::{FileData, VwSymbol, VwSymbolFinder};
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
 use crate::visitor::walk_design_file;
@@ -1434,7 +1439,7 @@ pub fn sort_files_by_dependencies(
     }
 
     // Topological sort using Kahn's algorithm
-    let sorted = topological_sort(files.clone(), dependencies)?;
+    let sorted = topological_sort_files(files.clone(), dependencies)?;
     *files = sorted;
 
     Ok(())
@@ -1538,81 +1543,50 @@ fn analyze_file(
     Ok(file_finder.get_symbols().clone())
 }
 
-fn topological_sort(
+fn topological_sort_files(
     files: Vec<PathBuf>,
     dependencies: HashMap<PathBuf, Vec<PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
-    let mut in_degree: HashMap<PathBuf, usize> = HashMap::new();
-    let mut adj_list: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut dep_graph: DiGraph<PathBuf, ()> = DiGraph::default();
+    let mut index_map: HashMap<PathBuf, NodeIndex> = HashMap::new();
 
-    // Initialize in-degree and adjacency list
+    // initialize the nodes
     for file in &files {
-        in_degree.insert(file.clone(), 0);
-        adj_list.insert(file.clone(), Vec::new());
+        let index = dep_graph.add_node(file.clone());
+        index_map.insert(file.clone(), index);
     }
 
-    // Build the graph
+    // now add edges from files to their dependencies
     for (file, deps) in &dependencies {
+        let source_node = index_map.get(file).ok_or(VwError::Dependency {
+            message: format!(
+                "Index map somehow didn't contain file {:?}",
+                file
+            ),
+        })?;
+        // file depends on every dep in deps
         for dep in deps {
-            if files.contains(dep) {
-                adj_list
-                    .get_mut(dep)
-                    .ok_or(VwError::Dependency {
-                        message: format!(
-                            "Somehow adj list didn't contain dep {:?}",
-                            dep
-                        ),
-                    })?
-                    .push(file.clone());
-                *in_degree.get_mut(file).ok_or(VwError::Dependency {
-                    message: format!(
-                        "Somehow in_degree didn't
-                        contain {:?}",
-                        file
-                    ),
-                })? += 1;
-            }
+            let dst_node = index_map.get(dep).ok_or(VwError::Dependency {
+                message: format!(
+                    "Index map somehow didn't contain dep {:?}",
+                    dep
+                ),
+            })?;
+            dep_graph.add_edge(*source_node, *dst_node, ());
         }
     }
 
-    // Kahn's algorithm
-    let mut queue = VecDeque::new();
-    let mut result = Vec::new();
+    // ok now topological sort
+    let ordered_files =
+        toposort(&dep_graph, None).map_err(|_| VwError::Dependency {
+            message: "Got circular dependency".to_string(),
+        })?;
 
-    // Add all nodes with in-degree 0 to queue
-    for (file, &degree) in &in_degree {
-        if degree == 0 {
-            queue.push_back(file.clone());
-        }
-    }
-
-    while let Some(current) = queue.pop_front() {
-        result.push(current.clone());
-
-        // For each neighbor of current
-        if let Some(neighbors) = adj_list.get(&current) {
-            for neighbor in neighbors {
-                *in_degree.get_mut(neighbor).ok_or(VwError::Dependency {
-                    message: format!(
-                        "Somehow in_degree doesn't have neighbor {:?}",
-                        neighbor
-                    ),
-                })? -= 1;
-
-                if in_degree[neighbor] == 0 {
-                    queue.push_back(neighbor.clone());
-                }
-            }
-        }
-    }
-
-    // Check for cycles
-    if result.len() != files.len() {
-        return Err(VwError::Dependency {
-            message: "Circular dependency detected in VHDL files".to_string(),
-        });
-    }
-
+    let result: Vec<PathBuf> = ordered_files
+        .iter()
+        .map(|&idx| dep_graph[idx].clone())
+        .rev()
+        .collect();
     Ok(result)
 }
 
