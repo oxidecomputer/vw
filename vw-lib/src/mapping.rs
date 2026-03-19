@@ -1,8 +1,8 @@
 use vhdl_lang::ast::{
     AnyDesignUnit, AnyPrimaryUnit, AttributeSpecification, Designator,
     DiscreteRange, ElementDeclaration, EntityClass, EntityDeclaration,
-    EntityName, Name, PackageDeclaration, Range, RangeConstraint,
-    SubtypeConstraint, TypeDeclaration, TypeDefinition,
+    EntityName, Name, PackageDeclaration, PackageInstantiation, Range,
+    RangeConstraint, SubtypeConstraint, TypeDeclaration, TypeDefinition,
 };
 
 use crate::visitor::{Visitor, VisitorResult};
@@ -229,6 +229,15 @@ impl Visitor for VwSymbolFinder {
 
     fn visit_package(&mut self, package: &PackageDeclaration) -> VisitorResult {
         let name = package.ident.tree.item.name_utf8();
+        self.symbols.push(VwSymbol::Package(name));
+        VisitorResult::Continue
+    }
+
+    fn visit_package_instance(
+        &mut self,
+        instance: &PackageInstantiation,
+    ) -> VisitorResult {
+        let name = instance.ident.tree.item.name_utf8();
         self.symbols.push(VwSymbol::Package(name));
         VisitorResult::Continue
     }
