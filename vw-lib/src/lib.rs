@@ -28,13 +28,18 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::{fmt, fs};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use vhdl_lang::{VHDLParser, VHDLStandard};
+
+use petgraph::{
+    algo::toposort,
+    graph::{DiGraph, NodeIndex},
+};
 
 use crate::mapping::{FileData, VwSymbol, VwSymbolFinder};
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
@@ -197,11 +202,16 @@ pub struct Dependency {
     pub branch: Option<String>,
     #[serde(default)]
     pub commit: Option<String>,
-    pub src: String,
+    #[serde(default)]
+    pub src: Vec<String>,
     #[serde(default)]
     pub recursive: bool,
     #[serde(default)]
     pub sim_only: bool,
+    #[serde(default)]
+    pub submodules: bool,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -213,12 +223,17 @@ pub struct LockFile {
 pub struct LockedDependency {
     pub repo: String,
     pub commit: String,
-    pub src: String,
+    #[serde(default)]
+    pub src: Vec<String>,
     pub path: PathBuf,
     #[serde(default)]
     pub recursive: bool,
     #[serde(default)]
     pub sim_only: bool,
+    #[serde(default)]
+    pub submodules: bool,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -455,6 +470,8 @@ pub async fn update_workspace_with_token(
                 &dep.src,
                 &dep_path,
                 dep.recursive,
+                &dep.exclude,
+                dep.submodules,
                 creds,
             )
             .await
@@ -478,11 +495,14 @@ pub async fn update_workspace_with_token(
                 path: dep_path.clone(),
                 recursive: dep.recursive,
                 sim_only: dep.sim_only,
+                submodules: dep.submodules,
+                exclude: dep.exclude.clone(),
             },
         );
 
         // Find VHDL files in the cached dependency directory
-        let vhdl_files = find_vhdl_files(&dep_path, dep.recursive)?;
+        let vhdl_files =
+            find_vhdl_files(&dep_path, dep.recursive, &dep.exclude)?;
         if !vhdl_files.is_empty() {
             let portable_files =
                 vhdl_files.into_iter().map(make_path_portable).collect();
@@ -574,15 +594,17 @@ pub async fn add_dependency_with_token(
     }
 
     let dep_name = name.unwrap_or_else(|| extract_repo_name(&repo));
-    let src_path = src.unwrap_or_else(|| ".".to_string());
+    let src_paths = vec![src.unwrap_or_else(|| ".".to_string())];
 
     let dependency = Dependency {
         repo: repo.clone(),
         branch,
         commit,
-        src: src_path,
+        src: src_paths,
         recursive,
         sim_only,
+        submodules: false,
+        exclude: Vec::new(),
     };
 
     config.dependencies.insert(dep_name.clone(), dependency);
@@ -731,8 +753,11 @@ pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
             continue;
         }
 
-        let vhdl_files =
-            find_vhdl_files(&locked_dep.path, locked_dep.recursive)?;
+        let vhdl_files = find_vhdl_files(
+            &locked_dep.path,
+            locked_dep.recursive,
+            &locked_dep.exclude,
+        )?;
 
         // Create array entry for this library
         tcl_content.push_str(&format!("set dep_files({dep_name}) [list"));
@@ -879,15 +904,18 @@ impl FileCache {
 
     /// Get cached file dependencies, reading and parsing file if not cached.
     pub fn get_dependencies(&mut self, path: &Path) -> Result<&Vec<VwSymbol>> {
-        if !self.dependencies.contains_key(path) {
-            let content =
-                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
-                    message: format!("Failed to read file {path:?}: {e}"),
+        match self.dependencies.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to read file {path:?}: {e}"),
+                    }
                 })?;
-            let deps = parse_file_dependencies(&content)?;
-            self.dependencies.insert(path.to_path_buf(), deps);
+                let deps = parse_file_dependencies(&content)?;
+                Ok(e.insert(deps))
+            }
         }
-        Ok(self.dependencies.get(path).unwrap())
     }
 
     /// Get cached provided symbols (packages and entities), reading and parsing if not cached.
@@ -895,28 +923,34 @@ impl FileCache {
         &mut self,
         path: &Path,
     ) -> Result<&Vec<VwSymbol>> {
-        if !self.provided_symbols.contains_key(path) {
-            let content =
-                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
-                    message: format!("Failed to read file {path:?}: {e}"),
+        match self.provided_symbols.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to read file {path:?}: {e}"),
+                    }
                 })?;
-            let symbols = parse_provided_symbols(&content)?;
-            self.provided_symbols.insert(path.to_path_buf(), symbols);
+                let symbols = parse_provided_symbols(&content)?;
+                Ok(e.insert(symbols))
+            }
         }
-        Ok(self.provided_symbols.get(path).unwrap())
     }
 
     /// Get cached entities in file, reading and parsing if not cached.
     pub fn get_entities(&mut self, path: &Path) -> Result<&Vec<String>> {
-        if !self.entities.contains_key(path) {
-            let content =
-                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
-                    message: format!("Failed to read file {path:?}: {e}"),
+        match self.entities.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to read file {path:?}: {e}"),
+                    }
                 })?;
-            let entities = parse_entities(&content)?;
-            self.entities.insert(path.to_path_buf(), entities);
+                let entities = parse_entities(&content)?;
+                Ok(e.insert(entities))
+            }
         }
-        Ok(self.entities.get(path).unwrap())
     }
 
     /// Get mutable access to the entities cache for functions that only need entity lookups.
@@ -1025,9 +1059,96 @@ pub async fn analyze_ext_libraries(
     vhdl_std: VhdlStandard,
     cache: &mut FileCache,
 ) -> Result<()> {
-    // First, analyze all non-defaultlib libraries
-    for (lib_name, library) in &vhdl_ls_config.libraries {
-        if lib_name != "defaultlib" {
+    // Collect non-defaultlib library names
+    let ext_lib_names: Vec<String> = vhdl_ls_config
+        .libraries
+        .keys()
+        .filter(|k| k.as_str() != "defaultlib")
+        .cloned()
+        .collect();
+
+    // Build inter-library dependency graph by scanning for `library <name>;`
+    let ext_lib_set: HashSet<String> = ext_lib_names.iter().cloned().collect();
+    let mut lib_deps: HashMap<String, Vec<String>> = HashMap::new();
+    for lib_name in &ext_lib_names {
+        let mut deps = Vec::new();
+        if let Some(library) = vhdl_ls_config.libraries.get(lib_name) {
+            for file_path in &library.files {
+                let expanded = if file_path.starts_with("$HOME") {
+                    if let Some(home) = dirs::home_dir() {
+                        home.join(
+                            file_path
+                                .strip_prefix("$HOME/")
+                                .unwrap_or(file_path),
+                        )
+                    } else {
+                        PathBuf::from(file_path)
+                    }
+                } else {
+                    PathBuf::from(file_path)
+                };
+                if let Ok(contents) = fs::read_to_string(&expanded) {
+                    for line in contents.lines() {
+                        let trimmed = line.trim().to_lowercase();
+                        if let Some(rest) = trimmed.strip_prefix("library ") {
+                            let dep_lib = rest.trim_end_matches(';').trim();
+                            if ext_lib_set.contains(dep_lib)
+                                && dep_lib != lib_name.to_lowercase()
+                            {
+                                deps.push(dep_lib.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lib_deps.insert(lib_name.clone(), deps);
+    }
+
+    // Topological sort of library names (Kahn's algorithm)
+    let mut in_degree: HashMap<String, usize> =
+        ext_lib_names.iter().map(|n| (n.clone(), 0)).collect();
+    let mut adj: HashMap<String, Vec<String>> = ext_lib_names
+        .iter()
+        .map(|n| (n.clone(), Vec::new()))
+        .collect();
+    for (lib, deps) in &lib_deps {
+        for dep in deps {
+            if let Some(neighbors) = adj.get_mut(dep) {
+                neighbors.push(lib.clone());
+            }
+            if let Some(deg) = in_degree.get_mut(lib) {
+                *deg += 1;
+            }
+        }
+    }
+    let mut queue: VecDeque<String> = in_degree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let mut sorted_libs = Vec::new();
+    while let Some(current) = queue.pop_front() {
+        sorted_libs.push(current.clone());
+        if let Some(neighbors) = adj.get(&current) {
+            for neighbor in neighbors {
+                if let Some(deg) = in_degree.get_mut(neighbor) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to unsorted if cycle detected
+    if sorted_libs.len() != ext_lib_names.len() {
+        sorted_libs = ext_lib_names;
+    }
+
+    // Analyze libraries in dependency order
+    for lib_name in &sorted_libs {
+        if let Some(library) = vhdl_ls_config.libraries.get(lib_name) {
             // Convert library name to be NVC-compatible (no hyphens)
             let nvc_lib_name = lib_name.replace('-', "_");
 
@@ -1318,7 +1439,7 @@ pub fn sort_files_by_dependencies(
     }
 
     // Topological sort using Kahn's algorithm
-    let sorted = topological_sort(files.clone(), dependencies)?;
+    let sorted = topological_sort_files(files.clone(), dependencies)?;
     *files = sorted;
 
     Ok(())
@@ -1422,61 +1543,50 @@ fn analyze_file(
     Ok(file_finder.get_symbols().clone())
 }
 
-fn topological_sort(
+fn topological_sort_files(
     files: Vec<PathBuf>,
     dependencies: HashMap<PathBuf, Vec<PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
-    let mut in_degree: HashMap<PathBuf, usize> = HashMap::new();
-    let mut adj_list: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut dep_graph: DiGraph<PathBuf, ()> = DiGraph::default();
+    let mut index_map: HashMap<PathBuf, NodeIndex> = HashMap::new();
 
-    // Initialize in-degree and adjacency list
+    // initialize the nodes
     for file in &files {
-        in_degree.insert(file.clone(), 0);
-        adj_list.insert(file.clone(), Vec::new());
+        let index = dep_graph.add_node(file.clone());
+        index_map.insert(file.clone(), index);
     }
 
-    // Build the graph
+    // now add edges from files to their dependencies
     for (file, deps) in &dependencies {
+        let source_node = index_map.get(file).ok_or(VwError::Dependency {
+            message: format!(
+                "Index map somehow didn't contain file {:?}",
+                file
+            ),
+        })?;
+        // file depends on every dep in deps
         for dep in deps {
-            if files.contains(dep) {
-                adj_list.get_mut(dep).unwrap().push(file.clone());
-                *in_degree.get_mut(file).unwrap() += 1;
-            }
+            let dst_node = index_map.get(dep).ok_or(VwError::Dependency {
+                message: format!(
+                    "Index map somehow didn't contain dep {:?}",
+                    dep
+                ),
+            })?;
+            dep_graph.add_edge(*source_node, *dst_node, ());
         }
     }
 
-    // Kahn's algorithm
-    let mut queue = VecDeque::new();
-    let mut result = Vec::new();
+    // ok now topological sort
+    let ordered_files =
+        toposort(&dep_graph, None).map_err(|_| VwError::Dependency {
+            message: "Got circular dependency".to_string(),
+        })?;
 
-    // Add all nodes with in-degree 0 to queue
-    for (file, &degree) in &in_degree {
-        if degree == 0 {
-            queue.push_back(file.clone());
-        }
-    }
-
-    while let Some(current) = queue.pop_front() {
-        result.push(current.clone());
-
-        // For each neighbor of current
-        if let Some(neighbors) = adj_list.get(&current) {
-            for neighbor in neighbors {
-                *in_degree.get_mut(neighbor).unwrap() -= 1;
-                if in_degree[neighbor] == 0 {
-                    queue.push_back(neighbor.clone());
-                }
-            }
-        }
-    }
-
-    // Check for cycles
-    if result.len() != files.len() {
-        return Err(VwError::Dependency {
-            message: "Circular dependency detected in VHDL files".to_string(),
-        });
-    }
-
+    let result: Vec<PathBuf> = ordered_files
+        .iter()
+        .map(|&idx| dep_graph[idx].clone())
+        .rev()
+        .collect();
     Ok(result)
 }
 
@@ -1564,15 +1674,17 @@ fn get_cached_entities<'a>(
     path: &Path,
     entities_cache: &'a mut HashMap<PathBuf, Vec<String>>,
 ) -> Result<&'a Vec<String>> {
-    if !entities_cache.contains_key(path) {
-        let content =
-            fs::read_to_string(path).map_err(|e| VwError::FileSystem {
-                message: format!("Failed to read file {path:?}: {e}"),
-            })?;
-        let entities = parse_entities(&content)?;
-        entities_cache.insert(path.to_path_buf(), entities);
+    match entities_cache.entry(path.to_path_buf()) {
+        Entry::Occupied(e) => Ok(e.into_mut()),
+        Entry::Vacant(e) => {
+            let content =
+                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
+                    message: format!("Failed to read file {path:?}: {e}"),
+                })?;
+            let entities = parse_entities(&content)?;
+            Ok(e.insert(entities))
+        }
     }
-    Ok(entities_cache.get(path).unwrap())
 }
 
 fn make_path_portable(path: PathBuf) -> PathBuf {
@@ -1696,115 +1808,133 @@ async fn get_branch_head_commit(
     let branch = branch.to_string();
     let credentials = credentials.map(|(u, p)| (u.to_string(), p.to_string()));
 
-    tokio::task::spawn_blocking(move || {
-        // Create a temporary directory for the operation
-        let temp_dir =
-            tempfile::tempdir().map_err(|e| VwError::FileSystem {
-                message: format!("Failed to create temporary directory: {e}"),
-            })?;
-
-        // Create an empty repository to work with remotes
-        let repo =
-            git2::Repository::init_bare(temp_dir.path()).map_err(|e| {
-                VwError::Git {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            // Create a temporary directory for the operation
+            let temp_dir =
+                tempfile::tempdir().map_err(|e| VwError::FileSystem {
                     message: format!(
-                        "Failed to initialize temporary repository: {e}"
+                        "Failed to create temporary directory: {e}"
                     ),
-                }
-            })?;
+                })?;
 
-        // Create a remote
-        let mut remote =
-            repo.remote_anonymous(&normalized_repo_url).map_err(|e| {
-                VwError::Git {
-                    message: format!("Failed to create remote: {e}"),
-                }
-            })?;
-
-        // Connect and list references
-        // Always set a credentials callback so git2 doesn't fail with "no callback set".
-        // The callback will try explicit credentials first, then fall back to git's
-        // credential helper system (which includes .netrc support).
-        let mut callbacks = git2::RemoteCallbacks::new();
-        let attempt_count = RefCell::new(0);
-
-        callbacks.credentials(move |url, username_from_url, allowed_types| {
-            let mut attempts = attempt_count.borrow_mut();
-            *attempts += 1;
-
-            // Limit attempts to prevent infinite loops
-            if *attempts > 1 {
-                return git2::Cred::default();
-            }
-
-            // First, try explicit credentials from netrc if available
-            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
-            {
-                if let Some((ref username, ref password)) = credentials {
-                    // Use both username and password from netrc
-                    return git2::Cred::userpass_plaintext(username, password);
-                }
-            }
-
-            // Try SSH key if available
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                if let Some(username) = username_from_url {
-                    if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
-                        return Ok(cred);
+            // Create an empty repository to work with remotes
+            let repo =
+                git2::Repository::init_bare(temp_dir.path()).map_err(|e| {
+                    VwError::Git {
+                        message: format!(
+                            "Failed to initialize temporary repository: {e}"
+                        ),
                     }
-                }
-            }
+                })?;
 
-            // Fall back to git's credential helper system (includes .netrc)
-            if let Ok(config) = git2::Config::open_default() {
-                if let Ok(cred) = git2::Cred::credential_helper(
-                    &config,
-                    url,
-                    username_from_url,
-                ) {
-                    return Ok(cred);
-                }
-            }
+            // Create a remote
+            let mut remote = repo
+                .remote_anonymous(&normalized_repo_url)
+                .map_err(|e| VwError::Git {
+                    message: format!("Failed to create remote: {e}"),
+                })?;
 
-            git2::Cred::default()
-        });
+            // Connect and list references
+            // Always set a credentials callback so git2 doesn't fail with "no callback set".
+            // The callback will try explicit credentials first, then fall back to git's
+            // credential helper system (which includes .netrc support).
+            let mut callbacks = git2::RemoteCallbacks::new();
+            let attempt_count = RefCell::new(0);
 
-        remote
-            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
-            .map_err(|e| VwError::Git {
-                message: format!("Failed to connect to remote: {e}"),
+            callbacks.credentials(
+                move |url, username_from_url, allowed_types| {
+                    let mut attempts = attempt_count.borrow_mut();
+                    *attempts += 1;
+
+                    // Limit attempts to prevent infinite loops
+                    if *attempts > 1 {
+                        return git2::Cred::default();
+                    }
+
+                    // First, try explicit credentials from netrc if available
+                    if allowed_types
+                        .contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+                    {
+                        if let Some((ref username, ref password)) = credentials
+                        {
+                            // Use both username and password from netrc
+                            return git2::Cred::userpass_plaintext(
+                                username, password,
+                            );
+                        }
+                    }
+
+                    // Try SSH key if available
+                    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                        if let Some(username) = username_from_url {
+                            if let Ok(cred) =
+                                git2::Cred::ssh_key_from_agent(username)
+                            {
+                                return Ok(cred);
+                            }
+                        }
+                    }
+
+                    // Fall back to git's credential helper system (includes .netrc)
+                    if let Ok(config) = git2::Config::open_default() {
+                        if let Ok(cred) = git2::Cred::credential_helper(
+                            &config,
+                            url,
+                            username_from_url,
+                        ) {
+                            return Ok(cred);
+                        }
+                    }
+
+                    git2::Cred::default()
+                },
+            );
+
+            remote
+                .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
+                .map_err(|e| VwError::Git {
+                    message: format!("Failed to connect to remote: {e}"),
+                })?;
+
+            let refs = remote.list().map_err(|e| VwError::Git {
+                message: format!("Failed to list remote references: {e}"),
             })?;
 
-        let refs = remote.list().map_err(|e| VwError::Git {
-            message: format!("Failed to list remote references: {e}"),
-        })?;
-
-        // Look for the specific branch reference
-        let ref_name = format!("refs/heads/{branch}");
-        for remote_head in refs {
-            if remote_head.name() == ref_name {
-                return Ok(remote_head.oid().to_string());
+            // Look for the specific branch reference
+            let ref_name = format!("refs/heads/{branch}");
+            for remote_head in refs {
+                if remote_head.name() == ref_name {
+                    return Ok(remote_head.oid().to_string());
+                }
             }
-        }
 
-        Err(VwError::Git {
-            message: format!(
-                "Branch '{branch}' not found in remote repository"
-            ),
-        })
-    })
+            Err(VwError::Git {
+                message: format!(
+                    "Branch '{branch}' not found in remote repository"
+                ),
+            })
+        }),
+    )
     .await
+    .map_err(|_| VwError::Git {
+        message: "Git ls-remote timed out after 30 seconds".to_string(),
+    })?
     .map_err(|e| VwError::Git {
         message: format!("Failed to execute git ls-remote task: {e}"),
     })?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_dependency(
     repo_url: &str,
     commit: &str,
-    src_path: &str,
+    src_paths: &[String],
     dest_path: &Path,
     recursive: bool,
+    exclude: &[String],
+    submodules: bool,
     credentials: Option<(&str, &str)>, // (username, password)
 ) -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| VwError::FileSystem {
@@ -1821,101 +1951,139 @@ async fn download_dependency(
 
     let commit = commit.to_string();
     let temp_path = temp_dir.path().to_path_buf();
-    let src_path = src_path.to_string();
+    let src_paths = src_paths.to_vec();
     let credentials = credentials.map(|(u, p)| (u.to_string(), p.to_string()));
 
-    tokio::task::spawn_blocking(move || {
-        // Set up clone options with authentication
-        let mut builder = git2::build::RepoBuilder::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::task::spawn_blocking(move || {
+            // Set up clone options with authentication
+            let mut builder = git2::build::RepoBuilder::new();
 
-        // Always set a credentials callback so git2 doesn't fail with "no callback set".
-        // The callback will try explicit credentials first, then fall back to git's
-        // credential helper system (which includes .netrc support).
-        let mut callbacks = git2::RemoteCallbacks::new();
-        let attempt_count = RefCell::new(0);
+            // Always set a credentials callback so git2 doesn't fail with "no callback set".
+            // The callback will try explicit credentials first, then fall back to git's
+            // credential helper system (which includes .netrc support).
+            let mut callbacks = git2::RemoteCallbacks::new();
+            let attempt_count = RefCell::new(0);
 
-        callbacks.credentials(move |url, username_from_url, allowed_types| {
-            let mut attempts = attempt_count.borrow_mut();
-            *attempts += 1;
+            callbacks.credentials(
+                move |url, username_from_url, allowed_types| {
+                    let mut attempts = attempt_count.borrow_mut();
+                    *attempts += 1;
 
-            // Limit attempts to prevent infinite loops
-            if *attempts > 1 {
-                return git2::Cred::default();
-            }
-
-            // First, try explicit credentials from netrc if available
-            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
-            {
-                if let Some((ref username, ref password)) = credentials {
-                    // Use both username and password from netrc
-                    return git2::Cred::userpass_plaintext(username, password);
-                }
-            }
-
-            // Try SSH key if available
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                if let Some(username) = username_from_url {
-                    if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
-                        return Ok(cred);
+                    // Limit attempts to prevent infinite loops
+                    if *attempts > 1 {
+                        return git2::Cred::default();
                     }
-                }
-            }
 
-            // Fall back to git's credential helper system (includes .netrc)
-            if let Ok(config) = git2::Config::open_default() {
-                if let Ok(cred) = git2::Cred::credential_helper(
-                    &config,
-                    url,
-                    username_from_url,
-                ) {
-                    return Ok(cred);
-                }
-            }
+                    // First, try explicit credentials from netrc if available
+                    if allowed_types
+                        .contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+                    {
+                        if let Some((ref username, ref password)) = credentials
+                        {
+                            // Use both username and password from netrc
+                            return git2::Cred::userpass_plaintext(
+                                username, password,
+                            );
+                        }
+                    }
 
-            git2::Cred::default()
-        });
+                    // Try SSH key if available
+                    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                        if let Some(username) = username_from_url {
+                            if let Ok(cred) =
+                                git2::Cred::ssh_key_from_agent(username)
+                            {
+                                return Ok(cred);
+                            }
+                        }
+                    }
 
-        let mut fetch_options = git2::FetchOptions::new();
-        fetch_options.remote_callbacks(callbacks);
-        builder.fetch_options(fetch_options);
+                    // Fall back to git's credential helper system (includes .netrc)
+                    if let Ok(config) = git2::Config::open_default() {
+                        if let Ok(cred) = git2::Cred::credential_helper(
+                            &config,
+                            url,
+                            username_from_url,
+                        ) {
+                            return Ok(cred);
+                        }
+                    }
 
-        // Clone the repository
-        let repo =
-            builder
+                    git2::Cred::default()
+                },
+            );
+
+            let mut fetch_options = git2::FetchOptions::new();
+            fetch_options.depth(1); // shallow clone — only need one commit
+            fetch_options.remote_callbacks(callbacks);
+            builder.fetch_options(fetch_options);
+
+            // Clone the repository
+            let repo = builder
                 .clone(&normalized_repo_url, &temp_path)
                 .map_err(|e| VwError::Git {
                     message: format!("Failed to clone repository: {e}"),
                 })?;
 
-        // Parse the commit SHA
-        let commit_oid =
-            git2::Oid::from_str(&commit).map_err(|e| VwError::Git {
-                message: format!("Invalid commit SHA '{commit}': {e}"),
-            })?;
+            // Parse the commit SHA
+            let commit_oid =
+                git2::Oid::from_str(&commit).map_err(|e| VwError::Git {
+                    message: format!("Invalid commit SHA '{commit}': {e}"),
+                })?;
 
-        // Find the commit object
-        let commit_obj =
-            repo.find_commit(commit_oid).map_err(|e| VwError::Git {
-                message: format!("Commit '{commit}' not found: {e}"),
-            })?;
+            // Find the commit object
+            let commit_obj =
+                repo.find_commit(commit_oid).map_err(|e| VwError::Git {
+                    message: format!("Commit '{commit}' not found: {e}"),
+                })?;
 
-        // Checkout the specific commit
-        repo.checkout_tree(commit_obj.as_object(), None)
-            .map_err(|e| VwError::Git {
-                message: format!("Failed to checkout commit '{commit}': {e}"),
-            })?;
+            // Checkout the specific commit
+            repo.checkout_tree(commit_obj.as_object(), None)
+                .map_err(|e| VwError::Git {
+                    message: format!(
+                        "Failed to checkout commit '{commit}': {e}"
+                    ),
+                })?;
 
-        // Set HEAD to the commit
-        repo.set_head_detached(commit_oid)
-            .map_err(|e| VwError::Git {
-                message: format!(
-                    "Failed to set HEAD to commit '{commit}': {e}"
-                ),
-            })?;
+            // Set HEAD to the commit
+            repo.set_head_detached(commit_oid)
+                .map_err(|e| VwError::Git {
+                    message: format!(
+                        "Failed to set HEAD to commit '{commit}': {e}"
+                    ),
+                })?;
 
-        Ok::<(), VwError>(())
-    })
+            // Initialize and update submodules if requested
+            if submodules {
+                for mut submodule in
+                    repo.submodules().map_err(|e| VwError::Git {
+                        message: format!("Failed to list submodules: {e}"),
+                    })?
+                {
+                    submodule.init(false).map_err(|e| VwError::Git {
+                        message: format!(
+                            "Failed to init submodule '{}': {e}",
+                            submodule.name().unwrap_or("unknown")
+                        ),
+                    })?;
+                    submodule.update(true, None).map_err(|e| VwError::Git {
+                        message: format!(
+                            "Failed to update submodule '{}': {e}",
+                            submodule.name().unwrap_or("unknown")
+                        ),
+                    })?;
+                }
+            }
+
+            Ok::<(), VwError>(())
+        }),
+    )
     .await
+    .map_err(|_| VwError::Git {
+        message: "Git clone timed out after 120 seconds".to_string(),
+    })?
     .map_err(|e| VwError::Git {
         message: format!("Failed to execute git operations: {e}"),
     })??;
@@ -1925,7 +2093,15 @@ async fn download_dependency(
     })?;
 
     // Treat all src values as globs (handles files, directories, and patterns)
-    copy_vhdl_files_glob(temp_dir.path(), &src_path, dest_path, recursive)?;
+    for src_path in &src_paths {
+        copy_vhdl_files_glob(
+            temp_dir.path(),
+            src_path,
+            dest_path,
+            recursive,
+            exclude,
+        )?;
+    }
 
     Ok(())
 }
@@ -1935,11 +2111,18 @@ fn copy_vhdl_files_glob(
     src_pattern: &str,
     dest: &Path,
     recursive: bool,
+    exclude: &[String],
 ) -> Result<()> {
     // Build patterns to match
     let src_path = repo_root.join(src_pattern);
     let mut patterns = Vec::new();
     let strip_prefix: PathBuf;
+
+    // Compile exclude patterns
+    let exclude_patterns: Vec<glob::Pattern> = exclude
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
 
     // Check if src_pattern points to a directory
     if src_path.is_dir() {
@@ -2018,6 +2201,13 @@ fn copy_vhdl_files_glob(
                                 }
                             })?;
 
+                        // Check if file matches any exclude pattern
+                        let path_str = relative_path.to_string_lossy();
+                        if exclude_patterns.iter().any(|p| p.matches(&path_str))
+                        {
+                            continue; // Skip excluded files
+                        }
+
                         let dest_file = dest.join(relative_path);
 
                         // Create parent directories if needed
@@ -2054,9 +2244,31 @@ fn copy_vhdl_files_glob(
     Ok(())
 }
 
-fn find_vhdl_files(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+fn find_vhdl_files(
+    dir: &Path,
+    recursive: bool,
+    exclude: &[String],
+) -> Result<Vec<PathBuf>> {
     let mut vhdl_files = Vec::new();
     find_vhdl_files_impl(dir, &mut vhdl_files, recursive)?;
+
+    // Filter out excluded files
+    if !exclude.is_empty() {
+        let exclude_patterns: Vec<glob::Pattern> = exclude
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
+
+        vhdl_files.retain(|file| {
+            // Match against path relative to the base directory
+            let relative = file.strip_prefix(dir).unwrap_or(file);
+            let path_str = relative.to_string_lossy();
+            !exclude_patterns
+                .iter()
+                .any(|pattern| pattern.matches(&path_str))
+        });
+    }
+
     Ok(vhdl_files)
 }
 
@@ -2188,7 +2400,12 @@ async fn build_rust_library(
     })??;
 
     // Find the .so file in the workspace target directory (parent of testbench dir)
-    let lib_name = format!("lib{}.so", package_name.replace('-', "_"));
+    let ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let lib_name = format!("lib{}.{ext}", package_name.replace('-', "_"));
     let workspace_target = bench_dir.join("target").join("debug");
 
     let lib_path = workspace_target.join(&lib_name);
