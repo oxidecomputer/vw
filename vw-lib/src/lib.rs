@@ -28,13 +28,28 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
-use std::fs;
+use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::{fmt, fs};
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
+use vhdl_lang::{VHDLParser, VHDLStandard};
+
+use petgraph::{
+    algo::toposort,
+    graph::{DiGraph, NodeIndex},
+};
+
+use crate::mapping::{FileData, VwSymbol, VwSymbolFinder};
+use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
+use crate::visitor::walk_design_file;
+
+pub mod mapping;
+pub mod nvc_helpers;
+pub mod visitor;
+
+const BUILD_DIR: &str = "vw_build";
 
 // ============================================================================
 // Error Types
@@ -48,7 +63,9 @@ pub enum VwError {
     FileSystem { message: String },
     Testbench { message: String },
     NvcSimulation { command: String },
+    NvcElab { command: String },
     NvcAnalysis { library: String, command: String },
+    CodeGen { message: String },
     Io(std::io::Error),
     Serialization(toml::ser::Error),
     Deserialization(toml::de::Error),
@@ -56,7 +73,6 @@ pub enum VwError {
 }
 
 impl std::error::Error for VwError {}
-
 impl From<std::io::Error> for VwError {
     fn from(err: std::io::Error) -> Self {
         VwError::Io(err)
@@ -92,11 +108,20 @@ impl fmt::Display for VwError {
                 writeln!(f, "{command}")?;
                 Ok(())
             }
+            VwError::NvcElab { command } => {
+                writeln!(f, "NVC elaboration failed")?;
+                writeln!(f, "command:")?;
+                writeln!(f, "{command}")?;
+                Ok(())
+            }
             VwError::NvcAnalysis { library, command } => {
                 writeln!(f, "NVC analysis failed for library '{library}'")?;
                 writeln!(f, "command:")?;
                 writeln!(f, "{command}")?;
                 Ok(())
+            }
+            VwError::CodeGen { message } => {
+                write!(f, "Code generation failed: {message}")
             }
             VwError::Config { message } => {
                 write!(f, "Configuration error: {message}")
@@ -131,6 +156,15 @@ impl fmt::Display for VwError {
 pub enum VhdlStandard {
     Vhdl2008,
     Vhdl2019,
+}
+
+impl From<VhdlStandard> for VHDLStandard {
+    fn from(val: VhdlStandard) -> Self {
+        match val {
+            VhdlStandard::Vhdl2008 => VHDLStandard::VHDL2008,
+            VhdlStandard::Vhdl2019 => VHDLStandard::VHDL2019,
+        }
+    }
 }
 
 impl fmt::Display for VhdlStandard {
@@ -168,11 +202,16 @@ pub struct Dependency {
     pub branch: Option<String>,
     #[serde(default)]
     pub commit: Option<String>,
-    pub src: String,
+    #[serde(default)]
+    pub src: Vec<String>,
     #[serde(default)]
     pub recursive: bool,
     #[serde(default)]
     pub sim_only: bool,
+    #[serde(default)]
+    pub submodules: bool,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -184,12 +223,17 @@ pub struct LockFile {
 pub struct LockedDependency {
     pub repo: String,
     pub commit: String,
-    pub src: String,
+    #[serde(default)]
+    pub src: Vec<String>,
     pub path: PathBuf,
     #[serde(default)]
     pub recursive: bool,
     #[serde(default)]
     pub sim_only: bool,
+    #[serde(default)]
+    pub submodules: bool,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,6 +243,16 @@ pub struct VhdlLsConfig {
     pub libraries: HashMap<String, VhdlLsLibrary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lint: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct CargoToml {
+    package: CargoPackage,
+}
+
+#[derive(Deserialize, Debug)]
+struct CargoPackage {
+    name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -416,6 +470,8 @@ pub async fn update_workspace_with_token(
                 &dep.src,
                 &dep_path,
                 dep.recursive,
+                &dep.exclude,
+                dep.submodules,
                 creds,
             )
             .await
@@ -439,11 +495,14 @@ pub async fn update_workspace_with_token(
                 path: dep_path.clone(),
                 recursive: dep.recursive,
                 sim_only: dep.sim_only,
+                submodules: dep.submodules,
+                exclude: dep.exclude.clone(),
             },
         );
 
         // Find VHDL files in the cached dependency directory
-        let vhdl_files = find_vhdl_files(&dep_path, dep.recursive)?;
+        let vhdl_files =
+            find_vhdl_files(&dep_path, dep.recursive, &dep.exclude)?;
         if !vhdl_files.is_empty() {
             let portable_files =
                 vhdl_files.into_iter().map(make_path_portable).collect();
@@ -535,15 +594,17 @@ pub async fn add_dependency_with_token(
     }
 
     let dep_name = name.unwrap_or_else(|| extract_repo_name(&repo));
-    let src_path = src.unwrap_or_else(|| ".".to_string());
+    let src_paths = vec![src.unwrap_or_else(|| ".".to_string())];
 
     let dependency = Dependency {
         repo: repo.clone(),
         branch,
         commit,
-        src: src_path,
+        src: src_paths,
         recursive,
         sim_only,
+        submodules: false,
+        exclude: Vec::new(),
     };
 
     config.dependencies.insert(dep_name.clone(), dependency);
@@ -692,8 +753,11 @@ pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
             continue;
         }
 
-        let vhdl_files =
-            find_vhdl_files(&locked_dep.path, locked_dep.recursive)?;
+        let vhdl_files = find_vhdl_files(
+            &locked_dep.path,
+            locked_dep.recursive,
+            &locked_dep.exclude,
+        )?;
 
         // Create array entry for this library
         tcl_content.push_str(&format!("set dep_files({dep_name}) [list"));
@@ -730,13 +794,20 @@ pub fn generate_deps_tcl(workspace_dir: &Utf8Path) -> Result<()> {
 
 /// List all available testbenches in the workspace.
 pub fn list_testbenches(
-    workspace_dir: &Utf8Path,
+    bench_dir: &Utf8Path,
+    ignore_dirs: &HashSet<String>,
+    recurse: bool,
 ) -> Result<Vec<TestbenchInfo>> {
-    let bench_dir = workspace_dir.join("bench");
-    if !bench_dir.exists() {
-        return Ok(Vec::new());
-    }
+    let mut entities_cache = HashMap::new();
+    list_testbenches_impl(bench_dir, ignore_dirs, recurse, &mut entities_cache)
+}
 
+fn list_testbenches_impl(
+    bench_dir: &Utf8Path,
+    ignore_dirs: &HashSet<String>,
+    recurse: bool,
+    entities_cache: &mut HashMap<PathBuf, Vec<String>>,
+) -> Result<Vec<TestbenchInfo>> {
     let mut testbenches = Vec::new();
 
     for entry in fs::read_dir(bench_dir).map_err(|e| VwError::FileSystem {
@@ -750,13 +821,29 @@ pub fn list_testbenches(
         if path.is_file() {
             if let Some(extension) = path.extension() {
                 if extension == "vhd" || extension == "vhdl" {
-                    let entities = find_entities_in_file(&path)?;
+                    let entities = get_cached_entities(&path, entities_cache)?;
                     for entity in entities {
                         testbenches.push(TestbenchInfo {
-                            name: entity,
+                            name: entity.clone(),
                             path: path.clone(),
                         });
                     }
+                }
+            }
+        } else if recurse {
+            let dir_path: Utf8PathBuf =
+                path.try_into().map_err(|e| VwError::FileSystem {
+                    message: format!("Failed to get dir path: {e}"),
+                })?;
+            if let Some(file_name) = dir_path.file_name() {
+                if !ignore_dirs.contains(file_name) {
+                    let mut lower_testbenches = list_testbenches_impl(
+                        &dir_path,
+                        ignore_dirs,
+                        recurse,
+                        entities_cache,
+                    )?;
+                    testbenches.append(&mut lower_testbenches);
                 }
             }
         }
@@ -771,17 +858,297 @@ pub struct TestbenchInfo {
     pub path: PathBuf,
 }
 
-/// Run a testbench using NVC simulator.
-pub async fn run_testbench(
-    workspace_dir: &Utf8Path,
-    testbench_name: String,
-    vhdl_std: VhdlStandard,
-) -> Result<()> {
-    let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
+pub struct RecordProcessor {
+    pub vhdl_std: VhdlStandard,
+    pub symbols: HashMap<String, VwSymbol>,
+    pub symbol_to_file: HashMap<String, String>,
+    pub tagged_names: HashSet<String>,
+    pub file_info: HashMap<String, FileData>,
+    pub target_attr: String,
+}
 
-    // First, analyze all non-defaultlib libraries
-    for (lib_name, library) in &vhdl_ls_config.libraries {
-        if lib_name != "defaultlib" {
+const RECORD_PARSE_ATTRIBUTE: &str = "serialize_rust";
+impl RecordProcessor {
+    pub fn new(std: VhdlStandard) -> Self {
+        Self {
+            vhdl_std: std,
+            symbols: HashMap::new(),
+            symbol_to_file: HashMap::new(),
+            tagged_names: HashSet::new(),
+            file_info: HashMap::new(),
+            target_attr: RECORD_PARSE_ATTRIBUTE.to_string(),
+        }
+    }
+}
+
+// ============================================================================
+// File Cache - Reduces redundant file reads during build
+// ============================================================================
+
+/// Cache for parsed file data to avoid redundant parsing during builds.
+/// Only caches parsed results, not raw file contents.
+pub struct FileCache {
+    dependencies: HashMap<PathBuf, Vec<VwSymbol>>,
+    provided_symbols: HashMap<PathBuf, Vec<VwSymbol>>,
+    entities: HashMap<PathBuf, Vec<String>>,
+}
+
+impl FileCache {
+    pub fn new() -> Self {
+        Self {
+            dependencies: HashMap::new(),
+            provided_symbols: HashMap::new(),
+            entities: HashMap::new(),
+        }
+    }
+
+    /// Get cached file dependencies, reading and parsing file if not cached.
+    pub fn get_dependencies(&mut self, path: &Path) -> Result<&Vec<VwSymbol>> {
+        match self.dependencies.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to read file {path:?}: {e}"),
+                    }
+                })?;
+                let deps = parse_file_dependencies(&content)?;
+                Ok(e.insert(deps))
+            }
+        }
+    }
+
+    /// Get cached provided symbols (packages and entities), reading and parsing if not cached.
+    pub fn get_provided_symbols(
+        &mut self,
+        path: &Path,
+    ) -> Result<&Vec<VwSymbol>> {
+        match self.provided_symbols.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to read file {path:?}: {e}"),
+                    }
+                })?;
+                let symbols = parse_provided_symbols(&content)?;
+                Ok(e.insert(symbols))
+            }
+        }
+    }
+
+    /// Get cached entities in file, reading and parsing if not cached.
+    pub fn get_entities(&mut self, path: &Path) -> Result<&Vec<String>> {
+        match self.entities.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!("Failed to read file {path:?}: {e}"),
+                    }
+                })?;
+                let entities = parse_entities(&content)?;
+                Ok(e.insert(entities))
+            }
+        }
+    }
+
+    /// Get mutable access to the entities cache for functions that only need entity lookups.
+    pub fn entities_cache_mut(&mut self) -> &mut HashMap<PathBuf, Vec<String>> {
+        &mut self.entities
+    }
+}
+
+impl Default for FileCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parse dependencies from file content (extracted for use by FileCache).
+fn parse_file_dependencies(content: &str) -> Result<Vec<VwSymbol>> {
+    let mut dependencies = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Package imports from "use work.package_name"
+    let imports = get_package_imports(content)?;
+    for pkg in imports {
+        let key = format!("pkg:{}", pkg.to_lowercase());
+        if seen.insert(key) {
+            dependencies.push(VwSymbol::Package(pkg));
+        }
+    }
+
+    // Find direct entity instantiations (instance_name: entity work.entity_name)
+    let entity_inst_pattern = r"(?i)\w+\s*:\s*entity\s+work\.(\w+)";
+    let entity_inst_re = regex::Regex::new(entity_inst_pattern)?;
+
+    for captures in entity_inst_re.captures_iter(content) {
+        if let Some(entity_name) = captures.get(1) {
+            let name = entity_name.as_str().to_string();
+            let key = format!("ent:{}", name.to_lowercase());
+            if seen.insert(key) {
+                dependencies.push(VwSymbol::Entity(name));
+            }
+        }
+    }
+
+    // Find component declarations
+    let comp_decl_pattern = r"(?i)component\s+(\w+)";
+    let comp_decl_re = regex::Regex::new(comp_decl_pattern)?;
+
+    for captures in comp_decl_re.captures_iter(content) {
+        if let Some(comp_name) = captures.get(1) {
+            let name = comp_name.as_str().to_string();
+            let key = format!("ent:{}", name.to_lowercase());
+            if seen.insert(key) {
+                dependencies.push(VwSymbol::Entity(name));
+            }
+        }
+    }
+
+    Ok(dependencies)
+}
+
+/// Parse provided symbols (packages and entities) from file content.
+fn parse_provided_symbols(content: &str) -> Result<Vec<VwSymbol>> {
+    let mut symbols = Vec::new();
+
+    // Find package declarations
+    let package_pattern = r"(?i)\bpackage\s+(\w+)\s+is\b";
+    let package_re = regex::Regex::new(package_pattern)?;
+
+    for captures in package_re.captures_iter(content) {
+        if let Some(package_name) = captures.get(1) {
+            symbols.push(VwSymbol::Package(package_name.as_str().to_string()));
+        }
+    }
+
+    // Find entity declarations
+    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
+    let entity_re = regex::Regex::new(entity_pattern)?;
+
+    for captures in entity_re.captures_iter(content) {
+        if let Some(entity_name) = captures.get(1) {
+            symbols.push(VwSymbol::Entity(entity_name.as_str().to_string()));
+        }
+    }
+
+    Ok(symbols)
+}
+
+/// Parse entity declarations from file content.
+fn parse_entities(content: &str) -> Result<Vec<String>> {
+    let mut entities = Vec::new();
+
+    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
+    let re = regex::Regex::new(entity_pattern)?;
+
+    for captures in re.captures_iter(content) {
+        if let Some(entity_name) = captures.get(1) {
+            entities.push(entity_name.as_str().to_string());
+        }
+    }
+
+    Ok(entities)
+}
+
+pub async fn analyze_ext_libraries(
+    vhdl_ls_config: &VhdlLsConfig,
+    processor: &mut RecordProcessor,
+    vhdl_std: VhdlStandard,
+    cache: &mut FileCache,
+) -> Result<()> {
+    // Collect non-defaultlib library names
+    let ext_lib_names: Vec<String> = vhdl_ls_config
+        .libraries
+        .keys()
+        .filter(|k| k.as_str() != "defaultlib")
+        .cloned()
+        .collect();
+
+    // Build inter-library dependency graph by scanning for `library <name>;`
+    let ext_lib_set: HashSet<String> = ext_lib_names.iter().cloned().collect();
+    let mut lib_deps: HashMap<String, Vec<String>> = HashMap::new();
+    for lib_name in &ext_lib_names {
+        let mut deps = Vec::new();
+        if let Some(library) = vhdl_ls_config.libraries.get(lib_name) {
+            for file_path in &library.files {
+                let expanded = if file_path.starts_with("$HOME") {
+                    if let Some(home) = dirs::home_dir() {
+                        home.join(
+                            file_path
+                                .strip_prefix("$HOME/")
+                                .unwrap_or(file_path),
+                        )
+                    } else {
+                        PathBuf::from(file_path)
+                    }
+                } else {
+                    PathBuf::from(file_path)
+                };
+                if let Ok(contents) = fs::read_to_string(&expanded) {
+                    for line in contents.lines() {
+                        let trimmed = line.trim().to_lowercase();
+                        if let Some(rest) = trimmed.strip_prefix("library ") {
+                            let dep_lib = rest.trim_end_matches(';').trim();
+                            if ext_lib_set.contains(dep_lib)
+                                && dep_lib != lib_name.to_lowercase()
+                            {
+                                deps.push(dep_lib.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lib_deps.insert(lib_name.clone(), deps);
+    }
+
+    // Topological sort of library names (Kahn's algorithm)
+    let mut in_degree: HashMap<String, usize> =
+        ext_lib_names.iter().map(|n| (n.clone(), 0)).collect();
+    let mut adj: HashMap<String, Vec<String>> = ext_lib_names
+        .iter()
+        .map(|n| (n.clone(), Vec::new()))
+        .collect();
+    for (lib, deps) in &lib_deps {
+        for dep in deps {
+            if let Some(neighbors) = adj.get_mut(dep) {
+                neighbors.push(lib.clone());
+            }
+            if let Some(deg) = in_degree.get_mut(lib) {
+                *deg += 1;
+            }
+        }
+    }
+    let mut queue: VecDeque<String> = in_degree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let mut sorted_libs = Vec::new();
+    while let Some(current) = queue.pop_front() {
+        sorted_libs.push(current.clone());
+        if let Some(neighbors) = adj.get(&current) {
+            for neighbor in neighbors {
+                if let Some(deg) = in_degree.get_mut(neighbor) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to unsorted if cycle detected
+    if sorted_libs.len() != ext_lib_names.len() {
+        sorted_libs = ext_lib_names;
+    }
+
+    // Analyze libraries in dependency order
+    for lib_name in &sorted_libs {
+        if let Some(library) = vhdl_ls_config.libraries.get(lib_name) {
             // Convert library name to be NVC-compatible (no hyphens)
             let nvc_lib_name = lib_name.replace('-', "_");
 
@@ -805,44 +1172,50 @@ pub async fn run_testbench(
             }
 
             // Sort files in dependency order (dependencies first)
-            sort_files_by_dependencies(&mut files)?;
+            sort_files_by_dependencies(processor, &mut files, cache)?;
 
             let file_strings: Vec<String> = files
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
 
-            let mut nvc_cmd = tokio::process::Command::new("nvc");
-            nvc_cmd
-                .arg(format!("--std={vhdl_std}"))
-                .arg(format!("--work={nvc_lib_name}"))
-                .arg("-M")
-                .arg("256m")
-                .arg("-a");
-
-            for file in &file_strings {
-                nvc_cmd.arg(file);
-            }
-
-            let status =
-                nvc_cmd.status().await.map_err(|e| VwError::Testbench {
-                    message: format!("Failed to execute NVC analysis: {e}"),
-                })?;
-
-            if !status.success() {
-                let cmd_str = format!(
-                    "nvc --std={} --work={} -M 256m -a {}",
-                    vhdl_std,
-                    nvc_lib_name,
-                    file_strings.join(" ")
-                );
-                return Err(VwError::NvcAnalysis {
-                    library: lib_name.clone(),
-                    command: cmd_str,
-                });
-            }
+            run_nvc_analysis(
+                vhdl_std,
+                BUILD_DIR,
+                &nvc_lib_name,
+                &file_strings,
+                false,
+            )
+            .await?;
         }
     }
+
+    Ok(())
+}
+
+/// Run a testbench using NVC simulator.
+pub async fn run_testbench(
+    workspace_dir: &Utf8Path,
+    testbench_name: String,
+    vhdl_std: VhdlStandard,
+    recurse: bool,
+    runtime_flags: &[String],
+    build_rust: bool,
+) -> Result<()> {
+    let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
+    let mut processor = RecordProcessor::new(vhdl_std);
+    let mut cache = FileCache::new();
+
+    fs::create_dir_all(BUILD_DIR)?;
+
+    // First, analyze all non-defaultlib libraries
+    analyze_ext_libraries(
+        &vhdl_ls_config,
+        &mut processor,
+        vhdl_std,
+        &mut cache,
+    )
+    .await?;
 
     // Get defaultlib files for later use
     let defaultlib_files = vhdl_ls_config
@@ -859,10 +1232,31 @@ pub async fn run_testbench(
         });
     }
 
-    let testbench_file = find_testbench_file(&testbench_name, &bench_dir)?;
+    let testbench_file = find_testbench_file(
+        &testbench_name,
+        &bench_dir,
+        recurse,
+        cache.entities_cache_mut(),
+    )?;
 
     // Filter defaultlib files to exclude OTHER testbenches but allow common bench code
     let bench_dir_abs = workspace_dir.as_std_path().join("bench");
+
+    // Pre-compute entities for bench files to avoid mutable borrow in closure
+    let mut bench_file_entities: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for file_path in &defaultlib_files {
+        let absolute_path = if file_path.is_relative() {
+            workspace_dir.as_std_path().join(file_path)
+        } else {
+            file_path.clone()
+        };
+        if absolute_path.starts_with(&bench_dir_abs) {
+            if let Ok(entities) = cache.get_entities(&absolute_path) {
+                bench_file_entities.insert(absolute_path, entities.clone());
+            }
+        }
+    }
+
     let filtered_defaultlib_files: Vec<PathBuf> = defaultlib_files
         .into_iter()
         .filter(|file_path| {
@@ -879,11 +1273,11 @@ pub async fn run_testbench(
             }
 
             // If it's in the bench directory, check if it's a different testbench
-            if let Ok(entities) = find_entities_in_file(&absolute_path) {
+            if let Some(entities) = bench_file_entities.get(&absolute_path) {
                 // Exclude files that contain testbench entities other than the one we're running
                 for entity in entities {
                     if entity.to_lowercase().ends_with("_tb")
-                        && entity != testbench_name
+                        && entity != &testbench_name
                     {
                         return false; // This is a different testbench, exclude it
                     }
@@ -896,82 +1290,61 @@ pub async fn run_testbench(
         .collect();
 
     // Find only the defaultlib files that are actually referenced by this testbench
-    let mut referenced_files =
-        find_referenced_files(&testbench_file, &filtered_defaultlib_files)?;
+    let mut referenced_files = find_referenced_files(
+        &testbench_file,
+        &filtered_defaultlib_files,
+        &mut cache,
+    )?;
 
     // Sort files in dependency order (dependencies first)
-    sort_files_by_dependencies(&mut referenced_files)?;
+    sort_files_by_dependencies(
+        &mut processor,
+        &mut referenced_files,
+        &mut cache,
+    )?;
+
+    let mut files: Vec<String> = referenced_files
+        .iter()
+        .map(|s| s.to_string_lossy().to_string())
+        .collect();
+
+    files.push(testbench_file.to_string_lossy().to_string());
+
+    run_nvc_analysis(vhdl_std, BUILD_DIR, "work", &files, false).await?;
+
+    run_nvc_elab(vhdl_std, BUILD_DIR, "work", &testbench_name, false).await?;
+
+    // Build Rust library if requested
+    let rust_lib_path = if build_rust {
+        Some(
+            build_rust_library(&bench_dir, &testbench_file)
+                .await?
+                .to_string_lossy()
+                .to_string(),
+        )
+    } else {
+        None
+    };
 
     // Run NVC simulation
-    let mut nvc_cmd = tokio::process::Command::new("nvc");
-    nvc_cmd
-        .arg(format!("--std={vhdl_std}"))
-        .arg("-M")
-        .arg("256m")
-        .arg("-L")
-        .arg(".")
-        .arg("-a")
-        .arg("--check-synthesis");
-
-    // Add only the defaultlib files that are referenced by this testbench
-    for file_path in &referenced_files {
-        nvc_cmd.arg(file_path.to_string_lossy().as_ref());
-    }
-
-    // Add testbench file
-    nvc_cmd.arg(testbench_file.to_string_lossy().as_ref());
-
-    // Elaborate and run
-    nvc_cmd
-        .arg("-e")
-        .arg(&testbench_name)
-        .arg("-r")
-        .arg(&testbench_name)
-        .arg("--dump-arrays")
-        .arg("--format=fst")
-        .arg(format!("--wave={testbench_name}.fst"));
-
-    let status = nvc_cmd.status().await.map_err(|e| VwError::Testbench {
-        message: format!("Failed to execute NVC simulation: {e}"),
-    })?;
-
-    if !status.success() {
-        // Build command string for display
-        let mut cmd_parts = vec!["nvc".to_string()];
-        cmd_parts.push(format!("--std={vhdl_std}"));
-        cmd_parts.push("-M".to_string());
-        cmd_parts.push("256m".to_string());
-        cmd_parts.push("-L".to_string());
-        cmd_parts.push(".".to_string());
-        cmd_parts.push("-a".to_string());
-        cmd_parts.push("--check-synthesis".to_string());
-
-        for file_path in &referenced_files {
-            cmd_parts.push(file_path.to_string_lossy().to_string());
-        }
-        cmd_parts.push(testbench_file.to_string_lossy().to_string());
-        cmd_parts.push("-e".to_string());
-        cmd_parts.push(testbench_name.clone());
-        cmd_parts.push("-r".to_string());
-        cmd_parts.push(testbench_name.clone());
-        cmd_parts.push("--dump-arrays".to_string());
-        cmd_parts.push("--format=fst".to_string());
-        cmd_parts.push(format!("--wave={testbench_name}.fst"));
-
-        let cmd_str = cmd_parts.join(" ");
-        return Err(VwError::NvcSimulation { command: cmd_str });
-    }
+    run_nvc_sim(
+        vhdl_std,
+        BUILD_DIR,
+        "work",
+        &testbench_name,
+        rust_lib_path,
+        &runtime_flags.to_vec(),
+        false,
+    )
+    .await?;
 
     Ok(())
 }
 
-// ============================================================================
-// Internal Helper Functions
-// ============================================================================
-
-fn find_referenced_files(
+pub fn find_referenced_files(
     testbench_file: &Path,
     available_files: &[PathBuf],
+    cache: &mut FileCache,
 ) -> Result<Vec<PathBuf>> {
     let mut referenced_files = Vec::new();
     let mut processed_files = HashSet::new();
@@ -989,13 +1362,12 @@ fn find_referenced_files(
             referenced_files.push(current_file.clone());
         }
 
-        // Parse the file to find dependencies
-        let dependencies = find_file_dependencies(&current_file)?;
+        let dependencies = cache.get_dependencies(&current_file)?.clone();
 
         // Find corresponding files for each dependency
         for dep in dependencies {
             for available_file in available_files {
-                if file_provides_symbol(available_file, &dep)? {
+                if file_provides_symbol(available_file, &dep, cache)? {
                     if !processed_files.contains(available_file) {
                         files_to_process.push(available_file.clone());
                     }
@@ -1008,107 +1380,55 @@ fn find_referenced_files(
     Ok(referenced_files)
 }
 
-fn find_file_dependencies(file_path: &Path) -> Result<Vec<String>> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
-        })?;
-
-    let mut dependencies = HashSet::new();
-
-    // Find 'use work.package_name' statements
-    let use_work_pattern = r"(?i)use\s+work\.(\w+)";
-    let use_work_re = regex::Regex::new(use_work_pattern)?;
-
-    for captures in use_work_re.captures_iter(&content) {
-        if let Some(package_name) = captures.get(1) {
-            dependencies.insert(package_name.as_str().to_string());
-        }
-    }
-
-    // Find direct entity instantiations (instance_name: entity work.entity_name)
-    let entity_inst_pattern = r"(?i)\w+\s*:\s*entity\s+work\.(\w+)";
-    let entity_inst_re = regex::Regex::new(entity_inst_pattern)?;
-
-    for captures in entity_inst_re.captures_iter(&content) {
-        if let Some(entity_name) = captures.get(1) {
-            dependencies.insert(entity_name.as_str().to_string());
-        }
-    }
-
-    // Find component instantiations (component_name : entity_name)
-    let component_pattern = r"(?i)(\w+)\s*:\s*(\w+)";
-    let component_re = regex::Regex::new(component_pattern)?;
-
-    for captures in component_re.captures_iter(&content) {
-        if let Some(entity_name) = captures.get(2) {
-            // Skip if this looks like an entity instantiation (already handled above)
-            if !entity_name.as_str().eq_ignore_ascii_case("entity") {
-                dependencies.insert(entity_name.as_str().to_string());
-            }
-        }
-    }
-
-    // Find component declarations
-    let comp_decl_pattern = r"(?i)component\s+(\w+)";
-    let comp_decl_re = regex::Regex::new(comp_decl_pattern)?;
-
-    for captures in comp_decl_re.captures_iter(&content) {
-        if let Some(comp_name) = captures.get(1) {
-            dependencies.insert(comp_name.as_str().to_string());
-        }
-    }
-
-    Ok(dependencies.into_iter().collect())
-}
-
-fn file_provides_symbol(file_path: &Path, symbol: &str) -> Result<bool> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
-        })?;
-
-    // Check for package declaration
-    let package_pattern =
-        format!(r"(?i)\bpackage\s+{}\s+is\b", regex::escape(symbol));
-    let package_re = regex::Regex::new(&package_pattern)?;
-
-    if package_re.is_match(&content) {
-        return Ok(true);
-    }
-
-    // Check for entity declaration
-    let entity_pattern =
-        format!(r"(?i)\bentity\s+{}\s+is\b", regex::escape(symbol));
-    let entity_re = regex::Regex::new(&entity_pattern)?;
-
-    if entity_re.is_match(&content) {
-        return Ok(true);
-    }
-
-    Ok(false)
-}
-
-fn sort_files_by_dependencies(files: &mut Vec<PathBuf>) -> Result<()> {
+pub fn sort_files_by_dependencies(
+    processor: &mut RecordProcessor,
+    files: &mut Vec<PathBuf>,
+    cache: &mut FileCache,
+) -> Result<()> {
     // Build dependency graph
     let mut dependencies: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     let mut all_symbols: HashMap<String, PathBuf> = HashMap::new();
 
     // First pass: collect all symbols provided by each file
     for file in files.iter() {
-        let symbols = get_file_symbols(file)?;
+        let symbols = analyze_file(processor, file)?;
         for symbol in symbols {
-            all_symbols.insert(symbol, file.clone());
+            match symbol {
+                VwSymbol::Package(name) => {
+                    all_symbols.insert(name.clone(), file.clone());
+                    let entry = processor
+                        .file_info
+                        .entry(file.to_string_lossy().to_string())
+                        .or_default();
+                    entry.add_defined_pkg(&name);
+
+                    // Use cache to get package imports only
+                    let deps = cache.get_dependencies(file)?;
+                    for dep in deps {
+                        if let VwSymbol::Package(pkg_name) = dep {
+                            entry.add_imported_pkg(pkg_name);
+                        }
+                    }
+                }
+                VwSymbol::Entity(name) => {
+                    all_symbols.insert(name, file.clone());
+                }
+                _ => {}
+            }
         }
     }
 
     // Second pass: find dependencies for each file
     for file in files.iter() {
-        let deps = find_file_dependencies(file)?;
+        let deps = cache.get_dependencies(file)?.clone();
         let mut file_deps = Vec::new();
 
         for dep in deps {
-            if let Some(provider_file) = all_symbols.get(&dep) {
+            let dep_name = match &dep {
+                VwSymbol::Package(name) | VwSymbol::Entity(name) => name,
+                _ => continue,
+            };
+            if let Some(provider_file) = all_symbols.get(dep_name) {
                 if provider_file != file {
                     file_deps.push(provider_file.clone());
                 }
@@ -1119,126 +1439,163 @@ fn sort_files_by_dependencies(files: &mut Vec<PathBuf>) -> Result<()> {
     }
 
     // Topological sort using Kahn's algorithm
-    let sorted = topological_sort(files.clone(), dependencies)?;
+    let sorted = topological_sort_files(files.clone(), dependencies)?;
     *files = sorted;
 
     Ok(())
 }
 
-fn get_file_symbols(file_path: &Path) -> Result<Vec<String>> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
+pub fn load_existing_vhdl_ls_config(
+    workspace_dir: &Utf8Path,
+) -> Result<VhdlLsConfig> {
+    let config_path = workspace_dir.join("vhdl_ls.toml");
+    if config_path.exists() {
+        let config_content = fs::read_to_string(&config_path).map_err(|e| {
+            VwError::FileSystem {
+                message: format!("Failed to read existing vhdl_ls.toml: {e}"),
+            }
         })?;
 
-    let mut symbols = Vec::new();
+        let config: VhdlLsConfig = toml::from_str(&config_content)?;
 
-    // Find package declarations
-    let package_pattern = r"(?i)\bpackage\s+(\w+)\s+is\b";
-    let package_re = regex::Regex::new(package_pattern)?;
-
-    for captures in package_re.captures_iter(&content) {
-        if let Some(package_name) = captures.get(1) {
-            symbols.push(package_name.as_str().to_string());
-        }
+        Ok(config)
+    } else {
+        Ok(VhdlLsConfig {
+            standard: None,
+            libraries: HashMap::new(),
+            lint: None,
+        })
     }
-
-    // Find entity declarations
-    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
-    let entity_re = regex::Regex::new(entity_pattern)?;
-
-    for captures in entity_re.captures_iter(&content) {
-        if let Some(entity_name) = captures.get(1) {
-            symbols.push(entity_name.as_str().to_string());
-        }
-    }
-
-    Ok(symbols)
 }
 
-fn topological_sort(
+// ============================================================================
+// Internal Helper Functions
+// ============================================================================
+
+fn get_package_imports(content: &str) -> Result<Vec<String>> {
+    // Find 'use work.package_name' statements
+    let use_work_pattern = r"(?i)use\s+work\.(\w+)";
+    let use_work_re = regex::Regex::new(use_work_pattern)?;
+    let mut imports = Vec::new();
+
+    for captures in use_work_re.captures_iter(content) {
+        if let Some(package_name) = captures.get(1) {
+            imports.push(package_name.as_str().to_string());
+        }
+    }
+    Ok(imports)
+}
+
+fn file_provides_symbol(
+    file_path: &Path,
+    needed: &VwSymbol,
+    cache: &mut FileCache,
+) -> Result<bool> {
+    let provided = cache.get_provided_symbols(file_path)?;
+    Ok(provided.iter().any(|s| match (needed, s) {
+        // Package dependency matches package declaration
+        (VwSymbol::Package(need), VwSymbol::Package(have)) => {
+            need.eq_ignore_ascii_case(have)
+        }
+        // Entity dependency matches entity declaration
+        (VwSymbol::Entity(need), VwSymbol::Entity(have)) => {
+            need.eq_ignore_ascii_case(have)
+        }
+        _ => false,
+    }))
+}
+
+fn analyze_file(
+    processor: &mut RecordProcessor,
+    file: &Path,
+) -> Result<Vec<VwSymbol>> {
+    let parser = VHDLParser::new(processor.vhdl_std.into());
+    let mut diagnostics = Vec::new();
+    let (_, design_file) = parser.parse_design_file(file, &mut diagnostics)?;
+
+    let mut file_finder = VwSymbolFinder::new(&processor.target_attr);
+    walk_design_file(&mut file_finder, &design_file);
+
+    let file_str = file.to_string_lossy().to_string();
+
+    // Add records to symbols map
+    for record in file_finder.get_records() {
+        let name = record.get_name().to_string();
+        processor
+            .symbols
+            .insert(name.clone(), VwSymbol::Record(record.clone()));
+        processor.symbol_to_file.insert(name, file_str.clone());
+    }
+
+    // Add enums from symbols (they're already VwSymbol::Enum)
+    for symbol in file_finder.get_symbols() {
+        if let VwSymbol::Enum(enum_data) = symbol {
+            let name = enum_data.get_name().to_string();
+            processor.symbols.insert(name.clone(), symbol.clone());
+            processor.symbol_to_file.insert(name, file_str.clone());
+        }
+    }
+
+    for tagged_type in file_finder.get_tagged_types() {
+        processor.tagged_names.insert(tagged_type.clone());
+    }
+
+    Ok(file_finder.get_symbols().clone())
+}
+
+fn topological_sort_files(
     files: Vec<PathBuf>,
     dependencies: HashMap<PathBuf, Vec<PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
-    let mut in_degree: HashMap<PathBuf, usize> = HashMap::new();
-    let mut adj_list: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut dep_graph: DiGraph<PathBuf, ()> = DiGraph::default();
+    let mut index_map: HashMap<PathBuf, NodeIndex> = HashMap::new();
 
-    // Initialize in-degree and adjacency list
+    // initialize the nodes
     for file in &files {
-        in_degree.insert(file.clone(), 0);
-        adj_list.insert(file.clone(), Vec::new());
+        let index = dep_graph.add_node(file.clone());
+        index_map.insert(file.clone(), index);
     }
 
-    // Build the graph
+    // now add edges from files to their dependencies
     for (file, deps) in &dependencies {
+        let source_node = index_map.get(file).ok_or(VwError::Dependency {
+            message: format!(
+                "Index map somehow didn't contain file {:?}",
+                file
+            ),
+        })?;
+        // file depends on every dep in deps
         for dep in deps {
-            if files.contains(dep) {
-                adj_list.get_mut(dep).unwrap().push(file.clone());
-                *in_degree.get_mut(file).unwrap() += 1;
-            }
+            let dst_node = index_map.get(dep).ok_or(VwError::Dependency {
+                message: format!(
+                    "Index map somehow didn't contain dep {:?}",
+                    dep
+                ),
+            })?;
+            dep_graph.add_edge(*source_node, *dst_node, ());
         }
     }
 
-    // Kahn's algorithm
-    let mut queue = VecDeque::new();
-    let mut result = Vec::new();
+    // ok now topological sort
+    let ordered_files =
+        toposort(&dep_graph, None).map_err(|_| VwError::Dependency {
+            message: "Got circular dependency".to_string(),
+        })?;
 
-    // Add all nodes with in-degree 0 to queue
-    for (file, &degree) in &in_degree {
-        if degree == 0 {
-            queue.push_back(file.clone());
-        }
-    }
-
-    while let Some(current) = queue.pop_front() {
-        result.push(current.clone());
-
-        // For each neighbor of current
-        if let Some(neighbors) = adj_list.get(&current) {
-            for neighbor in neighbors {
-                *in_degree.get_mut(neighbor).unwrap() -= 1;
-                if in_degree[neighbor] == 0 {
-                    queue.push_back(neighbor.clone());
-                }
-            }
-        }
-    }
-
-    // Check for cycles
-    if result.len() != files.len() {
-        return Err(VwError::Dependency {
-            message: "Circular dependency detected in VHDL files".to_string(),
-        });
-    }
-
+    let result: Vec<PathBuf> = ordered_files
+        .iter()
+        .map(|&idx| dep_graph[idx].clone())
+        .rev()
+        .collect();
     Ok(result)
 }
 
-fn find_entities_in_file(file_path: &Path) -> Result<Vec<String>> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
-        })?;
-
-    let mut entities = Vec::new();
-
-    // Regex to find entity declarations
-    let entity_pattern = r"(?i)\bentity\s+(\w+)\s+is\b";
-    let re = regex::Regex::new(entity_pattern)?;
-
-    for captures in re.captures_iter(&content) {
-        if let Some(entity_name) = captures.get(1) {
-            entities.push(entity_name.as_str().to_string());
-        }
-    }
-
-    Ok(entities)
-}
-
-fn find_testbench_file(
+fn find_testbench_file_recurse(
     testbench_name: &str,
     bench_dir: &Utf8Path,
-) -> Result<PathBuf> {
+    recurse: bool,
+    entities_cache: &mut HashMap<PathBuf, Vec<String>>,
+) -> Result<Vec<PathBuf>> {
     let mut found_files = Vec::new();
 
     for entry in fs::read_dir(bench_dir).map_err(|e| VwError::FileSystem {
@@ -1253,13 +1610,44 @@ fn find_testbench_file(
             if let Some(extension) = path.extension() {
                 if extension == "vhd" || extension == "vhdl" {
                     // Check if this file contains the entity we're looking for
-                    if file_contains_entity(&path, testbench_name)? {
+                    if file_contains_entity(
+                        &path,
+                        testbench_name,
+                        entities_cache,
+                    )? {
                         found_files.push(path);
                     }
                 }
             }
+        } else if recurse {
+            let dir_path: Utf8PathBuf =
+                path.try_into().map_err(|e| VwError::FileSystem {
+                    message: format!("Failed to get dir path: {e}"),
+                })?;
+            let mut lower_testbenches = find_testbench_file_recurse(
+                testbench_name,
+                &dir_path,
+                recurse,
+                entities_cache,
+            )?;
+            found_files.append(&mut lower_testbenches);
         }
     }
+    Ok(found_files)
+}
+
+fn find_testbench_file(
+    testbench_name: &str,
+    bench_dir: &Utf8Path,
+    recurse: bool,
+    entities_cache: &mut HashMap<PathBuf, Vec<String>>,
+) -> Result<PathBuf> {
+    let found_files = find_testbench_file_recurse(
+        testbench_name,
+        bench_dir,
+        recurse,
+        entities_cache,
+    )?;
 
     match found_files.len() {
         0 => Err(VwError::Testbench {
@@ -1272,19 +1660,31 @@ fn find_testbench_file(
     }
 }
 
-fn file_contains_entity(file_path: &Path, entity_name: &str) -> Result<bool> {
-    let content =
-        fs::read_to_string(file_path).map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read file {file_path:?}: {e}"),
-        })?;
+fn file_contains_entity(
+    file_path: &Path,
+    entity_name: &str,
+    entities_cache: &mut HashMap<PathBuf, Vec<String>>,
+) -> Result<bool> {
+    let entities = get_cached_entities(file_path, entities_cache)?;
+    Ok(entities.iter().any(|e| e.eq_ignore_ascii_case(entity_name)))
+}
 
-    // Simple regex to find entity declarations
-    // This is a basic implementation that looks for "entity <name> is"
-    let entity_pattern =
-        format!(r"(?i)\bentity\s+{}\s+is\b", regex::escape(entity_name));
-    let re = regex::Regex::new(&entity_pattern)?;
-
-    Ok(re.is_match(&content))
+/// Get entities from cache, parsing and caching if not present.
+fn get_cached_entities<'a>(
+    path: &Path,
+    entities_cache: &'a mut HashMap<PathBuf, Vec<String>>,
+) -> Result<&'a Vec<String>> {
+    match entities_cache.entry(path.to_path_buf()) {
+        Entry::Occupied(e) => Ok(e.into_mut()),
+        Entry::Vacant(e) => {
+            let content =
+                fs::read_to_string(path).map_err(|e| VwError::FileSystem {
+                    message: format!("Failed to read file {path:?}: {e}"),
+                })?;
+            let entities = parse_entities(&content)?;
+            Ok(e.insert(entities))
+        }
+    }
 }
 
 fn make_path_portable(path: PathBuf) -> PathBuf {
@@ -1408,115 +1808,133 @@ async fn get_branch_head_commit(
     let branch = branch.to_string();
     let credentials = credentials.map(|(u, p)| (u.to_string(), p.to_string()));
 
-    tokio::task::spawn_blocking(move || {
-        // Create a temporary directory for the operation
-        let temp_dir =
-            tempfile::tempdir().map_err(|e| VwError::FileSystem {
-                message: format!("Failed to create temporary directory: {e}"),
-            })?;
-
-        // Create an empty repository to work with remotes
-        let repo =
-            git2::Repository::init_bare(temp_dir.path()).map_err(|e| {
-                VwError::Git {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            // Create a temporary directory for the operation
+            let temp_dir =
+                tempfile::tempdir().map_err(|e| VwError::FileSystem {
                     message: format!(
-                        "Failed to initialize temporary repository: {e}"
+                        "Failed to create temporary directory: {e}"
                     ),
-                }
-            })?;
+                })?;
 
-        // Create a remote
-        let mut remote =
-            repo.remote_anonymous(&normalized_repo_url).map_err(|e| {
-                VwError::Git {
-                    message: format!("Failed to create remote: {e}"),
-                }
-            })?;
-
-        // Connect and list references
-        // Always set a credentials callback so git2 doesn't fail with "no callback set".
-        // The callback will try explicit credentials first, then fall back to git's
-        // credential helper system (which includes .netrc support).
-        let mut callbacks = git2::RemoteCallbacks::new();
-        let attempt_count = RefCell::new(0);
-
-        callbacks.credentials(move |url, username_from_url, allowed_types| {
-            let mut attempts = attempt_count.borrow_mut();
-            *attempts += 1;
-
-            // Limit attempts to prevent infinite loops
-            if *attempts > 1 {
-                return git2::Cred::default();
-            }
-
-            // First, try explicit credentials from netrc if available
-            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
-            {
-                if let Some((ref username, ref password)) = credentials {
-                    // Use both username and password from netrc
-                    return git2::Cred::userpass_plaintext(username, password);
-                }
-            }
-
-            // Try SSH key if available
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                if let Some(username) = username_from_url {
-                    if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
-                        return Ok(cred);
+            // Create an empty repository to work with remotes
+            let repo =
+                git2::Repository::init_bare(temp_dir.path()).map_err(|e| {
+                    VwError::Git {
+                        message: format!(
+                            "Failed to initialize temporary repository: {e}"
+                        ),
                     }
-                }
-            }
+                })?;
 
-            // Fall back to git's credential helper system (includes .netrc)
-            if let Ok(config) = git2::Config::open_default() {
-                if let Ok(cred) = git2::Cred::credential_helper(
-                    &config,
-                    url,
-                    username_from_url,
-                ) {
-                    return Ok(cred);
-                }
-            }
+            // Create a remote
+            let mut remote = repo
+                .remote_anonymous(&normalized_repo_url)
+                .map_err(|e| VwError::Git {
+                    message: format!("Failed to create remote: {e}"),
+                })?;
 
-            git2::Cred::default()
-        });
+            // Connect and list references
+            // Always set a credentials callback so git2 doesn't fail with "no callback set".
+            // The callback will try explicit credentials first, then fall back to git's
+            // credential helper system (which includes .netrc support).
+            let mut callbacks = git2::RemoteCallbacks::new();
+            let attempt_count = RefCell::new(0);
 
-        remote
-            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
-            .map_err(|e| VwError::Git {
-                message: format!("Failed to connect to remote: {e}"),
+            callbacks.credentials(
+                move |url, username_from_url, allowed_types| {
+                    let mut attempts = attempt_count.borrow_mut();
+                    *attempts += 1;
+
+                    // Limit attempts to prevent infinite loops
+                    if *attempts > 1 {
+                        return git2::Cred::default();
+                    }
+
+                    // First, try explicit credentials from netrc if available
+                    if allowed_types
+                        .contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+                    {
+                        if let Some((ref username, ref password)) = credentials
+                        {
+                            // Use both username and password from netrc
+                            return git2::Cred::userpass_plaintext(
+                                username, password,
+                            );
+                        }
+                    }
+
+                    // Try SSH key if available
+                    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                        if let Some(username) = username_from_url {
+                            if let Ok(cred) =
+                                git2::Cred::ssh_key_from_agent(username)
+                            {
+                                return Ok(cred);
+                            }
+                        }
+                    }
+
+                    // Fall back to git's credential helper system (includes .netrc)
+                    if let Ok(config) = git2::Config::open_default() {
+                        if let Ok(cred) = git2::Cred::credential_helper(
+                            &config,
+                            url,
+                            username_from_url,
+                        ) {
+                            return Ok(cred);
+                        }
+                    }
+
+                    git2::Cred::default()
+                },
+            );
+
+            remote
+                .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
+                .map_err(|e| VwError::Git {
+                    message: format!("Failed to connect to remote: {e}"),
+                })?;
+
+            let refs = remote.list().map_err(|e| VwError::Git {
+                message: format!("Failed to list remote references: {e}"),
             })?;
 
-        let refs = remote.list().map_err(|e| VwError::Git {
-            message: format!("Failed to list remote references: {e}"),
-        })?;
-
-        // Look for the specific branch reference
-        let ref_name = format!("refs/heads/{branch}");
-        for remote_head in refs {
-            if remote_head.name() == ref_name {
-                return Ok(remote_head.oid().to_string());
+            // Look for the specific branch reference
+            let ref_name = format!("refs/heads/{branch}");
+            for remote_head in refs {
+                if remote_head.name() == ref_name {
+                    return Ok(remote_head.oid().to_string());
+                }
             }
-        }
 
-        Err(VwError::Git {
-            message: format!(
-                "Branch '{branch}' not found in remote repository"
-            ),
-        })
-    })
+            Err(VwError::Git {
+                message: format!(
+                    "Branch '{branch}' not found in remote repository"
+                ),
+            })
+        }),
+    )
     .await
+    .map_err(|_| VwError::Git {
+        message: "Git ls-remote timed out after 30 seconds".to_string(),
+    })?
     .map_err(|e| VwError::Git {
         message: format!("Failed to execute git ls-remote task: {e}"),
     })?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_dependency(
     repo_url: &str,
     commit: &str,
-    src_path: &str,
+    src_paths: &[String],
     dest_path: &Path,
     recursive: bool,
+    exclude: &[String],
+    submodules: bool,
     credentials: Option<(&str, &str)>, // (username, password)
 ) -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| VwError::FileSystem {
@@ -1533,101 +1951,139 @@ async fn download_dependency(
 
     let commit = commit.to_string();
     let temp_path = temp_dir.path().to_path_buf();
-    let src_path = src_path.to_string();
+    let src_paths = src_paths.to_vec();
     let credentials = credentials.map(|(u, p)| (u.to_string(), p.to_string()));
 
-    tokio::task::spawn_blocking(move || {
-        // Set up clone options with authentication
-        let mut builder = git2::build::RepoBuilder::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::task::spawn_blocking(move || {
+            // Set up clone options with authentication
+            let mut builder = git2::build::RepoBuilder::new();
 
-        // Always set a credentials callback so git2 doesn't fail with "no callback set".
-        // The callback will try explicit credentials first, then fall back to git's
-        // credential helper system (which includes .netrc support).
-        let mut callbacks = git2::RemoteCallbacks::new();
-        let attempt_count = RefCell::new(0);
+            // Always set a credentials callback so git2 doesn't fail with "no callback set".
+            // The callback will try explicit credentials first, then fall back to git's
+            // credential helper system (which includes .netrc support).
+            let mut callbacks = git2::RemoteCallbacks::new();
+            let attempt_count = RefCell::new(0);
 
-        callbacks.credentials(move |url, username_from_url, allowed_types| {
-            let mut attempts = attempt_count.borrow_mut();
-            *attempts += 1;
+            callbacks.credentials(
+                move |url, username_from_url, allowed_types| {
+                    let mut attempts = attempt_count.borrow_mut();
+                    *attempts += 1;
 
-            // Limit attempts to prevent infinite loops
-            if *attempts > 1 {
-                return git2::Cred::default();
-            }
-
-            // First, try explicit credentials from netrc if available
-            if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT)
-            {
-                if let Some((ref username, ref password)) = credentials {
-                    // Use both username and password from netrc
-                    return git2::Cred::userpass_plaintext(username, password);
-                }
-            }
-
-            // Try SSH key if available
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                if let Some(username) = username_from_url {
-                    if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
-                        return Ok(cred);
+                    // Limit attempts to prevent infinite loops
+                    if *attempts > 1 {
+                        return git2::Cred::default();
                     }
-                }
-            }
 
-            // Fall back to git's credential helper system (includes .netrc)
-            if let Ok(config) = git2::Config::open_default() {
-                if let Ok(cred) = git2::Cred::credential_helper(
-                    &config,
-                    url,
-                    username_from_url,
-                ) {
-                    return Ok(cred);
-                }
-            }
+                    // First, try explicit credentials from netrc if available
+                    if allowed_types
+                        .contains(git2::CredentialType::USER_PASS_PLAINTEXT)
+                    {
+                        if let Some((ref username, ref password)) = credentials
+                        {
+                            // Use both username and password from netrc
+                            return git2::Cred::userpass_plaintext(
+                                username, password,
+                            );
+                        }
+                    }
 
-            git2::Cred::default()
-        });
+                    // Try SSH key if available
+                    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                        if let Some(username) = username_from_url {
+                            if let Ok(cred) =
+                                git2::Cred::ssh_key_from_agent(username)
+                            {
+                                return Ok(cred);
+                            }
+                        }
+                    }
 
-        let mut fetch_options = git2::FetchOptions::new();
-        fetch_options.remote_callbacks(callbacks);
-        builder.fetch_options(fetch_options);
+                    // Fall back to git's credential helper system (includes .netrc)
+                    if let Ok(config) = git2::Config::open_default() {
+                        if let Ok(cred) = git2::Cred::credential_helper(
+                            &config,
+                            url,
+                            username_from_url,
+                        ) {
+                            return Ok(cred);
+                        }
+                    }
 
-        // Clone the repository
-        let repo =
-            builder
+                    git2::Cred::default()
+                },
+            );
+
+            let mut fetch_options = git2::FetchOptions::new();
+            fetch_options.depth(1); // shallow clone — only need one commit
+            fetch_options.remote_callbacks(callbacks);
+            builder.fetch_options(fetch_options);
+
+            // Clone the repository
+            let repo = builder
                 .clone(&normalized_repo_url, &temp_path)
                 .map_err(|e| VwError::Git {
                     message: format!("Failed to clone repository: {e}"),
                 })?;
 
-        // Parse the commit SHA
-        let commit_oid =
-            git2::Oid::from_str(&commit).map_err(|e| VwError::Git {
-                message: format!("Invalid commit SHA '{commit}': {e}"),
-            })?;
+            // Parse the commit SHA
+            let commit_oid =
+                git2::Oid::from_str(&commit).map_err(|e| VwError::Git {
+                    message: format!("Invalid commit SHA '{commit}': {e}"),
+                })?;
 
-        // Find the commit object
-        let commit_obj =
-            repo.find_commit(commit_oid).map_err(|e| VwError::Git {
-                message: format!("Commit '{commit}' not found: {e}"),
-            })?;
+            // Find the commit object
+            let commit_obj =
+                repo.find_commit(commit_oid).map_err(|e| VwError::Git {
+                    message: format!("Commit '{commit}' not found: {e}"),
+                })?;
 
-        // Checkout the specific commit
-        repo.checkout_tree(commit_obj.as_object(), None)
-            .map_err(|e| VwError::Git {
-                message: format!("Failed to checkout commit '{commit}': {e}"),
-            })?;
+            // Checkout the specific commit
+            repo.checkout_tree(commit_obj.as_object(), None)
+                .map_err(|e| VwError::Git {
+                    message: format!(
+                        "Failed to checkout commit '{commit}': {e}"
+                    ),
+                })?;
 
-        // Set HEAD to the commit
-        repo.set_head_detached(commit_oid)
-            .map_err(|e| VwError::Git {
-                message: format!(
-                    "Failed to set HEAD to commit '{commit}': {e}"
-                ),
-            })?;
+            // Set HEAD to the commit
+            repo.set_head_detached(commit_oid)
+                .map_err(|e| VwError::Git {
+                    message: format!(
+                        "Failed to set HEAD to commit '{commit}': {e}"
+                    ),
+                })?;
 
-        Ok::<(), VwError>(())
-    })
+            // Initialize and update submodules if requested
+            if submodules {
+                for mut submodule in
+                    repo.submodules().map_err(|e| VwError::Git {
+                        message: format!("Failed to list submodules: {e}"),
+                    })?
+                {
+                    submodule.init(false).map_err(|e| VwError::Git {
+                        message: format!(
+                            "Failed to init submodule '{}': {e}",
+                            submodule.name().unwrap_or("unknown")
+                        ),
+                    })?;
+                    submodule.update(true, None).map_err(|e| VwError::Git {
+                        message: format!(
+                            "Failed to update submodule '{}': {e}",
+                            submodule.name().unwrap_or("unknown")
+                        ),
+                    })?;
+                }
+            }
+
+            Ok::<(), VwError>(())
+        }),
+    )
     .await
+    .map_err(|_| VwError::Git {
+        message: "Git clone timed out after 120 seconds".to_string(),
+    })?
     .map_err(|e| VwError::Git {
         message: format!("Failed to execute git operations: {e}"),
     })??;
@@ -1637,7 +2093,15 @@ async fn download_dependency(
     })?;
 
     // Treat all src values as globs (handles files, directories, and patterns)
-    copy_vhdl_files_glob(temp_dir.path(), &src_path, dest_path, recursive)?;
+    for src_path in &src_paths {
+        copy_vhdl_files_glob(
+            temp_dir.path(),
+            src_path,
+            dest_path,
+            recursive,
+            exclude,
+        )?;
+    }
 
     Ok(())
 }
@@ -1647,11 +2111,18 @@ fn copy_vhdl_files_glob(
     src_pattern: &str,
     dest: &Path,
     recursive: bool,
+    exclude: &[String],
 ) -> Result<()> {
     // Build patterns to match
     let src_path = repo_root.join(src_pattern);
     let mut patterns = Vec::new();
     let strip_prefix: PathBuf;
+
+    // Compile exclude patterns
+    let exclude_patterns: Vec<glob::Pattern> = exclude
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
 
     // Check if src_pattern points to a directory
     if src_path.is_dir() {
@@ -1730,6 +2201,13 @@ fn copy_vhdl_files_glob(
                                 }
                             })?;
 
+                        // Check if file matches any exclude pattern
+                        let path_str = relative_path.to_string_lossy();
+                        if exclude_patterns.iter().any(|p| p.matches(&path_str))
+                        {
+                            continue; // Skip excluded files
+                        }
+
                         let dest_file = dest.join(relative_path);
 
                         // Create parent directories if needed
@@ -1766,9 +2244,31 @@ fn copy_vhdl_files_glob(
     Ok(())
 }
 
-fn find_vhdl_files(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+fn find_vhdl_files(
+    dir: &Path,
+    recursive: bool,
+    exclude: &[String],
+) -> Result<Vec<PathBuf>> {
     let mut vhdl_files = Vec::new();
     find_vhdl_files_impl(dir, &mut vhdl_files, recursive)?;
+
+    // Filter out excluded files
+    if !exclude.is_empty() {
+        let exclude_patterns: Vec<glob::Pattern> = exclude
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
+
+        vhdl_files.retain(|file| {
+            // Match against path relative to the base directory
+            let relative = file.strip_prefix(dir).unwrap_or(file);
+            let path_str = relative.to_string_lossy();
+            !exclude_patterns
+                .iter()
+                .any(|pattern| pattern.matches(&path_str))
+        });
+    }
+
     Ok(vhdl_files)
 }
 
@@ -1837,25 +2337,83 @@ fn write_vhdl_ls_config(
     Ok(())
 }
 
-fn load_existing_vhdl_ls_config(
-    workspace_dir: &Utf8Path,
-) -> Result<VhdlLsConfig> {
-    let config_path = workspace_dir.join("vhdl_ls.toml");
-    if config_path.exists() {
-        let config_content = fs::read_to_string(&config_path).map_err(|e| {
+/// Build a Rust library for a testbench.
+/// Looks for Cargo.toml in the testbench directory, builds it, and returns the path to the .so file.
+async fn build_rust_library(
+    bench_dir: &Utf8Path,
+    testbench_file: &Path,
+) -> Result<PathBuf> {
+    // Get the testbench directory
+    let testbench_dir =
+        testbench_file.parent().ok_or_else(|| VwError::Testbench {
+            message: format!(
+                "Testbench file {:?} has no parent directory???",
+                testbench_file
+            ),
+        })?;
+
+    // Look for Cargo.toml in the testbench directory
+    let cargo_toml_path = testbench_dir.join("Cargo.toml");
+    if !cargo_toml_path.exists() {
+        return Err(VwError::Testbench {
+            message: format!(
+                "Cargo.toml not found in testbench directory: {:?}",
+                testbench_dir
+            ),
+        });
+    }
+
+    // Parse Cargo.toml to get the package name
+    let cargo_toml_content =
+        fs::read_to_string(&cargo_toml_path).map_err(|e| {
             VwError::FileSystem {
-                message: format!("Failed to read existing vhdl_ls.toml: {e}"),
+                message: format!("Failed to read Cargo.toml: {e}"),
             }
         })?;
 
-        let config: VhdlLsConfig = toml::from_str(&config_content)?;
+    let cargo_toml: CargoToml = toml::from_str(&cargo_toml_content)?;
+    let package_name = cargo_toml.package.name;
 
-        Ok(config)
-    } else {
-        Ok(VhdlLsConfig {
-            standard: None,
-            libraries: HashMap::new(),
-            lint: None,
-        })
+    // Run cargo build in the testbench directory
+    let testbench_dir_owned = testbench_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("cargo")
+            .arg("build")
+            .current_dir(&testbench_dir_owned)
+            .output()
+            .map_err(|e| VwError::Testbench {
+                message: format!("Failed to execute cargo build: {e}"),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(VwError::Testbench {
+                message: format!("cargo build failed:\n{stderr}"),
+            });
+        }
+
+        Ok::<(), VwError>(())
+    })
+    .await
+    .map_err(|e| VwError::Testbench {
+        message: format!("Failed to execute cargo build task: {e}"),
+    })??;
+
+    // Find the .so file in the workspace target directory (parent of testbench dir)
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_name = format!("lib{}.{ext}", package_name.replace('-', "_"));
+    let workspace_target = bench_dir.join("target").join("debug");
+
+    let lib_path = workspace_target.join(&lib_name);
+
+    if !lib_path.exists() {
+        return Err(VwError::Testbench {
+            message: format!(
+                "Built Rust library not found at expected path: {:?}",
+                lib_path
+            ),
+        });
     }
+
+    Ok(lib_path.into())
 }
