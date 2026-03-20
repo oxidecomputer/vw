@@ -2400,7 +2400,11 @@ async fn build_rust_library(
     })??;
 
     // Find the .so file in the workspace target directory (parent of testbench dir)
-    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
     let lib_name = format!("lib{}.{ext}", package_name.replace('-', "_"));
     let workspace_target = bench_dir.join("target").join("debug");
 
