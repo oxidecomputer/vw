@@ -1,34 +1,49 @@
 use vhdl_lang::ast::{
     AnyDesignUnit, AnyPrimaryUnit, AttributeSpecification, Designator,
     DiscreteRange, ElementDeclaration, EntityClass, EntityDeclaration,
-    EntityName, Name, PackageDeclaration, PackageInstantiation, Range,
-    RangeConstraint, SubtypeConstraint, TypeDeclaration, TypeDefinition,
+    EntityName, Name, ObjectClass, ObjectDeclaration, PackageDeclaration,
+    PackageInstantiation, Range, RangeConstraint, SubtypeConstraint,
+    TypeDeclaration, TypeDefinition,
 };
 
 use crate::visitor::{Visitor, VisitorResult};
 
 #[derive(Debug, Clone)]
-pub enum VwSymbol {
-    Package(String),
-    Entity(String),
-    Constant(String),
-    Record(RecordData),
-    Enum(EnumData),
+pub struct RecordFields {
+    pub fields: Vec<FieldData>,
 }
 
 #[derive(Debug, Clone)]
-pub struct EnumData {
-    pub containing_pkg: Option<String>,
-    pub name: String,
+pub struct EnumAttrs {
     pub has_custom_encoding: bool,
 }
 
-impl EnumData {
-    pub fn new(containing_pkg: Option<String>, name: &str) -> Self {
+#[derive(Debug, Clone)]
+pub enum SymbolKind {
+    Package,
+    Entity,
+    Constant,
+    Record(RecordFields),
+    Enum(EnumAttrs),
+}
+
+#[derive(Debug, Clone)]
+pub struct VwSymbol {
+    pub containing_pkg: Option<String>,
+    pub name: String,
+    pub kind: SymbolKind,
+}
+
+impl VwSymbol {
+    pub fn new(
+        containing_pkg: Option<String>,
+        name: &str,
+        kind: SymbolKind,
+    ) -> Self {
         Self {
             containing_pkg,
             name: String::from(name),
-            has_custom_encoding: false,
+            kind,
         }
     }
 
@@ -39,13 +54,14 @@ impl EnumData {
     pub fn get_name(&self) -> &str {
         &self.name
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct RecordData {
-    containing_pkg: Option<String>,
-    name: String,
-    fields: Vec<FieldData>,
+    pub fn get_fields(&self) -> Option<&Vec<FieldData>> {
+        if let SymbolKind::Record(record) = &self.kind {
+            Some(&record.fields)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -75,28 +91,6 @@ impl FileData {
     }
 }
 
-impl RecordData {
-    pub fn new(containing_pkg: Option<String>, name: &str) -> Self {
-        Self {
-            containing_pkg,
-            name: String::from(name),
-            fields: Vec::new(),
-        }
-    }
-
-    pub fn get_pkg_name(&self) -> Option<&String> {
-        self.containing_pkg.as_ref()
-    }
-
-    pub fn get_fields(&self) -> &Vec<FieldData> {
-        &self.fields
-    }
-
-    pub fn get_name(&self) -> &str {
-        &self.name
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct FieldData {
     pub name: String,
@@ -107,7 +101,6 @@ pub struct FieldData {
 #[derive(Debug)]
 pub struct VwSymbolFinder {
     symbols: Vec<VwSymbol>,
-    records: Vec<RecordData>,
     tagged_types: Vec<String>,
     target_attr: String,
 }
@@ -116,7 +109,6 @@ impl VwSymbolFinder {
     pub fn new(target_attr: &str) -> Self {
         Self {
             symbols: Vec::new(),
-            records: Vec::new(),
             tagged_types: Vec::new(),
             target_attr: target_attr.to_string(),
         }
@@ -124,10 +116,6 @@ impl VwSymbolFinder {
 
     pub fn get_symbols(&self) -> &Vec<VwSymbol> {
         &self.symbols
-    }
-
-    pub fn get_records(&self) -> &Vec<RecordData> {
-        &self.records
     }
 
     pub fn get_tagged_types(&self) -> &Vec<String> {
@@ -153,9 +141,10 @@ impl Visitor for VwSymbolFinder {
                         let type_name = id.name_utf8();
                         // Find the enum and set its flag
                         for symbol in &mut self.symbols {
-                            if let VwSymbol::Enum(enum_data) = symbol {
-                                if enum_data.name == type_name {
-                                    enum_data.has_custom_encoding = true;
+                            if let SymbolKind::Enum(attrs) = &mut symbol.kind
+                            {
+                                if symbol.name == type_name {
+                                    attrs.has_custom_encoding = true;
                                     break;
                                 }
                             }
@@ -168,19 +157,49 @@ impl Visitor for VwSymbolFinder {
         // if we found the attribute with the right name
         if attr_name == self.target_attr {
             // if we tagged a type (like a record)
-            if let EntityClass::Type = spec.entity_class {
-                // get the entity name
-                if let EntityName::Name(tag) = &spec.entity_name {
-                    // get the identifier
-                    if let Designator::Identifier(id) =
-                        &tag.designator.item.item
-                    {
-                        let type_name = id.name_utf8();
-                        self.tagged_types.push(type_name);
+            match spec.entity_class {
+                EntityClass::Type | EntityClass::Constant => {
+                    // get the entity name
+                    if let EntityName::Name(tag) = &spec.entity_name {
+                        // get the identifier
+                        if let Designator::Identifier(id) =
+                            &tag.designator.item.item
+                        {
+                            let type_name = id.name_utf8();
+                            self.tagged_types.push(type_name);
+                        }
                     }
-                }
+                },
+                _ => {}
             }
         }
+        VisitorResult::Continue
+    }
+
+    fn visit_object_declaration(
+        &mut self,
+        decl: &ObjectDeclaration,
+        unit: &AnyDesignUnit,
+    ) -> VisitorResult {
+        // if this is a constant Declaration
+        if let ObjectClass::Constant = decl.class {
+            let const_name = decl.idents[0].tree.item.name_utf8();
+            // where was this constant defined
+            let def_pkg_name = if let AnyDesignUnit::Primary(
+                AnyPrimaryUnit::Package(package),
+            ) = unit
+            {
+                Some(package.ident.tree.item.name_utf8())
+            } else {
+                None
+            };
+            self.symbols.push(VwSymbol::new(
+                def_pkg_name,
+                &const_name,
+                SymbolKind::Constant,
+            ));
+        }
+
         VisitorResult::Continue
     }
 
@@ -206,15 +225,21 @@ impl Visitor for VwSymbolFinder {
 
         match &decl.def {
             TypeDefinition::Record(elements) => {
-                let mut record_struct =
-                    RecordData::new(defining_pkg_name, &name);
                 let fields = get_fields(elements);
-                record_struct.fields = fields;
-                self.records.push(record_struct);
+                self.symbols.push(VwSymbol::new(
+                    defining_pkg_name,
+                    &name,
+                    SymbolKind::Record(RecordFields { fields }),
+                ));
             }
             TypeDefinition::Enumeration(_) => {
-                let enum_data = EnumData::new(defining_pkg_name, &name);
-                self.symbols.push(VwSymbol::Enum(enum_data));
+                self.symbols.push(VwSymbol::new(
+                    defining_pkg_name,
+                    &name,
+                    SymbolKind::Enum(EnumAttrs {
+                        has_custom_encoding: false,
+                    }),
+                ));
             }
             _ => {}
         }
@@ -223,13 +248,15 @@ impl Visitor for VwSymbolFinder {
 
     fn visit_entity(&mut self, entity: &EntityDeclaration) -> VisitorResult {
         let name = entity.ident.tree.item.name_utf8();
-        self.symbols.push(VwSymbol::Entity(name));
+        self.symbols
+            .push(VwSymbol::new(None, &name, SymbolKind::Entity));
         VisitorResult::Continue
     }
 
     fn visit_package(&mut self, package: &PackageDeclaration) -> VisitorResult {
         let name = package.ident.tree.item.name_utf8();
-        self.symbols.push(VwSymbol::Package(name));
+        self.symbols
+            .push(VwSymbol::new(None, &name, SymbolKind::Package));
         VisitorResult::Continue
     }
 
@@ -238,7 +265,8 @@ impl Visitor for VwSymbolFinder {
         instance: &PackageInstantiation,
     ) -> VisitorResult {
         let name = instance.ident.tree.item.name_utf8();
-        self.symbols.push(VwSymbol::Package(name));
+        self.symbols
+            .push(VwSymbol::new(None, &name, SymbolKind::Package));
         VisitorResult::Continue
     }
 }
