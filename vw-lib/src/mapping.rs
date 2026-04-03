@@ -10,6 +10,7 @@ use crate::visitor::{Visitor, VisitorResult};
 
 #[derive(Debug, Clone)]
 pub struct ConstantExpr {
+    pub type_name: Name,
     pub expression: Option<Expression>,
 }
 
@@ -200,11 +201,15 @@ impl Visitor for VwSymbolFinder {
 
             // figure out its expression
             let expr = decl.expression.as_ref().map(|span| span.item.clone());
+            let type_name = decl.subtype_indication.type_mark.item.clone();
 
             self.symbols.push(VwSymbol::new(
                 def_pkg_name,
                 &const_name,
-                SymbolKind::Constant(ConstantExpr { expression: expr }),
+                SymbolKind::Constant(ConstantExpr {
+                    type_name,
+                    expression: expr,
+                }),
             ));
         }
 
