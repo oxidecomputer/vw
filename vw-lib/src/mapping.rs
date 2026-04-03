@@ -1,12 +1,17 @@
 use vhdl_lang::ast::{
     AnyDesignUnit, AnyPrimaryUnit, AttributeSpecification, Designator,
     DiscreteRange, ElementDeclaration, EntityClass, EntityDeclaration,
-    EntityName, Name, ObjectClass, ObjectDeclaration, PackageDeclaration,
-    PackageInstantiation, Range, RangeConstraint, SubtypeConstraint,
-    TypeDeclaration, TypeDefinition,
+    EntityName, Expression, Name, ObjectClass, ObjectDeclaration,
+    PackageDeclaration, PackageInstantiation, Range, RangeConstraint,
+    SubtypeConstraint, TypeDeclaration, TypeDefinition,
 };
 
 use crate::visitor::{Visitor, VisitorResult};
+
+#[derive(Debug, Clone)]
+pub struct ConstantExpr {
+    pub expression: Option<Expression>,
+}
 
 #[derive(Debug, Clone)]
 pub struct RecordFields {
@@ -22,7 +27,7 @@ pub struct EnumAttrs {
 pub enum SymbolKind {
     Package,
     Entity,
-    Constant,
+    Constant(ConstantExpr),
     Record(RecordFields),
     Enum(EnumAttrs),
 }
@@ -141,8 +146,7 @@ impl Visitor for VwSymbolFinder {
                         let type_name = id.name_utf8();
                         // Find the enum and set its flag
                         for symbol in &mut self.symbols {
-                            if let SymbolKind::Enum(attrs) = &mut symbol.kind
-                            {
+                            if let SymbolKind::Enum(attrs) = &mut symbol.kind {
                                 if symbol.name == type_name {
                                     attrs.has_custom_encoding = true;
                                     break;
@@ -169,7 +173,7 @@ impl Visitor for VwSymbolFinder {
                             self.tagged_types.push(type_name);
                         }
                     }
-                },
+                }
                 _ => {}
             }
         }
@@ -193,10 +197,14 @@ impl Visitor for VwSymbolFinder {
             } else {
                 None
             };
+
+            // figure out its expression
+            let expr = decl.expression.as_ref().map(|span| span.item.clone());
+
             self.symbols.push(VwSymbol::new(
                 def_pkg_name,
                 &const_name,
-                SymbolKind::Constant,
+                SymbolKind::Constant(ConstantExpr { expression: expr }),
             ));
         }
 

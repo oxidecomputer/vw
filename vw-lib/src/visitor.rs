@@ -24,7 +24,12 @@
 //! ```
 
 use vhdl_lang::ast::{
-    AnyDesignUnit, AnyPrimaryUnit, AnySecondaryUnit, ArchitectureBody, Attribute, AttributeDeclaration, AttributeSpecification, ComponentDeclaration, ConfigurationDeclaration, ContextDeclaration, Declaration, DesignFile, EntityDeclaration, ObjectDeclaration, PackageBody, PackageDeclaration, PackageInstantiation, SubprogramBody, SubprogramDeclaration, SubprogramInstantiation, TypeDeclaration
+    AnyDesignUnit, AnyPrimaryUnit, AnySecondaryUnit, ArchitectureBody,
+    Attribute, AttributeDeclaration, AttributeSpecification,
+    ComponentDeclaration, ConfigurationDeclaration, ContextDeclaration,
+    Declaration, DesignFile, EntityDeclaration, ObjectDeclaration, PackageBody,
+    PackageDeclaration, PackageInstantiation, SubprogramBody,
+    SubprogramDeclaration, SubprogramInstantiation, TypeDeclaration,
 };
 
 /// Controls whether AST traversal should continue or stop.

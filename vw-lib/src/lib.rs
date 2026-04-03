@@ -1003,7 +1003,11 @@ fn parse_file_dependencies(content: &str) -> Result<Vec<VwSymbol>> {
             let name = entity_name.as_str().to_string();
             let key = format!("ent:{}", name.to_lowercase());
             if seen.insert(key) {
-                dependencies.push(VwSymbol::new(None, &name, SymbolKind::Entity));
+                dependencies.push(VwSymbol::new(
+                    None,
+                    &name,
+                    SymbolKind::Entity,
+                ));
             }
         }
     }
@@ -1017,7 +1021,11 @@ fn parse_file_dependencies(content: &str) -> Result<Vec<VwSymbol>> {
             let name = comp_name.as_str().to_string();
             let key = format!("ent:{}", name.to_lowercase());
             if seen.insert(key) {
-                dependencies.push(VwSymbol::new(None, &name, SymbolKind::Entity));
+                dependencies.push(VwSymbol::new(
+                    None,
+                    &name,
+                    SymbolKind::Entity,
+                ));
             }
         }
     }
@@ -1035,7 +1043,11 @@ fn parse_provided_symbols(content: &str) -> Result<Vec<VwSymbol>> {
 
     for captures in package_re.captures_iter(content) {
         if let Some(package_name) = captures.get(1) {
-            symbols.push(VwSymbol::new(None, package_name.as_str(), SymbolKind::Package));
+            symbols.push(VwSymbol::new(
+                None,
+                package_name.as_str(),
+                SymbolKind::Package,
+            ));
         }
     }
 
@@ -1045,7 +1057,11 @@ fn parse_provided_symbols(content: &str) -> Result<Vec<VwSymbol>> {
 
     for captures in entity_re.captures_iter(content) {
         if let Some(entity_name) = captures.get(1) {
-            symbols.push(VwSymbol::new(None, entity_name.as_str(), SymbolKind::Entity));
+            symbols.push(VwSymbol::new(
+                None,
+                entity_name.as_str(),
+                SymbolKind::Entity,
+            ));
         }
     }
 
@@ -1537,7 +1553,9 @@ fn analyze_file(
 
     for symbol in file_finder.get_symbols() {
         match symbol.kind {
-            SymbolKind::Enum(_) | SymbolKind::Record(_) | SymbolKind::Constant => {
+            SymbolKind::Enum(_)
+            | SymbolKind::Record(_)
+            | SymbolKind::Constant(_) => {
                 let name = symbol.get_name().to_string();
                 processor.symbols.insert(name.clone(), symbol.clone());
                 processor.symbol_to_file.insert(name, file_str.clone());
