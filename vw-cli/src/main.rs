@@ -123,6 +123,12 @@ enum Commands {
             requires = "testbench"
         )]
         build_rust: bool,
+        #[arg(
+            long,
+            help = "Generate/regenerate mixed-signal scaffolding from mist.toml",
+            requires = "testbench"
+        )]
+        scaffold: bool,
     },
 }
 
@@ -350,6 +356,7 @@ async fn main() {
             ignore,
             runtime_flags,
             build_rust,
+            scaffold,
         } => {
             if list {
                 let bench_dir = cwd.join("bench");
@@ -361,14 +368,27 @@ async fn main() {
                         ignore_set.insert(ignore_pattern);
                     }
 
+                    let mist_configs =
+                        vw_lib::sim::find_mist_configs(&bench_dir)
+                            .unwrap_or_default();
+
                     match list_testbenches(&bench_dir, &ignore_set, recurse) {
                         Ok(testbenches) => {
-                            if testbenches.is_empty() {
+                            if testbenches.is_empty() && mist_configs.is_empty()
+                            {
                                 println!(
                                     "No testbenches found in bench directory"
                                 );
                             } else {
                                 println!("Available testbenches:");
+                                for (name, config) in &mist_configs {
+                                    println!(
+                                        "  {} - {} (mixed-signal: {})",
+                                        name.cyan(),
+                                        config.entity.bright_black(),
+                                        config.netlist.bright_black()
+                                    );
+                                }
                                 for tb in testbenches {
                                     println!(
                                         "  {} - {}",
@@ -396,19 +416,28 @@ async fn main() {
                     recurse,
                     &runtime_flags,
                     build_rust,
+                    scaffold,
                 )
                 .await
                 {
                     Ok(()) => {
-                        println!(
-                            "{} Testbench '{}' completed successfully!",
-                            "✓".bright_green(),
-                            testbench_name
-                        );
-                        println!(
-                            "Waveform saved to: {}",
-                            format!("{testbench_name}.fst").cyan()
-                        );
+                        if scaffold {
+                            println!(
+                                "{} Scaffolding generated for '{}'",
+                                "✓".bright_green(),
+                                testbench_name
+                            );
+                        } else {
+                            println!(
+                                "{} Testbench '{}' completed successfully!",
+                                "✓".bright_green(),
+                                testbench_name
+                            );
+                            println!(
+                                "Waveform saved to: {}",
+                                format!("{testbench_name}.fst").cyan()
+                            );
+                        }
                     }
                     Err(e) => {
                         eprintln!("{} {e}", "error:".bright_red());

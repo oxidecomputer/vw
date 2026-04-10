@@ -189,3 +189,47 @@ pub async fn run_nvc_sim(
         Ok(None)
     }
 }
+
+/// Run a mixed-signal co-simulation via NVC with a bridge library loaded.
+///
+/// Unlike `run_nvc_sim`, this sets `COCOTB_RUST_MODE=1` and does not
+/// generate FST waveform output (analog output comes from Xyce `.prn`).
+pub async fn run_nvc_cosim(
+    std: VhdlStandard,
+    build_dir: &str,
+    lib_name: &str,
+    entity_name: &str,
+    bridge_lib_path: &str,
+    capture_output: bool,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, VwError> {
+    let mut args = get_base_nvc_cmd_args(std, build_dir, lib_name);
+    args.push("-r".to_string());
+    args.push(entity_name.to_string());
+    args.push(format!("--load={bridge_lib_path}"));
+
+    let envs = vec![
+        ("GPI_USERS".to_string(), bridge_lib_path.to_string()),
+        ("COCOTB_RUST_MODE".to_string(), "1".to_string()),
+    ];
+
+    if capture_output {
+        let output = run_cmd_w_output(&args, Some(&envs)).await?;
+
+        if !output.status.success() {
+            let cmd_str = format!("nvc {}", args.join(" "));
+            std::io::stdout().write_all(&output.stdout)?;
+            std::io::stderr().write_all(&output.stderr)?;
+
+            return Err(VwError::NvcSimulation { command: cmd_str });
+        }
+        Ok(Some((output.stdout, output.stderr)))
+    } else {
+        let status = run_cmd(&args, Some(&envs)).await?;
+
+        if !status.success() {
+            let cmd_str = format!("nvc {}", args.join(" "));
+            return Err(VwError::NvcSimulation { command: cmd_str });
+        }
+        Ok(None)
+    }
+}

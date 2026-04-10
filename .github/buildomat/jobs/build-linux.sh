@@ -17,7 +17,7 @@ set -o errexit
 set -o pipefail
 set -o xtrace
 
-sudo apt-get install build-essential pkg-config libssl-dev -y
+sudo apt-get install build-essential pkg-config libssl-dev libfontconfig-dev -y
 
 cargo --version
 rustc --version
