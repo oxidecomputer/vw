@@ -27,7 +27,7 @@ use vhdl_lang::ast::{
     AnyDesignUnit, AnyPrimaryUnit, AnySecondaryUnit, ArchitectureBody,
     Attribute, AttributeDeclaration, AttributeSpecification,
     ComponentDeclaration, ConfigurationDeclaration, ContextDeclaration,
-    Declaration, DesignFile, EntityDeclaration, PackageBody,
+    Declaration, DesignFile, EntityDeclaration, ObjectDeclaration, PackageBody,
     PackageDeclaration, PackageInstantiation, SubprogramBody,
     SubprogramDeclaration, SubprogramInstantiation, TypeDeclaration,
 };
@@ -136,6 +136,14 @@ pub trait Visitor {
     fn visit_type_declaration(
         &mut self,
         decl: &TypeDeclaration,
+        unit: &AnyDesignUnit,
+    ) -> VisitorResult {
+        VisitorResult::Continue
+    }
+
+    fn visit_object_declaration(
+        &mut self,
+        decl: &ObjectDeclaration,
         unit: &AnyDesignUnit,
     ) -> VisitorResult {
         VisitorResult::Continue
@@ -319,6 +327,7 @@ fn walk_declaration<V: Visitor>(
             visitor.visit_type_declaration(type_decl, unit)
         }
         Declaration::Component(comp) => visitor.visit_component(comp, unit),
+        Declaration::Object(obj) => visitor.visit_object_declaration(obj, unit),
         Declaration::Attribute(attr) => match attr {
             Attribute::Declaration(decl) => {
                 visitor.visit_attribute_declaration(decl, unit)
