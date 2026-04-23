@@ -288,6 +288,9 @@ async fn build_bridge_library(
     };
     let crate_name = name.replace('-', "_");
     let lib_name = format!("lib{crate_name}.{ext}");
+    let mut bench_dir = bench_dir.to_path_buf();
+    // assume this is a workspace
+    bench_dir.pop();
     let lib_path = bench_dir.join("target").join("release").join(&lib_name);
 
     if !lib_path.exists() {
