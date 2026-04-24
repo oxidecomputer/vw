@@ -17,8 +17,11 @@ set -o errexit
 set -o pipefail
 set -o xtrace
 
+
 cargo --version
 rustc --version
+
+export PKG_CONFIG_PATH=/opt/ooce/lib/amd64/pkgconfig
 
 banner "check"
 cargo fmt -- --check

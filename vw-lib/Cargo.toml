@@ -28,3 +28,8 @@ quote = "1"
 proc-macro2 = "1"
 syn = "2"
 prettyplease = "0.2"
+plotters = { workspace = true, optional = true }
+
+[features]
+default = ["plot"]
+plot = ["plotters"]

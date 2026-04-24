@@ -47,6 +47,7 @@ use crate::visitor::walk_design_file;
 
 pub mod mapping;
 pub mod nvc_helpers;
+pub mod sim;
 pub mod visitor;
 
 const BUILD_DIR: &str = "vw_build";
@@ -66,6 +67,7 @@ pub enum VwError {
     NvcElab { command: String },
     NvcAnalysis { library: String, command: String },
     CodeGen { message: String },
+    Simulation { message: String },
     Io(std::io::Error),
     Serialization(toml::ser::Error),
     Deserialization(toml::de::Error),
@@ -122,6 +124,9 @@ impl fmt::Display for VwError {
             }
             VwError::CodeGen { message } => {
                 write!(f, "Code generation failed: {message}")
+            }
+            VwError::Simulation { message } => {
+                write!(f, "Simulation error: {message}")
             }
             VwError::Config { message } => {
                 write!(f, "Configuration error: {message}")
@@ -185,6 +190,8 @@ pub struct WorkspaceConfig {
     #[allow(dead_code)]
     pub workspace: WorkspaceInfo,
     pub dependencies: HashMap<String, Dependency>,
+    #[serde(default)]
+    pub tools: Option<ToolsConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -262,6 +269,60 @@ pub struct VhdlLsLibrary {
     pub exclude: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_third_party: Option<bool>,
+}
+
+// ============================================================================
+// Tool Configuration (workspace-wide [tools] section)
+// ============================================================================
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ToolsConfig {
+    #[serde(default)]
+    pub xyce: Option<XyceConfig>,
+    #[serde(default, rename = "rust-cosim")]
+    pub rust_cosim: Option<RustCosimConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct XyceConfig {
+    pub prefix: String,
+    #[serde(rename = "trilinos-prefix")]
+    pub trilinos_prefix: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RustCosimConfig {
+    pub path: String,
+}
+
+// ============================================================================
+// Mixed-Signal Configuration (per-bench mist.toml)
+// ============================================================================
+
+/// Configuration parsed from a per-bench `mist.toml` file.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MistConfig {
+    /// Path to Xyce netlist, relative to the bench directory.
+    pub netlist: String,
+    /// VHDL entity name to co-simulate.
+    pub entity: String,
+    /// Clock frequency in Hz.
+    pub clock: f64,
+    /// Number of cycles to prime the pipeline before recording.
+    #[serde(default, rename = "prime-cycles")]
+    pub prime_cycles: Option<u32>,
+    /// Port-to-DAC mappings.
+    #[serde(default)]
+    pub ports: HashMap<String, PortMapping>,
+}
+
+/// Maps a VHDL output port to a Xyce YDAC device.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PortMapping {
+    /// Xyce YDAC device name (e.g., "dac_sym_main").
+    pub dac: String,
+    /// Encoding type: "pam4" or "unsigned".
+    pub encoding: String,
 }
 
 // ============================================================================
@@ -391,6 +452,7 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
             version: "0.1.0".to_string(),
         },
         dependencies: HashMap::new(),
+        tools: None,
     };
 
     save_workspace_config(workspace_dir, &config)?;
@@ -583,6 +645,7 @@ pub async fn add_dependency_with_token(
                     version: "0.1.0".to_string(),
                 },
                 dependencies: HashMap::new(),
+                tools: None,
             }
         });
 
@@ -1232,7 +1295,39 @@ pub async fn run_testbench(
     recurse: bool,
     runtime_flags: &[String],
     build_rust: bool,
+    scaffold: bool,
 ) -> Result<()> {
+    // Check for mixed-signal test (mist.toml in bench/<name>/)
+    let bench_test_dir = workspace_dir.join("bench").join(&testbench_name);
+    let mist_toml = bench_test_dir.join("mist.toml");
+    if mist_toml.exists() {
+        let ws_config = load_workspace_config(workspace_dir)?;
+        let mist_content =
+            fs::read_to_string(&mist_toml).map_err(|e| VwError::Config {
+                message: format!("Failed to read mist.toml: {e}"),
+            })?;
+        let mist_config: MistConfig =
+            toml::from_str(&mist_content).map_err(|e| VwError::Config {
+                message: format!("Failed to parse mist.toml: {e}"),
+            })?;
+        if scaffold {
+            return sim::scaffold(
+                &bench_test_dir,
+                &mist_config,
+                &ws_config.tools,
+            );
+        }
+        return sim::run_analog_test(
+            workspace_dir,
+            &testbench_name,
+            &bench_test_dir,
+            &mist_config,
+            &ws_config.tools,
+            vhdl_std,
+        )
+        .await;
+    }
+
     let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
     let mut processor = RecordProcessor::new(vhdl_std);
     let mut cache = FileCache::new();
