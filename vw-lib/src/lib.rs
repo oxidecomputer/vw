@@ -836,7 +836,10 @@ pub fn format_deps_tcl(deps: &HashMap<String, Vec<PathBuf>>) -> String {
         if !vhdl_files.is_empty() {
             tcl_content.push_str(" \\\n");
             for (i, file) in vhdl_files.iter().enumerate() {
-                let path_str = file.to_string_lossy();
+                // Use forward slashes so Tcl doesn't treat Windows-style
+                // backslashes as escape sequences. Vivado accepts forward
+                // slashes on both platforms.
+                let path_str = file.to_string_lossy().replace('\\', "/");
                 tcl_content.push_str(&format!("    {path_str}"));
 
                 if i < vhdl_files.len() - 1 {
