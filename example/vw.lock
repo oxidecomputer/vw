@@ -2,5 +2,5 @@
 repo = "https://github.com/oxidecomputer/quartz"
 commit = "09a412a5746785ff467040c57328911fb4aeb0ed"
 src = "hdl/ip/vhd"
-path = "/home/ry/.vw/deps/quartz-09a412a5746785ff467040c57328911fb4aeb0ed"
+path = "quartz-09a412a5746785ff467040c57328911fb4aeb0ed"
 recursive = true
