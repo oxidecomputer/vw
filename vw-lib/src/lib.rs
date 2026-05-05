@@ -1861,7 +1861,10 @@ fn get_cached_entities<'a>(
 fn make_path_portable(path: PathBuf) -> PathBuf {
     if let Some(home_dir) = dirs::home_dir() {
         if let Ok(relative_path) = path.strip_prefix(&home_dir) {
-            return PathBuf::from("$HOME").join(relative_path);
+            let joined = PathBuf::from("$HOME").join(relative_path);
+            // Normalize to forward slashes so files written on Windows
+            // remain readable on Linux (and vice versa).
+            return PathBuf::from(joined.to_string_lossy().replace('\\', "/"));
         }
     }
     path
