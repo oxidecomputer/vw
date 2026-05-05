@@ -32,6 +32,8 @@ use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::{fmt, fs};
 
+use glob::Pattern;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use vhdl_lang::{VHDLParser, VHDLStandard};
@@ -43,6 +45,7 @@ use petgraph::{
 
 use crate::mapping::{FileData, SymbolKind, VwSymbol, VwSymbolFinder};
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
+use crate::sim::find_mist_configs;
 use crate::visitor::walk_design_file;
 
 pub mod mapping;
@@ -63,6 +66,7 @@ pub enum VwError {
     Git { message: String },
     FileSystem { message: String },
     Testbench { message: String },
+    TestGroup { message: String },
     NvcSimulation { command: String },
     NvcElab { command: String },
     NvcAnalysis { library: String, command: String },
@@ -143,6 +147,9 @@ impl fmt::Display for VwError {
             VwError::Testbench { message } => {
                 write!(f, "Testbench error: {message}")
             }
+            VwError::TestGroup { message } => {
+                write!(f, "Test group error: {message}")
+            }
             VwError::Io(e) => write!(f, "IO error: {e}"),
             VwError::Serialization(e) => write!(f, "Serialization error: {e}"),
             VwError::Deserialization(e) => {
@@ -192,6 +199,8 @@ pub struct WorkspaceConfig {
     pub dependencies: HashMap<String, Dependency>,
     #[serde(default)]
     pub tools: Option<ToolsConfig>,
+    #[serde(default, rename = "test-groups")]
+    pub test_groups: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -453,6 +462,7 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
         },
         dependencies: HashMap::new(),
         tools: None,
+        test_groups: HashMap::new(),
     };
 
     save_workspace_config(workspace_dir, &config)?;
@@ -646,6 +656,7 @@ pub async fn add_dependency_with_token(
                 },
                 dependencies: HashMap::new(),
                 tools: None,
+                test_groups: HashMap::new(),
             }
         });
 
@@ -1954,6 +1965,135 @@ pub fn deps_directory() -> Result<PathBuf> {
     })?;
 
     Ok(deps_dir)
+}
+
+/// Find all the tests that match the selectors and return a set of test names.
+///
+/// Selectors are config-grammar strings: `name:<glob>`, `path:<glob>`, or
+/// `group:<name>`. `group:` references are resolved recursively against
+/// `test_groups`. Each top-level selector must match at least one test or
+/// expand to at least one tb name; otherwise an error is returned.
+pub fn resolve_test_selection(
+    selectors: &[String],
+    workspace_dir: &Utf8Path,
+    test_groups: &HashMap<String, Vec<String>>,
+    ignore: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let bench_dir = workspace_dir.join("bench");
+    let mut all_tests: Vec<TestbenchInfo> =
+        list_testbenches(&bench_dir, ignore, true)?;
+    let mixed_sig_tbs = find_mist_configs(&bench_dir)?.into_iter().map(
+        |(name, _)| TestbenchInfo {
+            path: bench_dir.join(&name).into(),
+            name,
+        },
+    );
+    all_tests.extend(mixed_sig_tbs);
+
+    let mut selected: HashSet<String> = HashSet::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+    for selector in selectors {
+        resolve_one(
+            selector,
+            workspace_dir,
+            test_groups,
+            &all_tests,
+            &mut visiting,
+            &mut selected,
+        )?;
+    }
+    Ok(selected)
+}
+
+fn resolve_one(
+    selector: &str,
+    workspace_dir: &Utf8Path,
+    test_groups: &HashMap<String, Vec<String>>,
+    tests: &[TestbenchInfo],
+    visiting: &mut HashSet<String>,
+    selected: &mut HashSet<String>,
+) -> Result<()> {
+    let (kind, rest) =
+        selector.split_once(':').ok_or_else(|| VwError::TestGroup {
+            message: format!(
+                "selector '{selector}' must start with `name:`, `path:`, or `group:`"
+            ),
+        })?;
+
+    match kind {
+        "group" => {
+            if !visiting.insert(rest.to_string()) {
+                return Err(VwError::TestGroup {
+                    message: format!(
+                        "circular reference to test group '{rest}'"
+                    ),
+                });
+            }
+            let entries =
+                test_groups.get(rest).ok_or_else(|| VwError::TestGroup {
+                    message: format!(
+                        "test group '{rest}' not found in vw.toml"
+                    ),
+                })?;
+            for entry in entries {
+                resolve_one(
+                    entry,
+                    workspace_dir,
+                    test_groups,
+                    tests,
+                    visiting,
+                    selected,
+                )?;
+            }
+            visiting.remove(rest);
+            Ok(())
+        }
+        "name" => match_pattern(selector, rest, tests, selected, |t, p| {
+            p.matches(&t.name)
+        }),
+        "path" => {
+            let workspace_std = workspace_dir.as_std_path();
+            match_pattern(selector, rest, tests, selected, |t, p| {
+                let rel = t
+                    .path
+                    .strip_prefix(workspace_std)
+                    .unwrap_or(&t.path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                p.matches(&rel)
+            })
+        }
+        _ => Err(VwError::TestGroup {
+            message: format!(
+                "unknown selector kind '{kind}:' in '{selector}'"
+            ),
+        }),
+    }
+}
+
+fn match_pattern(
+    selector: &str,
+    glob_str: &str,
+    tests: &[TestbenchInfo],
+    selected: &mut HashSet<String>,
+    is_match: impl Fn(&TestbenchInfo, &Pattern) -> bool,
+) -> Result<()> {
+    let pattern = Pattern::new(glob_str).map_err(|e| VwError::TestGroup {
+        message: format!("invalid glob pattern '{glob_str}': {e}"),
+    })?;
+    let mut matched = false;
+    for test in tests {
+        if is_match(test, &pattern) {
+            selected.insert(test.name.clone());
+            matched = true;
+        }
+    }
+    if !matched {
+        return Err(VwError::TestGroup {
+            message: format!("selector '{selector}' matched no tests"),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve a path stored in `vw.lock` against the local dependency cache.
