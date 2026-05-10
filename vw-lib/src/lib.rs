@@ -1216,19 +1216,7 @@ pub async fn analyze_ext_libraries(
         let mut deps = Vec::new();
         if let Some(library) = vhdl_ls_config.libraries.get(lib_name) {
             for file_path in &library.files {
-                let expanded = if file_path.starts_with("$HOME") {
-                    if let Some(home) = dirs::home_dir() {
-                        home.join(
-                            file_path
-                                .strip_prefix("$HOME/")
-                                .unwrap_or(file_path),
-                        )
-                    } else {
-                        PathBuf::from(file_path)
-                    }
-                } else {
-                    PathBuf::from(file_path)
-                };
+                let expanded = expand_home_token(file_path);
                 if let Ok(contents) = fs::read_to_string(&expanded) {
                     for line in contents.lines() {
                         let trimmed = line.trim().to_lowercase();
@@ -1296,21 +1284,7 @@ pub async fn analyze_ext_libraries(
 
             let mut files = Vec::new();
             for file_path in &library.files {
-                // Convert $HOME paths to absolute paths
-                let expanded_path = if file_path.starts_with("$HOME") {
-                    let home_dir = dirs::home_dir().ok_or_else(|| {
-                        VwError::FileSystem {
-                            message: "Could not determine home directory"
-                                .to_string(),
-                        }
-                    })?;
-                    home_dir.join(
-                        file_path.strip_prefix("$HOME/").unwrap_or(file_path),
-                    )
-                } else {
-                    PathBuf::from(file_path)
-                };
-                files.push(expanded_path);
+                files.push(expand_home_token(file_path));
             }
 
             // Sort files in dependency order (dependencies first)
@@ -1858,13 +1832,35 @@ fn get_cached_entities<'a>(
     }
 }
 
+/// Token used in vhdl_ls.toml paths to refer to the user's home directory.
+///
+/// vhdl_ls performs platform-specific environment-variable substitution: on
+/// Unix it expands `$VAR`, on Windows it expands `%VAR%`. `$HOME` is not set
+/// on Windows, so we emit `%UserProfile%` there.
+#[cfg(windows)]
+const HOME_VAR_TOKEN: &str = "%UserProfile%";
+#[cfg(not(windows))]
+const HOME_VAR_TOKEN: &str = "$HOME";
+
 fn make_path_portable(path: PathBuf) -> PathBuf {
     if let Some(home_dir) = dirs::home_dir() {
         if let Ok(relative_path) = path.strip_prefix(&home_dir) {
-            return PathBuf::from("$HOME").join(relative_path);
+            return PathBuf::from(HOME_VAR_TOKEN).join(relative_path);
         }
     }
     path
+}
+
+/// Expand the `HOME_VAR_TOKEN` prefix in a vhdl_ls.toml path back to an
+/// absolute path under the user's home directory. Paths without the token
+/// are returned unchanged.
+fn expand_home_token(file_path: &Path) -> PathBuf {
+    if let Ok(rest) = file_path.strip_prefix(HOME_VAR_TOKEN) {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    file_path.to_path_buf()
 }
 
 fn extract_repo_name(repo_url: &str) -> String {
