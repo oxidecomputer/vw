@@ -483,8 +483,7 @@ async fn main() {
                     }
                 }
             } else if !groups.is_empty() {
-                let ignore_set: HashSet<String> =
-                    ignore.into_iter().collect();
+                let ignore_set: HashSet<String> = ignore.into_iter().collect();
                 let selectors: Vec<String> =
                     groups.iter().map(|g| format!("group:{g}")).collect();
                 let test_names = match resolve_test_selection(

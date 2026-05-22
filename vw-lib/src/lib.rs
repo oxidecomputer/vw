@@ -1982,12 +1982,13 @@ pub fn resolve_test_selection(
     let bench_dir = workspace_dir.join("bench");
     let mut all_tests: Vec<TestbenchInfo> =
         list_testbenches(&bench_dir, ignore, true)?;
-    let mixed_sig_tbs = find_mist_configs(&bench_dir)?.into_iter().map(
-        |(name, _)| TestbenchInfo {
-            path: bench_dir.join(&name).into(),
-            name,
-        },
-    );
+    let mixed_sig_tbs =
+        find_mist_configs(&bench_dir)?.into_iter().map(|(name, _)| {
+            TestbenchInfo {
+                path: bench_dir.join(&name).into(),
+                name,
+            }
+        });
     all_tests.extend(mixed_sig_tbs);
 
     let mut selected: HashSet<String> = HashSet::new();
@@ -2064,9 +2065,7 @@ fn resolve_one(
             })
         }
         _ => Err(VwError::TestGroup {
-            message: format!(
-                "unknown selector kind '{kind}:' in '{selector}'"
-            ),
+            message: format!("unknown selector kind '{kind}:' in '{selector}'"),
         }),
     }
 }
