@@ -92,3 +92,24 @@ project/
 ├── vw.toml
 └── vhdl_ls.toml
 ```
+
+## htcl language stack
+
+`vw-htcl` (winnow parser, AST, analysis) is the source of truth for
+htcl semantics. It feeds `vw run` (interpreter front-end driving an
+EDA backend), `vw analyzer` (LSP), and eventually `vw repl`.
+
+There is a sibling tree-sitter grammar at
+`~/src/tree-sitter-htcl` (repo:
+https://github.com/oxidecomputer/tree-sitter-htcl) used by editors
+for syntax highlighting. **Both must stay in sync.** When changing
+the htcl grammar in `vw-htcl/src/parser.rs` or `ast.rs`:
+
+- Update `~/src/tree-sitter-htcl/grammar.js` to match.
+- Update or add corpus tests in `~/src/tree-sitter-htcl/test/corpus/`.
+- Update `~/src/tree-sitter-htcl/queries/highlights.scm` if new node
+  types deserve distinct highlighting.
+- Run `tree-sitter generate && tree-sitter test` in that repo.
+
+The sync contract (vw-htcl leads, divergences are documented) is
+written up in `~/src/tree-sitter-htcl/README.md`.

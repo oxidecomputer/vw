@@ -2,13 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
 use std::collections::HashSet;
 use std::fmt;
 use std::process;
 
+use vw_eda::EdaBackend;
 use vw_lib::{
     add_dependency_with_token, clear_cache, extract_hostname_from_repo_url,
     generate_deps_tcl, get_access_credentials_from_netrc, init_workspace,
@@ -130,6 +131,67 @@ enum Commands {
         )]
         scaffold: bool,
     },
+    #[command(about = "Run an htcl script against a Vivado worker")]
+    Run {
+        #[arg(help = "Path to an .htcl source file")]
+        file: Utf8PathBuf,
+        #[arg(
+            long,
+            help = "Parse and print diagnostics only; don't launch Vivado"
+        )]
+        check: bool,
+        #[arg(
+            short,
+            long,
+            help = "Forward Vivado's banner and info messages to stderr"
+        )]
+        verbose: bool,
+    },
+    #[command(about = "Launch the vw analyzer LSP server on stdio")]
+    Analyzer,
+    #[command(
+        about = "Parse and run analysis on htcl files without executing them"
+    )]
+    Check {
+        #[arg(required = true, help = "One or more .htcl source files")]
+        files: Vec<Utf8PathBuf>,
+    },
+    #[command(subcommand, about = "IP-XACT tooling")]
+    Ip(IpCommand),
+}
+
+#[derive(Subcommand)]
+enum IpCommand {
+    #[command(about = "Generate an htcl wrapper from an IP-XACT component")]
+    Generate {
+        #[arg(help = "Path to an IP-XACT component XML file")]
+        input: Utf8PathBuf,
+        #[arg(short, long, help = "Output file (defaults to stdout)")]
+        output: Option<Utf8PathBuf>,
+        #[arg(
+            long,
+            help = "Include parameters whose resolve attribute is not 'user'"
+        )]
+        include_internal: bool,
+        #[arg(
+            long = "preset",
+            value_name = "FILE",
+            help = "Supplementary Vivado preset XML file (`<preset param=... \
+                    name=...\\>` format). May be given multiple times. The \
+                    declared values are merged into `@enum(...)` lists in the \
+                    generated wrapper, on top of the IP-XACT `<choice>` \
+                    entries."
+        )]
+        presets: Vec<Utf8PathBuf>,
+        #[arg(
+            long,
+            help = "Skip auto-discovery of preset files under the Vivado \
+                    `data/versal/ps_pmc/<ip-name>/` tree. Use this if the \
+                    discovered files are wrong or you only want the explicit \
+                    `--preset` ones."
+        )]
+        no_auto_presets: bool,
+    },
 }
 
 /// Helper function to get access credentials for a repository URL from netrc if available
@@ -151,9 +213,8 @@ async fn get_access_credentials_for_workspace(
     // Load workspace config and check if any dependencies might need authentication
     if let Ok(config) = load_workspace_config(workspace_dir) {
         for dep in config.dependencies.values() {
-            if let Some(creds) =
-                get_access_credentials_for_repo(&dep.repo).await
-            {
+            let Some(repo) = dep.repo() else { continue };
+            if let Some(creds) = get_access_credentials_for_repo(repo).await {
                 return Some(creds);
             }
         }
@@ -319,13 +380,14 @@ async fn main() {
                             VersionInfo::Locked { commit } => {
                                 format!(" ({})", &commit[..8.min(commit.len())])
                             }
+                            VersionInfo::Local => " (local)".to_string(),
                             VersionInfo::Unknown => String::new(),
                         };
 
                         println!(
                             "  {} - {}{}",
                             dep.name.cyan(),
-                            dep.repo,
+                            dep.source,
                             version_info.bright_black()
                         );
                     }
@@ -452,5 +514,364 @@ async fn main() {
                 process::exit(1);
             }
         }
+        Commands::Run {
+            file,
+            check,
+            verbose,
+        } => {
+            if let Err(e) = run_htcl(&file, check, verbose).await {
+                eprintln!("{} {e}", "error:".bright_red());
+                process::exit(1);
+            }
+        }
+        Commands::Analyzer => {
+            init_analyzer_logging();
+            vw_analyzer::run_stdio().await;
+        }
+        Commands::Check { files } => {
+            let mut had_errors = false;
+            for file in &files {
+                match check_htcl(file).await {
+                    Ok(file_errs) => {
+                        if file_errs {
+                            had_errors = true;
+                        }
+                    }
+                    Err(e) => {
+                        had_errors = true;
+                        eprintln!("{} {file}: {e}", "error:".bright_red());
+                    }
+                }
+            }
+            if had_errors {
+                process::exit(1);
+            }
+        }
+        Commands::Ip(cmd) => match cmd {
+            IpCommand::Generate {
+                input,
+                output,
+                include_internal,
+                presets,
+                no_auto_presets,
+            } => {
+                if let Err(e) = run_ip_generate(
+                    &input,
+                    output.as_deref(),
+                    include_internal,
+                    &presets,
+                    no_auto_presets,
+                ) {
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
+            }
+        },
     }
+}
+
+fn run_ip_generate(
+    input: &Utf8Path,
+    output: Option<&Utf8Path>,
+    include_internal: bool,
+    explicit_presets: &[Utf8PathBuf],
+    no_auto_presets: bool,
+) -> Result<(), String> {
+    let component =
+        vw_ip::load(input).map_err(|e| format!("loading {input}: {e}"))?;
+
+    // Combine explicit `--preset` files with what we can auto-discover
+    // under Vivado's `data/versal/ps_pmc/<ip>/` tree.
+    let mut preset_paths: Vec<std::path::PathBuf> = explicit_presets
+        .iter()
+        .map(|p| std::path::PathBuf::from(p.as_str()))
+        .collect();
+    if !no_auto_presets {
+        let discovered =
+            vw_ip::discover_presets(std::path::Path::new(input.as_str()));
+        for p in discovered {
+            if !preset_paths.contains(&p) {
+                preset_paths.push(p);
+            }
+        }
+    }
+    for p in &preset_paths {
+        eprintln!("{:>12} {}", "Sourcing".bright_green().bold(), p.display());
+    }
+    let presets = if preset_paths.is_empty() {
+        vw_ip::PresetMap::new()
+    } else {
+        vw_ip::load_presets(&preset_paths)
+            .map_err(|e| format!("loading presets: {e}"))?
+    };
+
+    let opts = vw_ip::GenerateOptions {
+        user_configurable_only: !include_internal,
+        ..Default::default()
+    };
+    let text = vw_ip::generate(&component, &presets, &opts);
+    match output {
+        Some(path) => std::fs::write(path, &text)
+            .map_err(|e| format!("writing {path}: {e}"))?,
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+/// Read `entry` and recursively resolve its `src` imports. Looks for
+/// a `vw.toml` in the entry file's parent chain to discover the
+/// workspace; falls back to an empty resolver (so relative/absolute
+/// imports still work, but `@name/` imports fail with a clear error)
+/// when no workspace is found.
+///
+/// A [`CliObserver`] is attached so the loader's progress prints in
+/// real time as `Sourcing …` / `Checking …` lines.
+fn load_htcl_program(
+    entry: &Utf8Path,
+) -> Result<vw_htcl::LoadedProgram, Box<dyn std::error::Error>> {
+    let entry_path = std::path::Path::new(entry.as_str());
+    let workspace_dir = find_workspace_dir(entry);
+    let mut resolver = vw_htcl::Resolver::new();
+    if let Some(ws) = workspace_dir.as_deref() {
+        if let Ok(paths) = vw_lib::dep_cache_paths(ws) {
+            for (name, path) in paths {
+                resolver = resolver.with_dep(name, path);
+            }
+        }
+    }
+    let mut observer = CliObserver;
+    Ok(vw_htcl::load_program_with_observer(
+        entry_path,
+        &resolver,
+        &mut observer,
+    )?)
+}
+
+/// Prints Cargo-style `Sourcing …` and `Checking …` lines as the
+/// loader walks the dependency tree.
+struct CliObserver;
+
+impl vw_htcl::LoadObserver for CliObserver {
+    fn on_source(&mut self, raw: &str) {
+        println!(
+            "{:>12} {}",
+            "Sourcing".bright_green().bold(),
+            friendly_import(raw)
+        );
+    }
+    fn on_parsed(&mut self, file: &std::path::Path, raw: Option<&str>) {
+        let label = match raw {
+            Some(r) => friendly_import(r),
+            None => file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string(),
+        };
+        println!("{:>12} {}", "Checking".bright_green().bold(), label);
+    }
+}
+
+/// Trim the `@` prefix and any trailing `.htcl` from an import path
+/// so the CLI shows `amd-htcl/cpm5` rather than `@amd-htcl/cpm5.htcl`
+/// or a long filesystem path.
+fn friendly_import(raw: &str) -> String {
+    raw.trim_start_matches('@')
+        .trim_end_matches(".htcl")
+        .to_string()
+}
+
+/// Walk up from `start`'s parent directory looking for a `vw.toml`.
+fn find_workspace_dir(start: &Utf8Path) -> Option<Utf8PathBuf> {
+    let mut cur = start.parent()?.to_path_buf();
+    loop {
+        if cur.join("vw.toml").exists() {
+            return Some(cur);
+        }
+        cur = cur.parent()?.to_path_buf();
+    }
+}
+
+fn init_analyzer_logging() {
+    // Silent by default — see the matching note in vw-analyzer's main.
+    let filter = tracing_subscriber::EnvFilter::try_from_env("VW_ANALYZER_LOG")
+        .unwrap_or_else(|_| "vw_analyzer=off".into());
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .try_init();
+}
+
+/// Run parse + signature validation on `file`. Returns `Ok(true)`
+/// if any error-severity diagnostics were reported, `Ok(false)` for
+/// clean. Warnings don't flip the return value but still print.
+async fn check_htcl(
+    file: &camino::Utf8Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let program = load_htcl_program(file)?;
+    let parsed = vw_htcl::parse(&program.source);
+    let validator_diags = vw_htcl::validate(&parsed.document, &program.source);
+
+    // Build a per-file `LineIndex` lazily so we only pay for files
+    // that actually have diagnostics. Keyed by `file_index`.
+    let cwd_owned = std::env::current_dir().ok();
+    let cwd = cwd_owned.as_deref();
+    let mut indices: std::collections::HashMap<usize, vw_htcl::LineIndex> =
+        std::collections::HashMap::new();
+
+    let mut error_count = 0usize;
+    let mut warning_count = 0usize;
+    let mut emit = |severity: Option<vw_htcl::Severity>,
+                    message: &str,
+                    span: vw_htcl::Span| {
+        let level = match severity {
+            None | Some(vw_htcl::Severity::Error) => {
+                error_count += 1;
+                "error:".bright_red()
+            }
+            Some(vw_htcl::Severity::Warning) => {
+                warning_count += 1;
+                "warning:".bright_yellow()
+            }
+        };
+        // Map the span back to its originating file's line/col so the
+        // displayed location is the file the user actually wrote — not
+        // the flat dependency-concatenated source the loader produced.
+        let (display_path, line, col) = match program.locate_span(span) {
+            Some((idx, file_span)) => {
+                let loaded = &program.files[idx];
+                let index = indices
+                    .entry(idx)
+                    .or_insert_with(|| vw_htcl::LineIndex::new(&loaded.source));
+                let (start, _) = index.range(file_span);
+                (
+                    render_path(&loaded.path, cwd),
+                    start.line + 1,
+                    start.character + 1,
+                )
+            }
+            None => (file.to_string(), 0, 0),
+        };
+        eprintln!("{} {display_path}:{line}:{col}: {message}", level);
+    };
+
+    for err in &parsed.errors {
+        emit(None, &err.message, err.span);
+    }
+    for d in &validator_diags {
+        emit(Some(d.severity), &d.message, d.span);
+    }
+
+    if error_count > 0 || warning_count > 0 {
+        eprintln!("{file}: {error_count} error(s), {warning_count} warning(s)");
+    }
+    Ok(error_count > 0)
+}
+
+/// Render `path` relative to `cwd` when it sits underneath, otherwise
+/// fall back to the absolute path. Keeps diagnostic locations short
+/// and click-through-able in editors / terminals.
+fn render_path(
+    path: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+) -> String {
+    if let Some(cwd) = cwd {
+        if let Ok(rel) = path.strip_prefix(cwd) {
+            return rel.display().to_string();
+        }
+    }
+    path.display().to_string()
+}
+
+async fn run_htcl(
+    file: &camino::Utf8Path,
+    check_only: bool,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let program = load_htcl_program(file)?;
+    let source = program.source;
+    let parsed = vw_htcl::parse(&source);
+    let line_index = vw_htcl::LineIndex::new(&source);
+
+    let mut had_errors = false;
+    for err in &parsed.errors {
+        had_errors = true;
+        let (start, _end) = line_index.range(err.span);
+        eprintln!(
+            "{} {}:{}:{}: {}",
+            "error:".bright_red(),
+            file,
+            start.line + 1,
+            start.character + 1,
+            err.message
+        );
+    }
+    if had_errors {
+        return Err(format!(
+            "{} parse error(s); aborting",
+            parsed.errors.len()
+        )
+        .into());
+    }
+
+    if check_only {
+        let cmd_count = parsed
+            .document
+            .stmts
+            .iter()
+            .filter(|s| matches!(s, vw_htcl::Stmt::Command(_)))
+            .count();
+        println!(
+            "{} {file}: parsed OK ({cmd_count} command(s))",
+            "✓".bright_green()
+        );
+        return Ok(());
+    }
+
+    let mut backend =
+        vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
+            verbose,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("failed to start Vivado worker: {e}"))?;
+    // Stream user puts output as it's produced rather than buffering
+    // until each eval completes — necessary for long-running commands
+    // like `synth_design` where the user wants to see progress live.
+    backend.set_stdout_sink(|chunk: &str| {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(chunk.as_bytes());
+        let _ = out.flush();
+    });
+
+    // Lower structured proc declarations and call sites to plain Tcl
+    // before sending. Generic commands pass through unchanged.
+    let table = vw_htcl::signature_table(&parsed.document);
+    for stmt in &parsed.document.stmts {
+        let vw_htcl::Stmt::Command(cmd) = stmt else {
+            continue;
+        };
+        let tcl = vw_htcl::lower_command(cmd, &source, &table);
+        match backend.eval(&tcl).await {
+            Ok(out) => {
+                // Puts output already streamed to stdout via the
+                // sink; `out.stdout` is empty here by contract. The
+                // eval's return value gets a newline only when it's
+                // not already empty.
+                if !out.value.is_empty() {
+                    println!("{}", out.value);
+                }
+            }
+            Err(vw_eda::BackendError::Tcl { message, .. }) => {
+                eprintln!("{} {message}", "vivado:".bright_red());
+            }
+            Err(e) => {
+                eprintln!("{} {e}", "vivado:".bright_red());
+            }
+        }
+    }
+    let _ = backend.shutdown().await;
+    Ok(())
 }

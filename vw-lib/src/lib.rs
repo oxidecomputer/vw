@@ -202,13 +202,36 @@ pub struct WorkspaceInfo {
     pub version: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+/// How a workspace dependency identifies its source. Currently a git
+/// repo or a local filesystem path; the natural future addition is a
+/// registry-resolved variant (`Registry { name, version }`) once a
+/// crates.io-like index exists.
+///
+/// `#[serde(untagged)]` keeps the `vw.toml` ergonomics that came
+/// before: an entry with `repo = "..."` reads as `Git`, an entry with
+/// `path = "..."` reads as `Path`. New variants need new
+/// non-ambiguous required keys for serde to discriminate cleanly.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DependencySource {
+    Git {
+        repo: String,
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default)]
+        commit: Option<String>,
+        #[serde(default)]
+        submodules: bool,
+    },
+    Path {
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Dependency {
-    pub repo: String,
-    #[serde(default)]
-    pub branch: Option<String>,
-    #[serde(default)]
-    pub commit: Option<String>,
+    #[serde(flatten)]
+    pub source: DependencySource,
     #[serde(default)]
     pub src: Vec<String>,
     #[serde(default)]
@@ -216,9 +239,49 @@ pub struct Dependency {
     #[serde(default)]
     pub sim_only: bool,
     #[serde(default)]
-    pub submodules: bool,
-    #[serde(default)]
     pub exclude: Vec<String>,
+}
+
+impl Dependency {
+    pub fn is_local(&self) -> bool {
+        matches!(self.source, DependencySource::Path { .. })
+    }
+
+    /// Git-only accessor: the upstream repo URL.
+    pub fn repo(&self) -> Option<&str> {
+        match &self.source {
+            DependencySource::Git { repo, .. } => Some(repo),
+            DependencySource::Path { .. } => None,
+        }
+    }
+
+    pub fn branch(&self) -> Option<&str> {
+        match &self.source {
+            DependencySource::Git { branch, .. } => branch.as_deref(),
+            DependencySource::Path { .. } => None,
+        }
+    }
+
+    pub fn commit(&self) -> Option<&str> {
+        match &self.source {
+            DependencySource::Git { commit, .. } => commit.as_deref(),
+            DependencySource::Path { .. } => None,
+        }
+    }
+
+    pub fn submodules(&self) -> bool {
+        match &self.source {
+            DependencySource::Git { submodules, .. } => *submodules,
+            DependencySource::Path { .. } => false,
+        }
+    }
+
+    pub fn local_path(&self) -> Option<&Path> {
+        match &self.source {
+            DependencySource::Path { path } => Some(path.as_path()),
+            DependencySource::Git { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -503,75 +566,102 @@ pub async fn update_workspace_with_token(
     let mut update_info = Vec::new();
 
     for (name, dep) in &config.dependencies {
-        // Use credentials passed from caller
         let creds = credentials
             .as_ref()
             .map(|c| (c.username.as_str(), c.password.as_str()));
 
-        let commit_sha = resolve_dependency_commit(
-            &dep.repo,
-            &dep.branch,
-            &dep.commit,
-            creds,
-        )
-        .await
-        .map_err(|e| VwError::Dependency {
-            message: format!(
-                "Failed to resolve commit for dependency '{name}': {e}"
-            ),
-        })?;
+        // Decide the on-disk location for this dep: cache directory
+        // for git deps (downloaded if missing), or the declared
+        // filesystem path for local deps. Local deps don't get a lock
+        // entry — there's no commit to pin.
+        let dep_path = match &dep.source {
+            DependencySource::Git {
+                repo,
+                branch,
+                commit,
+                submodules,
+            } => {
+                let commit_sha =
+                    resolve_dependency_commit(repo, branch, commit, creds)
+                        .await
+                        .map_err(|e| VwError::Dependency {
+                            message: format!(
+                        "Failed to resolve commit for dependency '{name}': {e}"
+                    ),
+                        })?;
+                let dep_path = deps_dir.join(format!("{name}-{commit_sha}"));
+                let was_cached = dep_path.exists();
+                if !was_cached {
+                    download_dependency(
+                        repo,
+                        &commit_sha,
+                        &dep.src,
+                        &dep_path,
+                        dep.recursive,
+                        &dep.exclude,
+                        *submodules,
+                        creds,
+                    )
+                    .await
+                    .map_err(|e| VwError::Dependency {
+                        message: format!(
+                            "Failed to download dependency '{name}': {e}"
+                        ),
+                    })?;
+                }
+                update_info.push(DependencyUpdateInfo {
+                    name: name.clone(),
+                    commit: commit_sha.clone(),
+                    was_cached,
+                });
+                lock_file.dependencies.insert(
+                    name.clone(),
+                    LockedDependency {
+                        repo: repo.clone(),
+                        commit: commit_sha.clone(),
+                        src: dep.src.clone(),
+                        path: PathBuf::from(format!("{name}-{commit_sha}")),
+                        recursive: dep.recursive,
+                        sim_only: dep.sim_only,
+                        submodules: *submodules,
+                        exclude: dep.exclude.clone(),
+                    },
+                );
+                dep_path
+            }
+            DependencySource::Path { path } => {
+                if !path.exists() {
+                    return Err(VwError::Dependency {
+                        message: format!(
+                            "Local dependency '{name}' path does not exist: {}",
+                            path.display()
+                        ),
+                    });
+                }
+                update_info.push(DependencyUpdateInfo {
+                    name: name.clone(),
+                    commit: "local".into(),
+                    was_cached: true,
+                });
+                path.clone()
+            }
+        };
 
-        let dep_path = deps_dir.join(format!("{name}-{commit_sha}"));
-
-        let was_cached = dep_path.exists();
-
-        if !was_cached {
-            download_dependency(
-                &dep.repo,
-                &commit_sha,
-                &dep.src,
-                &dep_path,
-                dep.recursive,
-                &dep.exclude,
-                dep.submodules,
-                creds,
-            )
-            .await
-            .map_err(|e| VwError::Dependency {
-                message: format!("Failed to download dependency '{name}': {e}"),
-            })?;
-        }
-
-        update_info.push(DependencyUpdateInfo {
-            name: name.clone(),
-            commit: commit_sha.clone(),
-            was_cached,
-        });
-
-        lock_file.dependencies.insert(
-            name.clone(),
-            LockedDependency {
-                repo: dep.repo.clone(),
-                commit: commit_sha.clone(),
-                src: dep.src.clone(),
-                path: PathBuf::from(format!("{name}-{commit_sha}")),
-                recursive: dep.recursive,
-                sim_only: dep.sim_only,
-                submodules: dep.submodules,
-                exclude: dep.exclude.clone(),
-            },
-        );
-
-        // Find VHDL files in the cached dependency directory
+        // VHDL libraries: same treatment regardless of source. Local
+        // deps' file paths are kept absolute (they aren't relative to
+        // the per-user cache); git deps stay portable.
         let vhdl_files =
             find_vhdl_files(&dep_path, dep.recursive, &dep.exclude)?;
         if !vhdl_files.is_empty() {
-            let portable_files =
-                vhdl_files.into_iter().map(make_path_portable).collect();
+            let files = if dep.is_local() {
+                vhdl_files
+            } else {
+                vhdl_files.into_iter().map(make_path_portable).collect()
+            };
             vhdl_ls_config.libraries.insert(
                 name.clone(),
                 VhdlLsLibrary {
-                    files: portable_files,
+                    files,
                     exclude: None,
                     is_third_party: None,
                 },
@@ -660,13 +750,15 @@ pub async fn add_dependency_with_token(
     let src_paths = vec![src.unwrap_or_else(|| ".".to_string())];
 
     let dependency = Dependency {
-        repo: repo.clone(),
-        branch,
-        commit,
+        source: DependencySource::Git {
+            repo: repo.clone(),
+            branch,
+            commit,
+            submodules: false,
+        },
         src: src_paths,
         recursive,
         sim_only,
-        submodules: false,
         exclude: Vec::new(),
     };
 
@@ -735,42 +827,42 @@ pub fn list_dependencies(
 
     let mut deps = Vec::new();
     for (name, dep) in &config.dependencies {
-        let version_info = match &lock_file {
-            Some(lock) => {
-                if let Some(locked_dep) = lock.dependencies.get(name) {
-                    VersionInfo::Locked {
-                        commit: locked_dep.commit.clone(),
-                    }
-                } else {
-                    // Not yet resolved, show branch/commit from config
-                    match (&dep.branch, &dep.commit) {
-                        (Some(branch), None) => VersionInfo::Branch {
-                            branch: branch.clone(),
-                        },
-                        (None, Some(commit)) => VersionInfo::Commit {
-                            commit: commit.clone(),
-                        },
-                        _ => VersionInfo::Unknown,
-                    }
-                }
+        let (source_label, version_info) = match &dep.source {
+            DependencySource::Path { path } => {
+                (path.display().to_string(), VersionInfo::Local)
             }
-            None => {
-                // No lock file, show branch/commit from config
-                match (&dep.branch, &dep.commit) {
-                    (Some(branch), None) => VersionInfo::Branch {
-                        branch: branch.clone(),
+            DependencySource::Git {
+                repo,
+                branch,
+                commit,
+                ..
+            } => {
+                let from_config =
+                    || match (branch.as_deref(), commit.as_deref()) {
+                        (Some(b), None) => {
+                            VersionInfo::Branch { branch: b.into() }
+                        }
+                        (None, Some(c)) => {
+                            VersionInfo::Commit { commit: c.into() }
+                        }
+                        _ => VersionInfo::Unknown,
+                    };
+                let version = match &lock_file {
+                    Some(lock) => match lock.dependencies.get(name) {
+                        Some(locked_dep) => VersionInfo::Locked {
+                            commit: locked_dep.commit.clone(),
+                        },
+                        None => from_config(),
                     },
-                    (None, Some(commit)) => VersionInfo::Commit {
-                        commit: commit.clone(),
-                    },
-                    _ => VersionInfo::Unknown,
-                }
+                    None => from_config(),
+                };
+                (repo.clone(), version)
             }
         };
 
         deps.push(DependencyInfo {
             name: name.clone(),
-            repo: dep.repo.clone(),
+            source: source_label,
             version: version_info,
         });
     }
@@ -781,15 +873,25 @@ pub fn list_dependencies(
 #[derive(Debug, Clone)]
 pub struct DependencyInfo {
     pub name: String,
-    pub repo: String,
+    /// User-facing source description: the repo URL for git deps,
+    /// the local path for path deps.
+    pub source: String,
     pub version: VersionInfo,
 }
 
 #[derive(Debug, Clone)]
 pub enum VersionInfo {
-    Branch { branch: String },
-    Commit { commit: String },
-    Locked { commit: String },
+    Branch {
+        branch: String,
+    },
+    Commit {
+        commit: String,
+    },
+    Locked {
+        commit: String,
+    },
+    /// Local filesystem dependency — no commit to pin.
+    Local,
     Unknown,
 }
 
@@ -1962,6 +2064,46 @@ pub fn deps_directory() -> Result<PathBuf> {
 /// per-user `$HOME/.vw/deps` directory) so the file is identical across
 /// machines. Absolute paths are returned unchanged to remain compatible
 /// with lock files written by older versions of vw.
+/// Build a `name → absolute cache path` map for every dependency in
+/// the workspace's `vw.lock`. Used by htcl's `src @name/...` resolver
+/// in `vw-htcl::src_path::Resolver` so the language-layer crate stays
+/// free of workspace / lockfile concerns.
+///
+/// Returns an empty map (not an error) if the workspace has no
+/// `vw.lock` yet — relative and absolute `src` imports still work
+/// against an empty resolver, only `@name/` lookups fail.
+pub fn dep_cache_paths(
+    workspace_dir: &Utf8Path,
+) -> Result<HashMap<String, PathBuf>> {
+    let mut out = HashMap::new();
+
+    // Local deps live wherever `vw.toml` says; they don't need a
+    // lockfile (nothing to pin). Read them straight from the workspace
+    // config so they work before — or without — a `vw update`.
+    if let Ok(config) = load_workspace_config(workspace_dir) {
+        for (name, dep) in config.dependencies {
+            if let Some(path) = dep.local_path() {
+                out.insert(name, path.to_path_buf());
+            }
+        }
+    }
+
+    // Git deps are resolved through the lockfile and the per-user
+    // cache. A missing lock isn't an error here — just skip git entries.
+    match load_lock_file(workspace_dir) {
+        Ok(lock) => {
+            for (name, locked) in lock.dependencies {
+                let abs = resolve_dep_path(&locked.path)?;
+                out.insert(name, abs);
+            }
+        }
+        Err(VwError::Config { .. }) => {}
+        Err(e) => return Err(e),
+    }
+
+    Ok(out)
+}
+
 fn resolve_dep_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -2620,4 +2762,70 @@ async fn build_rust_library(
     }
 
     Ok(lib_path.into())
+}
+
+#[cfg(test)]
+mod dependency_source_tests {
+    use super::*;
+
+    /// A `vw.toml` entry with `repo = "..."` parses as a git source —
+    /// the historical behaviour that pre-dates path deps.
+    #[test]
+    fn git_dep_parses_from_repo_key() {
+        let toml = r#"
+            [workspace]
+            name = "demo"
+            version = "0.1.0"
+
+            [dependencies.quartz]
+            repo = "https://github.com/oxidecomputer/quartz"
+            branch = "main"
+            src = ["hdl/ip/vhd"]
+            recursive = true
+        "#;
+        let config: WorkspaceConfig = toml::from_str(toml).unwrap();
+        let dep = &config.dependencies["quartz"];
+        assert!(!dep.is_local());
+        assert_eq!(dep.repo(), Some("https://github.com/oxidecomputer/quartz"));
+        assert_eq!(dep.branch(), Some("main"));
+        assert!(dep.recursive);
+        assert_eq!(dep.src, vec!["hdl/ip/vhd".to_string()]);
+    }
+
+    /// The metroid layout: `path = "..."` and nothing else.
+    #[test]
+    fn path_dep_parses_from_path_key() {
+        let toml = r#"
+            [workspace]
+            name = "metroid"
+            version = "0.1.0"
+
+            [dependencies.amd-htcl]
+            path = "/home/ry/src/amd-htcl"
+        "#;
+        let config: WorkspaceConfig = toml::from_str(toml).unwrap();
+        let dep = &config.dependencies["amd-htcl"];
+        assert!(dep.is_local());
+        assert_eq!(dep.local_path(), Some(Path::new("/home/ry/src/amd-htcl")));
+        assert_eq!(dep.repo(), None);
+        assert_eq!(dep.branch(), None);
+    }
+
+    /// Local deps round-trip through serialize/deserialize.
+    #[test]
+    fn path_dep_roundtrips() {
+        let dep = Dependency {
+            source: DependencySource::Path {
+                path: PathBuf::from("/some/where"),
+            },
+            src: Vec::new(),
+            recursive: false,
+            sim_only: false,
+            exclude: Vec::new(),
+        };
+        let serialized = toml::to_string(&dep).unwrap();
+        let deserialized: Dependency = toml::from_str(&serialized).unwrap();
+        assert!(deserialized.is_local());
+        assert_eq!(deserialized.local_path(), Some(Path::new("/some/where")));
+    }
 }

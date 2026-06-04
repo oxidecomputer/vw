@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["vw-lib", "vw-cli"]
+members = [
+    "vw-lib",
+    "vw-cli",
+    "vw-htcl",
+    "vw-eda",
+    "vw-vivado",
+    "vw-analyzer",
+    "vw-quote",
+    "vw-ip",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,3 +33,11 @@ url = "2.5"
 glob = "0.3"
 petgraph = "0.8.3"
 plotters = "0.3"
+winnow = "0.6"
+async-trait = "0.1"
+tower-lsp = "0.20"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+portable-pty = "0.8"
+ipxact = { path = "/home/ry/src/ipe/crates/ipxact" }

@@ -1,0 +1,16 @@
+[package]
+name = "vw-quote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+
+[dev-dependencies]
+vw-htcl = { path = "../vw-htcl" }

@@ -1,0 +1,18 @@
+[package]
+name = "vw-vivado"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vivado EDA backend: spawns a long-lived Vivado worker and drives it via the vw-eda wire protocol"
+
+[dependencies]
+vw-eda = { path = "../vw-eda" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+portable-pty.workspace = true
