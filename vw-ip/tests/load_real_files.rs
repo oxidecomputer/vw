@@ -54,8 +54,12 @@ fn generates_cips_wrapper_that_reparses() {
         return;
     }
     let component = load(CIPS).expect("load CIPS");
-    let out =
-        generate(&component, &Default::default(), &GenerateOptions::default());
+    let out = generate(
+        &component,
+        &Default::default(),
+        &Default::default(),
+        &GenerateOptions::default(),
+    );
     eprintln!("--- generated CIPS wrapper (first 60 lines) ---");
     for line in out.lines().take(60) {
         eprintln!("{line}");
@@ -85,8 +89,12 @@ fn generates_cpm5_wrapper_in_split_mode() {
         return;
     }
     let component = load(CPM5).expect("load CPM5");
-    let out =
-        generate(&component, &Default::default(), &GenerateOptions::default());
+    let out = generate(
+        &component,
+        &Default::default(),
+        &Default::default(),
+        &GenerateOptions::default(),
+    );
 
     // Walk the generated source and measure per-proc arg counts so we
     // can assert nothing is anywhere near the 4200-arg PCIE1 disaster

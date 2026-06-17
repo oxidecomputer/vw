@@ -18,12 +18,16 @@
 //! `CPM_PCIE0_*`, `CPM_PCIE1_*`, `PS_PMC_*` and so on are clear
 //! prefix clusters. See [`group_parameters`].
 
+pub mod cips_dict;
 pub mod generate;
 pub mod group;
 pub mod presets;
 pub mod summary;
 pub mod tree;
 
+pub use cips_dict::{
+    load_schemas as load_cips_dict_schemas, DictField, DictSchema,
+};
 pub use generate::{generate, GenerateOptions};
 pub use group::{group_parameters, ParameterGroup};
 pub use presets::{

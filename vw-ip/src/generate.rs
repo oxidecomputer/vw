@@ -72,6 +72,7 @@ impl Default for GenerateOptions {
 pub fn generate(
     component: &Component,
     presets: &crate::presets::PresetMap,
+    dict_schemas: &std::collections::HashMap<String, crate::DictSchema>,
     opts: &GenerateOptions,
 ) -> String {
     let parameters: Vec<&Parameter> = component
@@ -80,11 +81,126 @@ pub fn generate(
             !opts.user_configurable_only || p.value.is_user_configurable()
         })
         .collect();
-    if parameters.len() > opts.split_threshold {
+    let mut out = if parameters.len() > opts.split_threshold {
         generate_split(component, presets, &parameters, opts)
     } else {
         generate_single(component, presets, &parameters, opts)
+    };
+    if !dict_schemas.is_empty() {
+        append_dict_sub_procs(&mut out, component, dict_schemas, opts);
     }
+    out
+}
+
+/// Append `create_<ip>_<param>` sub-procs — one for each IP-XACT
+/// `structured_tcldict` parameter we have a schema for. Each builds a
+/// Tcl dict-list of `KEY VALUE` pairs the user passes back into the
+/// top proc's `-<param>` argument.
+fn append_dict_sub_procs(
+    out: &mut String,
+    component: &Component,
+    dict_schemas: &std::collections::HashMap<String, crate::DictSchema>,
+    opts: &GenerateOptions,
+) {
+    let ip_name = sanitize_ident(&component.name);
+    let top_proc = format!("create_{ip_name}");
+    let mut keys: Vec<&String> = dict_schemas.keys().collect();
+    keys.sort();
+    for param_name in keys {
+        let schema = &dict_schemas[param_name];
+        if schema.fields.is_empty() {
+            continue;
+        }
+        writeln!(out).unwrap();
+        emit_dict_sub_proc(out, &top_proc, param_name, schema, opts);
+    }
+}
+
+fn emit_dict_sub_proc(
+    out: &mut String,
+    top_proc: &str,
+    param_name: &str,
+    schema: &crate::DictSchema,
+    opts: &GenerateOptions,
+) {
+    let suffix = sanitize_ident(&param_name.to_ascii_lowercase());
+    let sub_name = format!("{top_proc}_{suffix}");
+
+    let mut doc = Doc::new();
+    doc.push(Item::DocComment(format!(
+        "Apply a `CONFIG.{param_name}` value to a block-design cell.",
+    )));
+    doc.push(Item::DocComment(format!(
+        "Pass the cell handle returned by `{top_proc}`.",
+    )));
+    doc.push(Item::Blank);
+    doc.push(Item::DocComment(
+        "Block-design cell to set the property on.".into(),
+    ));
+    doc.push(Item::Command(Command {
+        doc_comments: Vec::new(),
+        words: vec![Word::Bare("cell".into())],
+        body: None,
+    }));
+    if !schema.fields.is_empty() {
+        doc.push(Item::Blank);
+    }
+    for f in &schema.fields {
+        emit_dict_field_arg(&mut doc, f, opts);
+    }
+
+    let mut body = String::new();
+    writeln!(body, "set_property -dict [list \\").unwrap();
+    writeln!(body, "  CONFIG.{param_name} [list \\").unwrap();
+    let n = schema.fields.len();
+    for (i, f) in schema.fields.iter().enumerate() {
+        let arg = lowercase_ident(&f.name);
+        let cont = if i + 1 == n { "" } else { " \\" };
+        writeln!(body, "    {} ${arg}{cont}", f.name).unwrap();
+    }
+    writeln!(body, "  ] \\").unwrap();
+    writeln!(body, "] $cell").unwrap();
+    emit_proc(out, &sub_name, &doc, &body);
+}
+
+fn emit_dict_field_arg(
+    doc: &mut Doc,
+    f: &crate::DictField,
+    opts: &GenerateOptions,
+) {
+    if opts.include_descriptions {
+        if let Some(desc) = f.description.as_deref().filter(|s| !s.is_empty()) {
+            for line in desc.lines() {
+                doc.push(Item::DocComment(line.trim_end().into()));
+            }
+        }
+    }
+    let mut words = Vec::new();
+    if !f.enum_values.is_empty() {
+        let formatted: Vec<String> = f
+            .enum_values
+            .iter()
+            .map(|v| format_attribute_value(v))
+            .collect();
+        words.push(Word::Raw(format!("@enum({})", formatted.join(", "))));
+    }
+    // Dict fields are always optional: Vivado treats an unset
+    // inner key as "use the IP's implicit default", so make every
+    // arg defaultable. When the Xilinx CSV didn't yield a default —
+    // either the row was missing one or the value had unbalanced
+    // braces and was rejected — fall back to an empty string so the
+    // user can omit the arg and let Vivado decide.
+    words.push(Word::Raw(format!(
+        "@default({})",
+        format_attribute_value(&f.default)
+    )));
+    let lowered = lowercase_ident(&f.name);
+    words.push(Word::Bare(lowered));
+    doc.push(Item::Command(Command {
+        doc_comments: Vec::new(),
+        words,
+        body: None,
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +668,7 @@ mod tests {
         let out = generate(
             &mk_component(),
             &Default::default(),
+            &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
         let n_procs =
@@ -566,6 +683,7 @@ mod tests {
         let out = generate(
             &component,
             &Default::default(),
+            &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
         eprintln!("--- generated ---\n{out}\n--- end ---");
@@ -588,6 +706,7 @@ mod tests {
         let out = generate(
             &component,
             &Default::default(),
+            &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
         // Sub-proc args block starts with the `cell` arg.
@@ -603,6 +722,7 @@ mod tests {
         let out = generate(
             &component,
             &Default::default(),
+            &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
         // None of the tiny prefix groups becomes its own proc...
@@ -666,7 +786,12 @@ mod tests {
             split_threshold: 5,
             ..GenerateOptions::default()
         };
-        let out = generate(&component, &Default::default(), &opts);
+        let out = generate(
+            &component,
+            &Default::default(),
+            &::std::collections::HashMap::new(),
+            &opts,
+        );
         // Inside the GROUP_A proc, the arg names should be `field0`,
         // not `group_a_field0`.
         assert!(out.contains("@default(0) field0\n"), "{out}");
@@ -680,6 +805,7 @@ mod tests {
         let out = generate(
             &mk_component(),
             &Default::default(),
+            &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
         let parsed = vw_htcl::parse(&out);
@@ -695,6 +821,7 @@ mod tests {
         let out = generate(
             &mk_component(),
             &Default::default(),
+            &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
         assert!(out.contains("## A demo IP."), "{out}");
@@ -706,6 +833,7 @@ mod tests {
         let out = generate(
             &mk_component(),
             &Default::default(),
+            &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
         assert!(out.contains("@default(32) bus_width"), "{out}");
@@ -718,6 +846,7 @@ mod tests {
         let out = generate(
             &mk_component(),
             &Default::default(),
+            &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
         assert!(out.contains("CONFIG.BUS_WIDTH $bus_width"), "{out}");

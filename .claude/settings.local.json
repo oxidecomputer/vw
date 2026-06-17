@@ -10,7 +10,9 @@
       "Read(//home/ry/src/tree-sitter-htcl/bindings/**)",
       "Bash(tree-sitter generate *)",
       "Bash(tree-sitter parse *)",
-      "Bash(tree-sitter test *)"
+      "Bash(tree-sitter test *)",
+      "Read(//home/ry/src/redhawk/host/vivado/metro/ip/**)",
+      "Read(//home/ry/src/amd-htcl/**)"
     ]
   }
 }

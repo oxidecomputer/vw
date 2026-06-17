@@ -605,11 +605,24 @@ fn run_ip_generate(
             .map_err(|e| format!("loading presets: {e}"))?
     };
 
+    // Sub-proc schemas for Xilinx `structured_tcldict` parameters
+    // (PS_PMC_CONFIG, etc.). Empty when the component isn't a CIPS
+    // and doesn't have an accompanying schema tree.
+    let dict_schemas =
+        vw_ip::load_cips_dict_schemas(std::path::Path::new(input.as_str()));
+    for name in dict_schemas.keys() {
+        eprintln!(
+            "{:>12} schema for {name} ({} fields)",
+            "Loaded".bright_green().bold(),
+            dict_schemas[name].fields.len()
+        );
+    }
+
     let opts = vw_ip::GenerateOptions {
         user_configurable_only: !include_internal,
         ..Default::default()
     };
-    let text = vw_ip::generate(&component, &presets, &opts);
+    let text = vw_ip::generate(&component, &presets, &dict_schemas, &opts);
     match output {
         Some(path) => std::fs::write(path, &text)
             .map_err(|e| format!("writing {path}: {e}"))?,
