@@ -40,6 +40,6 @@ tower-lsp = "0.20"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
-portable-pty = "0.8"
+portable-pty = "0.9"
 #ipxact = { path = "/home/ry/src/ipe/crates/ipxact" }
 ipxact = { git = "https://github.com/oxidecomputer/ipe", branch = "ry/init" }
