@@ -16,7 +16,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
-repository = "https://github.com/your-username/vw"
+repository = "https://github.com/oxidecomputer/vw"
 
 [workspace.dependencies]
 # Shared dependencies
@@ -41,4 +41,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 portable-pty = "0.8"
-ipxact = { path = "/home/ry/src/ipe/crates/ipxact" }
+#ipxact = { path = "/home/ry/src/ipe/crates/ipxact" }
+ipxact = { git = "https://github.com/oxidecomputer/ipe", branch = "ry/init" }

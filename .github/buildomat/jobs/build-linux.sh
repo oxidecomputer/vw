@@ -7,6 +7,9 @@
 #: output_rules = [
 #:   "/work/release/*",
 #: ]
+#: access_repos = [
+#:   "oxidecomputer/ipe"
+#: ]
 #:
 #: [[publish]]
 #: series = "linux"
