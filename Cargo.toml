@@ -9,6 +9,7 @@ members = [
     "vw-analyzer",
     "vw-quote",
     "vw-ip",
+    "vw-htcl-cmd",
 ]
 
 [workspace.package]

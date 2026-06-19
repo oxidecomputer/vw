@@ -2255,6 +2255,7 @@ dependencies = [
  "vw-analyzer",
  "vw-eda",
  "vw-htcl",
+ "vw-htcl-cmd",
  "vw-ip",
  "vw-lib",
  "vw-vivado",
@@ -2296,6 +2297,16 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 1.0.69",
+ "winnow 0.6.26",
+]
+
+[[package]]
+name = "vw-htcl-cmd"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 1.0.69",
+ "vw-htcl",
  "winnow 0.6.26",
 ]
 

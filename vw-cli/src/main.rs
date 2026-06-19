@@ -158,6 +158,32 @@ enum Commands {
     },
     #[command(subcommand, about = "IP-XACT tooling")]
     Ip(IpCommand),
+    #[command(
+        subcommand,
+        name = "htcl-cmd",
+        about = "Generate htcl wrappers from Vivado command references"
+    )]
+    HtclCmd(HtclCmdCommand),
+}
+
+#[derive(Subcommand)]
+enum HtclCmdCommand {
+    #[command(
+        about = "Generate an htcl wrapper from a Vivado man-page command \
+                 reference"
+    )]
+    Generate {
+        #[arg(help = "Path to a Vivado man-page file (e.g. \
+                      <Vivado>/doc/eng/man/add_files)")]
+        input: Utf8PathBuf,
+        #[arg(short, long, help = "Output file (defaults to stdout)")]
+        output: Option<Utf8PathBuf>,
+        #[arg(
+            long,
+            help = "Command name to wrap (defaults to the input file stem)"
+        )]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -567,7 +593,39 @@ async fn main() {
                 }
             }
         },
+        Commands::HtclCmd(cmd) => match cmd {
+            HtclCmdCommand::Generate {
+                input,
+                output,
+                name,
+            } => {
+                if let Err(e) = run_htcl_cmd_generate(
+                    &input,
+                    output.as_deref(),
+                    name.as_deref(),
+                ) {
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
+            }
+        },
     }
+}
+
+fn run_htcl_cmd_generate(
+    input: &Utf8Path,
+    output: Option<&Utf8Path>,
+    name: Option<&str>,
+) -> Result<(), String> {
+    let page = vw_htcl_cmd::load(input.as_std_path(), name)
+        .map_err(|e| format!("loading {input}: {e}"))?;
+    let text = vw_htcl_cmd::generate(&page, &Default::default());
+    match output {
+        Some(path) => std::fs::write(path, &text)
+            .map_err(|e| format!("writing {path}: {e}"))?,
+        None => print!("{text}"),
+    }
+    Ok(())
 }
 
 fn run_ip_generate(

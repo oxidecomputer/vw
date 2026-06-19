@@ -1,0 +1,15 @@
+[package]
+name = "vw-htcl-cmd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generate documented htcl command wrappers from Vivado man-page references"
+
+[dependencies]
+vw-htcl = { path = "../vw-htcl" }
+thiserror.workspace = true
+winnow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
