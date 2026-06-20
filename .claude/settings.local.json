@@ -12,7 +12,8 @@
       "Bash(tree-sitter parse *)",
       "Bash(tree-sitter test *)",
       "Read(//home/ry/src/redhawk/host/vivado/metro/ip/**)",
-      "Read(//home/ry/src/amd-htcl/**)"
+      "Read(//home/ry/src/amd-htcl/**)",
+      "Bash(cargo install *)"
     ]
   }
 }

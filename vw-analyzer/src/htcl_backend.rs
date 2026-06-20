@@ -302,6 +302,22 @@ impl LanguageBackend for HtclBackend {
             line: position.line,
             character: position.character,
         });
+
+        // `src <partial>` is filesystem-aware, so it takes its own
+        // path before we fall back to the htcl-level analyzer.
+        let line = vw_htcl::cmdline::analyze(&doc.text, offset);
+        if crate::src_complete::is_src_path_context(&line) {
+            if let Ok(entry_file) = uri.to_file_path() {
+                let resolver = crate::workspace::build_resolver(&entry_file);
+                return crate::src_complete::src_path_completions(
+                    &entry_file,
+                    &line,
+                    &line_index,
+                    &resolver,
+                );
+            }
+        }
+
         // Workspace view here too: command-position completion picks
         // up imported proc names.
         let view = crate::workspace::build_view(uri, &doc.text);

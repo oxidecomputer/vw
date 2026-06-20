@@ -13,6 +13,7 @@
 mod backend;
 mod htcl_backend;
 mod server;
+mod src_complete;
 mod workspace;
 
 pub use backend::{LanguageBackend, SymbolInfo};

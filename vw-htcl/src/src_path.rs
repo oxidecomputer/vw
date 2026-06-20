@@ -97,6 +97,19 @@ impl Resolver {
         self
     }
 
+    /// Iterate the registered dependencies as `(name, root)` pairs.
+    /// Order is unspecified — callers that care should sort.
+    pub fn deps(&self) -> impl Iterator<Item = (&str, &Path)> {
+        self.cached_deps
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_path()))
+    }
+
+    /// Look up a dependency's cached root by name.
+    pub fn dep_root(&self, name: &str) -> Option<&Path> {
+        self.cached_deps.get(name).map(PathBuf::as_path)
+    }
+
     /// Resolve `path` (as written in a `src` statement) against the
     /// directory containing the importing file. Returns the canonical
     /// path to the imported file, with `.htcl` appended if absent.
