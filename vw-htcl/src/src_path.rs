@@ -73,6 +73,12 @@ pub enum ResolveError {
     EmptyPath { raw: String },
 }
 
+/// Bare `src @<dep>` resolves to `<dep_root>/{DEFAULT_MODULE}.htcl`.
+/// The convention is intentionally fixed (no `vw.toml` knob) so every
+/// htcl module is laid out the same way — a reader can open
+/// `module.htcl` and know they're at the entry point.
+pub const DEFAULT_MODULE: &str = "module";
+
 /// Resolver that turns import paths into on-disk file paths. Construct
 /// one per workspace and reuse it across imports.
 ///
@@ -129,12 +135,15 @@ impl Resolver {
                         subpath: subpath.clone(),
                     });
                 };
+                // Bare `@<dep>` resolves to the dep's default entry
+                // point — `module.htcl` at the dep root, analogous to
+                // Rust's `src/lib.rs`. `@<dep>/<sub>` still picks a
+                // specific module under the dep.
                 if subpath.is_empty() {
-                    return Err(ResolveError::EmptyPath {
-                        raw: path.to_string(),
-                    });
+                    root.join(DEFAULT_MODULE)
+                } else {
+                    root.join(subpath)
                 }
-                root.join(subpath)
             }
         };
 
@@ -210,6 +219,19 @@ mod tests {
         let (dir, resolver) = fixture();
         let resolved = resolver.resolve(dir.path(), "@quartz/ip/bacd").unwrap();
         assert!(resolved.ends_with("dep/ip/bacd.htcl"), "{resolved:?}");
+    }
+
+    #[test]
+    fn bare_named_dep_resolves_to_module_htcl() {
+        // `src @quartz` → `<dep_root>/module.htcl` (analogous to
+        // Rust's `use crate` resolving to `src/lib.rs`).
+        let dir = tempfile::tempdir().unwrap();
+        let dep_root = dir.path().join("dep");
+        fs::create_dir_all(&dep_root).unwrap();
+        fs::write(dep_root.join("module.htcl"), "# entry\n").unwrap();
+        let resolver = Resolver::new().with_dep("quartz", dep_root.clone());
+        let resolved = resolver.resolve(dir.path(), "@quartz").unwrap();
+        assert!(resolved.ends_with("dep/module.htcl"), "{resolved:?}");
     }
 
     #[test]

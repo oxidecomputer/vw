@@ -149,6 +149,12 @@ fn enumerate_entries(
         } else if path.extension().and_then(|s| s.to_str()) == Some("htcl") {
             let stem =
                 path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+            // `module.htcl` is the dep's default entry point, already
+            // reachable as bare `@<dep>` — listing it here as
+            // `@<dep>/module` would just be a noisier alias.
+            if stem == vw_htcl::src_path::DEFAULT_MODULE {
+                continue;
+            }
             out.push((stem.to_string(), CompletionItemKind::FILE));
         }
     }
@@ -168,9 +174,14 @@ fn dep_name_completions(
     let mut deps: Vec<(&str, &Path)> = resolver.deps().collect();
     deps.sort_by_key(|(n, _)| *n);
     let range = lsp_range(partial_span, line_index);
+    // Bare `@<dep>` is a complete import on its own (resolves to the
+    // dep's `module.htcl`), so don't append a trailing `/` — that
+    // would leave behind invalid syntax for a user who just wanted
+    // the default module. Users who want to drill in still type `/`
+    // themselves, which retriggers completion against the dep root.
     deps.into_iter()
         .map(|(name, _)| {
-            build_item(format!("@{name}/"), CompletionItemKind::MODULE, range)
+            build_item(format!("@{name}"), CompletionItemKind::MODULE, range)
         })
         .collect()
 }
@@ -244,6 +255,7 @@ mod tests {
 
     fn workspace_fixture() -> (tempfile::TempDir, PathBuf, Resolver) {
         // amd-htcl/
+        //   module.htcl                  ← default entry, HIDDEN from list
         //   cmd.htcl
         //   ip.htcl
         //   cmd/foo.htcl
@@ -254,6 +266,7 @@ mod tests {
         fs::create_dir_all(dep.join("cmd")).unwrap();
         fs::create_dir_all(dep.join("scripts")).unwrap();
         fs::create_dir_all(dep.join("ip/bd")).unwrap();
+        fs::write(dep.join("module.htcl"), "# entry").unwrap();
         fs::write(dep.join("cmd.htcl"), "# stub").unwrap();
         fs::write(dep.join("ip.htcl"), "# stub").unwrap();
         fs::write(dep.join("cmd/foo.htcl"), "# stub").unwrap();
@@ -318,9 +331,26 @@ mod tests {
 
     #[test]
     fn dep_name_completion_when_no_slash_yet() {
+        // Bare `@<dep>` is a complete import on its own, so the
+        // completion shouldn't append `/` — selecting `@amd-htcl`
+        // alone should leave valid syntax that resolves to
+        // `<dep>/module.htcl`.
         let (_dir, entry, resolver) = workspace_fixture();
         let labels = labels_for("src @", &entry, &resolver);
-        assert_eq!(labels, vec!["@amd-htcl/"]);
+        assert_eq!(labels, vec!["@amd-htcl"]);
+    }
+
+    #[test]
+    fn dep_root_listing_hides_module_htcl() {
+        // `module.htcl` is the default entry — already importable as
+        // bare `@amd-htcl`, so it should not show up as `module` in
+        // the per-dep file listing.
+        let (_dir, entry, resolver) = workspace_fixture();
+        let labels = labels_for("src @amd-htcl/", &entry, &resolver);
+        assert!(!labels.contains(&"module".to_string()), "{labels:?}");
+        // Sanity: the non-default modules still show.
+        assert!(labels.contains(&"cmd".to_string()));
+        assert!(labels.contains(&"ip".to_string()));
     }
 
     #[test]
