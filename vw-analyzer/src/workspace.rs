@@ -134,7 +134,12 @@ pub fn build_resolver(entry_file: &Path) -> Resolver {
     let Some(workspace_dir) = find_workspace_dir(entry_file) else {
         return resolver;
     };
-    if let Ok(paths) = vw_lib::dep_cache_paths(&workspace_dir) {
+    // Transitive: a library that does `src @other-lib/...` shouldn't
+    // force every consumer to redeclare `other-lib` in their own
+    // `vw.toml`. The walker pulls in each dep's own deps so the
+    // resolver sees the whole graph (Cargo-style first-seen-wins on
+    // name conflicts).
+    if let Ok(paths) = vw_lib::transitive_dep_cache_paths(&workspace_dir) {
         for (name, path) in paths {
             resolver = resolver.with_dep(name, path);
         }

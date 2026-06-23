@@ -159,7 +159,7 @@ fn emit_dict_sub_proc(
         writeln!(body, "    {} ${arg}{cont}", f.name).unwrap();
     }
     writeln!(body, "  ] \\").unwrap();
-    writeln!(body, "] $cell").unwrap();
+    writeln!(body, "] -objects $cell").unwrap();
     emit_proc(out, &sub_name, &doc, &body);
 }
 
@@ -248,8 +248,11 @@ fn generate_single(
 
 fn build_single_body(vlnv: &str, parameters: &[&Parameter]) -> String {
     let mut out = String::new();
-    writeln!(out, "set cell [create_bd_cell -type ip -vlnv {vlnv} $name]")
-        .unwrap();
+    writeln!(
+        out,
+        "set cell [create_bd_cell -type ip -vlnv {vlnv} -name $name]"
+    )
+    .unwrap();
     if parameters.is_empty() {
         return out;
     }
@@ -325,8 +328,9 @@ fn generate_split(
             emit_arg_decl(&mut top_doc, component, presets, p, opts, "");
         }
     }
-    let mut top_body =
-        format!("set cell [create_bd_cell -type ip -vlnv {vlnv} $name]\n");
+    let mut top_body = format!(
+        "set cell [create_bd_cell -type ip -vlnv {vlnv} -name $name]\n"
+    );
     if !tree.direct.is_empty() {
         write_set_property_dict(&mut top_body, &tree.direct, "");
     }
@@ -367,6 +371,16 @@ fn generate_split(
 // ---------------------------------------------------------------------------
 
 fn emit_file_header(out: &mut String, component: &Component, vlnv: &str) {
+    // Pull the runtime helpers — `ip::check`, `log::info`,
+    // `log::error` — into scope, then assert at load time that this
+    // wrapper's underlying IP is actually present in the running
+    // Vivado's IP repository. Missing-IP failures surface here, at
+    // import, rather than as a cryptic `create_bd_cell` failure
+    // deep in a design build.
+    writeln!(out, "src @vivado-cmd/ip").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "ip::check -name \"{vlnv}\"").unwrap();
+    writeln!(out).unwrap();
     if let Some(desc) =
         component.description.as_deref().filter(|s| !s.is_empty())
     {
@@ -416,7 +430,7 @@ fn write_set_property_dict(
         let arg = lowercase_ident(strip_prefix(&p.name, prefix_to_strip));
         writeln!(out, "  CONFIG.{} ${arg} \\", p.name).unwrap();
     }
-    writeln!(out, "] $cell").unwrap();
+    writeln!(out, "] -objects $cell").unwrap();
 }
 
 fn emit_arg_decl(

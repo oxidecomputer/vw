@@ -704,7 +704,10 @@ fn load_htcl_program(
     let workspace_dir = find_workspace_dir(entry);
     let mut resolver = vw_htcl::Resolver::new();
     if let Some(ws) = workspace_dir.as_deref() {
-        if let Ok(paths) = vw_lib::dep_cache_paths(ws) {
+        // Transitive resolution so a library's `src @other/...`
+        // import works even when the consumer hasn't redeclared
+        // `other` in their own `vw.toml`.
+        if let Ok(paths) = vw_lib::transitive_dep_cache_paths(ws) {
             for (name, path) in paths {
                 resolver = resolver.with_dep(name, path);
             }

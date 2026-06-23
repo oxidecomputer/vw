@@ -195,12 +195,31 @@ fn validate_command(
         idx += if value_word.is_some() { 2 } else { 1 };
     }
 
+    // Build canonical `@one_of` groups. Each arg's `@one_of(...)`
+    // declares an alternatives set: the arg itself plus the named
+    // siblings. We collapse declarations from each direction (sib A
+    // says `@one_of(B)` and sib B says `@one_of(A)`) into one
+    // canonical group, then check that **exactly one** arg from each
+    // group is supplied at the call site.
+    //
+    // Args participating in a group are treated as optional for the
+    // missing-required check below — the group rule is the source of
+    // truth for "must supply something."
+    let one_of_groups = collect_one_of_groups(sig);
+    let in_one_of: std::collections::HashSet<&str> = one_of_groups
+        .iter()
+        .flat_map(|g| g.iter().map(String::as_str))
+        .collect();
+
     // Required-args check. An arg is required when it has no
     // `@default` to fall back to — the user must supply a value.
-    // (`@required` is still recognized for documentation but is now
-    // implied by the absence of `@default` and adds nothing.)
+    // Args in an `@one_of` group are governed by the group rule
+    // instead, so skip them here.
     for arg in &sig.args {
         if seen.contains_key(&arg.name) {
+            continue;
+        }
+        if in_one_of.contains(arg.name.as_str()) {
             continue;
         }
         let is_required = arg.attribute("default").is_none();
@@ -214,6 +233,39 @@ fn validate_command(
                 span: cmd.span,
             });
         }
+    }
+
+    // `@one_of` groups: exactly one alternative must be present.
+    for group in &one_of_groups {
+        let present: Vec<&str> = group
+            .iter()
+            .filter(|n| seen.contains_key(n.as_str()))
+            .map(String::as_str)
+            .collect();
+        if present.len() == 1 {
+            continue;
+        }
+        let opts: Vec<String> = group.iter().map(|n| format!("-{n}")).collect();
+        let message = if present.is_empty() {
+            format!(
+                "missing required argument — exactly one of {} must be \
+                 supplied",
+                opts.join(", ")
+            )
+        } else {
+            let got: Vec<String> =
+                present.iter().map(|n| format!("-{n}")).collect();
+            format!(
+                "exactly one of {} may be supplied, got {}",
+                opts.join(", "),
+                got.join(", ")
+            )
+        };
+        diags.push(Diagnostic {
+            severity: Severity::Error,
+            message,
+            span: cmd.span,
+        });
     }
 
     // Inter-arg deps for present args.
@@ -277,6 +329,43 @@ fn validate_command(
             });
         }
     }
+}
+
+/// Collect canonical `@one_of` alternatives groups for a signature.
+///
+/// Each arg's `@one_of(sib1, sib2, ...)` declares that exactly one
+/// of `{arg, sib1, sib2, ...}` must be supplied at the call site.
+/// We treat the declaration as symmetric (both `dict @one_of(name)`
+/// and `name @one_of(dict)` describe the same group), so a `BTreeSet`
+/// of the participating names canonicalizes each group regardless of
+/// which direction (or which redundant copies) the author wrote.
+fn collect_one_of_groups(
+    sig: &ProcSignature,
+) -> Vec<std::collections::BTreeSet<String>> {
+    use std::collections::BTreeSet;
+    let mut seen: std::collections::HashSet<BTreeSet<String>> =
+        std::collections::HashSet::new();
+    let mut out: Vec<BTreeSet<String>> = Vec::new();
+    for arg in &sig.args {
+        let Some(attr) = arg.attribute("one_of") else {
+            continue;
+        };
+        let mut group: BTreeSet<String> = BTreeSet::new();
+        group.insert(arg.name.clone());
+        for value in &attr.values {
+            match value {
+                AttributeValue::Ident { value, .. }
+                | AttributeValue::String { value, .. } => {
+                    group.insert(value.clone());
+                }
+                AttributeValue::Integer { .. } => continue,
+            }
+        }
+        if group.len() >= 2 && seen.insert(group.clone()) {
+            out.push(group);
+        }
+    }
+    out
 }
 
 fn validate_value(
@@ -500,6 +589,82 @@ mod tests {
         );
         let d = diags(&src);
         assert!(d.iter().any(|d| d.message.contains("conflicts")));
+    }
+
+    #[test]
+    fn one_of_requires_exactly_one_alternative() {
+        // Two args in an @one_of group — neither supplied → error.
+        let src = proc_decl(
+            "  @default(\"\") @one_of(b) a\n  @default(\"\") @one_of(a) b",
+            "axis_interface",
+        );
+        let d = diags(&src);
+        assert!(
+            d.iter().any(|m| m.message.contains("exactly one of -a, -b")
+                && m.message.contains("must be supplied")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn one_of_satisfied_by_either_alternative() {
+        let src = proc_decl(
+            "  @default(\"\") @one_of(b) a\n  @default(\"\") @one_of(a) b",
+            "axis_interface -a 1",
+        );
+        assert!(diags(&src).is_empty());
+    }
+
+    #[test]
+    fn one_of_rejects_both_alternatives() {
+        // Both supplied — should be reported once (group rule).
+        let src = proc_decl(
+            "  @default(\"\") @one_of(b) a\n  @default(\"\") @one_of(a) b",
+            "axis_interface -a 1 -b 2",
+        );
+        let d = diags(&src);
+        assert!(
+            d.iter().any(|m| m.message.contains("got -a, -b")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn one_of_arg_is_not_treated_as_required() {
+        // An @one_of arg without @default should NOT trigger the
+        // separate "missing required" error — the group rule
+        // supersedes individual required-ness.
+        let src =
+            proc_decl("  @one_of(b) a\n  @one_of(a) b", "axis_interface -a 1");
+        let d = diags(&src);
+        assert!(
+            d.iter()
+                .all(|m| !m.message.contains("missing required argument -a")
+                    && !m.message.contains("missing required argument -b")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn one_of_declarations_are_symmetric() {
+        // Declaring `@one_of(b)` on `a` alone is enough; we don't need
+        // the reverse on `b`.
+        let src = proc_decl(
+            "  @default(\"\") @one_of(b) a\n  @default(\"\") b",
+            "axis_interface",
+        );
+        let d = diags(&src);
+        let group_errors: Vec<_> = d
+            .iter()
+            .filter(|m| {
+                m.message.contains("exactly one of")
+                    && m.message.contains("must be supplied")
+            })
+            .collect();
+        assert_eq!(group_errors.len(), 1, "{:?}", d);
     }
 
     #[test]

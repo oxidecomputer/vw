@@ -2112,6 +2112,55 @@ fn resolve_dep_path(path: &Path) -> Result<PathBuf> {
     Ok(deps_dir.join(path))
 }
 
+/// Like [`dep_cache_paths`], but walks the dependency graph
+/// transitively: for every dep whose cached root is itself a
+/// workspace (i.e. has its own `vw.toml`), pull in *its* deps too,
+/// and so on. The result is a flat `name → root` map covering every
+/// dep any file in this workspace's transitive closure might
+/// `src @<name>/...`-import.
+///
+/// First-seen-wins on name conflicts so the entry workspace's
+/// declarations take precedence over a dep's choice of the same
+/// name (matching Cargo's resolution: the top-level `Cargo.toml`
+/// pins the version for the whole graph).
+///
+/// Returns an empty map (not an error) if the entry workspace has
+/// no deps. Per-dep failures (missing `vw.toml`, malformed config)
+/// are skipped: a dep may not be its own htcl workspace, and that's
+/// fine — we just won't see *its* deps.
+pub fn transitive_dep_cache_paths(
+    entry_workspace_dir: &Utf8Path,
+) -> Result<HashMap<String, PathBuf>> {
+    let mut out: HashMap<String, PathBuf> = HashMap::new();
+    let mut visited: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    let mut queue: Vec<PathBuf> =
+        vec![entry_workspace_dir.as_std_path().to_path_buf()];
+
+    while let Some(ws) = queue.pop() {
+        if !visited.insert(ws.clone()) {
+            continue;
+        }
+        let Ok(ws_utf8) = Utf8PathBuf::from_path_buf(ws) else {
+            continue;
+        };
+        let Ok(paths) = dep_cache_paths(&ws_utf8) else {
+            continue;
+        };
+        for (name, dep_path) in paths {
+            // First-seen wins — don't let a transitive dep override
+            // the entry workspace's choice.
+            out.entry(name).or_insert_with(|| dep_path.clone());
+            // If the dep is itself a workspace, recurse into it. A
+            // dep without a `vw.toml` is a leaf (just files).
+            if dep_path.join("vw.toml").exists() {
+                queue.push(dep_path);
+            }
+        }
+    }
+    Ok(out)
+}
+
 async fn resolve_dependency_commit(
     repo_url: &str,
     branch: &Option<String>,
@@ -2809,6 +2858,104 @@ mod dependency_source_tests {
         assert_eq!(dep.local_path(), Some(Path::new("/home/ry/src/amd-htcl")));
         assert_eq!(dep.repo(), None);
         assert_eq!(dep.branch(), None);
+    }
+
+    #[test]
+    fn transitive_dep_resolution_pulls_in_lib_of_lib() {
+        // metroid → cips → vivado-cmd.  Asking for metroid's deps
+        // transitively should return cips AND vivado-cmd, even though
+        // metroid only declares cips.
+        let dir = tempfile::tempdir().unwrap();
+        let metroid = dir.path().join("metroid");
+        let cips = dir.path().join("cips");
+        let vivado_cmd = dir.path().join("vivado-cmd");
+        std::fs::create_dir_all(&metroid).unwrap();
+        std::fs::create_dir_all(&cips).unwrap();
+        std::fs::create_dir_all(&vivado_cmd).unwrap();
+        std::fs::write(
+            metroid.join("vw.toml"),
+            format!(
+                "[workspace]\nname=\"metroid\"\nversion=\"0.1.0\"\n\n\
+                 [dependencies.cips]\npath = \"{}\"\n",
+                cips.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            cips.join("vw.toml"),
+            format!(
+                "[workspace]\nname=\"cips\"\nversion=\"0.1.0\"\n\n\
+                 [dependencies.vivado-cmd]\npath = \"{}\"\n",
+                vivado_cmd.display()
+            ),
+        )
+        .unwrap();
+        // vivado-cmd is a leaf — has a vw.toml but no deps of its own.
+        std::fs::write(
+            vivado_cmd.join("vw.toml"),
+            "[workspace]\nname=\"vivado-cmd\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let metroid_utf8 = Utf8PathBuf::from_path_buf(metroid.clone()).unwrap();
+        let resolved = transitive_dep_cache_paths(&metroid_utf8).unwrap();
+        assert_eq!(resolved.get("cips"), Some(&cips));
+        assert_eq!(resolved.get("vivado-cmd"), Some(&vivado_cmd));
+        assert_eq!(resolved.len(), 2, "{resolved:?}");
+    }
+
+    #[test]
+    fn transitive_dep_resolution_first_seen_wins() {
+        // entry → A and entry → B, both A and B declare a dep
+        // `shared` pointing at different paths. Entry's view of
+        // `shared` is whichever was inserted first; entry itself
+        // doesn't declare `shared`, so the test just asserts we got
+        // *one* deterministic answer rather than a panic / duplicate.
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("entry");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        let shared_v1 = dir.path().join("shared-v1");
+        let shared_v2 = dir.path().join("shared-v2");
+        for d in [&entry, &a, &b, &shared_v1, &shared_v2] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(
+            entry.join("vw.toml"),
+            format!(
+                "[workspace]\nname=\"entry\"\nversion=\"0.1.0\"\n\n\
+                 [dependencies.a]\npath = \"{}\"\n\
+                 [dependencies.b]\npath = \"{}\"\n",
+                a.display(),
+                b.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            a.join("vw.toml"),
+            format!(
+                "[workspace]\nname=\"a\"\nversion=\"0.1.0\"\n\n\
+                 [dependencies.shared]\npath = \"{}\"\n",
+                shared_v1.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("vw.toml"),
+            format!(
+                "[workspace]\nname=\"b\"\nversion=\"0.1.0\"\n\n\
+                 [dependencies.shared]\npath = \"{}\"\n",
+                shared_v2.display()
+            ),
+        )
+        .unwrap();
+
+        let entry_utf8 = Utf8PathBuf::from_path_buf(entry).unwrap();
+        let resolved = transitive_dep_cache_paths(&entry_utf8).unwrap();
+        // `shared` is present exactly once and points at one of the
+        // two candidates; we don't pin which (HashMap iter order).
+        let shared = resolved.get("shared").unwrap();
+        assert!(*shared == shared_v1 || *shared == shared_v2, "{shared:?}");
     }
 
     /// Local deps round-trip through serialize/deserialize.

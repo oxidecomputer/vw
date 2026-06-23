@@ -13,7 +13,13 @@
       "Bash(tree-sitter test *)",
       "Read(//home/ry/src/redhawk/host/vivado/metro/ip/**)",
       "Read(//home/ry/src/amd-htcl/**)",
-      "Bash(cargo install *)"
+      "Bash(cargo install *)",
+      "Read(//home/ry/src/htcl/amd/vivado-cmd/**)",
+      "Read(//home/ry/src/htcl/amd/vivado-cmd/cmd/**)",
+      "Bash(vw ip *)",
+      "Read(//tmp/**)",
+      "Bash(vw check *)",
+      "Bash(grep -nA20 \"fn diagnostics\\\\|validate\\(\\\\|fn publish_diagnostics\" vw-analyzer/src/htcl_backend.rs)"
     ]
   }
 }
