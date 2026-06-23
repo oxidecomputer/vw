@@ -2,12 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
 use std::collections::HashSet;
 use std::fmt;
 use std::process;
+use vw_lib::resolve_test_selection;
 
 use vw_lib::{
     add_dependency_with_token, clear_cache, extract_hostname_from_repo_url,
@@ -93,12 +94,21 @@ enum Commands {
     DepsToTcl,
     #[command(about = "Run testbench using NVC")]
     Test {
-        #[arg(help = "Name of the testbench entity to run")]
+        #[arg(help = "Name of the testbench entity to run", group = "target")]
         testbench: Option<String>,
         #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
         std: CliVhdlStandard,
         #[arg(long, help = "List all available testbenches")]
         list: bool,
+        #[arg(long, help = "List test groups")]
+        list_groups: bool,
+        #[arg(
+            long = "group",
+            value_name = "NAME",
+            help = "Run all testbenches in the named group (repeatable)",
+            group = "target"
+        )]
+        groups: Vec<String>,
         #[arg(
             long,
             help = "Enable recursive search when looking for testbenches"
@@ -114,22 +124,62 @@ enum Commands {
             long,
             value_delimiter = ',',
             help = "Runtime flags to pass to NVC (comma-separated or use multiple times)",
-            requires = "testbench"
+            requires = "target"
         )]
         runtime_flags: Vec<String>,
         #[arg(
             long,
             help = "Build Rust library for testbench before running",
-            requires = "testbench"
+            requires = "target"
         )]
         build_rust: bool,
         #[arg(
             long,
             help = "Generate/regenerate mixed-signal scaffolding from mist.toml",
-            requires = "testbench"
+            requires = "target"
         )]
         scaffold: bool,
     },
+}
+
+async fn run_single_testbench(
+    cwd: &Utf8Path,
+    testbench_name: String,
+    std: VhdlStandard,
+    recurse: bool,
+    runtime_flags: &[String],
+    build_rust: bool,
+    scaffold: bool,
+) -> vw_lib::Result<()> {
+    println!("Running testbench: {}", testbench_name.cyan());
+    run_testbench(
+        cwd,
+        testbench_name.clone(),
+        std,
+        recurse,
+        runtime_flags,
+        build_rust,
+        scaffold,
+    )
+    .await?;
+    if scaffold {
+        println!(
+            "{} Scaffolding generated for '{}'",
+            "✓".bright_green(),
+            testbench_name
+        );
+    } else {
+        println!(
+            "{} Testbench '{}' completed successfully!",
+            "✓".bright_green(),
+            testbench_name
+        );
+        println!(
+            "Waveform saved to: {}",
+            format!("{testbench_name}.fst").cyan()
+        );
+    }
+    Ok(())
 }
 
 /// Helper function to get access credentials for a repository URL from netrc if available
@@ -352,12 +402,22 @@ async fn main() {
             testbench,
             std,
             list,
+            list_groups,
+            groups,
             recurse,
             ignore,
             runtime_flags,
             build_rust,
             scaffold,
         } => {
+            let config = match load_workspace_config(&cwd) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
+            };
+
             if list {
                 let bench_dir = cwd.join("bench");
                 if !bench_dir.exists() {
@@ -407,11 +467,63 @@ async fn main() {
                         }
                     }
                 }
-            } else if let Some(testbench_name) = testbench {
-                println!("Running testbench: {}", testbench_name.cyan());
-                match run_testbench(
+            } else if list_groups {
+                if config.test_groups.is_empty() {
+                    println!("No test groups defined in vw.toml");
+                } else {
+                    println!("Test groups:");
+                    let mut sorted: Vec<_> =
+                        config.test_groups.iter().collect();
+                    sorted.sort_by_key(|(name, _)| name.as_str());
+                    for (name, entries) in sorted {
+                        println!("  {}", name.cyan());
+                        for entry in entries {
+                            println!("    {}", entry.bright_black());
+                        }
+                    }
+                }
+            } else if !groups.is_empty() {
+                let ignore_set: HashSet<String> = ignore.into_iter().collect();
+                let selectors: Vec<String> =
+                    groups.iter().map(|g| format!("group:{g}")).collect();
+                let test_names = match resolve_test_selection(
+                    &selectors,
                     &cwd,
-                    testbench_name.clone(),
+                    &config.test_groups,
+                    &ignore_set,
+                ) {
+                    Ok(names) => names,
+                    Err(e) => {
+                        eprintln!("{} {e}", "error:".bright_red());
+                        process::exit(1);
+                    }
+                };
+                let mut sorted: Vec<String> = test_names.into_iter().collect();
+                sorted.sort();
+                println!("Resolved {} testbench(es):", sorted.len());
+                for name in &sorted {
+                    println!("  {}", name.cyan());
+                }
+                for test in sorted {
+                    if let Err(e) = run_single_testbench(
+                        &cwd,
+                        test,
+                        std.into(),
+                        true,
+                        &runtime_flags,
+                        build_rust,
+                        scaffold,
+                    )
+                    .await
+                    {
+                        eprintln!("{} {e}", "error:".bright_red());
+                        process::exit(1);
+                    }
+                }
+            } else if let Some(testbench_name) = testbench {
+                if let Err(e) = run_single_testbench(
+                    &cwd,
+                    testbench_name,
                     std.into(),
                     recurse,
                     &runtime_flags,
@@ -420,29 +532,8 @@ async fn main() {
                 )
                 .await
                 {
-                    Ok(()) => {
-                        if scaffold {
-                            println!(
-                                "{} Scaffolding generated for '{}'",
-                                "✓".bright_green(),
-                                testbench_name
-                            );
-                        } else {
-                            println!(
-                                "{} Testbench '{}' completed successfully!",
-                                "✓".bright_green(),
-                                testbench_name
-                            );
-                            println!(
-                                "Waveform saved to: {}",
-                                format!("{testbench_name}.fst").cyan()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("{} {e}", "error:".bright_red());
-                        process::exit(1);
-                    }
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
                 }
             } else {
                 eprintln!(
