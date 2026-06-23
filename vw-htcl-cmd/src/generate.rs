@@ -116,52 +116,102 @@ pub fn generate(page: &ManPage, opts: &GenerateOptions) -> String {
     cleaned
 }
 
-/// Write the proc-level doc comments (the command description + a
-/// `See also:` footer) immediately above where the `proc` line will
-/// go, so they attach to it.
+/// Write the proc-level doc comments above the `proc` line so they
+/// attach to it. The output is structured as
+///
+/// ```text
+/// ## <summary sentence>
+/// ##
+/// ## <body paragraph 1>
+/// ##
+/// ## <body paragraph 2>
+/// ```
+///
+/// where the summary is the first sentence of the source description
+/// (LSP-clients use it for inline annotations like
+/// `CompletionItem::detail`) and the body is everything after,
+/// rendered as separate paragraphs. The body paragraphs are
+/// re-wrapped at ~78 columns so the on-disk file stays readable
+/// without preserving the man-page's source wrap.
 fn emit_proc_doc(out: &mut String, page: &ManPage, opts: &GenerateOptions) {
-    let mut wrote = false;
-    let mut blanks = 0;
-    for line in &page.description {
-        let line = sanitize_doc(line);
-        if line.is_empty() {
-            blanks += 1;
-            continue;
-        }
-        // Collapse runs of blank lines into a single `##` separator.
-        if wrote && blanks > 0 {
-            writeln!(out, "##").unwrap();
-        }
-        blanks = 0;
-        writeln!(out, "## {line}").unwrap();
-        wrote = true;
-    }
-    if !wrote {
-        writeln!(out, "## Wrapper for the Vivado `{}` command.", page.name)
+    let raw: Vec<String> =
+        page.description.iter().map(|l| sanitize_doc(l)).collect();
+    let summary = vw_htcl::doc::brief(&raw);
+    let extended = vw_htcl::doc::extended(&raw);
+
+    match summary {
+        None => {
+            writeln!(
+                out,
+                "## Wrapper for the Vivado `{}` command.",
+                page.name
+            )
             .unwrap();
+        }
+        Some(s) => {
+            emit_paragraph_lines(out, &s, "## ", 78);
+        }
     }
+    if let Some(body) = extended {
+        for paragraph in body.split("\n\n") {
+            writeln!(out, "##").unwrap();
+            emit_paragraph_lines(out, paragraph, "## ", 78);
+        }
+    }
+
     if opts.include_see_also && !page.see_also.is_empty() {
         writeln!(out, "##").unwrap();
         writeln!(out, "## See also: {}", page.see_also.join(", ")).unwrap();
     }
 }
 
+fn emit_paragraph_lines(
+    out: &mut String,
+    text: &str,
+    prefix: &str,
+    width: usize,
+) {
+    let body_width = width.saturating_sub(prefix.len());
+    for line in vw_htcl::doc::wrap_paragraph(text, body_width) {
+        writeln!(out, "{prefix}{line}").unwrap();
+    }
+}
+
 /// Build the structured arg list as an emit [`Doc`]: per-argument doc
-/// comments followed by an `@attr… ident` declaration.
+/// comments followed by an `@attr… ident` declaration. The doc
+/// comments follow the same `summary, blank, body` shape the
+/// proc-level docs use, so LSP clients can split brief/detail from
+/// extended documentation consistently.
 fn build_args(page: &ManPage) -> Doc {
     let mut doc = Doc::new();
     for (i, arg) in page.arguments.iter().enumerate() {
         if i > 0 {
             doc.push(Item::Blank);
         }
-        for line in &arg.description {
-            let line = sanitize_doc(line);
-            if line.is_empty() {
-                doc.push(Item::DocComment(String::new()));
-            } else {
+        let raw: Vec<String> =
+            arg.description.iter().map(|l| sanitize_doc(l)).collect();
+        let summary = vw_htcl::doc::brief(&raw);
+        let extended = vw_htcl::doc::extended(&raw);
+
+        // The arg block sits inside the proc's args braces, indented
+        // two spaces by `emit_proc`. Wrap a touch tighter so the
+        // final line lands at ~80 columns.
+        let body_width = 76usize;
+        if let Some(s) = summary.as_deref() {
+            for line in vw_htcl::doc::wrap_paragraph(s, body_width) {
                 doc.push(Item::DocComment(line));
             }
         }
+        if let Some(body) = extended {
+            for paragraph in body.split("\n\n") {
+                doc.push(Item::DocComment(String::new()));
+                for line in vw_htcl::doc::wrap_paragraph(paragraph, body_width)
+                {
+                    doc.push(Item::DocComment(line));
+                }
+            }
+        }
+
         doc.push(Item::Command(Command {
             doc_comments: Vec::new(),
             words: arg_attr_words(arg),

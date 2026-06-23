@@ -406,17 +406,16 @@ fn signature_help_response(help: &vw_htcl::SignatureHelp<'_>) -> SignatureHelp {
         let end = label.chars().count() as u32;
         parameters.push(ParameterInformation {
             label: ParameterLabel::LabelOffsets([start, end]),
-            documentation: arg
-                .doc_comments
-                .first()
-                .map(|d| Documentation::String(d.clone())),
+            documentation: vw_htcl::doc::brief(&arg.doc_comments)
+                .map(Documentation::String),
         });
     }
 
-    let documentation = (!help.doc_comments.is_empty()).then(|| {
+    let reflowed = vw_htcl::doc::reflow_doc_comments(help.doc_comments);
+    let documentation = (!reflowed.is_empty()).then(|| {
         Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: help.doc_comments.join("\n"),
+            value: reflowed,
         })
     });
 
@@ -530,22 +529,26 @@ fn format_proc(
     writeln!(out, "```htcl").unwrap();
     writeln!(out, "proc {name}").unwrap();
     writeln!(out, "```").unwrap();
-    if !proc_doc_comments.is_empty() {
+    let reflowed = vw_htcl::doc::reflow_doc_comments(proc_doc_comments);
+    if !reflowed.is_empty() {
         out.push('\n');
-        for line in proc_doc_comments {
-            writeln!(out, "{line}").unwrap();
-        }
+        out.push_str(&reflowed);
+        out.push('\n');
     }
     if let Some(sig) = signature {
         if !sig.args.is_empty() {
             out.push_str("\n### Parameters\n\n");
             for arg in &sig.args {
                 write!(out, "- `-{}`", arg.name).unwrap();
-                if let Some(brief) = arg.doc_comments.first() {
+                let reflowed =
+                    vw_htcl::doc::reflow_doc_comments(&arg.doc_comments);
+                let mut paragraphs = reflowed.split("\n\n");
+                if let Some(brief) = paragraphs.next().filter(|s| !s.is_empty())
+                {
                     write!(out, " — {brief}").unwrap();
                 }
                 out.push('\n');
-                for extra in arg.doc_comments.iter().skip(1) {
+                for extra in paragraphs.filter(|s| !s.is_empty()) {
                     writeln!(out, "  {extra}").unwrap();
                 }
                 for attr in &arg.attributes {
@@ -562,11 +565,11 @@ fn format_arg(arg: &ProcArg) -> String {
     writeln!(out, "```htcl").unwrap();
     writeln!(out, "-{}", arg.name).unwrap();
     writeln!(out, "```").unwrap();
-    if !arg.doc_comments.is_empty() {
+    let reflowed = vw_htcl::doc::reflow_doc_comments(&arg.doc_comments);
+    if !reflowed.is_empty() {
         out.push('\n');
-        for line in &arg.doc_comments {
-            writeln!(out, "{line}").unwrap();
-        }
+        out.push_str(&reflowed);
+        out.push('\n');
     }
     if !arg.attributes.is_empty() {
         out.push('\n');

@@ -143,7 +143,7 @@ fn complete_enum_values(
                 label: insert.clone(),
                 kind: CompletionKind::EnumValue,
                 detail: Some(format!("value for -{}", arg.name)),
-                documentation: arg.doc_comments.first().cloned(),
+                documentation: crate::doc::brief(&arg.doc_comments),
                 replace: line.partial_span,
             })
         })
@@ -277,13 +277,17 @@ fn in_proc_args(stmts: &[Stmt], offset: u32) -> bool {
 }
 
 fn first_doc_line(docs: &[String]) -> Option<String> {
-    docs.first().cloned()
+    crate::doc::brief(docs)
 }
 
 fn proc_documentation(p: &ProcInfo<'_>) -> Option<String> {
+    // Use `extended` (body only) here because the call site populates
+    // `CompletionItem::detail` with the brief sentence separately —
+    // shipping the full reflowed text would duplicate that sentence at
+    // the top of every popup.
     let mut out = String::new();
-    if !p.doc_comments.is_empty() {
-        out.push_str(&p.doc_comments.join("\n"));
+    if let Some(ext) = crate::doc::extended(p.doc_comments) {
+        out.push_str(&ext);
     }
     if let Some(sig) = p.signature {
         if !sig.args.is_empty() {
@@ -292,7 +296,7 @@ fn proc_documentation(p: &ProcInfo<'_>) -> Option<String> {
             }
             for arg in &sig.args {
                 write!(out, "- `-{}`", arg.name).unwrap();
-                if let Some(d) = arg.doc_comments.first() {
+                if let Some(d) = crate::doc::brief(&arg.doc_comments) {
                     write!(out, " — {d}").unwrap();
                 }
                 out.push('\n');
@@ -303,9 +307,11 @@ fn proc_documentation(p: &ProcInfo<'_>) -> Option<String> {
 }
 
 fn arg_documentation(arg: &ProcArg) -> String {
+    // `extended` only — the brief sentence is handled by the caller's
+    // `detail` field; see `proc_documentation` for the rationale.
     let mut out = String::new();
-    if !arg.doc_comments.is_empty() {
-        out.push_str(&arg.doc_comments.join("\n"));
+    if let Some(ext) = crate::doc::extended(&arg.doc_comments) {
+        out.push_str(&ext);
     }
     for attr in &arg.attributes {
         if !out.is_empty() {
@@ -486,9 +492,17 @@ cfg -mode -|\n";
 
     #[test]
     fn flag_completion_carries_doc_and_detail() {
+        // Multi-sentence doc: the brief sentence goes in `detail`,
+        // the rest goes in `documentation`. They must NOT overlap —
+        // an LSP client renders both, and a repeated leading
+        // sentence reads as a duplicate to the user.
         let src = "\
-proc cfg {\n  ## Bus width in bits.\n  @default(8) width\n} { }\n\
-cfg |\n";
+proc cfg {
+  ## Bus width in bits. Must be a power of two.
+  @default(8) width
+} { }
+cfg |
+";
         let (s, off) = cursor(src);
         let parsed = parse(&s);
         let items = complete_at(&parsed.document, &s, off);
@@ -496,7 +510,11 @@ cfg |\n";
         assert_eq!(item.kind, CompletionKind::Flag);
         assert_eq!(item.detail.as_deref(), Some("Bus width in bits."));
         let doc = item.documentation.as_deref().unwrap();
-        assert!(doc.contains("Bus width in bits."), "{doc}");
+        assert!(doc.contains("Must be a power of two."), "{doc}");
+        assert!(
+            !doc.contains("Bus width in bits."),
+            "documentation should not repeat the brief: {doc}"
+        );
         assert!(doc.contains("@default"), "{doc}");
     }
 }

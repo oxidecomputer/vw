@@ -384,8 +384,26 @@ fn emit_file_header(out: &mut String, component: &Component, vlnv: &str) {
     if let Some(desc) =
         component.description.as_deref().filter(|s| !s.is_empty())
     {
-        for line in desc.lines() {
-            writeln!(out, "## {}", line.trim_end()).unwrap();
+        // Split the IP-XACT description into a one-sentence summary
+        // plus body so an LSP client can show a short blurb on hover
+        // / completion without repeating it in the documentation
+        // popup. Same shape as the cmd-doc generator.
+        let raw: Vec<String> =
+            desc.lines().map(|l| l.trim_end().to_string()).collect();
+        let summary = vw_htcl::doc::brief(&raw);
+        let extended = vw_htcl::doc::extended(&raw);
+        if let Some(s) = summary {
+            for line in vw_htcl::doc::wrap_paragraph(&s, 78) {
+                writeln!(out, "## {line}").unwrap();
+            }
+        }
+        if let Some(body) = extended {
+            for paragraph in body.split("\n\n") {
+                writeln!(out, "##").unwrap();
+                for line in vw_htcl::doc::wrap_paragraph(paragraph, 78) {
+                    writeln!(out, "## {line}").unwrap();
+                }
+            }
         }
         writeln!(out, "##").unwrap();
     }

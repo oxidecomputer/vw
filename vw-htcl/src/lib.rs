@@ -20,6 +20,7 @@
 pub mod ast;
 pub mod cmdline;
 pub mod complete;
+pub mod doc;
 pub mod emit;
 pub mod goto;
 pub mod hover;
