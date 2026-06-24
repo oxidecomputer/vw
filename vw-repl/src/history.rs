@@ -114,8 +114,7 @@ impl History {
 }
 
 fn default_history_path() -> Option<PathBuf> {
-    let state =
-        dirs::state_dir().or_else(dirs::data_local_dir)?;
+    let state = dirs::state_dir().or_else(dirs::data_local_dir)?;
     Some(state.join("vw").join("repl-history"))
 }
 

@@ -105,8 +105,12 @@ fn collect_signatures<'doc>(
         let Stmt::Command(cmd) = stmt else { continue };
         match &cmd.kind {
             CommandKind::Proc(proc) => {
-                let Some(name) = proc.name.as_deref() else { continue };
-                let Some(sig) = proc.signature.as_ref() else { continue };
+                let Some(name) = proc.name.as_deref() else {
+                    continue;
+                };
+                let Some(sig) = proc.signature.as_ref() else {
+                    continue;
+                };
                 let qualified = qualify(prefix, name);
                 if table.insert(qualified.clone(), sig).is_some() {
                     diags.push(Diagnostic {
@@ -120,7 +124,9 @@ fn collect_signatures<'doc>(
                 }
             }
             CommandKind::NamespaceEval(ns) => {
-                let Some(name) = ns.name.as_deref() else { continue };
+                let Some(name) = ns.name.as_deref() else {
+                    continue;
+                };
                 // `extern` is reserved by htcl's lowering as the
                 // prefix for runtime-Tcl-proc disambiguation
                 // (`extern::foo` → `__vw_extern_foo`). A user-
@@ -130,11 +136,10 @@ fn collect_signatures<'doc>(
                 if name == "extern" {
                     diags.push(Diagnostic {
                         severity: Severity::Error,
-                        message:
-                            "`extern` is a reserved namespace name in \
+                        message: "`extern` is a reserved namespace name in \
                              htcl (used for runtime-Tcl-proc \
                              disambiguation); pick a different name"
-                                .into(),
+                            .into(),
                         span: ns.name_span,
                     });
                     continue;
@@ -711,9 +716,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         cur[0] = i;
         for j in 1..=n {
             let sub = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j] + 1)
-                .min(cur[j - 1] + 1)
-                .min(prev[j - 1] + sub);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + sub);
         }
         std::mem::swap(&mut prev, &mut cur);
     }
@@ -944,11 +947,7 @@ namespace eval outer {
 outer::inner::foo -x bogus
 ";
         let d = diags(src);
-        assert!(
-            d.iter().any(|m| m.message.contains("bogus")),
-            "{:?}",
-            d
-        );
+        assert!(d.iter().any(|m| m.message.contains("bogus")), "{:?}", d);
     }
 
     #[test]
@@ -981,11 +980,7 @@ port::plum_if_pin -name p -pin q
         let src = "totally_made_up_thing -arg 1\n";
         let d = diags(src);
         let err = d.iter().find(|m| m.severity == Severity::Error).unwrap();
-        assert!(
-            !err.message.contains("did you mean"),
-            "{}",
-            err.message
-        );
+        assert!(!err.message.contains("did you mean"), "{}", err.message);
     }
 
     #[test]

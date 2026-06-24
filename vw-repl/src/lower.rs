@@ -121,7 +121,11 @@ impl ProcLocation {
     }
 }
 
-pub fn prepare(input: &str, cwd: &Path) -> Result<Prepared, LowerError> {
+pub fn prepare(
+    input: &str,
+    cwd: &Path,
+    session_prelude: &str,
+) -> Result<Prepared, LowerError> {
     let workspace_dir = find_workspace_dir(cwd);
     let resolver = build_resolver(workspace_dir.as_deref());
 
@@ -129,7 +133,16 @@ pub fn prepare(input: &str, cwd: &Path) -> Result<Prepared, LowerError> {
         .as_deref()
         .map(Utf8Path::as_std_path)
         .unwrap_or(cwd);
-    let scratch = ScratchFile::new(scratch_dir, input)?;
+
+    // Prepend the session prelude — the committed source of every
+    // prior batch — so the analyzer sees every proc/namespace
+    // that's already been declared in the running Tcl session. The
+    // prelude is appended-to-disk only inside the scratch file;
+    // the lowering output strips it back out and only ships the
+    // new statements, which avoids re-defining wrappers on every
+    // input.
+    let (combined, pending_start) = combine_session(session_prelude, input);
+    let scratch = ScratchFile::new(scratch_dir, &combined)?;
 
     let program = vw_htcl::load_program(&scratch.path, &resolver)?;
     let parsed = vw_htcl::parse(&program.source);
@@ -139,18 +152,14 @@ pub fn prepare(input: &str, cwd: &Path) -> Result<Prepared, LowerError> {
         let (start, _) = idx.range(err.span);
         let where_ =
             render_location(&program, err.span, start.line + 1, &scratch.path);
-        return Err(LowerError::Parse(format!(
-            "{where_}: {}",
-            err.message
-        )));
+        return Err(LowerError::Parse(format!("{where_}: {}", err.message)));
     }
 
     // Validator runs first so unknown-keyword-call errors land
     // before we ship anything. These are now hard errors (not just
     // pre-flight warnings); routing them back as `LowerError` keeps
     // the App's existing error-rendering path unchanged.
-    let validator_diags =
-        vw_htcl::validate(&parsed.document, &program.source);
+    let validator_diags = vw_htcl::validate(&parsed.document, &program.source);
     if let Some(first_err) = validator_diags
         .iter()
         .find(|d| matches!(d.severity, vw_htcl::Severity::Error))
@@ -172,15 +181,21 @@ pub fn prepare(input: &str, cwd: &Path) -> Result<Prepared, LowerError> {
     let table = vw_htcl::signature_table(&parsed.document);
     let line_index = LineIndex::new(&program.source);
     let mut commands = Vec::new();
-    // Collect every extern referenced across the program so we can
-    // emit one idempotent rename block as the batch's prelude,
-    // exposing each external Tcl proc at its mangled name.
     let mut extern_names: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     for stmt in &parsed.document.stmts {
-        let vw_htcl::Stmt::Command(cmd) = stmt else { continue };
-        let lowered_raw =
-            vw_htcl::lower_command(cmd, &program.source, &table);
+        let vw_htcl::Stmt::Command(cmd) = stmt else {
+            continue;
+        };
+        // Skip statements that came from the session prelude —
+        // they're already declared in the running Tcl. Only ship
+        // statements from the new input (and anything it
+        // transitively `src`-imports, which the loader appends
+        // after the user's text).
+        if cmd.span.start < pending_start as u32 {
+            continue;
+        }
+        let lowered_raw = vw_htcl::lower_command(cmd, &program.source, &table);
         let rewritten = vw_htcl::rewrite_externs(&lowered_raw);
         for name in rewritten.names {
             extern_names.insert(name);
@@ -201,28 +216,25 @@ pub fn prepare(input: &str, cwd: &Path) -> Result<Prepared, LowerError> {
         });
     }
 
-    // Prepend the extern-rename prelude as a synthetic command. The
-    // rename is idempotent (guarded by `info commands`), so it's
-    // safe to re-ship across REPL inputs.
-    if !extern_names.is_empty() {
-        let names: Vec<String> = extern_names.into_iter().collect();
-        let prelude = vw_htcl::extern_rename_prelude(&names);
-        commands.insert(
-            0,
-            PreparedCommand {
-                tcl: prelude,
-                origin: Origin {
-                    file: None,
-                    line: 0,
-                    snippet: "(extern setup)".to_string(),
-                    via: Vec::new(),
-                },
-            },
-        );
-    }
+    // No prelude needed in the current architecture: wrappers
+    // live in the `vivado::` namespace and `extern::name` rewrites
+    // to `::name`, which Tcl resolves at the global root regardless
+    // of the calling namespace. We still drain `extern_names` so
+    // the analyzer can grow future per-extern bookkeeping without
+    // rewiring this path.
+    let _ = extern_names;
 
-    let procs =
-        build_proc_locations(&parsed.document, &program, &scratch.path);
+    // The session document grows with the NEW content only —
+    // anything we lowered from past the `pending_start` cut. That
+    // way `with_pending` on the next batch reconstructs the full
+    // declaration history without double-counting.
+    let committed_source = program
+        .source
+        .get(pending_start..)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let procs = build_proc_locations(&parsed.document, &program, &scratch.path);
     // The dedicated pre-flight `collect_warnings` is gone — the
     // validator now treats "unknown call with `-flag` args" as a
     // hard error and the REPL has already returned via `LowerError`
@@ -231,7 +243,7 @@ pub fn prepare(input: &str, cwd: &Path) -> Result<Prepared, LowerError> {
 
     Ok(Prepared {
         commands,
-        committed_source: program.source,
+        committed_source,
         procs,
         warnings,
     })
@@ -263,10 +275,14 @@ fn collect_procs(
 ) {
     use vw_htcl::CommandKind;
     for stmt in stmts {
-        let vw_htcl::Stmt::Command(cmd) = stmt else { continue };
+        let vw_htcl::Stmt::Command(cmd) = stmt else {
+            continue;
+        };
         match &cmd.kind {
             CommandKind::Proc(proc) => {
-                let Some(name) = proc.name.as_deref() else { continue };
+                let Some(name) = proc.name.as_deref() else {
+                    continue;
+                };
                 let qualified = qualify(prefix, name);
                 if let Some(loc) =
                     proc_body_location(program, proc.body_span, scratch_path)
@@ -275,15 +291,11 @@ fn collect_procs(
                 }
             }
             CommandKind::NamespaceEval(ns) => {
-                let Some(name) = ns.name.as_deref() else { continue };
+                let Some(name) = ns.name.as_deref() else {
+                    continue;
+                };
                 let nested = qualify(prefix, name);
-                collect_procs(
-                    &ns.body,
-                    &nested,
-                    program,
-                    scratch_path,
-                    out,
-                );
+                collect_procs(&ns.body, &nested, program, scratch_path, out);
             }
             _ => {}
         }
@@ -409,10 +421,7 @@ fn build_via_chain(
 }
 
 fn first_line(source: &str, start: usize, end: usize) -> String {
-    let line_end = source[start..]
-        .find('\n')
-        .map(|n| start + n)
-        .unwrap_or(end);
+    let line_end = source[start..].find('\n').map(|n| start + n).unwrap_or(end);
     source[start..line_end].trim().to_string()
 }
 
@@ -451,9 +460,31 @@ fn find_workspace_dir(start: &Path) -> Option<Utf8PathBuf> {
     }
 }
 
+/// Concatenate the session prelude with the new input. Returns the
+/// combined text plus the byte offset of where the new input
+/// begins — the lowering uses that cutoff to decide which
+/// statements are new (and must be shipped to Vivado) vs already-
+/// declared (analyzer reads them for signature lookup but doesn't
+/// re-emit them).
+fn combine_session(prelude: &str, input: &str) -> (String, usize) {
+    if prelude.is_empty() {
+        return (input.to_string(), 0);
+    }
+    let mut out = String::with_capacity(prelude.len() + input.len() + 1);
+    out.push_str(prelude);
+    if !prelude.ends_with('\n') {
+        out.push('\n');
+    }
+    let pending_start = out.len();
+    out.push_str(input);
+    (out, pending_start)
+}
+
 fn build_resolver(workspace_dir: Option<&Utf8Path>) -> Resolver {
     let mut resolver = Resolver::new();
-    let Some(ws) = workspace_dir else { return resolver };
+    let Some(ws) = workspace_dir else {
+        return resolver;
+    };
     if let Ok(paths) = vw_lib::transitive_dep_cache_paths(ws) {
         for (name, path) in paths {
             resolver = resolver.with_dep(name, path);
@@ -498,6 +529,7 @@ mod tests {
         let err = prepare(
             "set proj [\n  create_project\n    -in_memory 1\n    -name foo\n]\n",
             dir.path(),
+            "",
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -508,26 +540,59 @@ mod tests {
     #[test]
     fn extern_prefixed_call_is_accepted() {
         // The opt-out: `extern::create_project` is explicitly a
-        // raw Tcl call, no wrapper required. Lowering rewrites it
-        // to the mangled symbol and emits the rename prelude.
+        // raw Tcl call, no wrapper required. Lowering strips the
+        // prefix so the bare native resolves through Tcl's global
+        // namespace at runtime — no rename plumbing, no prelude.
         let dir = tempfile::tempdir().unwrap();
-        let prep = prepare(
-            "extern::create_project -name foo\n",
-            dir.path(),
-        )
-        .unwrap();
-        // Two commands: the synthetic extern-rename prelude, then
-        // the user's call.
-        assert_eq!(prep.commands.len(), 2);
+        let prep =
+            prepare("extern::create_project -name foo\n", dir.path(), "")
+                .unwrap();
+        assert_eq!(prep.commands.len(), 1, "{:?}", prep.commands);
         assert!(
-            prep.commands[0].tcl.contains("rename create_project"),
+            prep.commands[0].tcl.contains("create_project -name foo"),
             "{}",
             prep.commands[0].tcl
         );
         assert!(
-            prep.commands[1].tcl.contains("__vw_extern_create_project"),
+            !prep.commands[0].tcl.contains("extern::"),
             "{}",
-            prep.commands[1].tcl
+            prep.commands[0].tcl
+        );
+    }
+
+    #[test]
+    fn session_prelude_brings_prior_procs_into_scope() {
+        // Reproduces the REPL "src @lib then call" pattern: a
+        // wrapper declared in a previous batch (now in the session
+        // prelude) should be visible to the analyzer when we
+        // lower a bare call in the next batch — and the lowering
+        // should ship only the new statement, not redefine the
+        // wrapper.
+        let dir = tempfile::tempdir().unwrap();
+        let prelude = "\
+namespace eval vivado {
+  proc current_project {
+    @enum(0, 1) @default(0) quiet
+    @enum(0, 1) @default(0) verbose
+    @default(\"\") project
+  } {
+    set cmd [list ::current_project]
+    return [{*}$cmd]
+  }
+}
+";
+        let prep =
+            prepare("vivado::current_project\n", dir.path(), prelude).unwrap();
+        // Only the new call ships — the wrapper declaration from
+        // the prelude is already defined in Tcl and shouldn't get
+        // re-emitted.
+        assert_eq!(prep.commands.len(), 1, "{:?}", prep.commands);
+        // And the lowered call uses the wrapper's keyword→
+        // positional rewrite, supplying defaults for omitted args.
+        assert!(
+            prep.commands[0].tcl.contains("vivado::current_project 0 0"),
+            "{}",
+            prep.commands[0].tcl
         );
     }
 
@@ -539,6 +604,7 @@ mod tests {
             "proc create_project { @default(\"\") name } { }\n\
              set proj [ create_project -name foo ]\n",
             dir.path(),
+            "",
         )
         .unwrap();
         assert!(prep.warnings.is_empty(), "{:?}", prep.warnings);
@@ -547,7 +613,7 @@ mod tests {
     #[test]
     fn lowers_plain_proc_call_to_tcl() {
         let dir = tempfile::tempdir().unwrap();
-        let prep = prepare("puts hello", dir.path()).unwrap();
+        let prep = prepare("puts hello", dir.path(), "").unwrap();
         assert_eq!(prep.commands.len(), 1);
         assert!(prep.commands[0].tcl.contains("puts hello"));
         // Input is at line 1 of the buffer.
@@ -559,7 +625,8 @@ mod tests {
     #[test]
     fn each_statement_gets_its_own_origin() {
         let dir = tempfile::tempdir().unwrap();
-        let prep = prepare("set x 1\nset y 2\nset z 3", dir.path()).unwrap();
+        let prep =
+            prepare("set x 1\nset y 2\nset z 3", dir.path(), "").unwrap();
         assert_eq!(prep.commands.len(), 3);
         assert_eq!(prep.commands[0].origin.line, 1);
         assert_eq!(prep.commands[1].origin.line, 2);
@@ -591,7 +658,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let prep = prepare("src @dep", dir.path()).unwrap();
+        let prep = prepare("src @dep", dir.path(), "").unwrap();
         let loc = prep
             .procs
             .get("foo::bar")
@@ -619,16 +686,9 @@ mod tests {
         let leaf_dep = dir.path().join("leaf_dep");
         std::fs::create_dir_all(&mid_dep).unwrap();
         std::fs::create_dir_all(&leaf_dep).unwrap();
-        std::fs::write(
-            leaf_dep.join("module.htcl"),
-            "set leaf_var 1\n",
-        )
-        .unwrap();
-        std::fs::write(
-            mid_dep.join("module.htcl"),
-            "src @leaf\n",
-        )
-        .unwrap();
+        std::fs::write(leaf_dep.join("module.htcl"), "set leaf_var 1\n")
+            .unwrap();
+        std::fs::write(mid_dep.join("module.htcl"), "src @leaf\n").unwrap();
         std::fs::write(
             dir.path().join("vw.toml"),
             format!(
@@ -641,12 +701,16 @@ mod tests {
         )
         .unwrap();
 
-        let prep = prepare("src @mid", dir.path()).unwrap();
+        let prep = prepare("src @mid", dir.path(), "").unwrap();
         assert_eq!(prep.commands.len(), 1);
         let origin = &prep.commands[0].origin;
         // Leaf-most command lives in leaf_dep/module.htcl.
         assert!(
-            origin.file.as_ref().unwrap().ends_with("leaf_dep/module.htcl"),
+            origin
+                .file
+                .as_ref()
+                .unwrap()
+                .ends_with("leaf_dep/module.htcl"),
             "{:?}",
             origin.file
         );
@@ -684,18 +748,14 @@ mod tests {
         )
         .unwrap();
 
-        let prep = prepare("src @dep", dir.path()).unwrap();
+        let prep = prepare("src @dep", dir.path(), "").unwrap();
         // Two commands from the imported file: `proc hello` and the
         // bare `hello` call. Both must carry the imported file's
         // path as origin.
         assert_eq!(prep.commands.len(), 2);
         for cmd in &prep.commands {
             let file = cmd.origin.file.as_ref().expect("import has file");
-            assert!(
-                file.ends_with("dep/module.htcl"),
-                "{:?}",
-                file
-            );
+            assert!(file.ends_with("dep/module.htcl"), "{:?}", file);
         }
         // Line numbers point into the imported file.
         assert_eq!(prep.commands[0].origin.line, 1);

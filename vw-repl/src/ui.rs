@@ -34,9 +34,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),                       // scrollback (fills)
-            Constraint::Length(input_height(app)),    // input
-            Constraint::Length(1),                    // status bar
+            Constraint::Min(1),                    // scrollback (fills)
+            Constraint::Length(input_height(app)), // input
+            Constraint::Length(1),                 // status bar
         ])
         .split(f.area());
 
@@ -52,7 +52,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn input_height(app: &App) -> u16 {
     // Grow with the buffer up to a sensible cap so very long
     // multi-line entries don't squeeze the scrollback out.
-    let lines = app.input_line_count().max(1).min(12) as u16;
+    let lines = app.input_line_count().clamp(1, 12) as u16;
     lines + 2 // +2 for the top/bottom block border
 }
 
@@ -87,10 +87,7 @@ fn entry_lines(entry: &ScrollbackEntry) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
         ScrollbackKind::Result => ("  ", Style::default().fg(Color::Gray)),
-        ScrollbackKind::Stdout => (
-            "  ",
-            Style::default().fg(Color::White),
-        ),
+        ScrollbackKind::Stdout => ("  ", Style::default().fg(Color::White)),
         ScrollbackKind::Error => (
             "✗ ",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -99,10 +96,7 @@ fn entry_lines(entry: &ScrollbackEntry) -> Vec<Line<'static>> {
             "⚠ ",
             Style::default().fg(orange).add_modifier(Modifier::BOLD),
         ),
-        ScrollbackKind::Notice => (
-            "· ",
-            Style::default().fg(Color::DarkGray),
-        ),
+        ScrollbackKind::Notice => ("· ", Style::default().fg(Color::DarkGray)),
     };
     let body_style = match entry.kind {
         ScrollbackKind::Input => Style::default().fg(Color::White),
@@ -154,26 +148,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let (label, bg) = match app.worker_state() {
         // Indigo when Vivado is sitting idle, ready for input —
         // the "you can interact" steady state.
-        WorkerStatusView::Ready => (
-            " vivado: ready ",
-            Color::Rgb(75, 0, 130),
-        ),
+        WorkerStatusView::Ready => (" vivado: ready ", Color::Rgb(75, 0, 130)),
         // Orange whenever Vivado is anything but ready — starting
         // up, mid-eval, or dead. Catches the eye so the user
         // notices they can't (yet, or any longer) drive the
         // session.
-        WorkerStatusView::Starting => (
-            " vivado: starting ",
-            Color::Rgb(255, 140, 0),
-        ),
-        WorkerStatusView::Running => (
-            " vivado: running ",
-            Color::Rgb(255, 140, 0),
-        ),
-        WorkerStatusView::Down => (
-            " vivado: down ",
-            Color::Rgb(255, 140, 0),
-        ),
+        WorkerStatusView::Starting => {
+            (" vivado: starting ", Color::Rgb(255, 140, 0))
+        }
+        WorkerStatusView::Running => {
+            (" vivado: running ", Color::Rgb(255, 140, 0))
+        }
+        WorkerStatusView::Down => (" vivado: down ", Color::Rgb(255, 140, 0)),
     };
     let hint = if app.reverse_search().is_some() {
         "Esc cancel · Enter accept · Ctrl-R older"
@@ -186,10 +172,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let badge_width = label.chars().count() as u16;
     let layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(badge_width),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(badge_width)])
         .split(area);
     f.render_widget(
         Paragraph::new(Span::styled(

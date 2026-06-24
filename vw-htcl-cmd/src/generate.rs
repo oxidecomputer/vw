@@ -75,10 +75,13 @@ impl Default for GenerateOptions {
 /// Generate the htcl wrapper text for `page`.
 pub fn generate(page: &ManPage, opts: &GenerateOptions) -> String {
     let cmd = &page.name;
-    // The wrapper body forwards to the underlying Vivado proc via
-    // htcl's `extern::` prefix. The lowering pass autogenerates the
-    // rename plumbing — wrapper authors and this generator no
-    // longer need to write the `rename …` block by hand.
+    // Wrapper body forwards to the underlying Vivado proc via
+    // `extern::` (which the lowering rewrites to the bare native
+    // name). The wrapper itself lives inside `namespace eval
+    // vivado { ... }` so it doesn't shadow the global name the
+    // body is forwarding to — that's what frees Vivado's own
+    // internal Tcl from accidentally hitting our typed wrappers
+    // when it calls a sibling builtin.
     let forwarded = format!("extern::{}", page.name);
 
     let overrides = opts.constraints.for_command(&page.name);
@@ -94,6 +97,9 @@ pub fn generate(page: &ManPage, opts: &GenerateOptions) -> String {
     writeln!(out, "# Do not edit by hand.").unwrap();
     writeln!(out).unwrap();
 
+    writeln!(out, "namespace eval vivado {{").unwrap();
+    writeln!(out).unwrap();
+
     // Proc doc comment: the command Description, then a See-Also footer.
     emit_proc_doc(&mut out, page, opts);
 
@@ -101,6 +107,9 @@ pub fn generate(page: &ManPage, opts: &GenerateOptions) -> String {
     let args = build_args(page, &effective);
     let body = build_body(&forwarded, &effective);
     emit_proc(&mut out, cmd, &args, &body);
+
+    writeln!(out).unwrap();
+    writeln!(out, "}}").unwrap();
 
     // Trim trailing whitespace line-by-line (empty doc comments emit a
     // trailing space) and guarantee a single trailing newline.
@@ -138,12 +147,8 @@ fn emit_proc_doc(out: &mut String, page: &ManPage, opts: &GenerateOptions) {
 
     match summary {
         None => {
-            writeln!(
-                out,
-                "## Wrapper for the Vivado `{}` command.",
-                page.name
-            )
-            .unwrap();
+            writeln!(out, "## Wrapper for the Vivado `{}` command.", page.name)
+                .unwrap();
         }
         Some(s) => {
             emit_paragraph_lines(out, &s, "## ", 78);
@@ -204,14 +209,13 @@ fn effective_args(
 ) -> Vec<EffectiveArg> {
     page.arguments
         .iter()
-        .map(|arg| effective_arg(arg, overrides.and_then(|o| o.args.get(&arg.ident))))
+        .map(|arg| {
+            effective_arg(arg, overrides.and_then(|o| o.args.get(&arg.ident)))
+        })
         .collect()
 }
 
-fn effective_arg(
-    arg: &Argument,
-    over: Option<&ArgOverride>,
-) -> EffectiveArg {
+fn effective_arg(arg: &Argument, over: Option<&ArgOverride>) -> EffectiveArg {
     let empty = ArgOverride::default();
     let over = over.unwrap_or(&empty);
 
@@ -229,9 +233,7 @@ fn effective_arg(
     // Enum: man-page-derived for booleans; constraints can clear or
     // replace.
     let mut enum_values: Option<Vec<String>> = match &arg.kind {
-        ArgKind::Boolean => {
-            Some(vec!["0".to_string(), "1".to_string()])
-        }
+        ArgKind::Boolean => Some(vec!["0".to_string(), "1".to_string()]),
         _ => None,
     };
     if over.clear_enum {
@@ -245,8 +247,7 @@ fn effective_arg(
     // default acts like a value-taking flag — body-emit should
     // forward `-flag $value`, not `if {$flag} { ... }`. This is the
     // exact shape `set_property -dict` needs.
-    let kind = if matches!(arg.kind, ArgKind::Boolean)
-        && enum_values.is_none()
+    let kind = if matches!(arg.kind, ArgKind::Boolean) && enum_values.is_none()
     {
         if arg.flag.is_some() {
             ArgKind::Value
@@ -332,10 +333,8 @@ fn effective_attr_words(arg: &EffectiveArg) -> Vec<Word> {
         words.push(Word::Raw(format!("@one_of({})", arg.one_of.join(", "))));
     }
     if !arg.requires.is_empty() {
-        words.push(Word::Raw(format!(
-            "@requires({})",
-            arg.requires.join(", ")
-        )));
+        words
+            .push(Word::Raw(format!("@requires({})", arg.requires.join(", "))));
     }
     if !arg.conflicts.is_empty() {
         words.push(Word::Raw(format!(
@@ -360,10 +359,7 @@ fn format_attribute_value(s: &str) -> String {
     if is_int || is_ident {
         s.to_string()
     } else {
-        format!(
-            "\"{}\"",
-            s.replace('\\', "\\\\").replace('"', "\\\"")
-        )
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
 }
 

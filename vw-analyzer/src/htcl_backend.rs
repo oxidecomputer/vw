@@ -412,7 +412,7 @@ fn signature_help_response(help: &vw_htcl::SignatureHelp<'_>) -> SignatureHelp {
     }
 
     let reflowed = vw_htcl::doc::reflow_doc_comments(help.doc_comments);
-    let documentation = (!reflowed.is_empty()).then(|| {
+    let documentation = (!reflowed.is_empty()).then_some({
         Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
             value: reflowed,
@@ -471,18 +471,15 @@ fn proc_doc_comments_for_in(
     for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
         match &cmd.kind {
-            CommandKind::Proc(p) => {
+            CommandKind::Proc(p)
                 // Pointer-identity match: `proc` was looked up out
                 // of this same parse, so its address inside the AST
                 // is unique.
-                if std::ptr::eq(p, proc) {
+                if std::ptr::eq(p, proc) => {
                     return Some(cmd.doc_comments.clone());
                 }
-            }
             CommandKind::NamespaceEval(ns) => {
-                if let Some(found) =
-                    proc_doc_comments_for_in(&ns.body, proc)
-                {
+                if let Some(found) = proc_doc_comments_for_in(&ns.body, proc) {
                     return Some(found);
                 }
             }
@@ -508,7 +505,9 @@ fn proc_doc_comments_by_name_in(
         let Stmt::Command(cmd) = stmt else { continue };
         match &cmd.kind {
             CommandKind::Proc(p) => {
-                let Some(decl_name) = p.name.as_deref() else { continue };
+                let Some(decl_name) = p.name.as_deref() else {
+                    continue;
+                };
                 let qualified = if prefix.is_empty() {
                     decl_name.to_string()
                 } else {
@@ -519,7 +518,9 @@ fn proc_doc_comments_by_name_in(
                 }
             }
             CommandKind::NamespaceEval(ns) => {
-                let Some(ns_name) = ns.name.as_deref() else { continue };
+                let Some(ns_name) = ns.name.as_deref() else {
+                    continue;
+                };
                 let nested = if prefix.is_empty() {
                     ns_name.to_string()
                 } else {

@@ -49,8 +49,12 @@ fn collect_into<'a>(
         let Stmt::Command(cmd) = stmt else { continue };
         match &cmd.kind {
             CommandKind::Proc(proc) => {
-                let Some(name) = proc.name.as_deref() else { continue };
-                let Some(sig) = proc.signature.as_ref() else { continue };
+                let Some(name) = proc.name.as_deref() else {
+                    continue;
+                };
+                let Some(sig) = proc.signature.as_ref() else {
+                    continue;
+                };
                 let qualified = if prefix.is_empty() {
                     name.to_string()
                 } else {
@@ -59,7 +63,9 @@ fn collect_into<'a>(
                 table.insert(qualified, sig);
             }
             CommandKind::NamespaceEval(ns) => {
-                let Some(name) = ns.name.as_deref() else { continue };
+                let Some(name) = ns.name.as_deref() else {
+                    continue;
+                };
                 let nested = if prefix.is_empty() {
                     name.to_string()
                 } else {
@@ -220,20 +226,26 @@ pub struct ExternRewrite {
     pub names: Vec<String>,
 }
 
-/// Replace every `extern::<name>` occurrence in `text` with the
-/// mangled Tcl symbol `__vw_extern_<name>` (with `::` inside the
-/// name folded to `__` so the resulting identifier is single-
-/// segment Tcl). Returns the new text plus the unique, sorted set
-/// of names seen — those are what the caller renames into place
-/// in the prelude.
+/// Rewrite every `extern::<name>` in `text` to `::<name>` — the
+/// Tcl-absolute form that anchors the lookup at the global
+/// namespace. Returns the rewritten text plus the unique, sorted
+/// set of names seen.
 ///
-/// The rewrite is text-level, not AST-level. We have to handle
-/// proc bodies (which lower as raw text), and a textual pass cleanly
-/// catches calls at any nesting depth — inside `[ … ]`,
-/// inside multi-arm `if {…} { … extern::foo … } else { … }`, etc.
-/// Word-boundary detection on the leading side prevents a token
-/// like `not_extern::foo` from triggering; the trailing identifier
-/// is parsed greedily so `extern::a::b::c` rewrites as one unit.
+/// Anchoring at `::` matters because htcl wrappers live inside
+/// `namespace eval vivado { … }`. Inside that namespace a bare
+/// `create_project` resolution searches the *current* namespace
+/// first and finds `vivado::create_project` (the wrapper itself!) —
+/// infinite recursion. The leading `::` skips the current-
+/// namespace search and goes straight to the global, where the
+/// unshadowed Vivado native lives.
+///
+/// The rewrite is text-level, not AST-level. Proc bodies lower
+/// as raw text, and a textual pass cleanly catches calls at any
+/// nesting depth — inside `[ … ]`, inside multi-arm
+/// `if {…} { … extern::foo … } else { … }`, etc. Word-boundary
+/// detection on the leading side prevents `not_extern::foo` from
+/// triggering; the trailing identifier is parsed greedily so
+/// `extern::a::b::c` rewrites as one unit (→ `::a::b::c`).
 pub fn rewrite_externs(text: &str) -> ExternRewrite {
     let mut out = String::with_capacity(text.len());
     let mut names: std::collections::BTreeSet<String> =
@@ -241,27 +253,25 @@ pub fn rewrite_externs(text: &str) -> ExternRewrite {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        // Look for the prefix at a word boundary.
         if i + EXTERN_PREFIX.len() <= bytes.len()
-            && &bytes[i..i + EXTERN_PREFIX.len()]
-                == EXTERN_PREFIX.as_bytes()
+            && &bytes[i..i + EXTERN_PREFIX.len()] == EXTERN_PREFIX.as_bytes()
             && (i == 0 || !is_extern_ident_byte(bytes[i - 1]))
         {
             let name_start = i + EXTERN_PREFIX.len();
             let name_end = scan_extern_name_end(bytes, name_start);
             if name_end > name_start {
                 let name = &text[name_start..name_end];
-                out.push_str("__vw_extern_");
-                out.push_str(&name.replace("::", "__"));
+                // Leading `::` makes the lookup absolute (global
+                // namespace) — necessary inside `namespace eval
+                // vivado { … }` so the wrapper body doesn't
+                // recurse on itself.
+                out.push_str("::");
+                out.push_str(name);
                 names.insert(name.to_string());
                 i = name_end;
                 continue;
             }
         }
-        // Copy a single character through. We can't index bytes
-        // directly because the text may contain multi-byte UTF-8
-        // (proc doc comments, string literals); advance to the
-        // next char boundary instead.
         let ch_end = next_char_boundary(text, i);
         out.push_str(&text[i..ch_end]);
         i = ch_end;
@@ -283,10 +293,7 @@ fn scan_extern_name_end(bytes: &[u8], start: usize) -> usize {
             i += 1;
         } else if bytes[i] == b':'
             && bytes.get(i + 1).copied() == Some(b':')
-            && bytes
-                .get(i + 2)
-                .copied()
-                .is_some_and(is_extern_ident_byte)
+            && bytes.get(i + 2).copied().is_some_and(is_extern_ident_byte)
         {
             i += 2;
         } else {
@@ -304,20 +311,16 @@ fn next_char_boundary(s: &str, start: usize) -> usize {
     end
 }
 
-/// Build the one-time setup Tcl that exposes each extern at its
-/// mangled name. Idempotent — re-running across REPL inputs is
-/// harmless because each rename is guarded.
-pub fn extern_rename_prelude(names: &[String]) -> String {
-    let mut out = String::new();
-    for name in names {
-        let mangled = format!("__vw_extern_{}", name.replace("::", "__"));
-        out.push_str(&format!(
-            "if {{[info commands {mangled}] eq \"\" && \
-             [info commands {name}] ne \"\"}} {{ \
-             rename {name} {mangled} }}\n"
-        ));
-    }
-    out
+/// Historically emitted a rename prelude that aliased each Vivado
+/// native to a mangled name so wrappers could forward to the
+/// underlying proc without recursing on themselves. With wrappers
+/// now living in the `vivado::` namespace and no longer shadowing
+/// the globals they wrap, no rename is needed — `extern::foo`
+/// just rewrites to bare `foo`, which Tcl resolves to the global
+/// native. Kept as a public symbol so callers don't have to track
+/// the layering change; returns the empty string.
+pub fn extern_rename_prelude(_names: &[String]) -> String {
+    String::new()
 }
 
 /// True when `call_name` is the explicit `extern::…` form — used
@@ -352,11 +355,7 @@ fn lower_words(
         .join(" ")
 }
 
-fn lower_word(
-    word: &Word,
-    source: &str,
-    table: &SignatureTable<'_>,
-) -> String {
+fn lower_word(word: &Word, source: &str, table: &SignatureTable<'_>) -> String {
     match word.form {
         WordForm::Bare => lower_word_parts(&word.parts, source, table),
         WordForm::Quoted => {
@@ -521,7 +520,8 @@ set proj [
         // `[outer [inner ...] ...]` — newlines inside both layers
         // become spaces; the parser sees nested CmdSubst so the
         // recursive collection covers both.
-        let src = "set x [\n  foo\n    -a [\n      bar\n        -b 1\n    ]\n]\n";
+        let src =
+            "set x [\n  foo\n    -a [\n      bar\n        -b 1\n    ]\n]\n";
         let out = lowered(src);
         assert!(!out[0].contains('\n'), "lowered: {:?}", out[0]);
     }
@@ -539,48 +539,46 @@ set proj [
     }
 
     #[test]
-    fn rewrite_externs_mangles_call_sites() {
+    fn rewrite_externs_anchors_at_global_namespace() {
         let r = rewrite_externs(
             "set cmd [list extern::set_property]\n\
              extern::create_project -name foo\n",
         );
-        assert!(r.text.contains("__vw_extern_set_property"), "{}", r.text);
-        assert!(r.text.contains("__vw_extern_create_project"), "{}", r.text);
-        // Original tokens are gone from the rewritten text.
+        // Leading `::` anchors the lookup at Tcl's global
+        // namespace, which is where unshadowed Vivado natives
+        // live — necessary so wrapper bodies inside `namespace
+        // eval vivado { … }` don't recurse on themselves.
+        assert!(r.text.contains("[list ::set_property]"), "{}", r.text);
+        assert!(r.text.contains("::create_project -name foo"), "{}", r.text);
         assert!(!r.text.contains("extern::"), "{}", r.text);
-        // Names returned sorted + unique.
         assert_eq!(r.names, vec!["create_project", "set_property"]);
     }
 
     #[test]
-    fn rewrite_externs_handles_namespaced_names() {
+    fn rewrite_externs_preserves_namespaced_names() {
         let r = rewrite_externs("extern::common::send_msg_id A B C\n");
-        // `::` inside the name folds to `__` so the mangled symbol
-        // is single-segment Tcl.
-        assert!(
-            r.text.contains("__vw_extern_common__send_msg_id"),
-            "{}",
-            r.text
-        );
+        // Same anchoring for multi-segment names —
+        // `::common::send_msg_id` resolves the leading namespace
+        // search from the global root.
+        assert!(r.text.contains("::common::send_msg_id A B C"), "{}", r.text);
         assert_eq!(r.names, vec!["common::send_msg_id"]);
     }
 
     #[test]
     fn rewrite_externs_respects_word_boundary() {
-        // A token like `not_extern::foo` must NOT rewrite — the
-        // prefix is in the middle of a word.
         let r = rewrite_externs("set x not_extern::foo\n");
         assert_eq!(r.text, "set x not_extern::foo\n");
         assert!(r.names.is_empty());
     }
 
     #[test]
-    fn extern_rename_prelude_is_idempotent_per_name() {
+    fn extern_rename_prelude_is_empty() {
+        // Wrappers no longer shadow globals (they live in the
+        // `vivado::` namespace), so the historical rename plumbing
+        // is unnecessary. The helper still exists for API stability
+        // but always returns empty.
         let p = extern_rename_prelude(&["set_property".to_string()]);
-        // The `if` guard makes re-running safe.
-        assert!(p.contains("info commands __vw_extern_set_property"));
-        assert!(p.contains("info commands set_property"));
-        assert!(p.contains("rename set_property __vw_extern_set_property"));
+        assert!(p.is_empty(), "{p}");
     }
 
     #[test]

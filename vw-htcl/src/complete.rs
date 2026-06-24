@@ -257,7 +257,9 @@ fn collect_procs_in<'a>(
         let Stmt::Command(cmd) = stmt else { continue };
         match &cmd.kind {
             CommandKind::Proc(proc) => {
-                let Some(name) = proc.name.as_deref() else { continue };
+                let Some(name) = proc.name.as_deref() else {
+                    continue;
+                };
                 let qualified = if prefix.is_empty() {
                     name.to_string()
                 } else {
@@ -270,7 +272,9 @@ fn collect_procs_in<'a>(
                 });
             }
             CommandKind::NamespaceEval(ns) => {
-                let Some(name) = ns.name.as_deref() else { continue };
+                let Some(name) = ns.name.as_deref() else {
+                    continue;
+                };
                 let nested = if prefix.is_empty() {
                     name.to_string()
                 } else {

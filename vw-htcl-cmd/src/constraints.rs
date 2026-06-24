@@ -107,11 +107,12 @@ impl ConstraintsTable {
 
     /// Load from a TOML file at `path`.
     pub fn load(path: &Path) -> Result<Self, ConstraintsError> {
-        let text =
-            std::fs::read_to_string(path).map_err(|e| ConstraintsError::Io {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            ConstraintsError::Io {
                 path: path.to_path_buf(),
                 source: e,
-            })?;
+            }
+        })?;
         toml::from_str(&text).map_err(|e| ConstraintsError::Parse {
             path: path.to_path_buf(),
             source: e,

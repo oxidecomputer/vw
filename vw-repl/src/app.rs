@@ -17,9 +17,7 @@
 
 use std::time::Duration;
 
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
     LeaveAlternateScreen,
@@ -92,7 +90,8 @@ pub struct App {
     /// Proc-name → body-location map for the in-flight batch. Used
     /// by the error renderer to translate Tcl's `(procedure "X"
     /// line N)` frames back to htcl file:line locations.
-    pending_procs: std::collections::HashMap<String, crate::lower::ProcLocation>,
+    pending_procs:
+        std::collections::HashMap<String, crate::lower::ProcLocation>,
     /// Set when `:quit` (or Ctrl-D on an empty buffer) fires, so the
     /// outer loop bails out after the current frame.
     exit: bool,
@@ -271,10 +270,7 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 if self.input.is_empty() {
-                    self.push(
-                        ScrollbackKind::Notice,
-                        "exit".to_string(),
-                    );
+                    self.push(ScrollbackKind::Notice, "exit".to_string());
                     self.exit = true;
                 }
             }
@@ -320,7 +316,9 @@ impl App {
     }
 
     async fn handle_reverse_search_key(&mut self, key: KeyEvent) {
-        let Some(rs) = self.reverse_search.as_mut() else { return };
+        let Some(rs) = self.reverse_search.as_mut() else {
+            return;
+        };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
                 self.reverse_search = None;
@@ -357,7 +355,9 @@ impl App {
     }
 
     fn rerun_reverse_search(&mut self) {
-        let Some(rs) = self.reverse_search.as_mut() else { return };
+        let Some(rs) = self.reverse_search.as_mut() else {
+            return;
+        };
         match self.history.search_back(&rs.query, None) {
             Some((idx, hit)) => {
                 rs.match_index = Some(idx);
@@ -427,20 +427,18 @@ impl App {
         // A lowering failure (unknown dep, parse error in an
         // imported file, etc.) never reaches Vivado.
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let lowered = match crate::lower::prepare(&text, &cwd) {
-            Ok(l) => l,
-            Err(e) => {
-                // The user cares "did my input run or not" — the
-                // fact that this came back from the lowering
-                // pipeline (vs. the Vivado worker) is internal
-                // accounting. Just say ERROR.
-                self.push(
-                    ScrollbackKind::Error,
-                    format!("ERROR: {e}"),
-                );
-                return;
-            }
-        };
+        let lowered =
+            match crate::lower::prepare(&text, &cwd, self.session.prelude()) {
+                Ok(l) => l,
+                Err(e) => {
+                    // The user cares "did my input run or not" — the
+                    // fact that this came back from the lowering
+                    // pipeline (vs. the Vivado worker) is internal
+                    // accounting. Just say ERROR.
+                    self.push(ScrollbackKind::Error, format!("ERROR: {e}"));
+                    return;
+                }
+            };
 
         // Surface any pre-flight warnings *before* shipping. If the
         // eval then fails, the user already has the context they
@@ -458,10 +456,7 @@ impl App {
             // imported source to the session anyway so future
             // analyzer queries see the imported procs.
             self.session.commit(&lowered.committed_source);
-            self.push(
-                ScrollbackKind::Notice,
-                "(no Tcl to evaluate)".into(),
-            );
+            self.push(ScrollbackKind::Notice, "(no Tcl to evaluate)".into());
             return;
         }
 
@@ -528,10 +523,7 @@ impl App {
         match event {
             WorkerEvent::Started => {
                 self.worker_state = WorkerState::Ready;
-                self.push(
-                    ScrollbackKind::Notice,
-                    "vivado ready".into(),
-                );
+                self.push(ScrollbackKind::Notice, "vivado ready".into());
                 if let Some(path) = self.opts.initial_load.clone() {
                     match std::fs::read_to_string(path.as_std_path()) {
                         Ok(content) => {
@@ -728,10 +720,7 @@ fn render_eval_error(
             for frame in &frames {
                 push_frame(app, frame);
             }
-            app.push(
-                ScrollbackKind::Error,
-                format!("{other}"),
-            );
+            app.push(ScrollbackKind::Error, format!("{other}"));
             return;
         }
     };
@@ -813,7 +802,9 @@ fn parse_tcl_proc_frames(info: &str) -> Vec<TclProcFrame> {
         let Some((name, rest)) = rest.split_once("\" line ") else {
             continue;
         };
-        let Some(num) = rest.strip_suffix(')') else { continue };
+        let Some(num) = rest.strip_suffix(')') else {
+            continue;
+        };
         let Ok(n) = num.parse::<u32>() else { continue };
         out.push(TclProcFrame {
             proc: name.to_string(),
@@ -831,10 +822,7 @@ struct TclProcFrame {
     line: u32,
 }
 
-fn render_origin_path(
-    file: Option<&std::path::Path>,
-    line: u32,
-) -> String {
+fn render_origin_path(file: Option<&std::path::Path>, line: u32) -> String {
     match file {
         Some(p) => format!("{}:{line}", display_path(p)),
         None => format!("(input):{line}"),

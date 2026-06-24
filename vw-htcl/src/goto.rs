@@ -232,14 +232,15 @@ fn find_proc_decl_in<'a>(
                 }
             }
             CommandKind::NamespaceEval(ns) => {
-                let Some(ns_name) = ns.name.as_deref() else { continue };
+                let Some(ns_name) = ns.name.as_deref() else {
+                    continue;
+                };
                 let nested = if prefix.is_empty() {
                     ns_name.to_string()
                 } else {
                     format!("{prefix}::{ns_name}")
                 };
-                if let Some(found) =
-                    find_proc_decl_in(&ns.body, &nested, name)
+                if let Some(found) = find_proc_decl_in(&ns.body, &nested, name)
                 {
                     return Some(found);
                 }

@@ -150,7 +150,7 @@ fn emit_dict_sub_proc(
     }
 
     let mut body = String::new();
-    writeln!(body, "set_property -dict [list \\").unwrap();
+    writeln!(body, "vivado::set_property -dict [list \\").unwrap();
     writeln!(body, "  CONFIG.{param_name} [list \\").unwrap();
     let n = schema.fields.len();
     for (i, f) in schema.fields.iter().enumerate() {
@@ -250,7 +250,7 @@ fn build_single_body(vlnv: &str, parameters: &[&Parameter]) -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "set cell [create_bd_cell -type ip -vlnv {vlnv} -name $name]"
+        "set cell [vivado::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
     )
     .unwrap();
     if parameters.is_empty() {
@@ -329,7 +329,7 @@ fn generate_split(
         }
     }
     let mut top_body = format!(
-        "set cell [create_bd_cell -type ip -vlnv {vlnv} -name $name]\n"
+        "set cell [vivado::create_bd_cell -type ip -vlnv {vlnv} -name $name]\n"
     );
     if !tree.direct.is_empty() {
         write_set_property_dict(&mut top_body, &tree.direct, "");
@@ -443,7 +443,7 @@ fn write_set_property_dict(
     parameters: &[&Parameter],
     prefix_to_strip: &str,
 ) {
-    writeln!(out, "set_property -dict [list \\").unwrap();
+    writeln!(out, "vivado::set_property -dict [list \\").unwrap();
     for p in parameters {
         let arg = lowercase_ident(strip_prefix(&p.name, prefix_to_strip));
         writeln!(out, "  CONFIG.{} ${arg} \\", p.name).unwrap();

@@ -41,7 +41,8 @@ impl Session {
     /// positions into this absolute offset).
     #[allow(dead_code)] // wired up by the in-progress completion slice
     pub fn with_pending(&self, pending: &str) -> (String, u32) {
-        let mut combined = String::with_capacity(self.text.len() + pending.len() + 1);
+        let mut combined =
+            String::with_capacity(self.text.len() + pending.len() + 1);
         combined.push_str(&self.text);
         if !self.text.is_empty() && !self.text.ends_with('\n') {
             combined.push('\n');

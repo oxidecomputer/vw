@@ -69,9 +69,7 @@ pub fn extended(lines: &[String]) -> Option<String> {
             continue;
         }
         let next = bytes.get(i + 1).copied();
-        if next.is_none()
-            || matches!(next, Some(b' ' | b'\t' | b'\n'))
-        {
+        if next.is_none() || matches!(next, Some(b' ' | b'\t' | b'\n')) {
             split_at = Some(i + 1);
             break;
         }
@@ -114,17 +112,16 @@ pub fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
 pub fn reflow_doc_comments(lines: &[String]) -> String {
     let mut out = String::new();
     let mut paragraph = String::new();
-    let flush =
-        |paragraph: &mut String, out: &mut String| {
-            if paragraph.is_empty() {
-                return;
-            }
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str(paragraph);
-            paragraph.clear();
-        };
+    let flush = |paragraph: &mut String, out: &mut String| {
+        if paragraph.is_empty() {
+            return;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(paragraph);
+        paragraph.clear();
+    };
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -256,7 +253,8 @@ mod tests {
     fn brief_does_not_trip_on_decimal_or_versal_dots() {
         // `3.4` shouldn't end the sentence — terminator must be
         // followed by whitespace or end-of-string.
-        let out = brief(&lines(["Source IP-XACT: xilinx.com:ip:versal_cips:3.4"]));
+        let out =
+            brief(&lines(["Source IP-XACT: xilinx.com:ip:versal_cips:3.4"]));
         assert_eq!(
             out.as_deref(),
             Some("Source IP-XACT: xilinx.com:ip:versal_cips:3.4")
