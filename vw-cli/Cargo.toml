@@ -20,6 +20,7 @@ vw-vivado = { path = "../vw-vivado" }
 vw-analyzer = { path = "../vw-analyzer" }
 vw-ip = { path = "../vw-ip" }
 vw-htcl-cmd = { path = "../vw-htcl-cmd" }
+vw-repl = { path = "../vw-repl" }
 clap = { version = "4.0", features = ["derive"] }
 colored = "2.0"
 tokio.workspace = true

@@ -40,9 +40,13 @@ pub use goto::definition_at;
 pub use hover::{hover_at, HoverTarget};
 pub use loader::{
     load as load_program, load_with_observer as load_program_with_observer,
-    LoadError, LoadObserver, LoadedProgram,
+    ImportEdge, LoadError, LoadObserver, LoadedFile, LoadedProgram,
+    SourceRegion,
 };
-pub use lower::{lower_command, signature_table, SignatureTable};
+pub use lower::{
+    extern_rename_prelude, is_extern_call, lower_command, rewrite_externs,
+    signature_table, ExternRewrite, SignatureTable, EXTERN_PREFIX,
+};
 pub use signature_help::{signature_help_at, SignatureHelp};
 pub use src_path::{
     classify as classify_src_path, PathKind, ResolveError, Resolver,

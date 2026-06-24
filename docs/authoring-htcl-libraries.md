@@ -49,8 +49,9 @@ htcl is lowered to plain Tcl and shipped to the backend.
 An htcl library is one or more `.htcl` files. Most libraries place
 their entry point at a conventional path (`src/<name>.htcl`) and
 may `src`-import additional files. A `proc` declared in any
-imported file becomes callable in the consumer's scope. There are
-no namespaces or module objects in v1 — proc names are flat.
+imported file becomes callable in the consumer's scope. Proc names
+are flat unless wrapped in a `namespace eval` block, which groups
+related helpers under a `<ns>::<name>` prefix — see §2.10 below.
 
 ## 2. The language
 
@@ -360,6 +361,59 @@ set dma_to_classifier [
     -tuser_width 6
 ]
 ```
+
+### 2.10 Namespaces — `namespace eval`
+
+When several procs share a logical prefix (`project::set_*`,
+`ip::*`, `log::*`), wrapping them in a `namespace eval` block lets
+each member be defined with a short bare name while still being
+*called* under the qualified `<ns>::<name>` form:
+
+```htcl
+namespace eval project {
+  ## Set the target HDL language for new sources in a project.
+  proc set_target_language {
+    proj
+    @enum(VHDL, Verilog) language
+  } {
+    set_property -name TARGET_LANGUAGE -value $language -objects $proj
+  }
+
+  ## Set the default library new sources land in.
+  proc set_default_library {
+    proj
+    @default(xil_defaultlib) library
+  } {
+    set_property -name DEFAULT_LIB -value $library -objects $proj
+  }
+}
+
+# At a call site:
+project::set_target_language -proj $proj -language VHDL
+project::set_default_library  -proj $proj
+```
+
+The analyzer treats each inner `proc` exactly as if it had been
+written `proc project::set_target_language { ... } { ... }` at the
+top level — same `@enum` / `@default` / `@requires` validation,
+same hover, same signature help, same completion. The only
+difference is source organization.
+
+Mechanics:
+
+- The `name` word can be a multi-segment Tcl namespace
+  (`namespace eval foo::bar { ... }`); the analyzer uses the
+  entire name as the prefix.
+- `namespace eval` blocks nest. An inner `proc baz` inside
+  `namespace eval outer { namespace eval inner { ... } }`
+  registers as `outer::inner::baz`.
+- A call from *inside* a namespace body to a sibling member must
+  still use the qualified name (no automatic same-namespace
+  resolution in v1). Write `project::helper $x`, not bare
+  `helper $x`.
+- Lowering walks namespace bodies recursively, so inner procs get
+  their attributes stripped and keyword args reordered the same
+  way top-level procs do.
 
 ## 3. How htcl differs from Tcl
 

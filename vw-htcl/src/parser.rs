@@ -99,32 +99,51 @@ fn populate_procs(
             populate_cmd_subst_parts(&mut word.parts, source, errors);
         }
 
-        let CommandKind::Proc(proc) = &mut cmd.kind else {
-            continue;
-        };
+        match &mut cmd.kind {
+            CommandKind::Proc(proc) => {
+                let (sig, errs) = parse_proc_args(source, proc.args_span);
+                errors.extend(errs);
+                proc.signature = Some(sig);
 
-        let (sig, errs) = parse_proc_args(source, proc.args_span);
-        errors.extend(errs);
-        proc.signature = Some(sig);
+                let delta = proc.body_span.start;
+                let body_text = proc.body_span.slice(source);
+                // Proc bodies are scripts — newlines still terminate
+                // statements there.
+                let (mut body_stmts, body_errs) =
+                    parse_fragment(body_text, Mode::Toplevel);
+                for stmt in &mut body_stmts {
+                    shift_stmt(stmt, delta);
+                }
+                for mut err in body_errs {
+                    err.span = err.span.shifted(delta);
+                    errors.push(err);
+                }
+                proc.body = body_stmts;
 
-        let delta = proc.body_span.start;
-        let body_text = proc.body_span.slice(source);
-        // Proc bodies are scripts — newlines still terminate
-        // statements there.
-        let (mut body_stmts, body_errs) =
-            parse_fragment(body_text, Mode::Toplevel);
-        for stmt in &mut body_stmts {
-            shift_stmt(stmt, delta);
+                // Spans are now absolute, so nested procs can be processed
+                // against the same `source`.
+                populate_procs(&mut proc.body, source, errors);
+            }
+            CommandKind::NamespaceEval(ns) => {
+                // Same body-recursion as `proc` — the braced body is
+                // a script fragment, parsed in toplevel mode so
+                // newlines terminate statements normally.
+                let delta = ns.body_span.start;
+                let body_text = ns.body_span.slice(source);
+                let (mut body_stmts, body_errs) =
+                    parse_fragment(body_text, Mode::Toplevel);
+                for stmt in &mut body_stmts {
+                    shift_stmt(stmt, delta);
+                }
+                for mut err in body_errs {
+                    err.span = err.span.shifted(delta);
+                    errors.push(err);
+                }
+                ns.body = body_stmts;
+                populate_procs(&mut ns.body, source, errors);
+            }
+            _ => {}
         }
-        for mut err in body_errs {
-            err.span = err.span.shifted(delta);
-            errors.push(err);
-        }
-        proc.body = body_stmts;
-
-        // Spans are now absolute, so nested procs can be processed
-        // against the same `source`.
-        populate_procs(&mut proc.body, source, errors);
     }
 }
 
@@ -192,10 +211,17 @@ fn shift_command(cmd: &mut Command, delta: u32) {
     // At this stage nested procs carry only the spans produced by
     // `parse_document`; `signature` is still `None` and `body` empty,
     // both filled later by the caller's `populate_procs` recursion.
-    if let CommandKind::Proc(proc) = &mut cmd.kind {
-        proc.name_span = proc.name_span.shifted(delta);
-        proc.args_span = proc.args_span.shifted(delta);
-        proc.body_span = proc.body_span.shifted(delta);
+    match &mut cmd.kind {
+        CommandKind::Proc(proc) => {
+            proc.name_span = proc.name_span.shifted(delta);
+            proc.args_span = proc.args_span.shifted(delta);
+            proc.body_span = proc.body_span.shifted(delta);
+        }
+        CommandKind::NamespaceEval(ns) => {
+            ns.name_span = ns.name_span.shifted(delta);
+            ns.body_span = ns.body_span.shifted(delta);
+        }
+        _ => {}
     }
 }
 
@@ -407,6 +433,19 @@ fn classify_command(words: &[Word]) -> CommandKind {
                 args_span: inner_text_span(args_word),
                 body_span: inner_text_span(body_word),
                 signature: None,
+                body: Vec::new(),
+            })
+        }
+        Some("namespace")
+            if words.len() >= 4
+                && words.get(1).and_then(Word::as_text) == Some("eval") =>
+        {
+            let name_word = &words[2];
+            let body_word = &words[3];
+            CommandKind::NamespaceEval(crate::ast::NamespaceEval {
+                name: name_word.as_text().map(String::from),
+                name_span: name_word.span,
+                body_span: inner_text_span(body_word),
                 body: Vec::new(),
             })
         }

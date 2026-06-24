@@ -24,10 +24,14 @@
 //! # Ok::<(), vw_htcl_cmd::Error>(())
 //! ```
 
+pub mod constraints;
 pub mod generate;
 pub mod model;
 pub mod parse;
 
+pub use constraints::{
+    ArgOverride, CommandOverride, ConstraintsError, ConstraintsTable,
+};
 pub use generate::{generate, GenerateOptions};
 pub use model::{ArgKind, Argument, ManPage};
 pub use parse::parse_man_page;

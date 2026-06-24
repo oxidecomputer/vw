@@ -107,9 +107,11 @@ fn generated_wrapper_reparses() {
     assert!(
         htcl.contains("{a b c}".replace('{', "(").replace('}', ")").as_str())
     );
-    // Natural name + guarded rename + forward.
+    // Natural name + extern-prefixed forward (lowering autogen
+    // produces the rename plumbing at session startup).
     assert!(htcl.contains("proc make_thing {"));
-    assert!(htcl.contains("rename make_thing __viv_make_thing"));
+    assert!(htcl.contains("[list extern::make_thing]"));
+    assert!(!htcl.contains("rename"));
     assert!(htcl.contains("lappend cmd -period $period"));
     assert!(htcl.contains("if {$add} { lappend cmd -add }"));
     assert!(htcl.contains("lappend cmd {*}$objects"));

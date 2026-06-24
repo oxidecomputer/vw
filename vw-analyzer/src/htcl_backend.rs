@@ -461,34 +461,80 @@ fn proc_doc_comments_for(
     document: &vw_htcl::Document,
     proc: &vw_htcl::Proc,
 ) -> Vec<String> {
-    for stmt in &document.stmts {
+    proc_doc_comments_for_in(&document.stmts, proc).unwrap_or_default()
+}
+
+fn proc_doc_comments_for_in(
+    stmts: &[Stmt],
+    proc: &vw_htcl::Proc,
+) -> Option<Vec<String>> {
+    for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
-        let CommandKind::Proc(p) = &cmd.kind else {
-            continue;
-        };
-        // Pointer-identity match: `proc` was looked up out of this
-        // same parse, so its address inside the AST is unique.
-        if std::ptr::eq(p, proc) {
-            return cmd.doc_comments.clone();
+        match &cmd.kind {
+            CommandKind::Proc(p) => {
+                // Pointer-identity match: `proc` was looked up out
+                // of this same parse, so its address inside the AST
+                // is unique.
+                if std::ptr::eq(p, proc) {
+                    return Some(cmd.doc_comments.clone());
+                }
+            }
+            CommandKind::NamespaceEval(ns) => {
+                if let Some(found) =
+                    proc_doc_comments_for_in(&ns.body, proc)
+                {
+                    return Some(found);
+                }
+            }
+            _ => {}
         }
     }
-    Vec::new()
+    None
 }
 
 fn proc_doc_comments_by_name(
     document: &vw_htcl::Document,
     name: &str,
 ) -> Vec<String> {
-    for stmt in &document.stmts {
+    proc_doc_comments_by_name_in(&document.stmts, "", name).unwrap_or_default()
+}
+
+fn proc_doc_comments_by_name_in(
+    stmts: &[Stmt],
+    prefix: &str,
+    name: &str,
+) -> Option<Vec<String>> {
+    for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
-        let CommandKind::Proc(p) = &cmd.kind else {
-            continue;
-        };
-        if p.name.as_deref() == Some(name) {
-            return cmd.doc_comments.clone();
+        match &cmd.kind {
+            CommandKind::Proc(p) => {
+                let Some(decl_name) = p.name.as_deref() else { continue };
+                let qualified = if prefix.is_empty() {
+                    decl_name.to_string()
+                } else {
+                    format!("{prefix}::{decl_name}")
+                };
+                if qualified == name {
+                    return Some(cmd.doc_comments.clone());
+                }
+            }
+            CommandKind::NamespaceEval(ns) => {
+                let Some(ns_name) = ns.name.as_deref() else { continue };
+                let nested = if prefix.is_empty() {
+                    ns_name.to_string()
+                } else {
+                    format!("{prefix}::{ns_name}")
+                };
+                if let Some(found) =
+                    proc_doc_comments_by_name_in(&ns.body, &nested, name)
+                {
+                    return Some(found);
+                }
+            }
+            _ => {}
         }
     }
-    Vec::new()
+    None
 }
 
 // --- markdown formatters --------------------------------------------------

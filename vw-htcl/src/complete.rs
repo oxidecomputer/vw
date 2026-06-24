@@ -49,7 +49,10 @@ pub struct Completion {
 }
 
 struct ProcInfo<'a> {
-    name: &'a str,
+    /// Qualified name as it would be called — bare proc name for
+    /// top-level declarations, `<ns>::<name>` for procs declared
+    /// inside `namespace eval` blocks.
+    name: String,
     doc_comments: &'a [String],
     signature: Option<&'a ProcSignature>,
 }
@@ -241,21 +244,43 @@ fn complete_flags(
 
 fn collect_procs(document: &Document) -> Vec<ProcInfo<'_>> {
     let mut out = Vec::new();
-    for stmt in &document.stmts {
-        let Stmt::Command(cmd) = stmt else { continue };
-        let CommandKind::Proc(proc) = &cmd.kind else {
-            continue;
-        };
-        let Some(name) = proc.name.as_deref() else {
-            continue;
-        };
-        out.push(ProcInfo {
-            name,
-            doc_comments: &cmd.doc_comments,
-            signature: proc.signature.as_ref(),
-        });
-    }
+    collect_procs_in(&document.stmts, "", &mut out);
     out
+}
+
+fn collect_procs_in<'a>(
+    stmts: &'a [Stmt],
+    prefix: &str,
+    out: &mut Vec<ProcInfo<'a>>,
+) {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        match &cmd.kind {
+            CommandKind::Proc(proc) => {
+                let Some(name) = proc.name.as_deref() else { continue };
+                let qualified = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}::{name}")
+                };
+                out.push(ProcInfo {
+                    name: qualified,
+                    doc_comments: &cmd.doc_comments,
+                    signature: proc.signature.as_ref(),
+                });
+            }
+            CommandKind::NamespaceEval(ns) => {
+                let Some(name) = ns.name.as_deref() else { continue };
+                let nested = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}::{name}")
+                };
+                collect_procs_in(&ns.body, &nested, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// True if `offset` is inside any proc's argument-declaration braces,

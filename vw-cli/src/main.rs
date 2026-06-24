@@ -150,6 +150,23 @@ enum Commands {
     #[command(about = "Launch the vw analyzer LSP server on stdio")]
     Analyzer,
     #[command(
+        about = "Interactive htcl REPL backed by a long-lived Vivado worker"
+    )]
+    Repl {
+        #[arg(
+            short,
+            long,
+            help = "Forward Vivado's banner / info chatter to scrollback"
+        )]
+        verbose: bool,
+        #[arg(
+            long = "load",
+            value_name = "FILE",
+            help = "Source FILE into the session as soon as Vivado is up"
+        )]
+        initial_load: Option<Utf8PathBuf>,
+    },
+    #[command(
         about = "Parse and run analysis on htcl files without executing them"
     )]
     Check {
@@ -183,6 +200,12 @@ enum HtclCmdCommand {
             help = "Command name to wrap (defaults to the input file stem)"
         )]
         name: Option<String>,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Per-command constraint overrides (TOML)"
+        )]
+        constraints: Option<Utf8PathBuf>,
     },
 }
 
@@ -554,6 +577,20 @@ async fn main() {
             init_analyzer_logging();
             vw_analyzer::run_stdio().await;
         }
+        Commands::Repl {
+            verbose,
+            initial_load,
+        } => {
+            if let Err(e) = vw_repl::run(vw_repl::ReplOptions {
+                verbose,
+                initial_load,
+            })
+            .await
+            {
+                eprintln!("{} {e}", "error:".bright_red());
+                process::exit(1);
+            }
+        }
         Commands::Check { files } => {
             let mut had_errors = false;
             for file in &files {
@@ -598,11 +635,13 @@ async fn main() {
                 input,
                 output,
                 name,
+                constraints,
             } => {
                 if let Err(e) = run_htcl_cmd_generate(
                     &input,
                     output.as_deref(),
                     name.as_deref(),
+                    constraints.as_deref(),
                 ) {
                     eprintln!("{} {e}", "error:".bright_red());
                     process::exit(1);
@@ -616,10 +655,20 @@ fn run_htcl_cmd_generate(
     input: &Utf8Path,
     output: Option<&Utf8Path>,
     name: Option<&str>,
+    constraints_path: Option<&Utf8Path>,
 ) -> Result<(), String> {
     let page = vw_htcl_cmd::load(input.as_std_path(), name)
         .map_err(|e| format!("loading {input}: {e}"))?;
-    let text = vw_htcl_cmd::generate(&page, &Default::default());
+    let constraints = match constraints_path {
+        Some(p) => vw_htcl_cmd::ConstraintsTable::load(p.as_std_path())
+            .map_err(|e| format!("loading constraints: {e}"))?,
+        None => vw_htcl_cmd::ConstraintsTable::empty(),
+    };
+    let opts = vw_htcl_cmd::GenerateOptions {
+        constraints,
+        ..Default::default()
+    };
+    let text = vw_htcl_cmd::generate(&page, &opts);
     match output {
         Some(path) => std::fs::write(path, &text)
             .map_err(|e| format!("writing {path}: {e}"))?,

@@ -201,14 +201,50 @@ fn definition_in_call<'a>(
     None
 }
 
+/// Find the `proc` declaration that registers under `name` in the
+/// document's signature table. Walks `namespace eval` bodies
+/// recursively so a call to `project::set_target_language` resolves
+/// to the inner `proc set_target_language` inside
+/// `namespace eval project { … }`.
 fn find_proc_decl<'a>(document: &'a Document, name: &str) -> Option<&'a Proc> {
-    for stmt in &document.stmts {
+    find_proc_decl_in(&document.stmts, "", name)
+}
+
+fn find_proc_decl_in<'a>(
+    stmts: &'a [Stmt],
+    prefix: &str,
+    name: &str,
+) -> Option<&'a Proc> {
+    for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
-        let CommandKind::Proc(proc) = &cmd.kind else {
-            continue;
-        };
-        if proc.name.as_deref() == Some(name) {
-            return Some(proc);
+        match &cmd.kind {
+            CommandKind::Proc(proc) => {
+                let Some(decl_name) = proc.name.as_deref() else {
+                    continue;
+                };
+                let qualified = if prefix.is_empty() {
+                    decl_name.to_string()
+                } else {
+                    format!("{prefix}::{decl_name}")
+                };
+                if qualified == name {
+                    return Some(proc);
+                }
+            }
+            CommandKind::NamespaceEval(ns) => {
+                let Some(ns_name) = ns.name.as_deref() else { continue };
+                let nested = if prefix.is_empty() {
+                    ns_name.to_string()
+                } else {
+                    format!("{prefix}::{ns_name}")
+                };
+                if let Some(found) =
+                    find_proc_decl_in(&ns.body, &nested, name)
+                {
+                    return Some(found);
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -339,6 +375,30 @@ show -width 16\n";
         let target = definition_at(&parsed.document, src, pos).unwrap();
         // Decl `width` arg name is the second `width` in the source.
         let decl_pos = nth(src, "width", 0);
+        assert_eq!(target.start, decl_pos);
+    }
+
+    #[test]
+    fn call_to_namespaced_proc_resolves_to_inner_decl() {
+        // `project::set_target_language` at the call site should
+        // resolve to `proc set_target_language` declared inside the
+        // matching `namespace eval project { ... }` block.
+        let src = "\
+namespace eval project {
+  proc set_target_language {
+    proj
+    language
+  } { }
+}
+project::set_target_language -proj p -language VHDL
+";
+        let parsed = parse(src);
+        let pos = first(src, "project::set_target_language");
+        let target = definition_at(&parsed.document, src, pos).unwrap();
+        // The decl's name span covers just `set_target_language`
+        // (without the namespace prefix), which appears as the
+        // first occurrence of that bare token in the source.
+        let decl_pos = first(src, "set_target_language");
         assert_eq!(target.start, decl_pos);
     }
 

@@ -103,6 +103,26 @@ pub struct LoadedProgram {
 pub struct LoadedFile {
     pub path: PathBuf,
     pub source: String,
+    /// The `src` import that pulled this file in, or `None` for
+    /// the entry file the loader was started against. Captured at
+    /// load time so analyzers and the REPL can render call chains
+    /// like `failing.htcl:12  ←  importer.htcl:4 (src @dep/foo)
+    /// ←  entry.htcl:1 (src ip/cips)` — which is the htcl-level
+    /// equivalent of a stack trace.
+    pub imported_via: Option<ImportEdge>,
+}
+
+/// An edge in the import graph: this file was loaded because the
+/// file at index [`Self::importer_file`] executed a `src` statement
+/// covering [`Self::src_span`] in the importer's source.
+#[derive(Debug, Clone, Copy)]
+pub struct ImportEdge {
+    pub importer_file: usize,
+    /// Span of the `src` statement in the **importer's file-local
+    /// source** (i.e. an offset into the importer's
+    /// [`LoadedFile::source`], *not* into the flattened
+    /// [`LoadedProgram::source`]).
+    pub src_span: crate::span::Span,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,6 +175,24 @@ impl LoadedProgram {
             crate::span::Span::new(file_start, file_start + length),
         ))
     }
+
+    /// Walk the import chain from `file_index` toward the entry,
+    /// yielding each [`ImportEdge`] in order (nearest first). The
+    /// entry file has no edge and so produces no items.
+    pub fn ancestry(
+        &self,
+        file_index: usize,
+    ) -> impl Iterator<Item = ImportEdge> + '_ {
+        let mut cur = self.files.get(file_index).and_then(|f| f.imported_via);
+        std::iter::from_fn(move || {
+            let edge = cur?;
+            cur = self
+                .files
+                .get(edge.importer_file)
+                .and_then(|f| f.imported_via);
+            Some(edge)
+        })
+    }
 }
 
 /// Read `entry` and recursively resolve its imports. Each file is
@@ -183,7 +221,7 @@ pub fn load_with_observer(
         resolver,
         observer,
     };
-    state.load_file(&entry, None)?;
+    state.load_file(&entry, None, None)?;
     Ok(state.program)
 }
 
@@ -200,6 +238,7 @@ impl State<'_, '_> {
         &mut self,
         path: &Path,
         reached_via: Option<&str>,
+        imported_via: Option<ImportEdge>,
     ) -> Result<(), LoadError> {
         if self.loaded.contains(path) || self.in_progress.contains(path) {
             return Ok(());
@@ -224,6 +263,7 @@ impl State<'_, '_> {
         self.program.files.push(LoadedFile {
             path: path.to_path_buf(),
             source: source.clone(),
+            imported_via,
         });
 
         // Walk the parsed document, copying text in span order. Any
@@ -271,7 +311,14 @@ impl State<'_, '_> {
             {
                 self.observer.on_source(raw);
             }
-            self.load_file(&resolved, Some(raw))?;
+            self.load_file(
+                &resolved,
+                Some(raw),
+                Some(ImportEdge {
+                    importer_file: file_index as usize,
+                    src_span: cmd.span,
+                }),
+            )?;
         }
         // Tail after the last `src`.
         self.emit_chunk(&source, cursor, source.len(), file_index);

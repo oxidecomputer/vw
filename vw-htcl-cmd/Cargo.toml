@@ -8,7 +8,9 @@ description = "Generate documented htcl command wrappers from Vivado man-page re
 
 [dependencies]
 vw-htcl = { path = "../vw-htcl" }
+serde.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 winnow.workspace = true
 
 [dev-dependencies]

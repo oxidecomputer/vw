@@ -57,6 +57,31 @@ pub enum CommandKind {
     Set,
     Proc(Proc),
     Src(SrcImport),
+    NamespaceEval(NamespaceEval),
+}
+
+/// A `namespace eval <name> { <body> }` block.
+///
+/// Recognized at parse time so that any `proc` declarations inside
+/// the braces register in the document's signature table under the
+/// qualified name `<name>::<proc>` (Tcl namespace semantics), and
+/// the analyzer can offer the same hover / completion / signature
+/// help / goto experience for namespaced procs as for top-level
+/// ones. The body parses as a script just like a proc body, so
+/// nested `namespace eval` blocks compose.
+#[derive(Clone, Debug)]
+pub struct NamespaceEval {
+    /// Bare-text namespace name when extractable (the common case),
+    /// `None` when the name word couldn't be reduced to literal text
+    /// (e.g. it contains substitutions). Multi-segment names like
+    /// `foo::bar` are preserved as-is and the analyzer uses them as
+    /// the full prefix.
+    pub name: Option<String>,
+    pub name_span: Span,
+    pub body_span: Span,
+    /// The body parsed into statements. Spans are absolute (whole-
+    /// source) coordinates, same convention as [`Proc::body`].
+    pub body: Vec<Stmt>,
 }
 
 /// A `src <path>` import — load and evaluate another htcl module.

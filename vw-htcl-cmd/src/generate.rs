@@ -41,15 +41,25 @@ use std::fmt::Write;
 
 use vw_htcl::emit::{Command, Doc, Item, Word};
 
+use crate::constraints::{ArgOverride, ConstraintsTable};
 use crate::model::{ArgKind, Argument, ManPage};
 
 #[derive(Clone, Debug)]
 pub struct GenerateOptions {
     /// Prefix for the stashed original command (`rename add_files
-    /// __viv_add_files`).
+    /// __viv_add_files`). Kept for backwards compatibility — the
+    /// lowering pass now generates the rename plumbing, so this
+    /// field has no effect.
     pub rename_prefix: String,
     /// Emit each command's `See Also` list as a doc-comment footer.
     pub include_see_also: bool,
+    /// Per-command signature augmentations loaded from
+    /// `cmd-constraints.toml`. The generator merges these onto the
+    /// man-page-derived shape so wrapper authors can declare
+    /// mutually-exclusive call modes, value-taking flags
+    /// misclassified by the man page, etc., without hand-editing
+    /// the generated files.
+    pub constraints: ConstraintsTable,
 }
 
 impl Default for GenerateOptions {
@@ -57,6 +67,7 @@ impl Default for GenerateOptions {
         Self {
             rename_prefix: "__viv_".to_string(),
             include_see_also: true,
+            constraints: ConstraintsTable::empty(),
         }
     }
 }
@@ -64,7 +75,14 @@ impl Default for GenerateOptions {
 /// Generate the htcl wrapper text for `page`.
 pub fn generate(page: &ManPage, opts: &GenerateOptions) -> String {
     let cmd = &page.name;
-    let orig = format!("{}{}", opts.rename_prefix, page.name);
+    // The wrapper body forwards to the underlying Vivado proc via
+    // htcl's `extern::` prefix. The lowering pass autogenerates the
+    // rename plumbing — wrapper authors and this generator no
+    // longer need to write the `rename …` block by hand.
+    let forwarded = format!("extern::{}", page.name);
+
+    let overrides = opts.constraints.for_command(&page.name);
+    let effective = effective_args(page, overrides);
 
     let mut out = String::new();
     writeln!(
@@ -76,33 +94,12 @@ pub fn generate(page: &ManPage, opts: &GenerateOptions) -> String {
     writeln!(out, "# Do not edit by hand.").unwrap();
     writeln!(out).unwrap();
 
-    // Guarded rename: stash the builtin so the wrapper can forward to
-    // it. Guard keeps it a no-op if the command is missing or already
-    // renamed (e.g. the file is sourced twice in one Vivado session).
-    writeln!(
-        out,
-        "# Preserve the underlying Vivado `{cmd}` command so this typed \
-         wrapper"
-    )
-    .unwrap();
-    writeln!(out, "# can forward to it after shadowing the global name.")
-        .unwrap();
-    writeln!(
-        out,
-        "if {{[info commands {orig}] eq \"\" && [info commands {cmd}] ne \
-         \"\"}} {{"
-    )
-    .unwrap();
-    writeln!(out, "  rename {cmd} {orig}").unwrap();
-    writeln!(out, "}}").unwrap();
-    writeln!(out).unwrap();
-
     // Proc doc comment: the command Description, then a See-Also footer.
     emit_proc_doc(&mut out, page, opts);
 
     // Proc args (structured) and body (compact Tcl).
-    let args = build_args(page);
-    let body = build_body(&orig, page);
+    let args = build_args(page, &effective);
+    let body = build_body(&forwarded, &effective);
     emit_proc(&mut out, cmd, &args, &body);
 
     // Trim trailing whitespace line-by-line (empty doc comments emit a
@@ -177,14 +174,110 @@ fn emit_paragraph_lines(
     }
 }
 
+/// One argument plus whatever overrides from `cmd-constraints.toml`
+/// apply to it. `default`, `enum_values`, `one_of`, `requires`,
+/// `conflicts` are the *final* values the wrapper should emit;
+/// constraint resolution has already happened.
+///
+/// `kind` is derived: a constraint that clears the enum and adds a
+/// default to a man-page-Boolean arg flips it to value-taking, so
+/// the body-emitter forwards `-flag $value` instead of `if {$f} {
+/// lappend cmd -flag }`.
+#[derive(Clone, Debug)]
+struct EffectiveArg {
+    ident: String,
+    flag: Option<String>,
+    kind: ArgKind,
+    /// `None` → no default (required); `Some(text)` → emit `@default(text)`.
+    default: Option<String>,
+    /// `None` → no enum; `Some(vec)` → emit `@enum(...)`.
+    enum_values: Option<Vec<String>>,
+    one_of: Vec<String>,
+    requires: Vec<String>,
+    conflicts: Vec<String>,
+    description: Vec<String>,
+}
+
+fn effective_args(
+    page: &ManPage,
+    overrides: Option<&crate::constraints::CommandOverride>,
+) -> Vec<EffectiveArg> {
+    page.arguments
+        .iter()
+        .map(|arg| effective_arg(arg, overrides.and_then(|o| o.args.get(&arg.ident))))
+        .collect()
+}
+
+fn effective_arg(
+    arg: &Argument,
+    over: Option<&ArgOverride>,
+) -> EffectiveArg {
+    let empty = ArgOverride::default();
+    let over = over.unwrap_or(&empty);
+
+    // Default value: explicit override wins; else man-page heuristic.
+    let mut default: Option<String> = match &arg.kind {
+        ArgKind::Boolean => Some("0".to_string()),
+        ArgKind::Value | ArgKind::Positional => {
+            (!arg.required).then(|| "".to_string())
+        }
+    };
+    if let Some(d) = over.default.as_deref() {
+        default = Some(d.to_string());
+    }
+
+    // Enum: man-page-derived for booleans; constraints can clear or
+    // replace.
+    let mut enum_values: Option<Vec<String>> = match &arg.kind {
+        ArgKind::Boolean => {
+            Some(vec!["0".to_string(), "1".to_string()])
+        }
+        _ => None,
+    };
+    if over.clear_enum {
+        enum_values = None;
+    }
+    if let Some(v) = &over.enum_ {
+        enum_values = Some(v.clone());
+    }
+
+    // Kind: an arg with no `@enum` (cleared) and a string-typed
+    // default acts like a value-taking flag — body-emit should
+    // forward `-flag $value`, not `if {$flag} { ... }`. This is the
+    // exact shape `set_property -dict` needs.
+    let kind = if matches!(arg.kind, ArgKind::Boolean)
+        && enum_values.is_none()
+    {
+        if arg.flag.is_some() {
+            ArgKind::Value
+        } else {
+            ArgKind::Positional
+        }
+    } else {
+        arg.kind
+    };
+
+    EffectiveArg {
+        ident: arg.ident.clone(),
+        flag: arg.flag.clone(),
+        kind,
+        default,
+        enum_values,
+        one_of: over.one_of.clone(),
+        requires: over.requires.clone(),
+        conflicts: over.conflicts.clone(),
+        description: arg.description.clone(),
+    }
+}
+
 /// Build the structured arg list as an emit [`Doc`]: per-argument doc
 /// comments followed by an `@attr… ident` declaration. The doc
 /// comments follow the same `summary, blank, body` shape the
 /// proc-level docs use, so LSP clients can split brief/detail from
 /// extended documentation consistently.
-fn build_args(page: &ManPage) -> Doc {
+fn build_args(_page: &ManPage, effective: &[EffectiveArg]) -> Doc {
     let mut doc = Doc::new();
-    for (i, arg) in page.arguments.iter().enumerate() {
+    for (i, arg) in effective.iter().enumerate() {
         if i > 0 {
             doc.push(Item::Blank);
         }
@@ -193,9 +286,6 @@ fn build_args(page: &ManPage) -> Doc {
         let summary = vw_htcl::doc::brief(&raw);
         let extended = vw_htcl::doc::extended(&raw);
 
-        // The arg block sits inside the proc's args braces, indented
-        // two spaces by `emit_proc`. Wrap a touch tighter so the
-        // final line lands at ~80 columns.
         let body_width = 76usize;
         if let Some(s) = summary.as_deref() {
             for line in vw_htcl::doc::wrap_paragraph(s, body_width) {
@@ -214,41 +304,80 @@ fn build_args(page: &ManPage) -> Doc {
 
         doc.push(Item::Command(Command {
             doc_comments: Vec::new(),
-            words: arg_attr_words(arg),
+            words: effective_attr_words(arg),
             body: None,
         }));
     }
     doc
 }
 
-/// The attribute words + identifier for one argument declaration.
-fn arg_attr_words(arg: &Argument) -> Vec<Word> {
+/// The attribute words + identifier for one effective argument.
+fn effective_attr_words(arg: &EffectiveArg) -> Vec<Word> {
     let mut words = Vec::new();
-    match arg.kind {
-        ArgKind::Boolean => {
-            words.push(Word::Raw("@enum(0, 1)".to_string()));
-            words.push(Word::Raw("@default(0)".to_string()));
-        }
-        ArgKind::Value | ArgKind::Positional => {
-            // Required args carry no default, so htcl forces the caller
-            // to supply them; optional args default to the empty string
-            // sentinel that the body treats as "omitted".
-            if !arg.required {
-                words.push(Word::Raw("@default(\"\")".to_string()));
-            }
-        }
+    if let Some(values) = &arg.enum_values {
+        let inner = values
+            .iter()
+            .map(|v| format_attribute_value(v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        words.push(Word::Raw(format!("@enum({inner})")));
+    }
+    if let Some(default) = &arg.default {
+        words.push(Word::Raw(format!(
+            "@default({})",
+            format_attribute_value(default)
+        )));
+    }
+    if !arg.one_of.is_empty() {
+        words.push(Word::Raw(format!("@one_of({})", arg.one_of.join(", "))));
+    }
+    if !arg.requires.is_empty() {
+        words.push(Word::Raw(format!(
+            "@requires({})",
+            arg.requires.join(", ")
+        )));
+    }
+    if !arg.conflicts.is_empty() {
+        words.push(Word::Raw(format!(
+            "@conflicts({})",
+            arg.conflicts.join(", ")
+        )));
     }
     words.push(Word::Bare(arg.ident.clone()));
     words
 }
 
+fn format_attribute_value(s: &str) -> String {
+    let is_int = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let is_ident = !s.is_empty()
+        && s.bytes().enumerate().all(|(i, b)| {
+            if i == 0 {
+                b.is_ascii_alphabetic() || b == b'_'
+            } else {
+                b.is_ascii_alphanumeric() || b == b'_'
+            }
+        });
+    if is_int || is_ident {
+        s.to_string()
+    } else {
+        format!(
+            "\"{}\"",
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        )
+    }
+}
+
 /// Build the proc body: assemble the forwarded command incrementally,
-/// then invoke the stashed original by list-expansion.
-fn build_body(orig: &str, page: &ManPage) -> String {
+/// then invoke the underlying extern by list-expansion. Each arg's
+/// kind drives its emit form — `Boolean` → `if {$x} { lappend cmd
+/// -flag }`, `Value` → `if {$x ne ""} { lappend cmd -flag $x }`,
+/// `Positional` → `if {$x ne ""} { lappend cmd {*}$x }`.
+fn build_body(orig: &str, effective: &[EffectiveArg]) -> String {
     let mut body = String::new();
     writeln!(body, "set cmd [list {orig}]").unwrap();
-    for arg in &page.arguments {
+    for arg in effective {
         let id = &arg.ident;
+        let required = arg.default.is_none();
         match arg.kind {
             ArgKind::Boolean => {
                 let flag = arg.flag.as_deref().unwrap_or(id);
@@ -257,7 +386,7 @@ fn build_body(orig: &str, page: &ManPage) -> String {
             }
             ArgKind::Value => {
                 let flag = arg.flag.as_deref().unwrap_or(id);
-                if arg.required {
+                if required {
                     writeln!(body, "lappend cmd -{flag} ${id}").unwrap();
                 } else {
                     writeln!(
@@ -268,7 +397,7 @@ fn build_body(orig: &str, page: &ManPage) -> String {
                 }
             }
             ArgKind::Positional => {
-                if arg.required {
+                if required {
                     writeln!(body, "lappend cmd {{*}}${id}").unwrap();
                 } else {
                     writeln!(

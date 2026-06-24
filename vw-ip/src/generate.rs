@@ -728,6 +728,14 @@ mod tests {
         let errors: Vec<_> = diags
             .iter()
             .filter(|d| d.severity == vw_htcl::Severity::Error)
+            // The generator emits calls into vivado-cmd
+            // (`ip::check`, `create_bd_cell`, `set_property`);
+            // those resolve when the wrapper is sourced through
+            // the loader, but this unit test runs the validator
+            // on the bare generated text. The unknown-call
+            // diagnostic is *expected* in that mode; we filter it
+            // out so the test catches real structural breakage.
+            .filter(|d| !d.message.starts_with("undefined proc"))
             .collect();
         assert!(errors.is_empty(), "{errors:#?}");
     }

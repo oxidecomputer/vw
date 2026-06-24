@@ -1,0 +1,25 @@
+[package]
+name = "vw-repl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Interactive REPL for htcl scripts, driven by a long-lived Vivado worker"
+
+[dependencies]
+vw-htcl = { path = "../vw-htcl" }
+vw-eda = { path = "../vw-eda" }
+vw-vivado = { path = "../vw-vivado" }
+vw-lib = { path = "../vw-lib" }
+camino.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tui-textarea.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

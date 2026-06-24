@@ -86,7 +86,9 @@ fn local_def_target(cmd: &Command, name: &str) -> Option<Span> {
             let target = cmd.words.get(1)?;
             (target.as_text()? == name).then_some(target.span)
         }
-        CommandKind::Proc(_) | CommandKind::Src(_) => None,
+        CommandKind::Proc(_)
+        | CommandKind::Src(_)
+        | CommandKind::NamespaceEval(_) => None,
     }
 }
 

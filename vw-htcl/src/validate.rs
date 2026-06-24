@@ -51,8 +51,21 @@ fn validate_stmts(
     for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
         validate_command(cmd, source, table, diags);
-        if let CommandKind::Proc(proc) = &cmd.kind {
-            validate_stmts(&proc.body, source, table, diags);
+        match &cmd.kind {
+            CommandKind::Proc(proc) => {
+                validate_stmts(&proc.body, source, table, diags);
+            }
+            CommandKind::NamespaceEval(ns) => {
+                // Calls inside the namespace body are validated the
+                // same way; the signature-table is document-wide so
+                // a call to `project::set_target_language` from
+                // anywhere resolves to the same entry. (Bare,
+                // sibling-relative calls inside a namespace body
+                // aren't auto-qualified yet — write the qualified
+                // name explicitly.)
+                validate_stmts(&ns.body, source, table, diags);
+            }
+            _ => {}
         }
         // Also descend into any `[ … ]` command substitutions on this
         // command's words so calls written inline get validated the
@@ -67,37 +80,157 @@ fn validate_stmts(
     }
 }
 
-/// Build a name → signature map from top-level proc declarations.
-/// Duplicate names raise a diagnostic and the later declaration wins
-/// (matching Tcl semantics: a second `proc` redefines).
+/// Build a name → signature map from every proc declaration in
+/// the document, including those nested inside `namespace eval`
+/// blocks (which register under `<ns>::<proc>`, matching Tcl's
+/// namespace semantics). Duplicate names raise a diagnostic and the
+/// later declaration wins, again matching Tcl (a second `proc`
+/// redefines).
 pub fn build_signature_table<'doc>(
     document: &'doc Document,
     diags: &mut Vec<Diagnostic>,
 ) -> HashMap<String, &'doc ProcSignature> {
     let mut table = HashMap::new();
-    for stmt in &document.stmts {
+    collect_signatures(&document.stmts, "", &mut table, diags);
+    table
+}
+
+fn collect_signatures<'doc>(
+    stmts: &'doc [Stmt],
+    prefix: &str,
+    table: &mut HashMap<String, &'doc ProcSignature>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
-        let CommandKind::Proc(proc) = &cmd.kind else {
-            continue;
-        };
-        let Some(name) = proc.name.clone() else {
-            continue;
-        };
-        let Some(sig) = proc.signature.as_ref() else {
-            continue;
-        };
-        if table.insert(name.clone(), sig).is_some() {
-            diags.push(Diagnostic {
-                severity: Severity::Warning,
-                message: format!(
-                    "duplicate definition of proc {name}; later \
-                     definition wins"
-                ),
-                span: proc.name_span,
-            });
+        match &cmd.kind {
+            CommandKind::Proc(proc) => {
+                let Some(name) = proc.name.as_deref() else { continue };
+                let Some(sig) = proc.signature.as_ref() else { continue };
+                let qualified = qualify(prefix, name);
+                if table.insert(qualified.clone(), sig).is_some() {
+                    diags.push(Diagnostic {
+                        severity: Severity::Warning,
+                        message: format!(
+                            "duplicate definition of proc {qualified}; \
+                             later definition wins"
+                        ),
+                        span: proc.name_span,
+                    });
+                }
+            }
+            CommandKind::NamespaceEval(ns) => {
+                let Some(name) = ns.name.as_deref() else { continue };
+                // `extern` is reserved by htcl's lowering as the
+                // prefix for runtime-Tcl-proc disambiguation
+                // (`extern::foo` → `__vw_extern_foo`). A user-
+                // defined namespace named `extern` would silently
+                // collide with that rewrite at call sites; reject
+                // it up front.
+                if name == "extern" {
+                    diags.push(Diagnostic {
+                        severity: Severity::Error,
+                        message:
+                            "`extern` is a reserved namespace name in \
+                             htcl (used for runtime-Tcl-proc \
+                             disambiguation); pick a different name"
+                                .into(),
+                        span: ns.name_span,
+                    });
+                    continue;
+                }
+                let nested = qualify(prefix, name);
+                collect_signatures(&ns.body, &nested, table, diags);
+            }
+            _ => {}
         }
     }
-    table
+}
+
+/// Tcl core builtins that legitimately take either `-flag`
+/// arguments natively (`string match -nocase`, `regexp -line`,
+/// `lsort -unique`) or take positional list arguments that
+/// commonly start with `-` (e.g. `lappend cmd -ruledeck $x` where
+/// `-ruledeck` is being appended as a literal token, not parsed
+/// by `lappend`). Calls to anything in this list pass the
+/// unknown-call check unconditionally.
+///
+/// Keep this small but pragmatic: a missed builtin produces a
+/// pestering error on calls that work fine; an over-included name
+/// hides a real "you forgot to src @x" mistake. The set below is
+/// the standard Tcl core surface most htcl bodies actually use.
+fn is_known_tcl_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        // Container ops whose positional args often look like flags.
+        "lappend"
+            | "lset"
+            | "linsert"
+            | "lreplace"
+            | "lrange"
+            | "lindex"
+            | "list"
+            | "llength"
+            | "dict"
+            | "array"
+            | "set"
+            | "unset"
+            | "incr"
+            | "append"
+            | "concat"
+            // String / regex / sort builtins that accept `-flag`s natively.
+            | "string"
+            | "regexp"
+            | "regsub"
+            | "lsort"
+            | "lsearch"
+            | "switch"
+            | "format"
+            | "scan"
+            | "binary"
+            // Flow / introspection / interp.
+            | "after"
+            | "eval"
+            | "uplevel"
+            | "upvar"
+            | "apply"
+            | "info"
+            | "package"
+            | "catch"
+            | "try"
+            | "throw"
+            | "error"
+            | "return"
+            | "expr"
+            // I/O & filesystem.
+            | "puts"
+            | "gets"
+            | "read"
+            | "close"
+            | "open"
+            | "file"
+            | "exec"
+            | "fconfigure"
+            | "fileevent"
+            | "flush"
+            // Channels / Tk-style.
+            | "namespace"
+            | "variable"
+            | "global"
+            | "rename"
+            | "interp"
+    )
+}
+
+/// Join a namespace prefix with a member name using Tcl's `::`
+/// separator. The empty prefix yields the bare name (used at the
+/// document root where there's no enclosing namespace).
+fn qualify(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}::{name}")
+    }
 }
 
 fn validate_command(
@@ -114,13 +247,51 @@ fn validate_command(
             },
             None => return,
         },
-        // Don't validate inside proc/set declarations themselves —
-        // those are declarations, not calls.
-        CommandKind::Proc(_) | CommandKind::Set | CommandKind::Src(_) => {
+        // Don't validate inside declarations themselves — those
+        // aren't calls. (NamespaceEval is a declaration; its body's
+        // statements are validated by the recursion in
+        // `validate_stmts`.)
+        CommandKind::Proc(_)
+        | CommandKind::Set
+        | CommandKind::Src(_)
+        | CommandKind::NamespaceEval(_) => {
             return;
         }
     };
+    // `extern::name` is the user's opt-out: "this call resolves
+    // to a runtime Tcl proc, don't analyze its signature." Lowering
+    // strips the prefix and aliases the underlying proc into place.
+    if crate::lower::is_extern_call(call_name) {
+        return;
+    }
     let Some(sig) = table.get(call_name) else {
+        // Unknown call. If it uses `-flag` keyword arguments, the
+        // user probably meant an htcl wrapper that isn't loaded —
+        // shipping it to the EDA backend would either error
+        // cryptically or do something nonsensical with the
+        // arguments. Force the user to be explicit: either `src` a
+        // wrapper module, or use `extern::<name>` for the raw
+        // Tcl/EDA proc.
+        let uses_keyword = cmd.words.iter().skip(1).any(|w| {
+            w.as_text()
+                .is_some_and(|t| t.starts_with('-') && t.len() > 1)
+        });
+        if uses_keyword && !is_known_tcl_builtin(call_name) {
+            let hint = match suggest_name(call_name, table.keys()) {
+                Some(s) => format!(" — did you mean `{s}`?"),
+                None => String::new(),
+            };
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!(
+                    "undefined proc `{call_name}`{hint}; either \
+                     `src` a module that defines it or use \
+                     `extern::{call_name}` to call the underlying \
+                     Tcl proc directly"
+                ),
+                span: cmd.words[0].span,
+            });
+        }
         return;
     };
 
@@ -493,6 +664,62 @@ fn check_range(
     }
 }
 
+/// Standard compiler-style "did you mean X?" suggestion: pick the
+/// in-scope name with the smallest edit distance from `target`,
+/// within a length-scaled threshold. Returns `None` when no
+/// candidate is close enough (so unknown calls that aren't
+/// near-misses don't get nonsense suggestions tacked on).
+fn suggest_name<'a, I>(target: &str, candidates: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    // rustc-style threshold: scales with name length so single-char
+    // typos count for short names, but a 12-char identifier
+    // tolerates a few keystroke errors. Floor at 1, ceiling at 3 —
+    // anything past 3 starts producing surprising suggestions.
+    let threshold = (target.chars().count() / 3).clamp(1, 3);
+    let mut best: Option<(usize, &str)> = None;
+    for cand in candidates {
+        let d = levenshtein(target, cand);
+        if d == 0 || d > threshold {
+            continue;
+        }
+        if best.map(|(b, _)| d < b).unwrap_or(true) {
+            best = Some((d, cand.as_str()));
+        }
+    }
+    best.map(|(_, s)| s.to_string())
+}
+
+/// Standard Levenshtein edit distance — number of single-character
+/// insertions, deletions, or substitutions to turn `a` into `b`.
+/// Two-row rolling table; O(n*m) time, O(n) space.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let m = a.len();
+    let n = b.len();
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut cur = vec![0usize; n + 1];
+    for i in 1..=m {
+        cur[0] = i;
+        for j in 1..=n {
+            let sub = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1)
+                .min(cur[j - 1] + 1)
+                .min(prev[j - 1] + sub);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[n]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +895,154 @@ mod tests {
     }
 
     #[test]
+    fn namespace_eval_proc_validates_at_qualified_name() {
+        // A proc declared inside `namespace eval project { ... }`
+        // should be reachable from the validator at its qualified
+        // name (`project::set_target_language`), so `@enum`
+        // constraints on its args still catch bad values at call
+        // sites — exactly like a top-level proc declaration would.
+        let src = "\
+namespace eval project {
+  proc set_target_language {
+    proj
+    @enum(VHDL, Verilog) language
+  } { }
+}
+project::set_target_language -proj p -language Klingon
+";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|m| m.message.contains("Klingon")
+                && m.message.contains("@enum")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn namespaced_proc_satisfied_by_valid_args() {
+        let src = "\
+namespace eval project {
+  proc set_target_language {
+    proj
+    @enum(VHDL, Verilog) language
+  } { }
+}
+project::set_target_language -proj p -language VHDL
+";
+        assert!(diags(src).is_empty());
+    }
+
+    #[test]
+    fn nested_namespace_eval_qualifies_recursively() {
+        let src = "\
+namespace eval outer {
+  namespace eval inner {
+    proc foo { @enum(a, b) x } { }
+  }
+}
+outer::inner::foo -x bogus
+";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|m| m.message.contains("bogus")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn unknown_call_gets_did_you_mean_suggestion() {
+        // The exact shape that caught the user's typo in metroid:
+        // a single-char edit-distance miss against a known proc
+        // should produce a `did you mean ...` suggestion.
+        let src = "\
+namespace eval port {
+  proc plumb_if_pin {
+    name
+    pin
+  } { }
+}
+port::plum_if_pin -name p -pin q
+";
+        let d = diags(src);
+        let err = d.iter().find(|m| m.severity == Severity::Error).unwrap();
+        assert!(
+            err.message.contains("did you mean `port::plumb_if_pin`"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn unrelated_unknown_call_has_no_suggestion() {
+        // A name with no near-miss should NOT get a fake suggestion
+        // tacked on — that's just misleading noise.
+        let src = "totally_made_up_thing -arg 1\n";
+        let d = diags(src);
+        let err = d.iter().find(|m| m.severity == Severity::Error).unwrap();
+        assert!(
+            !err.message.contains("did you mean"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn unknown_keyword_call_is_an_error() {
+        // No proc declaration in scope, no `extern::` prefix — the
+        // call uses `-flag` shape so the validator demands the user
+        // be explicit about the dependency.
+        let src = "create_project -in_memory 1 -name foo\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|m| m.severity == Severity::Error
+                && m.message.contains("create_project")
+                && m.message.contains("extern::")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn extern_prefixed_call_skips_unknown_check() {
+        // `extern::` is the user's opt-out: they're calling a raw
+        // Tcl proc deliberately. No diagnostic even though the
+        // name isn't in the signature table.
+        let src = "extern::create_project -name foo\n";
+        assert!(diags(src).is_empty());
+    }
+
+    #[test]
+    fn positional_unknown_call_is_allowed() {
+        // No `-flag` args → looks like a positional Tcl builtin
+        // call (puts, set, etc.). Pass through silently.
+        let src = "puts hello\n";
+        assert!(diags(src).is_empty());
+    }
+
+    #[test]
+    fn known_tcl_builtin_with_keyword_args_is_allowed() {
+        // `string match -nocase ...` is a legitimate Tcl-core
+        // pattern; the allowlist keeps it from triggering the
+        // unknown-call error.
+        let src = "string match -nocase pat str\n";
+        assert!(diags(src).is_empty());
+    }
+
+    #[test]
+    fn namespace_eval_extern_is_rejected() {
+        let src = "namespace eval extern { proc foo {} { } }\n";
+        let d = diags(src);
+        assert!(
+            d.iter()
+                .any(|m| m.message.contains("reserved namespace name")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
     fn duplicate_arg_warns() {
         let src = proc_decl("  has_a", "axis_interface -has_a 1 -has_a 2");
         let d = diags(&src);
@@ -746,10 +1121,12 @@ create_cpm5 -name x\n";
     }
 
     #[test]
-    fn unknown_proc_is_not_validated() {
-        let src = "axis_interface -has_tkeep 1\n";
-        // No proc declaration anywhere — call sites to undeclared
-        // commands aren't an htcl error (could be a Vivado builtin).
+    fn unknown_positional_call_is_not_validated() {
+        // Bare positional call to an unknown name (could be a Tcl
+        // builtin) is silently accepted. Unknown calls with
+        // `-flag` args are the *only* unknown-call case that
+        // errors — see `unknown_keyword_call_is_an_error`.
+        let src = "axis_interface tkeep_yes 1\n";
         assert!(diags(src).is_empty());
     }
 }
