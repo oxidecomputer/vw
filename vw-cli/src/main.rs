@@ -979,7 +979,14 @@ async fn run_htcl(
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
         };
-        let tcl = vw_htcl::lower_command(cmd, &source, &table);
+        let lowered = vw_htcl::lower_command(cmd, &source, &table);
+        // Rewrite `extern::name` → `::name` (the textual pass the
+        // REPL also runs) so calls to runtime-Tcl/Vivado procs
+        // reach Vivado as the bare native name instead of the
+        // literal `extern::` text — without this, every wrapper
+        // body that forwards via `extern::` errors out at runtime
+        // with `invalid command name "extern::create_project"`.
+        let tcl = vw_htcl::rewrite_externs(&lowered).text;
         match backend.eval(&tcl).await {
             Ok(out) => {
                 // Puts output already streamed to stdout via the

@@ -322,13 +322,11 @@ impl App {
             // (Mac laptops, 60% boards) where PageUp doesn't exist
             // physically and fn-modifier translation isn't always
             // reliable through the terminal.
-            (KeyCode::PageUp, _)
-            | (KeyCode::Up, KeyModifiers::CONTROL) => {
+            (KeyCode::PageUp, _) | (KeyCode::Up, KeyModifiers::CONTROL) => {
                 self.scrollback_scroll =
                     self.scrollback_scroll.saturating_add(5);
             }
-            (KeyCode::PageDown, _)
-            | (KeyCode::Down, KeyModifiers::CONTROL) => {
+            (KeyCode::PageDown, _) | (KeyCode::Down, KeyModifiers::CONTROL) => {
                 self.scrollback_scroll =
                     self.scrollback_scroll.saturating_sub(5);
             }
@@ -464,8 +462,7 @@ impl App {
         // A lowering failure (unknown dep, parse error in an
         // imported file, etc.) never reaches Vivado.
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let lowered = match crate::lower::prepare(&text, &cwd, &self.session)
-        {
+        let lowered = match crate::lower::prepare(&text, &cwd, &self.session) {
             Ok(l) => l,
             Err(e) => {
                 // The user cares "did my input run or not" — the

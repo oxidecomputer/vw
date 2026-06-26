@@ -1188,8 +1188,10 @@ namespace eval vivado {
             &prior_table,
         );
         assert!(
-            bad_diags.iter().any(|d| d.message.contains("bogus")
-                && d.message.contains("@enum")),
+            bad_diags
+                .iter()
+                .any(|d| d.message.contains("bogus")
+                    && d.message.contains("@enum")),
             "{:?}",
             bad_diags
         );

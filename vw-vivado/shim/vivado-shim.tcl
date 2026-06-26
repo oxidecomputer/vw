@@ -199,10 +199,19 @@ proc ::vw::log {msg} {
 # as its value — but a leading `-` value is exotic enough that we
 # accept the ambiguity).
 proc ::vw::kwargs {argv sig} {
-    # Initialize each parameter to its declared default.
+    # Initialize each parameter to its declared default. Also
+    # initialize a `__vw_kw_<name>_set` flag to 0 — wrappers can
+    # check this to distinguish "user supplied this arg" from
+    # "we filled in the default", which matters for
+    # set_property -dict where setting unsupplied properties
+    # (with their defaults) re-validates the whole cell and
+    # rejects values Vivado considers out of range for the
+    # cell's current state.
     foreach {name default} $sig {
         upvar 1 $name var
         set var $default
+        upvar 1 __vw_kw_${name}_set seen
+        set seen 0
     }
     set n [llength $argv]
     set i 0
@@ -236,6 +245,8 @@ proc ::vw::kwargs {argv sig} {
             }
         }
         upvar 1 $key var
+        upvar 1 __vw_kw_${key}_set seen
+        set seen 1
         if {$bare} {
             set var 1
             incr i

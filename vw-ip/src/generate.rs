@@ -149,17 +149,34 @@ fn emit_dict_sub_proc(
         emit_dict_field_arg(&mut doc, f, opts);
     }
 
+    // Build the inner CONFIG.<param> dict conditionally so unsupplied
+    // args never reach Vivado. Unconditionally emitting every field
+    // (even at its declared default) re-validates the whole cell and
+    // Vivado rejects values whose defaults happen to be out-of-range
+    // for the cell's current state — e.g. `STRADDLE_SIZE=0` when the
+    // valid enum is `{None, 2_TLP}`. The `__vw_kw_<arg>_set` flag is
+    // set by `::vw::kwargs` (shim helper) only when the user passed
+    // a value for that arg, so the test filters out the defaults.
     let mut body = String::new();
-    writeln!(body, "vivado::set_property -dict [list \\").unwrap();
-    writeln!(body, "  CONFIG.{param_name} [list \\").unwrap();
-    let n = schema.fields.len();
-    for (i, f) in schema.fields.iter().enumerate() {
+    writeln!(body, "set _vw_inner [list]").unwrap();
+    for f in &schema.fields {
         let arg = lowercase_ident(&f.name);
-        let cont = if i + 1 == n { "" } else { " \\" };
-        writeln!(body, "    {} ${arg}{cont}", f.name).unwrap();
+        writeln!(
+            body,
+            "if {{${{__vw_kw_{arg}_set}}}} \
+             {{ lappend _vw_inner {} ${arg} }}",
+            f.name
+        )
+        .unwrap();
     }
-    writeln!(body, "  ] \\").unwrap();
-    writeln!(body, "] -objects $cell").unwrap();
+    writeln!(body, "if {{[llength $_vw_inner] > 0}} {{").unwrap();
+    writeln!(
+        body,
+        "  vivado_cmd::set_property -dict \
+         [list CONFIG.{param_name} $_vw_inner] -objects $cell"
+    )
+    .unwrap();
+    writeln!(body, "}}").unwrap();
     emit_proc(out, &sub_name, &doc, &body);
 }
 
@@ -250,13 +267,20 @@ fn build_single_body(vlnv: &str, parameters: &[&Parameter]) -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "set cell [vivado::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
+        "set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
     )
     .unwrap();
-    if parameters.is_empty() {
-        return out;
+    if !parameters.is_empty() {
+        write_set_property_dict(&mut out, parameters, "");
     }
-    write_set_property_dict(&mut out, parameters, "");
+    // Every `create_<ip>` proc must return the cell handle so the
+    // caller can pass it back into the IP's sub-procs (or any other
+    // wrapper that takes `-cell $x`). Without the explicit return,
+    // the proc returns whatever its last statement returned — which
+    // is `""` for the empty-conditional-dict shape, breaking
+    // downstream callers with cryptic `Missing value for option
+    // 'objects'` errors.
+    writeln!(out, "return $cell").unwrap();
     out
 }
 
@@ -329,7 +353,7 @@ fn generate_split(
         }
     }
     let mut top_body = format!(
-        "set cell [vivado::create_bd_cell -type ip -vlnv {vlnv} -name $name]\n"
+        "set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]\n"
     );
     if !tree.direct.is_empty() {
         write_set_property_dict(&mut top_body, &tree.direct, "");
@@ -360,6 +384,10 @@ fn generate_split(
 
         let mut body = String::new();
         write_set_property_dict(&mut body, &n.direct, &n.label);
+        // Return the cell the user passed in. Lets `set x [create_<ip>_<group>
+        // -cell $cell ...]` round-trip the handle for downstream calls and
+        // avoids `$x = ""` when the conditional-dict had zero supplied args.
+        writeln!(body, "return $cell").unwrap();
         emit_proc(&mut out, &sub_name, &sub_doc, &body);
     }
 
@@ -443,12 +471,31 @@ fn write_set_property_dict(
     parameters: &[&Parameter],
     prefix_to_strip: &str,
 ) {
-    writeln!(out, "vivado::set_property -dict [list \\").unwrap();
+    // Build the dict conditionally so only user-supplied args reach
+    // Vivado. See `emit_dict_proc` for the rationale — unconditionally
+    // setting all CONFIG.* properties re-validates the whole cell and
+    // Vivado rejects values whose declared defaults happen to be
+    // out-of-range for the cell's current state. The
+    // `__vw_kw_<arg>_set` flag is set by `::vw::kwargs` (shim helper)
+    // only when the user passed a value for that arg.
+    writeln!(out, "set _vw_d [list]").unwrap();
     for p in parameters {
         let arg = lowercase_ident(strip_prefix(&p.name, prefix_to_strip));
-        writeln!(out, "  CONFIG.{} ${arg} \\", p.name).unwrap();
+        writeln!(
+            out,
+            "if {{${{__vw_kw_{arg}_set}}}} \
+             {{ lappend _vw_d CONFIG.{} ${arg} }}",
+            p.name
+        )
+        .unwrap();
     }
-    writeln!(out, "] -objects $cell").unwrap();
+    writeln!(out, "if {{[llength $_vw_d] > 0}} {{").unwrap();
+    writeln!(
+        out,
+        "  vivado_cmd::set_property -dict $_vw_d -objects $cell"
+    )
+    .unwrap();
+    writeln!(out, "}}").unwrap();
 }
 
 fn emit_arg_decl(

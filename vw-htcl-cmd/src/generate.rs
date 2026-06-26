@@ -516,7 +516,13 @@ fn emit_typed_invocation(
         let flag = first.flag.as_deref().unwrap_or(id);
         let required = first.default.is_none();
         if required {
-            emit_typed_invocation_with(body, orig, rest, &[(*first, flag)], depth);
+            emit_typed_invocation_with(
+                body,
+                orig,
+                rest,
+                &[(*first, flag)],
+                depth,
+            );
         } else {
             writeln!(body, "{indent}if {{${id} ne \"\"}} {{").unwrap();
             emit_typed_invocation_with(

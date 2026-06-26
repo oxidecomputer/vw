@@ -225,8 +225,7 @@ impl VivadoBackend {
         let reader = pair.master.try_clone_reader().map_err(|e| {
             BackendError::Worker(format!("pty reader clone failed: {e}"))
         })?;
-        let (pty_tx, pty_rx) =
-            tokio::sync::mpsc::unbounded_channel::<String>();
+        let (pty_tx, pty_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let stdout_pump = spawn_stdout_pump(reader, pty_tx);
 
         // Wait for the shim to connect.
@@ -416,9 +415,7 @@ impl VivadoBackend {
                     // drain. Flushing here means the user always
                     // sees every classified message attributable
                     // to the eval before the eval's result.
-                    if let Some((kind, text)) =
-                        self.pty_classifier.flush()
-                    {
+                    if let Some((kind, text)) = self.pty_classifier.flush() {
                         self.emit_pty_chunk(kind, &text, &mut accumulated);
                     }
                     return Ok((r, accumulated));
@@ -445,9 +442,8 @@ impl VivadoBackend {
         line: &str,
         accumulated: &mut String,
     ) {
-        let outcome = self
-            .pty_classifier
-            .handle(line, std::time::Instant::now());
+        let outcome =
+            self.pty_classifier.handle(line, std::time::Instant::now());
         for (kind, text) in outcome.chunks {
             self.emit_pty_chunk(kind, &text, accumulated);
         }
@@ -482,9 +478,8 @@ impl VivadoBackend {
             self.emit_pty_chunk(kind, &text, &mut sink_void);
         }
         while let Ok(line) = self.pty_rx.try_recv() {
-            let outcome = self
-                .pty_classifier
-                .handle(&line, std::time::Instant::now());
+            let outcome =
+                self.pty_classifier.handle(&line, std::time::Instant::now());
             for (kind, text) in outcome.chunks {
                 self.emit_pty_chunk(kind, &text, &mut sink_void);
             }
@@ -767,11 +762,8 @@ pub(crate) fn classify_vivado_message_line(line: &str) -> Option<StreamKind> {
 /// Allowlist of prefixes our shim and worker emit for self-
 /// diagnostics. Any line starting with one of these classifies
 /// as [`StreamKind::Info`].
-pub(crate) const VW_LOG_PREFIXES: &[&str] = &[
-    "[vw-shim]",
-    "[vw-pty]",
-    "[vw-shim-stream]",
-];
+pub(crate) const VW_LOG_PREFIXES: &[&str] =
+    &["[vw-shim]", "[vw-pty]", "[vw-shim-stream]"];
 
 /// Window during which a classified PTY line will absorb a
 /// following unclassified line as a continuation. Vivado
@@ -850,7 +842,8 @@ impl PtyClassifier {
             // whatever was pending first — same path as the
             // window-expired case below.
             if let Some(prev) = self.pending.take() {
-                out.chunks.push((prev.kind, with_trailing_newline(&prev.text)));
+                out.chunks
+                    .push((prev.kind, with_trailing_newline(&prev.text)));
             }
             self.pending = Some(PendingPtyMessage {
                 kind,
@@ -897,7 +890,9 @@ impl PtyClassifier {
     /// message buffered right before the Vivado response doesn't
     /// linger unseen.
     pub fn flush(&mut self) -> Option<(StreamKind, String)> {
-        self.pending.take().map(|p| (p.kind, with_trailing_newline(&p.text)))
+        self.pending
+            .take()
+            .map(|p| (p.kind, with_trailing_newline(&p.text)))
     }
 }
 
@@ -938,8 +933,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        classify_chunk_for_sink, classify_vivado_message_line,
-        is_vw_log_chunk, PtyClassifier, StreamKind,
+        classify_chunk_for_sink, classify_vivado_message_line, is_vw_log_chunk,
+        PtyClassifier, StreamKind,
     };
 
     fn classifier(window_ms: u64) -> PtyClassifier {
@@ -968,16 +963,12 @@ mod tests {
         let t0 = Instant::now();
         let out = c.handle("WARNING: [X 1-1] header", t0);
         assert!(out.absorbed);
-        let out = c.handle(
-            "second body line",
-            t0 + Duration::from_millis(5),
-        );
+        let out = c.handle("second body line", t0 + Duration::from_millis(5));
         assert!(out.chunks.is_empty(), "{:?}", out.chunks);
         assert!(out.absorbed);
         // A third continuation works too (window refreshes on
         // each absorb).
-        let out =
-            c.handle("third line", t0 + Duration::from_millis(15));
+        let out = c.handle("third line", t0 + Duration::from_millis(15));
         assert!(out.chunks.is_empty(), "{:?}", out.chunks);
         assert!(out.absorbed);
         let (kind, text) = c.flush().unwrap();
@@ -1014,10 +1005,7 @@ mod tests {
         let mut c = classifier(20);
         let t0 = Instant::now();
         c.handle("WARNING: [X 1-1] one", t0);
-        let out = c.handle(
-            "ERROR: [Y 1-1] two",
-            t0 + Duration::from_millis(5),
-        );
+        let out = c.handle("ERROR: [Y 1-1] two", t0 + Duration::from_millis(5));
         assert_eq!(out.chunks.len(), 1);
         assert_eq!(out.chunks[0].0, StreamKind::Warning);
         assert_eq!(out.chunks[0].1, "WARNING: [X 1-1] one\n");
@@ -1034,9 +1022,7 @@ mod tests {
             "[vw-shim] installed send_msg_id override\n"
         ));
         assert!(is_vw_log_chunk("[vw-pty] classified-as=Warning\n"));
-        assert!(is_vw_log_chunk(
-            "  [vw-shim-stream] classified-as=Error\n"
-        ));
+        assert!(is_vw_log_chunk("  [vw-shim-stream] classified-as=Error\n"));
         // Real message content stays — never accidentally
         // suppress a Vivado warning that mentions our tag in its
         // body.
@@ -1081,7 +1067,6 @@ mod tests {
         assert!(!out.absorbed);
         assert!(c.flush().is_none());
     }
-
 
     #[test]
     fn classifies_each_standard_prefix_to_its_stream_kind() {
@@ -1157,10 +1142,7 @@ mod tests {
     fn does_not_match_partial_prefixes() {
         // `ERRORS:` would be a hypothetical other label and we
         // shouldn't false-positive on it.
-        assert_eq!(
-            classify_vivado_message_line("ERRORS: bogus prefix"),
-            None
-        );
+        assert_eq!(classify_vivado_message_line("ERRORS: bogus prefix"), None);
         assert_eq!(
             classify_vivado_message_line("INFOMERCIAL: not a message"),
             None
@@ -1237,10 +1219,7 @@ mod tests {
         // (a future shim subsystem nobody added to the allowlist,
         // or a user's puts that happens to bracket `[vw-*]`) is
         // rejected — keeps the classifier conservative.
-        assert_eq!(
-            classify_vivado_message_line("[vw-mystuff] foo"),
-            None
-        );
+        assert_eq!(classify_vivado_message_line("[vw-mystuff] foo"), None);
         assert_eq!(classify_vivado_message_line("[other] foo"), None);
     }
 

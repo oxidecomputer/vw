@@ -596,7 +596,10 @@ mod tests {
         // exactly once — that's what makes the wrapper exist in
         // Tcl. Subsequent batches must NOT re-emit it.
         assert!(
-            first.commands.iter().any(|c| c.tcl.contains("namespace eval")),
+            first
+                .commands
+                .iter()
+                .any(|c| c.tcl.contains("namespace eval")),
             "first batch must ship the namespace decl: {:?}",
             first.commands
         );
@@ -641,8 +644,7 @@ mod tests {
     #[test]
     fn lowers_plain_proc_call_to_tcl() {
         let dir = tempfile::tempdir().unwrap();
-        let prep =
-            prepare("puts hello", dir.path(), &empty_session()).unwrap();
+        let prep = prepare("puts hello", dir.path(), &empty_session()).unwrap();
         assert_eq!(prep.commands.len(), 1);
         assert!(prep.commands[0].tcl.contains("puts hello"));
         // Input is at line 1 of the buffer.
@@ -654,12 +656,9 @@ mod tests {
     #[test]
     fn each_statement_gets_its_own_origin() {
         let dir = tempfile::tempdir().unwrap();
-        let prep = prepare(
-            "set x 1\nset y 2\nset z 3",
-            dir.path(),
-            &empty_session(),
-        )
-        .unwrap();
+        let prep =
+            prepare("set x 1\nset y 2\nset z 3", dir.path(), &empty_session())
+                .unwrap();
         assert_eq!(prep.commands.len(), 3);
         assert_eq!(prep.commands[0].origin.line, 1);
         assert_eq!(prep.commands[1].origin.line, 2);
@@ -917,8 +916,7 @@ mod tests {
 
         let mut session = Session::new();
         // Batch A: pull the wrapper in.
-        let first =
-            prepare("src @vivado-cmd\n", dir.path(), &session).unwrap();
+        let first = prepare("src @vivado-cmd\n", dir.path(), &session).unwrap();
         session.commit(first.batch);
 
         // Batch B: call the wrapper. Look up its location through

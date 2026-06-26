@@ -86,7 +86,7 @@ pub fn lower_command(
     table: &SignatureTable<'_>,
 ) -> String {
     match &cmd.kind {
-        CommandKind::Proc(proc) => lower_proc_decl(proc, source),
+        CommandKind::Proc(proc) => lower_proc_decl(proc, source, table),
         CommandKind::NamespaceEval(ns) => {
             lower_namespace_eval(ns, source, table)
         }
@@ -164,9 +164,33 @@ fn lower_namespace_eval(
 /// plain Tcl: `proc name { <raw args text> } { <body> }`. The
 /// `::vw::kwargs` prelude is only emitted when we know what
 /// parameters to declare.
-fn lower_proc_decl(proc: &Proc, source: &str) -> String {
+fn lower_proc_decl(
+    proc: &Proc,
+    source: &str,
+    table: &SignatureTable<'_>,
+) -> String {
     let name = proc.name.as_deref().unwrap_or("");
-    let body = proc.body_span.slice(source);
+    // Re-emit the body by walking its parsed statements rather
+    // than slicing raw text. This is what gives htcl's "newlines
+    // inside `[ … ]` are whitespace" semantics inside proc bodies
+    // too — verbatim slicing leaves Tcl to interpret the
+    // newlines as command separators, which silently splits a
+    // multi-line `set x [ foo \n  -a 1 \n  -b 2 \n]` into four
+    // separate calls and drops every flag arg.
+    let body = if proc.body.is_empty() {
+        proc.body_span.slice(source).to_string()
+    } else {
+        let mut out = String::new();
+        for stmt in &proc.body {
+            let Stmt::Command(cmd) = stmt else { continue };
+            let line = lower_command(cmd, source, table);
+            if !line.is_empty() {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        out
+    };
     let Some(sig) = proc.signature.as_ref() else {
         // Couldn't parse a structured signature — emit the proc
         // verbatim. Tcl will accept it if the raw arg text is
@@ -345,11 +369,25 @@ fn lower_words(
     source: &str,
     table: &SignatureTable<'_>,
 ) -> String {
-    words
-        .iter()
-        .map(|w| lower_word(w, source, table))
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Preserve source-level adjacency between consecutive words.
+    // The parser splits `{*}$var` into two AST words ({*} as a
+    // braced "*", $var as a bare word) but their source spans
+    // touch — Tcl reads them as the expand-prefix operator.
+    // Joining with a literal space would force `{*} $var`, which
+    // Tcl reinterprets as a literal-`*`-arg followed by `$var`.
+    // Checking adjacency keeps the no-space form for `{*}$var`
+    // while still spacing genuinely-whitespace-separated words.
+    let mut out = String::new();
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 {
+            let prev_end = words[i - 1].span.end;
+            if w.span.start > prev_end {
+                out.push(' ');
+            }
+        }
+        out.push_str(&lower_word(w, source, table));
+    }
+    out
 }
 
 fn lower_word(word: &Word, source: &str, table: &SignatureTable<'_>) -> String {

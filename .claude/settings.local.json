@@ -24,7 +24,8 @@
       "Bash(vw --help)",
       "Bash(awk '{ ok+=$4; failed+=$6 } END { print ok \" passed, \" failed \" failed\" }')",
       "Bash(cargo clippy *)",
-      "Bash(awk *)"
+      "Bash(awk *)",
+      "Bash(/home/ry/src/vw/target/debug/vw run *)"
     ]
   }
 }
