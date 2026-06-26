@@ -12,4 +12,4 @@
 
 mod worker;
 
-pub use worker::{VivadoBackend, VivadoConfig};
+pub use worker::{StreamKind, VivadoBackend, VivadoConfig};

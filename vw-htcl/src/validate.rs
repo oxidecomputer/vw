@@ -32,8 +32,34 @@ pub struct Diagnostic {
 }
 
 pub fn validate(document: &Document, source: &str) -> Vec<Diagnostic> {
+    validate_with_signatures(document, source, &HashMap::new())
+}
+
+/// Same as [`validate`], but resolves unknown calls against an
+/// additional pool of signatures supplied by the caller — used by
+/// the REPL to make procs declared in earlier session batches
+/// visible to a new batch without re-parsing the whole prelude.
+///
+/// Merge rules:
+///
+/// - The document's own signatures shadow `extra`. Redefining a
+///   proc in `document` overrides the prior version (Tcl
+///   semantics — a second `proc` redefines).
+/// - Duplicate-definition diagnostics only fire for collisions
+///   **within** `document`. A new batch that re-`src`s a wrapper
+///   already loaded earlier shouldn't warn on every input.
+pub fn validate_with_signatures<'doc>(
+    document: &'doc Document,
+    source: &str,
+    extra: &HashMap<String, &'doc ProcSignature>,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    let table = build_signature_table(document, &mut diags);
+    let mut table = build_signature_table(document, &mut diags);
+    // Prior-batch signatures fill in the gaps. The doc's own entries
+    // win because `entry().or_insert(...)` is a no-op on present keys.
+    for (name, sig) in extra {
+        table.entry(name.clone()).or_insert(*sig);
+    }
     validate_stmts(&document.stmts, source, &table, &mut diags);
     diags
 }
@@ -1113,6 +1139,94 @@ create_cpm5\n";
 proc create_cpm5 {\n  name\n} { }\n\
 create_cpm5 -name x\n";
         assert!(diags(src).is_empty());
+    }
+
+    #[test]
+    fn extra_signatures_resolve_unknown_calls_from_prior_batches() {
+        // The REPL session case: a wrapper declared in a prior
+        // batch is in `extra`; the new batch's bare call to it must
+        // resolve (no `extern::` error) and its keyword args must
+        // validate against the prior signature.
+        let prior_src = "\
+namespace eval vivado {
+  proc create_project {
+    @default(\"\") name
+    @enum(0, 1) @default(0) in_memory
+  } { }
+}
+";
+        let prior_parsed = parse(prior_src);
+        assert!(prior_parsed.errors.is_empty());
+        let mut sink = Vec::new();
+        let prior_table =
+            build_signature_table(&prior_parsed.document, &mut sink);
+
+        // New batch: bare `vivado::create_project -name foo`. No
+        // declaration in scope here — only the prior batch's table
+        // saves it from the unknown-keyword-call error.
+        let new_src = "vivado::create_project -name foo\n";
+        let new_parsed = parse(new_src);
+        let diags = validate_with_signatures(
+            &new_parsed.document,
+            new_src,
+            &prior_table,
+        );
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "{:?}",
+            diags
+        );
+
+        // And the keyword-args still get validated — a bad enum
+        // value should still error even though the sig came in
+        // through `extra`.
+        let bad_src = "vivado::create_project -in_memory bogus\n";
+        let bad_parsed = parse(bad_src);
+        let bad_diags = validate_with_signatures(
+            &bad_parsed.document,
+            bad_src,
+            &prior_table,
+        );
+        assert!(
+            bad_diags.iter().any(|d| d.message.contains("bogus")
+                && d.message.contains("@enum")),
+            "{:?}",
+            bad_diags
+        );
+    }
+
+    #[test]
+    fn doc_signatures_shadow_extra_without_warning() {
+        // Re-declaring a proc in the new batch should NOT raise the
+        // "duplicate definition" warning against the prior-batch
+        // signature — that's a normal `src @lib` reload case in the
+        // REPL and would be noisy. The new declaration takes
+        // precedence.
+        let prior_src = "proc foo { @default(0) x } { }\n";
+        let prior_parsed = parse(prior_src);
+        let mut sink = Vec::new();
+        let prior_table =
+            build_signature_table(&prior_parsed.document, &mut sink);
+
+        let new_src = "proc foo { @default(1) y } { }\nfoo -y 2\n";
+        let new_parsed = parse(new_src);
+        let diags = validate_with_signatures(
+            &new_parsed.document,
+            new_src,
+            &prior_table,
+        );
+        assert!(
+            diags.iter().all(|d| !d.message.contains("duplicate")),
+            "{:?}",
+            diags
+        );
+        // And the new sig is the one that resolved: `-y` is
+        // accepted, `-x` would have been the prior sig's arg.
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "{:?}",
+            diags
+        );
     }
 
     #[test]

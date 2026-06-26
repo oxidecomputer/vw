@@ -21,7 +21,10 @@
       "Bash(vw check *)",
       "Bash(grep -nA20 \"fn diagnostics\\\\|validate\\(\\\\|fn publish_diagnostics\" vw-analyzer/src/htcl_backend.rs)",
       "Bash(awk '{sum += $4} END {print \"passed:\", sum}')",
-      "Bash(vw --help)"
+      "Bash(vw --help)",
+      "Bash(awk '{ ok+=$4; failed+=$6 } END { print ok \" passed, \" failed \" failed\" }')",
+      "Bash(cargo clippy *)",
+      "Bash(awk *)"
     ]
   }
 }

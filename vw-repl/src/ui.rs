@@ -164,7 +164,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let hint = if app.reverse_search().is_some() {
         "Esc cancel · Enter accept · Ctrl-R older"
     } else {
-        "Ctrl-D exit · Ctrl-R search · :load <file> · :restart · :quit"
+        "Ctrl-D exit · Ctrl-R search · Ctrl-↑/↓ scroll · :load <file> · :quit"
     };
     // Split the status bar into [hint (left, fills) | status
     // indicator (right, fixed width)] so the status badge always

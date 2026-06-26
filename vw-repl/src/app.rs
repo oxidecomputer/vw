@@ -31,7 +31,7 @@ use tui_textarea::{Input, TextArea};
 use vw_eda::EdaBackend;
 
 use crate::history::History;
-use crate::session::Session;
+use crate::session::{Session, SessionBatch};
 use crate::ui::{self, WorkerStatusView};
 use crate::{ReplError, ReplOptions};
 
@@ -83,15 +83,13 @@ pub struct App {
     worker_state: WorkerState,
     worker_tx: mpsc::Sender<WorkerCmd>,
     eval_rx: mpsc::UnboundedReceiver<WorkerEvent>,
-    /// The input we shipped to the worker but haven't yet seen a
+    /// The batch we shipped to the worker but haven't yet seen a
     /// result for. Held aside so a successful eval (and only a
-    /// successful one) commits to the session document.
-    pending_input: Option<String>,
-    /// Proc-name → body-location map for the in-flight batch. Used
-    /// by the error renderer to translate Tcl's `(procedure "X"
-    /// line N)` frames back to htcl file:line locations.
-    pending_procs:
-        std::collections::HashMap<String, crate::lower::ProcLocation>,
+    /// successful one) commits to the session — and so the error
+    /// renderer can look up procs declared in this in-flight
+    /// batch (which aren't yet in `session`) when drilling into a
+    /// Tcl stack frame.
+    pending_batch: Option<SessionBatch>,
     /// Set when `:quit` (or Ctrl-D on an empty buffer) fires, so the
     /// outer loop bails out after the current frame.
     exit: bool,
@@ -117,7 +115,13 @@ enum WorkerCmd {
 /// Events sent from the worker task back to the UI.
 enum WorkerEvent {
     Started,
-    Stdout(String),
+    /// One streaming chunk from the worker, with its source-of-
+    /// origin tag so the UI can render Vivado WARNING/ERROR lines
+    /// distinctly from user `puts` output.
+    Stream {
+        kind: vw_vivado::StreamKind,
+        data: String,
+    },
     /// One item of a batch completed. `origin` is the htcl source
     /// location the lowered Tcl came from so the renderer can show
     /// `file:line` rather than a Tcl stack trace pointing at the
@@ -154,9 +158,36 @@ async fn run_inner(
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCmd>(8);
     let (event_tx, eval_rx) = mpsc::unbounded_channel::<WorkerEvent>();
     let verbose = opts.verbose;
-    tokio::spawn(worker_task(worker_rx, event_tx, verbose));
+    // Verbose output can't go to stderr in REPL mode — that's the
+    // same fd the TUI renders on, so any byte stomps through the
+    // alternate-screen buffer. Route it to a per-process tempfile
+    // instead and tell the user where to find it.
+    let verbose_log_path = if verbose {
+        Some(
+            std::env::temp_dir()
+                .join(format!("vw-repl-vivado-{}.log", std::process::id())),
+        )
+    } else {
+        None
+    };
+    tokio::spawn(worker_task(
+        worker_rx,
+        event_tx,
+        verbose,
+        verbose_log_path.clone(),
+    ));
 
     let mut app = App::new(opts, worker_tx, eval_rx);
+    if let Some(p) = verbose_log_path {
+        app.push(
+            ScrollbackKind::Notice,
+            format!(
+                "verbose output streaming to {} — `tail -f` from \
+                 another terminal",
+                p.display()
+            ),
+        );
+    }
     let mut crossterm_events = crossterm::event::EventStream::new();
 
     loop {
@@ -208,8 +239,7 @@ impl App {
             worker_state: WorkerState::Starting,
             worker_tx,
             eval_rx,
-            pending_input: None,
-            pending_procs: std::collections::HashMap::new(),
+            pending_batch: None,
             exit: false,
         }
     }
@@ -287,11 +317,18 @@ impl App {
                     match_text: String::new(),
                 });
             }
-            (KeyCode::PageUp, _) => {
+            // Scrollback nav. PageUp/PageDown for keyboards that
+            // have them; Ctrl+Up/Ctrl+Down for compact keyboards
+            // (Mac laptops, 60% boards) where PageUp doesn't exist
+            // physically and fn-modifier translation isn't always
+            // reliable through the terminal.
+            (KeyCode::PageUp, _)
+            | (KeyCode::Up, KeyModifiers::CONTROL) => {
                 self.scrollback_scroll =
                     self.scrollback_scroll.saturating_add(5);
             }
-            (KeyCode::PageDown, _) => {
+            (KeyCode::PageDown, _)
+            | (KeyCode::Down, KeyModifiers::CONTROL) => {
                 self.scrollback_scroll =
                     self.scrollback_scroll.saturating_sub(5);
             }
@@ -427,18 +464,18 @@ impl App {
         // A lowering failure (unknown dep, parse error in an
         // imported file, etc.) never reaches Vivado.
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let lowered =
-            match crate::lower::prepare(&text, &cwd, self.session.prelude()) {
-                Ok(l) => l,
-                Err(e) => {
-                    // The user cares "did my input run or not" — the
-                    // fact that this came back from the lowering
-                    // pipeline (vs. the Vivado worker) is internal
-                    // accounting. Just say ERROR.
-                    self.push(ScrollbackKind::Error, format!("ERROR: {e}"));
-                    return;
-                }
-            };
+        let lowered = match crate::lower::prepare(&text, &cwd, &self.session)
+        {
+            Ok(l) => l,
+            Err(e) => {
+                // The user cares "did my input run or not" — the
+                // fact that this came back from the lowering
+                // pipeline (vs. the Vivado worker) is internal
+                // accounting. Just say ERROR.
+                self.push(ScrollbackKind::Error, format!("ERROR: {e}"));
+                return;
+            }
+        };
 
         // Surface any pre-flight warnings *before* shipping. If the
         // eval then fails, the user already has the context they
@@ -453,22 +490,21 @@ impl App {
         }
         if lowered.commands.is_empty() {
             // Pure `src` import or comments-only input. Commit the
-            // imported source to the session anyway so future
+            // parsed batch to the session anyway so future
             // analyzer queries see the imported procs.
-            self.session.commit(&lowered.committed_source);
+            self.session.commit(lowered.batch);
             self.push(ScrollbackKind::Notice, "(no Tcl to evaluate)".into());
             return;
         }
 
-        // Commit to the session document only after every command
-        // in the batch succeeds (see `handle_worker_event`); a
-        // failure mid-batch shouldn't pollute the analyzer's view.
+        // Commit to the session only after every command in the
+        // batch succeeds (see `handle_worker_event`); a failure
+        // mid-batch shouldn't pollute the analyzer's view.
         let _ = self
             .worker_tx
             .send(WorkerCmd::EvalBatch(lowered.commands))
             .await;
-        self.pending_input = Some(lowered.committed_source);
-        self.pending_procs = lowered.procs;
+        self.pending_batch = Some(lowered.batch);
         self.worker_state = WorkerState::Running;
     }
 
@@ -549,8 +585,22 @@ impl App {
                     format!("vivado failed to start: {e}"),
                 );
             }
-            WorkerEvent::Stdout(chunk) => {
-                self.push(ScrollbackKind::Stdout, chunk);
+            WorkerEvent::Stream { kind, data } => {
+                let scrollback_kind = match kind {
+                    vw_vivado::StreamKind::Stdout => ScrollbackKind::Stdout,
+                    vw_vivado::StreamKind::Info => ScrollbackKind::Notice,
+                    vw_vivado::StreamKind::Warning => ScrollbackKind::Warning,
+                    vw_vivado::StreamKind::Error => ScrollbackKind::Error,
+                };
+                // The PTY filter emits one line per chunk and
+                // the shim's `puts` capture preserves user-side
+                // newlines; trim a single trailing newline so the
+                // scrollback's per-entry layout doesn't insert a
+                // blank gap between Vivado messages.
+                let trimmed = data.trim_end_matches('\n').to_string();
+                if !trimmed.is_empty() {
+                    self.push(scrollback_kind, trimmed);
+                }
             }
             WorkerEvent::EvalDone {
                 origin,
@@ -580,16 +630,21 @@ impl App {
                                     out.value.clone(),
                                 );
                             }
-                            let pending =
-                                self.pending_input.take().unwrap_or_default();
-                            self.session.commit(&pending);
+                            if let Some(batch) = self.pending_batch.take() {
+                                self.session.commit(batch);
+                            }
                             self.worker_state = WorkerState::Ready;
                         }
                     }
                     Err(err) => {
                         self.worker_state = WorkerState::Ready;
-                        self.pending_input = None;
+                        // Hold the pending batch for the renderer
+                        // — drill-down lookups need its proc map.
+                        // It's cleared below once the trace is
+                        // emitted (a pending batch only outlives a
+                        // single result event).
                         render_eval_error(self, &origin, err);
+                        self.pending_batch = None;
                     }
                 }
             }
@@ -609,9 +664,11 @@ async fn worker_task(
     mut rx: mpsc::Receiver<WorkerCmd>,
     tx: mpsc::UnboundedSender<WorkerEvent>,
     verbose: bool,
+    verbose_log: Option<std::path::PathBuf>,
 ) {
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
+        verbose_log,
         ..Default::default()
     })
     .await;
@@ -626,12 +683,18 @@ async fn worker_task(
         }
     };
 
-    // Stream stdout chunks to the UI as they arrive. The closure
+    // Stream chunks to the UI as they arrive. The closure
     // captures the unbounded sender so it can fire without
-    // awaiting.
+    // awaiting. The kind tag (`StreamKind::Stdout` for user `puts`
+    // output, `Warning`/`Error`/`Info` for Vivado's own message
+    // lines harvested from the PTY) flows through unchanged so
+    // the UI can colour them appropriately.
     let stdout_tx = tx.clone();
-    backend.set_stdout_sink(move |chunk: &str| {
-        let _ = stdout_tx.send(WorkerEvent::Stdout(chunk.to_string()));
+    backend.set_stdout_sink(move |kind, chunk: &str| {
+        let _ = stdout_tx.send(WorkerEvent::Stream {
+            kind,
+            data: chunk.to_string(),
+        });
     });
 
     while let Some(cmd) = rx.recv().await {
@@ -726,9 +789,17 @@ fn render_eval_error(
     };
     if let Some(info) = info.as_deref() {
         for tcl_frame in parse_tcl_proc_frames(info) {
-            let Some(loc) = app.pending_procs.get(&tcl_frame.proc) else {
-                continue;
-            };
+            // Check the in-flight batch first (the lowering that
+            // just ran), then fall back to prior session batches.
+            // This is what gives wrappers declared in earlier
+            // inputs a real `.htcl` path in the drill-down trace
+            // instead of an `(input):N` line in a vanished scratch.
+            let loc = app
+                .pending_batch
+                .as_ref()
+                .and_then(|b| b.procs.get(&tcl_frame.proc))
+                .or_else(|| app.session.lookup_proc(&tcl_frame.proc));
+            let Some(loc) = loc else { continue };
             let Some((abs_line, content)) =
                 loc.resolve_body_line(tcl_frame.line)
             else {

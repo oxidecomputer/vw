@@ -100,18 +100,19 @@ pub fn lower_command(
             format!("# vw: unresolved `src {path}` — loader bypass")
         }
         _ => {
-            let call_name = cmd.words.first().and_then(Word::as_text);
-            if let Some(name) = call_name {
-                if let Some(sig) = table.get(name) {
-                    return lower_call(name, cmd, sig, source, table);
-                }
-            }
             // Verbatim, but reconstructed word-by-word so that any
             // `[ … ]` substitution inside the command gets its own
-            // commands lowered through the same pipeline — keyword
-            // → positional rewriting still applies to calls nested
-            // inside a `set proj [ create_project … ]`, and multi-
-            // line brackets collapse to one Tcl statement.
+            // commands lowered through the same pipeline (extern
+            // rewrites, multi-line bracket flattening).
+            //
+            // No keyword→positional rewrite here: htcl is keyword-
+            // only at the call site, and the rewrite from `-flag
+            // value` pairs to local variables happens at runtime
+            // in the wrapper's `::vw::kwargs $args { ... }` prelude
+            // (emitted by `lower_proc_decl`). That lets call sites
+            // anywhere — top-level, inside a proc body, inside a
+            // `[ ... ]`, inside an `eval` — work uniformly without
+            // the lowerer needing to see every call site.
             lower_words(&cmd.words, source, table)
         }
     }
@@ -119,7 +120,7 @@ pub fn lower_command(
 
 /// Lower a `namespace eval` block: recurse on each inner statement
 /// (so inner proc declarations get their htcl attributes stripped
-/// and inner calls get keyword→positional rewriting) and wrap the
+/// and gain the `::vw::kwargs` runtime prelude) and wrap the
 /// result in `namespace eval <name> { ... }`. Output is a single
 /// Tcl-valid string the EDA backend can `eval` directly.
 fn lower_namespace_eval(
@@ -140,73 +141,69 @@ fn lower_namespace_eval(
     format!("namespace eval {name} {{\n{body}}}")
 }
 
+/// Lower a `proc` declaration into a Tcl proc whose runtime
+/// signature is `args` (variadic). The first line of the body is a
+/// generated `::vw::kwargs $args { name default ... }` call that
+/// parses the caller's `-flag value` pairs into local variables
+/// matching the declared parameter names — defaults applied where
+/// the caller didn't supply a flag. After the prelude the original
+/// body runs unchanged, using `$name`, `$dir`, etc. just as if
+/// they were standard Tcl parameters.
+///
+/// Why this shape: htcl is keyword-only at the call site. Doing
+/// the parse at runtime (in the wrapper) means every call site
+/// works the same — top-level, inside a proc body, inside a
+/// `[ ... ]` substitution, inside an `eval`. The previous
+/// architecture rewrote `-flag value` → positional at compile
+/// time, but only for top-level calls the lowerer could see; calls
+/// inside proc bodies stayed verbatim and broke at runtime against
+/// a positional-only wrapper proc.
+///
+/// Procs without a parsed signature (parser couldn't extract one
+/// from the args list, e.g. mid-edit syntax error) pass through as
+/// plain Tcl: `proc name { <raw args text> } { <body> }`. The
+/// `::vw::kwargs` prelude is only emitted when we know what
+/// parameters to declare.
 fn lower_proc_decl(proc: &Proc, source: &str) -> String {
     let name = proc.name.as_deref().unwrap_or("");
     let body = proc.body_span.slice(source);
-    let args_list = match proc.signature.as_ref() {
-        Some(sig) => sig
-            .args
-            .iter()
-            .map(|a| a.name.clone())
-            .collect::<Vec<_>>()
-            .join(" "),
-        None => proc.args_span.slice(source).to_string(),
+    let Some(sig) = proc.signature.as_ref() else {
+        // Couldn't parse a structured signature — emit the proc
+        // verbatim. Tcl will accept it if the raw arg text is
+        // valid Tcl; otherwise the user already has a parse-error
+        // diagnostic from the upstream parser.
+        let args_list = proc.args_span.slice(source);
+        return format!("proc {name} {{{args_list}}} {{{body}}}");
     };
-    format!("proc {name} {{{args_list}}} {{{body}}}")
+    let sig_dict = build_kwargs_sig_dict(sig);
+    format!(
+        "proc {name} {{args}} {{\n  ::vw::kwargs $args {{{sig_dict}}}\n{body}}}"
+    )
 }
 
-fn lower_call(
-    name: &str,
-    cmd: &Command,
-    sig: &ProcSignature,
-    source: &str,
-    table: &SignatureTable<'_>,
-) -> String {
-    // Collect keyword args. Anything that doesn't look like a `-flag
-    // value` pair is silently dropped here — the validator already
-    // diagnosed it.
-    let mut values: HashMap<String, String> = HashMap::new();
-    let mut idx = 1usize;
-    while idx < cmd.words.len() {
-        let word = &cmd.words[idx];
-        let flag_name = match word.as_text() {
-            Some(t) if t.starts_with('-') => &t[1..],
-            _ => {
-                idx += 1;
-                continue;
-            }
-        };
-        let Some(value_word) = cmd.words.get(idx + 1) else {
-            idx += 1;
-            continue;
-        };
-        // Lower the value word through the same reconstruction the
-        // verbatim path uses, so a value like `[create_project
-        // -name foo]` gets its inner call rewritten too.
-        let v = lower_word(value_word, source, table);
-        values.insert(flag_name.to_string(), v);
-        idx += 2;
-    }
-
-    let mut positional = Vec::with_capacity(sig.args.len());
-    for arg in &sig.args {
-        if let Some(v) = values.remove(&arg.name) {
-            positional.push(v);
-        } else if let Some(default) = arg.attribute("default") {
-            let lit = default
-                .values
-                .first()
-                .map(|v| v.to_tcl_literal())
-                .unwrap_or_else(|| "{}".to_string());
-            positional.push(lit);
-        } else {
-            // No value, no default. Validator should have flagged
-            // this; emit an empty list so the Tcl proc at least gets
-            // the right arity.
-            positional.push("{}".to_string());
+/// Render the parameter list as a flat `name default name default
+/// ...` Tcl dict for [`::vw::kwargs`] to consume. The default for
+/// an arg without `@default` is the empty string `""` — at which
+/// point the validator has already complained at compile time
+/// about missing required args. Quote each default through
+/// [`AttributeValue::to_tcl_literal`] so integers, idents, and
+/// strings all round-trip correctly.
+fn build_kwargs_sig_dict(sig: &ProcSignature) -> String {
+    let mut out = String::new();
+    for (i, arg) in sig.args.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
         }
+        out.push_str(&arg.name);
+        out.push(' ');
+        let default = arg
+            .attribute("default")
+            .and_then(|attr| attr.values.first())
+            .map(|v| v.to_tcl_literal())
+            .unwrap_or_else(|| "\"\"".to_string());
+        out.push_str(&default);
     }
-    format!("{name} {}", positional.join(" "))
+    out
 }
 
 /// The syntactic prefix that marks a call to a runtime-Tcl proc
@@ -439,34 +436,55 @@ mod tests {
     }
 
     #[test]
-    fn proc_decl_drops_attributes() {
+    fn proc_decl_emits_kwargs_prelude() {
+        // Every htcl proc lowers to `proc name {args} { ::vw::kwargs
+        // ... ; body }` — the runtime helper parses the caller's
+        // `-flag value` pairs into local variables matching the
+        // declared param names, with defaults applied where the
+        // caller didn't supply a flag. Body text passes through
+        // unchanged.
         let src = "proc f {\n  @default(0) a\n  @default(1) b\n} { puts hi }\n";
         let out = lowered(src);
-        assert_eq!(out[0], "proc f {a b} { puts hi }");
+        assert!(
+            out[0].starts_with("proc f {args} {"),
+            "wrong arg-list form: {}",
+            out[0]
+        );
+        assert!(
+            out[0].contains("::vw::kwargs $args {a 0 b 1}"),
+            "missing or wrong kwargs prelude: {}",
+            out[0]
+        );
+        assert!(out[0].contains("puts hi"), "lost body: {}", out[0]);
     }
 
     #[test]
-    fn call_with_all_flags_reorders_to_positional() {
+    fn call_with_flags_ships_verbatim() {
+        // No more compile-time keyword→positional rewrite. The call
+        // ships as the user typed it; the wrapper proc parses the
+        // keywords at runtime via its kwargs prelude.
         let src = "proc f {\n  a\n  b\n} { puts hi }\nf -b 22 -a 11\n";
         let out = lowered(src);
-        assert_eq!(out[1], "f 11 22");
+        assert_eq!(out[1], "f -b 22 -a 11");
     }
 
     #[test]
-    fn call_with_omitted_arg_uses_default() {
+    fn call_with_omitted_arg_ships_verbatim() {
+        // The wrapper's default is wired in at runtime by
+        // ::vw::kwargs; the call site doesn't need to fill it.
         let src = "proc f {\n  @default(7) a\n  b\n} { puts hi }\nf -b 22\n";
         let out = lowered(src);
-        assert_eq!(out[1], "f 7 22");
+        assert_eq!(out[1], "f -b 22");
     }
 
     #[test]
-    fn inner_call_inside_brackets_is_rewritten_to_positional() {
-        // The shape that broke metroid/project.htcl: `set proj [
-        // some_known_proc -k v ]`. The outer `set` is verbatim,
-        // but the inner `some_known_proc` call must be rewritten
-        // from keyword form to positional — otherwise Tcl will pass
-        // the literal `-k v` words to the lowered Tcl proc (which
-        // takes positional args after lowering).
+    fn inner_call_inside_brackets_ships_verbatim() {
+        // What this test used to assert (`[make xc foo]` —
+        // keyword→positional rewrite for the inner call) is no
+        // longer the architecture. The inner call ships verbatim;
+        // the wrapper parses `-part`/`-name` at runtime. The only
+        // transformation we still apply is multi-line bracket
+        // flattening.
         let src = "proc make {
   @default(\"\") part
   name
@@ -478,19 +496,59 @@ set proj [
 ]
 ";
         let out = lowered(src);
-        // Two top-level statements: the proc declaration and the
-        // set call. We care about the set call's lowered form.
         assert_eq!(out.len(), 2, "{:?}", out);
         let set_line = &out[1];
-        // The inner `make` must be positional, not `-part xc -name foo`.
+        // Inner call stays keyword-form: `make -part xc -name foo`.
         assert!(
-            set_line.contains("[make xc foo]"),
-            "expected inner call rewritten; got: {set_line}"
+            set_line.contains("[make -part xc -name foo]"),
+            "inner call should ship verbatim; got: {set_line}"
         );
-        // And the whole thing collapses to a single line.
+        // Multi-line bracket body still collapses to one line.
         assert!(
             !set_line.contains('\n'),
             "expected single line; got: {set_line:?}"
+        );
+    }
+
+    #[test]
+    fn call_inside_proc_body_ships_verbatim() {
+        // Regression guard for the create_bd_design bug: a
+        // keyword-form call to a known wrapper, nested inside
+        // another proc's body, must NOT be rewritten. In the old
+        // architecture the lowerer only saw top-level call sites
+        // and silently failed to translate this one, so at runtime
+        // Tcl handed `-name cips` to a positional-only wrapper
+        // proc and errored "wrong # args". Now the wrapper parses
+        // keywords at runtime, so we just ship the call as-is.
+        let src = "proc create_bd_design { @default(\"\") name } { puts ok }\n\
+                   proc configure_cips {} {\n  \
+                     create_bd_design -name cips\n\
+                   }\n";
+        let out = lowered(src);
+        // The configure_cips proc decl is the second statement.
+        // Its body should still contain the keyword-form call —
+        // we don't touch it at compile time.
+        assert!(
+            out[1].contains("create_bd_design -name cips"),
+            "call inside proc body should ship verbatim; got:\n{}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn proc_with_no_default_emits_empty_string_default() {
+        // An htcl arg without `@default` is implicitly required —
+        // the validator catches a missing-flag call at compile
+        // time. At runtime we still need a placeholder default so
+        // `::vw::kwargs` doesn't blow up when the variable is
+        // referenced before the (missing) `-flag` would have set
+        // it; we use `""` (empty string).
+        let src = "proc f {\n  required_arg\n} { puts hi }\n";
+        let out = lowered(src);
+        assert!(
+            out[0].contains("::vw::kwargs $args {required_arg \"\"}"),
+            "wrong default for required arg: {}",
+            out[0]
         );
     }
 
@@ -597,9 +655,17 @@ set proj [
     }
 
     #[test]
-    fn string_default_quotes_correctly() {
-        let src = "proc f {\n  @default(\"hi\") greeting\n} { puts hi }\nf\n";
+    fn string_default_quotes_correctly_in_kwargs_sig() {
+        // Defaults are stamped into the proc's kwargs-prelude sig
+        // dict, not into the call site. A `@default("hi")` becomes
+        // the literal `"hi"` (quoted) in the dict — `::vw::kwargs`
+        // sets `$greeting` to it when the caller omits the flag.
+        let src = "proc f {\n  @default(\"hi\") greeting\n} { puts hi }\n";
         let out = lowered(src);
-        assert_eq!(out[1], "f \"hi\"");
+        assert!(
+            out[0].contains("::vw::kwargs $args {greeting \"hi\"}"),
+            "default should appear quoted in the sig dict: {}",
+            out[0]
+        );
     }
 }

@@ -77,6 +77,20 @@ pub struct ArgOverride {
     /// `@conflicts(...)` declarations to add.
     #[serde(default)]
     pub conflicts: Vec<String>,
+    /// Override whether this arg carries a Vivado typed Tcl_Obj
+    /// handle (e.g. a bd_cell, get_bd_pins result). `None` keeps
+    /// the generator default (a name-based allowlist of well-known
+    /// typed-arg names like `objects`/`cells`/`pin`/...). `Some(true)`
+    /// forces this arg to be treated as typed; `Some(false)` forces
+    /// it to be treated as a plain string.
+    ///
+    /// Typed args are passed directly via `-flag $value` in the
+    /// wrapper body — never through `[list]` or `lappend` — because
+    /// list-construction shimmers Vivado's internal typed Tcl_Obj to
+    /// a plain string, and downstream consumers like
+    /// `set_property -objects` reject the stringified path.
+    #[serde(default)]
+    pub typed: Option<bool>,
 }
 
 /// All overrides for one command, indexed by arg ident.

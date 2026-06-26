@@ -959,10 +959,13 @@ async fn run_htcl(
         })
         .await
         .map_err(|e| format!("failed to start Vivado worker: {e}"))?;
-    // Stream user puts output as it's produced rather than buffering
-    // until each eval completes — necessary for long-running commands
-    // like `synth_design` where the user wants to see progress live.
-    backend.set_stdout_sink(|chunk: &str| {
+    // Stream user puts output (and Vivado's own WARNING/ERROR/INFO
+    // lines) as they're produced rather than buffering until each
+    // eval completes — necessary for long-running commands like
+    // `synth_design` where the user wants to see progress live.
+    // `vw run` is a script driver; it doesn't distinguish the
+    // stream kinds and passes every chunk through unchanged.
+    backend.set_stdout_sink(|_kind, chunk: &str| {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(chunk.as_bytes());

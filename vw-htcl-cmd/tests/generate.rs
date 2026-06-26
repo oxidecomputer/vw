@@ -110,11 +110,38 @@ fn generated_wrapper_reparses() {
     // Natural name + extern-prefixed forward (lowering autogen
     // produces the rename plumbing at session startup).
     assert!(htcl.contains("proc make_thing {"));
-    assert!(htcl.contains("[list extern::make_thing]"));
     assert!(!htcl.contains("rename"));
-    assert!(htcl.contains("lappend cmd -period $period"));
-    assert!(htcl.contains("if {$add} { lappend cmd -add }"));
-    assert!(htcl.contains("lappend cmd {*}$objects"));
+    // New body shape: non-typed args accumulate into `flags` via
+    // lappend (safe — strings only). Typed args (objects, cell,
+    // pin, ...) are passed directly via `-flag $value` so Vivado's
+    // typed Tcl_Obj survives.
+    assert!(
+        htcl.contains("lappend flags -period $period"),
+        "non-typed value-flag should lappend into flags: {htcl}"
+    );
+    assert!(
+        htcl.contains("if {$add} { lappend flags -add }"),
+        "boolean should lappend into flags only when true: {htcl}"
+    );
+    // `objects` is in TYPED_ARG_NAMES → must NOT be lappended
+    // (would shimmer the typed handle). Must appear in a direct
+    // invocation as `-objects $objects` or as positional `$objects`.
+    assert!(
+        !htcl.contains("lappend flags {*}$objects"),
+        "typed arg `objects` must not be lappended: {htcl}"
+    );
+    assert!(
+        !htcl.contains("lappend cmd"),
+        "old `cmd`-accumulator shape should be gone: {htcl}"
+    );
+    assert!(
+        htcl.contains("extern::make_thing {*}$flags"),
+        "direct invocation with {{*}}$flags expected: {htcl}"
+    );
+    assert!(
+        htcl.contains("$objects"),
+        "objects must be referenced in the invocation: {htcl}"
+    );
 
     assert_reparses(&htcl);
 }

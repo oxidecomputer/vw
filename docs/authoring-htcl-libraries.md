@@ -175,15 +175,32 @@ proc create_versal_cips {
 
 Notes:
 
-- The args list is the **declared canonical order**. When a call
-  is lowered to Tcl, keyword args are reordered into this
-  canonical positional sequence.
+- **htcl is keyword-only.** Every proc you declare accepts its
+  arguments as `-flag value` pairs at the call site. There is no
+  positional call syntax — even an arg with no `@default` (an
+  implicitly-required arg) must be passed as `-arg value`. The
+  args list above is the **declaration order**, used by the
+  validator for documentation and stable diagnostics, not by Tcl
+  for dispatch.
 - Args with no `@default` are **required**. Omitting them at a
-  call site is an error.
-- The proc body is plain Tcl text. The body can refer to each arg
-  by its bare name (`$cell`, `$boot_secondary_pcie_enable`, …).
+  call site is a compile-time error from the validator.
+- The proc body is plain Tcl text. The body refers to each arg by
+  its bare name (`$cell`, `$boot_secondary_pcie_enable`, …) — the
+  same way it would for a standard Tcl proc with named parameters.
+  The lowerer wires up these locals from the caller's `-flag
+  value` pairs at runtime via a generated `::vw::kwargs` prelude.
+- Because the keyword parse happens at runtime (inside the
+  wrapper), call sites work uniformly at **any** nesting: at the
+  top level of a file, inside another proc's body, inside a
+  `namespace eval`, inside a `[ ... ]` command substitution, or
+  through an `eval`/`uplevel`. The lowerer doesn't need to see
+  the call site to translate it.
 - `proc` itself may be declared at any depth, but only **top-level**
-  proc declarations are visible to the call-site validator.
+  proc declarations are visible to the call-site validator. Procs
+  defined inside another proc's body ship as raw text and miss
+  the kwargs-prelude treatment — avoid nested proc declarations
+  in htcl, or write them in raw Tcl form (`proc inner args { ...
+  }`).
 
 ### 2.5 Argument attributes
 
@@ -412,8 +429,8 @@ Mechanics:
   resolution in v1). Write `project::helper $x`, not bare
   `helper $x`.
 - Lowering walks namespace bodies recursively, so inner procs get
-  their attributes stripped and keyword args reordered the same
-  way top-level procs do.
+  their attributes stripped and the same `::vw::kwargs` runtime
+  prelude that top-level procs get.
 
 ## 3. How htcl differs from Tcl
 

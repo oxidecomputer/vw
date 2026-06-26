@@ -51,7 +51,10 @@ pub use signature_help::{signature_help_at, SignatureHelp};
 pub use src_path::{
     classify as classify_src_path, PathKind, ResolveError, Resolver,
 };
-pub use validate::{validate, Diagnostic as ValidatorDiagnostic, Severity};
+pub use validate::{
+    validate, validate_with_signatures, Diagnostic as ValidatorDiagnostic,
+    Severity,
+};
 
 pub use ast::{
     Attribute, AttributeValue, Command, CommandKind, Document, Proc, ProcArg,

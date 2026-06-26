@@ -2,25 +2,61 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! In-memory session document.
+//! In-memory REPL session, held as parsed batches rather than a
+//! re-concatenated text blob.
 //!
-//! Every successful user input gets appended to a growing htcl
-//! script that future analyzer queries treat as the prelude.
-//! Combined with whatever's in the input buffer right now, this is
-//! the document the analyzer sees: variables and procs the user
-//! defined earlier are in scope, calls to them validate against
-//! their signatures, and completion can offer them.
+//! Every successful input contributes one [`SessionBatch`] — the
+//! loaded program (own source + import edges), its parsed
+//! [`vw_htcl::Document`], and the map from proc-name to
+//! [`ProcLocation`] for every proc the batch declared. Prior
+//! batches are read by [`crate::lower::prepare`] when lowering the
+//! next input: their signatures resolve unknown calls; their proc
+//! locations let the error renderer translate Tcl's `(procedure
+//! "X" line N)` frames back to the real `.htcl` file the wrapper
+//! body was declared in.
 //!
-//! v1 just keeps the concatenated text. Subsequent slices will plug
-//! this into [`vw_htcl::parse`] + [`vw_htcl::validate`] for inline
-//! diagnostics on the current input, and into [`vw_htcl::complete_at`]
-//! for tab completion.
+//! Why this shape (vs. the original text-blob prelude):
+//!
+//! 1. **Performance.** After a few `src @lib` imports the prelude
+//!    is hundreds of thousands of lines. Re-parsing and re-walking
+//!    it on every input is what made the REPL feel laggy. Storing
+//!    parsed state means each new input parses only its own
+//!    content + transitive imports — O(new), not O(total).
+//! 2. **Error rendering.** A drill-down frame for a wrapper proc
+//!    declared in an earlier batch knows the real `.htcl` path it
+//!    came from, so `(procedure "vivado::create_bd_design" line
+//!    2)` resolves to `vivado-cmd/bd.htcl:42` instead of
+//!    `(input):199185` of the giant combined scratch.
 
-/// A live REPL session: the concatenation of every input the user
-/// has successfully evaluated, in order.
-#[derive(Clone, Debug, Default)]
+use std::collections::HashMap;
+
+use vw_htcl::{Document, LoadedProgram, ProcSignature};
+
+use crate::lower::ProcLocation;
+
+/// One committed input: the parsed program it produced, plus the
+/// proc-location map the lowerer derived from it. Stored on a
+/// per-batch basis so signatures and proc lookups can fold across
+/// the whole session without ever re-parsing a prior batch.
+#[derive(Debug)]
+pub struct SessionBatch {
+    /// Loader output for this batch — file paths, import edges,
+    /// and the flattened source. Held alongside the parsed
+    /// document so future analyzer features (completion, goto-
+    /// def, hover) can walk back to per-file context without
+    /// re-running the loader. Spans inside [`document`] are
+    /// offsets into [`program.source`](LoadedProgram::source);
+    /// keeping the program alive keeps those spans meaningful.
+    #[allow(dead_code)]
+    pub program: LoadedProgram,
+    pub document: Document,
+    pub procs: HashMap<String, ProcLocation>,
+}
+
+/// A live REPL session: every committed batch in order.
+#[derive(Debug, Default)]
 pub struct Session {
-    text: String,
+    batches: Vec<SessionBatch>,
 }
 
 impl Session {
@@ -28,59 +64,121 @@ impl Session {
         Self::default()
     }
 
-    /// The prelude — everything the user has evaluated so far.
-    #[allow(dead_code)] // wired up by the in-progress completion slice
-    pub fn prelude(&self) -> &str {
-        &self.text
+    /// Append a batch — called from the App after every successful
+    /// eval (including the pure-`src` no-Tcl-to-eval case, which
+    /// commits immediately because no eval can fail).
+    pub fn commit(&mut self, batch: SessionBatch) {
+        self.batches.push(batch);
     }
 
-    /// The prelude with `pending` appended as if the user had just
-    /// submitted it. Used for analyzer queries against the current
-    /// input buffer. Returns the combined source plus the byte
-    /// offset where `pending` begins (callers translate cursor
-    /// positions into this absolute offset).
-    #[allow(dead_code)] // wired up by the in-progress completion slice
-    pub fn with_pending(&self, pending: &str) -> (String, u32) {
-        let mut combined =
-            String::with_capacity(self.text.len() + pending.len() + 1);
-        combined.push_str(&self.text);
-        if !self.text.is_empty() && !self.text.ends_with('\n') {
-            combined.push('\n');
+    /// Build a merged signature table covering every proc declared
+    /// in the session so far. Later batches shadow earlier ones,
+    /// matching Tcl's "second `proc` redefines" semantics. The
+    /// returned map borrows from `self`; held only for the duration
+    /// of the next batch's prepare() call.
+    pub fn signature_table(&self) -> HashMap<String, &ProcSignature> {
+        let mut table: HashMap<String, &ProcSignature> = HashMap::new();
+        for batch in &self.batches {
+            // Per-batch table merges into the running table; later
+            // batches' entries overwrite earlier ones via `insert`.
+            let batch_table = vw_htcl::signature_table(&batch.document);
+            for (name, sig) in batch_table {
+                table.insert(name, sig);
+            }
         }
-        let pending_start = combined.len() as u32;
-        combined.push_str(pending);
-        (combined, pending_start)
+        table
     }
 
-    /// Commit `entry` to the prelude. A trailing newline is added
-    /// so the next appended item starts on a fresh line — matters
-    /// for the parser's statement-boundary detection.
-    pub fn commit(&mut self, entry: &str) {
-        self.text.push_str(entry);
-        if !entry.ends_with('\n') {
-            self.text.push('\n');
+    /// Look up the most-recent proc location across every batch.
+    /// Returns `None` when no batch has declared that proc — the
+    /// error renderer's drill-down path silently skips such frames
+    /// (Tcl proc frames for builtins, dynamically-defined procs,
+    /// etc.).
+    pub fn lookup_proc(&self, name: &str) -> Option<&ProcLocation> {
+        for batch in self.batches.iter().rev() {
+            if let Some(loc) = batch.procs.get(name) {
+                return Some(loc);
+            }
         }
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vw_htcl::parse;
 
-    #[test]
-    fn pending_starts_after_prelude_with_separator() {
-        let mut s = Session::new();
-        s.commit("set x 1");
-        let (combined, off) = s.with_pending("puts $x");
-        assert_eq!(combined, "set x 1\nputs $x");
-        assert_eq!(off, 8);
+    fn batch_from(source: &str) -> SessionBatch {
+        // Build a minimal in-memory LoadedProgram from a string for
+        // tests that don't care about the loader pipeline.
+        let parsed = parse(source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        SessionBatch {
+            program: LoadedProgram {
+                source: source.to_string(),
+                files: Vec::new(),
+                regions: Vec::new(),
+            },
+            document: parsed.document,
+            procs: HashMap::new(),
+        }
     }
 
     #[test]
-    fn commit_adds_trailing_newline_when_missing() {
+    fn signature_table_folds_across_batches() {
         let mut s = Session::new();
-        s.commit("a");
-        s.commit("b\n");
-        assert_eq!(s.prelude(), "a\nb\n");
+        s.commit(batch_from("proc foo { x } { }\n"));
+        s.commit(batch_from("proc bar { y } { }\n"));
+        let table = s.signature_table();
+        assert!(table.contains_key("foo"));
+        assert!(table.contains_key("bar"));
+    }
+
+    #[test]
+    fn later_batch_shadows_earlier_signature() {
+        // Second `proc foo` redefines the first — the merged table
+        // returns the newer signature.
+        let mut s = Session::new();
+        s.commit(batch_from("proc foo { x } { }\n"));
+        s.commit(batch_from("proc foo { y z } { }\n"));
+        let table = s.signature_table();
+        let sig = table.get("foo").unwrap();
+        let arg_names: Vec<&str> =
+            sig.args.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(arg_names, vec!["y", "z"]);
+    }
+
+    #[test]
+    fn lookup_proc_returns_latest_batch() {
+        // Two batches both register `foo` in their `procs` map (the
+        // lowerer normally does this, but here we set it manually).
+        // `lookup_proc` returns the entry from the most recent
+        // batch.
+        let mut a = batch_from("proc foo { x } { }\n");
+        let mut b = batch_from("proc foo { y } { }\n");
+        a.procs.insert(
+            "foo".into(),
+            ProcLocation {
+                file: None,
+                body_start_line: 10,
+                body_lines: vec!["from-a".into()],
+            },
+        );
+        b.procs.insert(
+            "foo".into(),
+            ProcLocation {
+                file: None,
+                body_start_line: 20,
+                body_lines: vec!["from-b".into()],
+            },
+        );
+        let mut s = Session::new();
+        s.commit(a);
+        s.commit(b);
+        let got = s.lookup_proc("foo").unwrap();
+        assert_eq!(got.body_start_line, 20);
+        assert_eq!(got.body_lines[0], "from-b");
+        assert!(s.lookup_proc("missing").is_none());
     }
 }

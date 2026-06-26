@@ -44,6 +44,42 @@ use vw_htcl::emit::{Command, Doc, Item, Word};
 use crate::constraints::{ArgOverride, ConstraintsTable};
 use crate::model::{ArgKind, Argument, ManPage};
 
+/// Arg names whose values are Vivado typed `Tcl_Obj` handles —
+/// `bd_cell`, `bd_pin`, etc. — and therefore must be passed to the
+/// underlying command **directly** (`-flag $value`) rather than
+/// through `[list]` or `lappend`. List construction shimmers Tcl's
+/// internal typed representation away, leaving the handle as a
+/// plain path string; downstream code paths in Vivado (notably
+/// `set_property -objects`) reject the stringified path with
+/// `[Common 17-161] Invalid option value`.
+///
+/// Curated list of the obvious cases. Per-arg override via
+/// `cmd-constraints.toml`'s `typed = true|false` covers the long
+/// tail.
+const TYPED_ARG_NAMES: &[&str] = &[
+    "objects",
+    "of_objects",
+    "cell",
+    "cells",
+    "pin",
+    "pins",
+    "port",
+    "ports",
+    "intf_pin",
+    "intf_pins",
+    "intf_port",
+    "intf_ports",
+    "net",
+    "nets",
+];
+
+fn is_typed_arg(name: &str, override_: Option<bool>) -> bool {
+    match override_ {
+        Some(t) => t,
+        None => TYPED_ARG_NAMES.contains(&name),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerateOptions {
     /// Prefix for the stashed original command (`rename add_files
@@ -97,7 +133,14 @@ pub fn generate(page: &ManPage, opts: &GenerateOptions) -> String {
     writeln!(out, "# Do not edit by hand.").unwrap();
     writeln!(out).unwrap();
 
-    writeln!(out, "namespace eval vivado {{").unwrap();
+    // Wrappers live in `vivado_cmd::`, NOT `vivado::`. Vivado has
+    // its own internal `::vivado` namespace and code paths that
+    // behave differently depending on the calling namespace —
+    // notably `set_property -dict -objects ...` rejects valid cell
+    // handles when invoked from inside `::vivado`. Picking a name
+    // Vivado doesn't use means our wrapper bodies never collide
+    // with Vivado-internal namespace state.
+    writeln!(out, "namespace eval vivado_cmd {{").unwrap();
     writeln!(out).unwrap();
 
     // Proc doc comment: the command Description, then a See-Also footer.
@@ -201,6 +244,10 @@ struct EffectiveArg {
     requires: Vec<String>,
     conflicts: Vec<String>,
     description: Vec<String>,
+    /// True when this arg carries a Vivado typed `Tcl_Obj` handle
+    /// — body emission passes it directly (`-flag $value`) rather
+    /// than threading it through a list. See [`TYPED_ARG_NAMES`].
+    typed: bool,
 }
 
 fn effective_args(
@@ -258,6 +305,8 @@ fn effective_arg(arg: &Argument, over: Option<&ArgOverride>) -> EffectiveArg {
         arg.kind
     };
 
+    let typed = is_typed_arg(&arg.ident, over.typed);
+
     EffectiveArg {
         ident: arg.ident.clone(),
         flag: arg.flag.clone(),
@@ -268,6 +317,7 @@ fn effective_arg(arg: &Argument, over: Option<&ArgOverride>) -> EffectiveArg {
         requires: over.requires.clone(),
         conflicts: over.conflicts.clone(),
         description: arg.description.clone(),
+        typed,
     }
 }
 
@@ -363,50 +413,178 @@ fn format_attribute_value(s: &str) -> String {
     }
 }
 
-/// Build the proc body: assemble the forwarded command incrementally,
-/// then invoke the underlying extern by list-expansion. Each arg's
-/// kind drives its emit form — `Boolean` → `if {$x} { lappend cmd
-/// -flag }`, `Value` → `if {$x ne ""} { lappend cmd -flag $x }`,
-/// `Positional` → `if {$x ne ""} { lappend cmd {*}$x }`.
+/// Build the proc body.
+///
+/// Args are split into two cohorts:
+///
+/// - **Non-typed args** (booleans, strings, positionals whose name
+///   isn't in the typed-handle allowlist) accumulate into a `flags`
+///   list via `lappend`. Each arg's kind drives its emit form —
+///   `Boolean` → `if {$x} { lappend flags -flag }`, `Value` →
+///   `if {$x ne ""} { lappend flags -flag $x }`, `Positional` →
+///   `if {$x ne ""} { lappend flags {*}$x }`. These values are all
+///   strings, so the lappend / `{*}`-expansion that follows is
+///   safe — string values don't have a typed Tcl_Obj to shimmer.
+/// - **Typed-handle args** (`-objects`/`-cell`/etc., per
+///   [`TYPED_ARG_NAMES`] or per-arg `typed = true` override) are
+///   passed **directly** to the underlying command via
+///   `-flag $value`. Putting them through `[list]` or `lappend`
+///   would shimmer Vivado's internal typed Tcl_Obj to a string,
+///   and downstream code paths like `set_property -objects` reject
+///   the stringified path with `[Common 17-161] Invalid option
+///   value '...' specified for 'objects'`.
+///
+/// The invocation site branches on which typed args are present so
+/// no typed-arg flag appears in the call when its variable is
+/// empty. With N typed args this is 2^N branches; in practice N is
+/// 0 or 1 for almost every Vivado command, and never more than 2.
 fn build_body(orig: &str, effective: &[EffectiveArg]) -> String {
     let mut body = String::new();
-    writeln!(body, "set cmd [list {orig}]").unwrap();
-    for arg in effective {
+
+    let non_typed: Vec<&EffectiveArg> =
+        effective.iter().filter(|a| !a.typed).collect();
+    let typed: Vec<&EffectiveArg> =
+        effective.iter().filter(|a| a.typed).collect();
+
+    // Non-typed accumulator. `flags` is a plain Tcl list — only
+    // ever contains string values, so list-construction shimmer is
+    // a non-issue.
+    writeln!(body, "set flags [list]").unwrap();
+    for arg in &non_typed {
         let id = &arg.ident;
         let required = arg.default.is_none();
         match arg.kind {
             ArgKind::Boolean => {
                 let flag = arg.flag.as_deref().unwrap_or(id);
-                writeln!(body, "if {{${id}}} {{ lappend cmd -{flag} }}")
+                writeln!(body, "if {{${id}}} {{ lappend flags -{flag} }}")
                     .unwrap();
             }
             ArgKind::Value => {
                 let flag = arg.flag.as_deref().unwrap_or(id);
                 if required {
-                    writeln!(body, "lappend cmd -{flag} ${id}").unwrap();
+                    writeln!(body, "lappend flags -{flag} ${id}").unwrap();
                 } else {
                     writeln!(
                         body,
-                        "if {{${id} ne \"\"}} {{ lappend cmd -{flag} ${id} }}"
+                        "if {{${id} ne \"\"}} {{ lappend flags -{flag} ${id} }}"
                     )
                     .unwrap();
                 }
             }
             ArgKind::Positional => {
                 if required {
-                    writeln!(body, "lappend cmd {{*}}${id}").unwrap();
+                    writeln!(body, "lappend flags {{*}}${id}").unwrap();
                 } else {
                     writeln!(
                         body,
-                        "if {{${id} ne \"\"}} {{ lappend cmd {{*}}${id} }}"
+                        "if {{${id} ne \"\"}} \
+                         {{ lappend flags {{*}}${id} }}"
                     )
                     .unwrap();
                 }
             }
         }
     }
-    writeln!(body, "return [{{*}}$cmd]").unwrap();
+
+    // Typed-arg branching. Direct invocation per combination of
+    // typed args that are non-empty, so the typed values never
+    // touch a Tcl list.
+    emit_typed_invocation(&mut body, orig, &typed, 0);
+
     body
+}
+
+/// Emit the typed-arg branch tree. At each level we split on
+/// "this typed arg present?" and recurse; at the leaves we emit
+/// the actual `return [extern::<cmd> {*}$flags ...]` with whatever
+/// subset of typed args was present.
+fn emit_typed_invocation(
+    body: &mut String,
+    orig: &str,
+    typed: &[&EffectiveArg],
+    depth: usize,
+) {
+    let indent = "  ".repeat(depth);
+    if typed.is_empty() {
+        writeln!(body, "{indent}return [{orig} {{*}}$flags]").unwrap();
+        return;
+    }
+    if let Some((first, rest)) = typed.split_first() {
+        // Required typed args have no `ne ""` guard — they're
+        // always passed. Optional typed args branch on presence.
+        let id = &first.ident;
+        let flag = first.flag.as_deref().unwrap_or(id);
+        let required = first.default.is_none();
+        if required {
+            emit_typed_invocation_with(body, orig, rest, &[(*first, flag)], depth);
+        } else {
+            writeln!(body, "{indent}if {{${id} ne \"\"}} {{").unwrap();
+            emit_typed_invocation_with(
+                body,
+                orig,
+                rest,
+                &[(*first, flag)],
+                depth + 1,
+            );
+            writeln!(body, "{indent}}} else {{").unwrap();
+            emit_typed_invocation(body, orig, rest, depth + 1);
+            writeln!(body, "{indent}}}").unwrap();
+        }
+    }
+}
+
+/// Inner: we've decided to include `included` typed args; the
+/// remaining `rest` still need branching. At the leaf we emit a
+/// `return` with `{*}$flags` and each included typed arg as
+/// `-flag $var`.
+fn emit_typed_invocation_with(
+    body: &mut String,
+    orig: &str,
+    rest: &[&EffectiveArg],
+    included: &[(&EffectiveArg, &str)],
+    depth: usize,
+) {
+    let indent = "  ".repeat(depth);
+    if rest.is_empty() {
+        let mut line = format!("{indent}return [{orig} {{*}}$flags");
+        for (arg, flag) in included {
+            match arg.kind {
+                ArgKind::Positional => {
+                    write!(line, " ${id}", id = arg.ident).unwrap();
+                }
+                _ => {
+                    write!(line, " -{flag} ${id}", id = arg.ident).unwrap();
+                }
+            }
+        }
+        line.push(']');
+        writeln!(body, "{line}").unwrap();
+        return;
+    }
+    if let Some((first, more)) = rest.split_first() {
+        let id = &first.ident;
+        let flag = first.flag.as_deref().unwrap_or(id);
+        let required = first.default.is_none();
+        if required {
+            let mut new_included = included.to_vec();
+            new_included.push((*first, flag));
+            emit_typed_invocation_with(body, orig, more, &new_included, depth);
+        } else {
+            writeln!(body, "{indent}if {{${id} ne \"\"}} {{").unwrap();
+            let mut new_included = included.to_vec();
+            new_included.push((*first, flag));
+            emit_typed_invocation_with(
+                body,
+                orig,
+                more,
+                &new_included,
+                depth + 1,
+            );
+            writeln!(body, "{indent}}} else {{").unwrap();
+            emit_typed_invocation_with(body, orig, more, included, depth + 1);
+            writeln!(body, "{indent}}}").unwrap();
+        }
+    }
 }
 
 /// Emit `proc <name> { <args> } { <body> }` with args and body each

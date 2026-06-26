@@ -19,6 +19,11 @@ use std::path::{Path, PathBuf};
 use camino::{Utf8Path, Utf8PathBuf};
 use vw_htcl::{LineIndex, Resolver};
 
+use crate::session::{Session, SessionBatch};
+
+struct NoopObserver;
+impl vw_htcl::LoadObserver for NoopObserver {}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LowerError {
     #[error("writing scratch input file: {0}")]
@@ -73,14 +78,14 @@ pub struct Prepared {
     /// order. The worker fires `eval` once per item and stops at
     /// the first failure.
     pub commands: Vec<PreparedCommand>,
-    /// The htcl source to commit to the session document iff every
-    /// command succeeds. Includes whatever the loader pulled in.
-    pub committed_source: String,
-    /// `name → proc body location` for every proc defined in the
-    /// loaded program, top-level and namespaced. The error
-    /// renderer uses this to translate Tcl's `(procedure "X" line
-    /// N)` frames back to absolute htcl file:line locations.
-    pub procs: std::collections::HashMap<String, ProcLocation>,
+    /// The parsed program + proc map for this batch. Stays out of
+    /// the session document until every command in [`commands`]
+    /// succeeds — at which point the App calls
+    /// [`Session::commit`](crate::session::Session::commit) to
+    /// fold it into the running session. On failure the batch is
+    /// dropped, which is what keeps a half-applied state from
+    /// polluting the analyzer.
+    pub batch: SessionBatch,
     /// Pre-flight findings worth surfacing to the user *before* we
     /// ship anything to Vivado. The most common one is "this call
     /// uses `-flag` keyword args but the proc isn't a loaded htcl
@@ -124,7 +129,21 @@ impl ProcLocation {
 pub fn prepare(
     input: &str,
     cwd: &Path,
-    session_prelude: &str,
+    session: &Session,
+) -> Result<Prepared, LowerError> {
+    let mut noop = NoopObserver;
+    prepare_with_observer(input, cwd, session, &mut noop)
+}
+
+/// Same as [`prepare`], with an extra hook the loader fires per
+/// parsed file. Used by the perf regression test to assert that a
+/// new batch only parses its own content (plus any transitive
+/// `src` imports), never the entire prior-session prelude.
+pub fn prepare_with_observer(
+    input: &str,
+    cwd: &Path,
+    session: &Session,
+    observer: &mut dyn vw_htcl::LoadObserver,
 ) -> Result<Prepared, LowerError> {
     let workspace_dir = find_workspace_dir(cwd);
     let resolver = build_resolver(workspace_dir.as_deref());
@@ -134,17 +153,19 @@ pub fn prepare(
         .map(Utf8Path::as_std_path)
         .unwrap_or(cwd);
 
-    // Prepend the session prelude — the committed source of every
-    // prior batch — so the analyzer sees every proc/namespace
-    // that's already been declared in the running Tcl session. The
-    // prelude is appended-to-disk only inside the scratch file;
-    // the lowering output strips it back out and only ships the
-    // new statements, which avoids re-defining wrappers on every
-    // input.
-    let (combined, pending_start) = combine_session(session_prelude, input);
-    let scratch = ScratchFile::new(scratch_dir, &combined)?;
+    // The scratch contains ONLY the new input — never a prepended
+    // prelude. Prior batches contribute parsed signatures and proc
+    // locations directly via `session`, so we never re-parse the
+    // entire session on each keystroke. This is what keeps the
+    // REPL responsive after several `src @lib` imports have built
+    // up hundreds of thousands of lines of wrapper declarations.
+    let scratch = ScratchFile::new(scratch_dir, input)?;
 
-    let program = vw_htcl::load_program(&scratch.path, &resolver)?;
+    let program = vw_htcl::load_program_with_observer(
+        &scratch.path,
+        &resolver,
+        observer,
+    )?;
     let parsed = vw_htcl::parse(&program.source);
 
     if let Some(err) = parsed.errors.first() {
@@ -156,10 +177,17 @@ pub fn prepare(
     }
 
     // Validator runs first so unknown-keyword-call errors land
-    // before we ship anything. These are now hard errors (not just
-    // pre-flight warnings); routing them back as `LowerError` keeps
-    // the App's existing error-rendering path unchanged.
-    let validator_diags = vw_htcl::validate(&parsed.document, &program.source);
+    // before we ship anything. Prior-batch signatures are merged
+    // in so calls to wrappers from earlier inputs resolve. These
+    // are hard errors (not pre-flight warnings); routing them back
+    // as `LowerError` keeps the App's existing error-rendering
+    // path unchanged.
+    let prior_sigs = session.signature_table();
+    let validator_diags = vw_htcl::validate_with_signatures(
+        &parsed.document,
+        &program.source,
+        &prior_sigs,
+    );
     if let Some(first_err) = validator_diags
         .iter()
         .find(|d| matches!(d.severity, vw_htcl::Severity::Error))
@@ -178,7 +206,13 @@ pub fn prepare(
         )));
     }
 
-    let table = vw_htcl::signature_table(&parsed.document);
+    // Build the lowering table by merging prior-batch signatures
+    // with the new doc's own. The new doc's entries shadow prior
+    // ones (Tcl's "second `proc` redefines" semantics) — done by
+    // starting from the prior table and `extend`-ing with the new
+    // doc's table, since `extend` overwrites on key collision.
+    let mut table = prior_sigs;
+    table.extend(vw_htcl::signature_table(&parsed.document));
     let line_index = LineIndex::new(&program.source);
     let mut commands = Vec::new();
     let mut extern_names: std::collections::BTreeSet<String> =
@@ -187,14 +221,6 @@ pub fn prepare(
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
         };
-        // Skip statements that came from the session prelude —
-        // they're already declared in the running Tcl. Only ship
-        // statements from the new input (and anything it
-        // transitively `src`-imports, which the loader appends
-        // after the user's text).
-        if cmd.span.start < pending_start as u32 {
-            continue;
-        }
         let lowered_raw = vw_htcl::lower_command(cmd, &program.source, &table);
         let rewritten = vw_htcl::rewrite_externs(&lowered_raw);
         for name in rewritten.names {
@@ -224,16 +250,6 @@ pub fn prepare(
     // rewiring this path.
     let _ = extern_names;
 
-    // The session document grows with the NEW content only —
-    // anything we lowered from past the `pending_start` cut. That
-    // way `with_pending` on the next batch reconstructs the full
-    // declaration history without double-counting.
-    let committed_source = program
-        .source
-        .get(pending_start..)
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-
     let procs = build_proc_locations(&parsed.document, &program, &scratch.path);
     // The dedicated pre-flight `collect_warnings` is gone — the
     // validator now treats "unknown call with `-flag` args" as a
@@ -243,8 +259,11 @@ pub fn prepare(
 
     Ok(Prepared {
         commands,
-        committed_source,
-        procs,
+        batch: SessionBatch {
+            program,
+            document: parsed.document,
+            procs,
+        },
         warnings,
     })
 }
@@ -460,26 +479,6 @@ fn find_workspace_dir(start: &Path) -> Option<Utf8PathBuf> {
     }
 }
 
-/// Concatenate the session prelude with the new input. Returns the
-/// combined text plus the byte offset of where the new input
-/// begins — the lowering uses that cutoff to decide which
-/// statements are new (and must be shipped to Vivado) vs already-
-/// declared (analyzer reads them for signature lookup but doesn't
-/// re-emit them).
-fn combine_session(prelude: &str, input: &str) -> (String, usize) {
-    if prelude.is_empty() {
-        return (input.to_string(), 0);
-    }
-    let mut out = String::with_capacity(prelude.len() + input.len() + 1);
-    out.push_str(prelude);
-    if !prelude.ends_with('\n') {
-        out.push('\n');
-    }
-    let pending_start = out.len();
-    out.push_str(input);
-    (out, pending_start)
-}
-
 fn build_resolver(workspace_dir: Option<&Utf8Path>) -> Resolver {
     let mut resolver = Resolver::new();
     let Some(ws) = workspace_dir else {
@@ -517,6 +516,10 @@ impl Drop for ScratchFile {
 mod tests {
     use super::*;
 
+    fn empty_session() -> Session {
+        Session::new()
+    }
+
     #[test]
     fn unknown_keyword_call_inside_bracket_errors() {
         // Mirrors the metroid project.htcl shape: a call to an
@@ -529,7 +532,7 @@ mod tests {
         let err = prepare(
             "set proj [\n  create_project\n    -in_memory 1\n    -name foo\n]\n",
             dir.path(),
-            "",
+            &empty_session(),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -544,9 +547,12 @@ mod tests {
         // prefix so the bare native resolves through Tcl's global
         // namespace at runtime — no rename plumbing, no prelude.
         let dir = tempfile::tempdir().unwrap();
-        let prep =
-            prepare("extern::create_project -name foo\n", dir.path(), "")
-                .unwrap();
+        let prep = prepare(
+            "extern::create_project -name foo\n",
+            dir.path(),
+            &empty_session(),
+        )
+        .unwrap();
         assert_eq!(prep.commands.len(), 1, "{:?}", prep.commands);
         assert!(
             prep.commands[0].tcl.contains("create_project -name foo"),
@@ -561,38 +567,60 @@ mod tests {
     }
 
     #[test]
-    fn session_prelude_brings_prior_procs_into_scope() {
+    fn prior_batch_procs_resolve_in_next_batch() {
         // Reproduces the REPL "src @lib then call" pattern: a
-        // wrapper declared in a previous batch (now in the session
-        // prelude) should be visible to the analyzer when we
-        // lower a bare call in the next batch — and the lowering
-        // should ship only the new statement, not redefine the
-        // wrapper.
+        // wrapper declared in a previous batch should be visible
+        // to the analyzer/lowering when we lower a bare call in
+        // the next batch — and the new batch should ship only
+        // its own statement (not re-emit the wrapper).
         let dir = tempfile::tempdir().unwrap();
-        let prelude = "\
-namespace eval vivado {
-  proc current_project {
-    @enum(0, 1) @default(0) quiet
-    @enum(0, 1) @default(0) verbose
-    @default(\"\") project
-  } {
-    set cmd [list ::current_project]
-    return [{*}$cmd]
-  }
-}
-";
-        let prep =
-            prepare("vivado::current_project\n", dir.path(), prelude).unwrap();
-        // Only the new call ships — the wrapper declaration from
-        // the prelude is already defined in Tcl and shouldn't get
-        // re-emitted.
-        assert_eq!(prep.commands.len(), 1, "{:?}", prep.commands);
-        // And the lowered call uses the wrapper's keyword→
-        // positional rewrite, supplying defaults for omitted args.
+        let mut session = Session::new();
+        // Batch 1: declare the wrapper. Commit so it joins the
+        // session — same flow the App follows on successful eval.
+        let first = prepare(
+            "namespace eval vivado {\n  \
+                proc current_project {\n    \
+                  @enum(0, 1) @default(0) quiet\n    \
+                  @enum(0, 1) @default(0) verbose\n    \
+                  @default(\"\") project\n  \
+                } {\n    \
+                  set cmd [list ::current_project]\n    \
+                  return [{*}$cmd]\n  \
+                }\n\
+              }\n",
+            dir.path(),
+            &session,
+        )
+        .unwrap();
+        // The first batch ships its own declaration to the worker
+        // exactly once — that's what makes the wrapper exist in
+        // Tcl. Subsequent batches must NOT re-emit it.
         assert!(
-            prep.commands[0].tcl.contains("vivado::current_project 0 0"),
+            first.commands.iter().any(|c| c.tcl.contains("namespace eval")),
+            "first batch must ship the namespace decl: {:?}",
+            first.commands
+        );
+        session.commit(first.batch);
+
+        // Batch 2: bare call to the wrapper. Should ship as-is
+        // (htcl is keyword-only at the call site; the wrapper
+        // parses its own kwargs at runtime via the ::vw::kwargs
+        // prelude), with no rewriting and no re-emission of the
+        // prior batch's declaration.
+        let prep =
+            prepare("vivado::current_project\n", dir.path(), &session).unwrap();
+        assert_eq!(prep.commands.len(), 1, "{:?}", prep.commands);
+        assert!(
+            prep.commands[0].tcl.contains("vivado::current_project"),
             "{}",
             prep.commands[0].tcl
+        );
+        // And nothing in the new batch's source mentions the
+        // wrapper body — we never re-parsed the prior batch.
+        assert!(
+            !prep.batch.program.source.contains("namespace eval vivado"),
+            "{}",
+            prep.batch.program.source
         );
     }
 
@@ -604,7 +632,7 @@ namespace eval vivado {
             "proc create_project { @default(\"\") name } { }\n\
              set proj [ create_project -name foo ]\n",
             dir.path(),
-            "",
+            &empty_session(),
         )
         .unwrap();
         assert!(prep.warnings.is_empty(), "{:?}", prep.warnings);
@@ -613,7 +641,8 @@ namespace eval vivado {
     #[test]
     fn lowers_plain_proc_call_to_tcl() {
         let dir = tempfile::tempdir().unwrap();
-        let prep = prepare("puts hello", dir.path(), "").unwrap();
+        let prep =
+            prepare("puts hello", dir.path(), &empty_session()).unwrap();
         assert_eq!(prep.commands.len(), 1);
         assert!(prep.commands[0].tcl.contains("puts hello"));
         // Input is at line 1 of the buffer.
@@ -625,8 +654,12 @@ namespace eval vivado {
     #[test]
     fn each_statement_gets_its_own_origin() {
         let dir = tempfile::tempdir().unwrap();
-        let prep =
-            prepare("set x 1\nset y 2\nset z 3", dir.path(), "").unwrap();
+        let prep = prepare(
+            "set x 1\nset y 2\nset z 3",
+            dir.path(),
+            &empty_session(),
+        )
+        .unwrap();
         assert_eq!(prep.commands.len(), 3);
         assert_eq!(prep.commands[0].origin.line, 1);
         assert_eq!(prep.commands[1].origin.line, 2);
@@ -658,8 +691,9 @@ namespace eval vivado {
             ),
         )
         .unwrap();
-        let prep = prepare("src @dep", dir.path(), "").unwrap();
+        let prep = prepare("src @dep", dir.path(), &empty_session()).unwrap();
         let loc = prep
+            .batch
             .procs
             .get("foo::bar")
             .expect("expected foo::bar in proc map");
@@ -701,7 +735,7 @@ namespace eval vivado {
         )
         .unwrap();
 
-        let prep = prepare("src @mid", dir.path(), "").unwrap();
+        let prep = prepare("src @mid", dir.path(), &empty_session()).unwrap();
         assert_eq!(prep.commands.len(), 1);
         let origin = &prep.commands[0].origin;
         // Leaf-most command lives in leaf_dep/module.htcl.
@@ -748,7 +782,7 @@ namespace eval vivado {
         )
         .unwrap();
 
-        let prep = prepare("src @dep", dir.path(), "").unwrap();
+        let prep = prepare("src @dep", dir.path(), &empty_session()).unwrap();
         // Two commands from the imported file: `proc hello` and the
         // bare `hello` call. Both must carry the imported file's
         // path as origin.
@@ -760,5 +794,165 @@ namespace eval vivado {
         // Line numbers point into the imported file.
         assert_eq!(prep.commands[0].origin.line, 1);
         assert_eq!(prep.commands[1].origin.line, 2);
+    }
+
+    #[test]
+    fn second_batch_parses_only_its_own_files() {
+        // Regression guard against the lag bug: after `src @dep`
+        // commits, a subsequent bare call must NOT cause the
+        // loader to re-parse the dep's files. We assert by hooking
+        // the loader's per-file observer and counting parses on
+        // each batch.
+        let dir = tempfile::tempdir().unwrap();
+        let dep = dir.path().join("dep");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(
+            dep.join("module.htcl"),
+            "namespace eval lib {\n  \
+              proc f { @default(0) x } { return $x }\n\
+            }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("vw.toml"),
+            format!(
+                "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n\n\
+                 [dependencies.dep]\npath = \"{}\"\n",
+                dep.display()
+            ),
+        )
+        .unwrap();
+
+        #[derive(Default)]
+        struct Counter {
+            parsed: Vec<PathBuf>,
+        }
+        impl vw_htcl::LoadObserver for Counter {
+            fn on_parsed(&mut self, file: &Path, _raw: Option<&str>) {
+                self.parsed.push(file.to_path_buf());
+            }
+        }
+
+        let mut session = Session::new();
+
+        // First batch: imports the dep. Two files parse — the
+        // entry scratch and the dep's module.htcl.
+        let mut counter = Counter::default();
+        let first = prepare_with_observer(
+            "src @dep\n",
+            dir.path(),
+            &session,
+            &mut counter,
+        )
+        .unwrap();
+        assert_eq!(
+            counter.parsed.len(),
+            2,
+            "first batch should parse entry + dep, got {:?}",
+            counter.parsed
+        );
+        session.commit(first.batch);
+
+        // Second batch: bare call to the wrapper. The prior
+        // batch's signatures are merged in via `session`, so the
+        // loader must NOT re-read the dep's file — only the new
+        // scratch parses.
+        let mut counter = Counter::default();
+        let _second = prepare_with_observer(
+            "lib::f -x 1\n",
+            dir.path(),
+            &session,
+            &mut counter,
+        )
+        .unwrap();
+        assert_eq!(
+            counter.parsed.len(),
+            1,
+            "second batch should parse only the new input, got {:?}",
+            counter.parsed
+        );
+        // And the one file parsed is the scratch, not the dep.
+        let only = &counter.parsed[0];
+        assert!(
+            !only.starts_with(&dep),
+            "the dep's files must not be re-parsed on a fresh \
+             batch: {:?}",
+            only
+        );
+    }
+
+    #[test]
+    fn prior_batch_proc_location_survives_for_drilldown() {
+        // The user-reported bug: `src @vivado-cmd` declares
+        // `vivado::create_bd_design` in batch A, then a later
+        // `vivado::create_bd_design -name metroid` fires in batch
+        // B and the Tcl error frame names that proc. The
+        // proc-location lookup must resolve to the REAL .htcl
+        // file the wrapper came from — not the disposable scratch
+        // path of either batch.
+        let dir = tempfile::tempdir().unwrap();
+        let dep = dir.path().join("vivado_cmd");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(
+            dep.join("module.htcl"),
+            "namespace eval vivado {\n  \
+              proc create_bd_design {\n    \
+                @default(\"\") name\n  \
+              } {\n    \
+                set cmd [list ::create_bd_design]\n    \
+                return [{*}$cmd]\n  \
+              }\n\
+            }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("vw.toml"),
+            format!(
+                "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n\n\
+                 [dependencies.vivado-cmd]\npath = \"{}\"\n",
+                dep.display()
+            ),
+        )
+        .unwrap();
+
+        let mut session = Session::new();
+        // Batch A: pull the wrapper in.
+        let first =
+            prepare("src @vivado-cmd\n", dir.path(), &session).unwrap();
+        session.commit(first.batch);
+
+        // Batch B: call the wrapper. Look up its location through
+        // the session — which is exactly the path the App's error
+        // renderer takes when resolving a Tcl drill-down frame.
+        let _second = prepare(
+            "vivado::create_bd_design -name metroid\n",
+            dir.path(),
+            &session,
+        )
+        .unwrap();
+        let loc = session.lookup_proc("vivado::create_bd_design").expect(
+            "wrapper from a prior `src @vivado-cmd` batch must be \
+             reachable through session.lookup_proc",
+        );
+        // The crucial assertion: the file pointer is the REAL
+        // imported .htcl, not `None` (the scratch) and not some
+        // huge synthetic offset.
+        let file = loc.file.as_ref().expect(
+            "wrapper from imported module must carry its real \
+             .htcl path, not the disposable scratch",
+        );
+        assert!(
+            file.ends_with("vivado_cmd/module.htcl"),
+            "expected the imported module path, got {:?}",
+            file
+        );
+        // And `body_start_line` is the file-local line of the
+        // proc body opener — small, not a combined-scratch offset.
+        assert!(
+            loc.body_start_line < 100,
+            "body_start_line should be a small file-local number, \
+             got {}",
+            loc.body_start_line
+        );
     }
 }
