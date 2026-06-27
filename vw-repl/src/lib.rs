@@ -21,6 +21,7 @@
 mod app;
 mod history;
 mod lower;
+mod render;
 mod session;
 mod ui;
 

@@ -57,6 +57,7 @@ use crate::model::{ArgKind, Argument, ManPage};
 /// `cmd-constraints.toml`'s `typed = true|false` covers the long
 /// tail.
 const TYPED_ARG_NAMES: &[&str] = &[
+    "object",
     "objects",
     "of_objects",
     "cell",

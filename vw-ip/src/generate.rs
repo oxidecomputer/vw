@@ -399,13 +399,14 @@ fn generate_split(
 // ---------------------------------------------------------------------------
 
 fn emit_file_header(out: &mut String, component: &Component, vlnv: &str) {
-    // Pull the runtime helpers — `ip::check`, `log::info`,
-    // `log::error` — into scope, then assert at load time that this
-    // wrapper's underlying IP is actually present in the running
-    // Vivado's IP repository. Missing-IP failures surface here, at
-    // import, rather than as a cryptic `create_bd_cell` failure
-    // deep in a design build.
-    writeln!(out, "src @vivado-cmd/ip").unwrap();
+    // Pull in the whole `vivado-cmd` library — the body uses
+    // `vivado_cmd::create_bd_cell` and `vivado_cmd::set_property`
+    // alongside `ip::check`, so `src @vivado-cmd/ip` (just the
+    // ip sub-module) leaves those references unresolved. The
+    // analyzer reports the unbound calls; sourcing the full
+    // package brings everything the emitted body actually uses
+    // into scope.
+    writeln!(out, "src @vivado-cmd").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "ip::check -name \"{vlnv}\"").unwrap();
     writeln!(out).unwrap();

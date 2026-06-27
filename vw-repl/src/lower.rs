@@ -93,6 +93,14 @@ pub struct Prepared {
     /// the arguments differently, and the resulting error message
     /// makes no sense without that context.
     pub warnings: Vec<PrepareWarning>,
+    /// Top-level statements that lived directly in the entry file
+    /// (the user's `--load` target, or the typed REPL input),
+    /// regardless of whether they lowered to any Tcl. Captured so
+    /// the `--load` echo path can show `src` directives next to
+    /// the calls that produce Tcl — without this, `src @vivado-cmd`
+    /// would never get its `›` echo because its lowering is empty
+    /// (consumed at load time by the loader).
+    pub entry_top_level: Vec<Origin>,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +222,34 @@ pub fn prepare_with_observer(
     let mut table = prior_sigs;
     table.extend(vw_htcl::signature_table(&parsed.document));
     let line_index = LineIndex::new(&program.source);
+    // Parse the *raw* input (not `program.source`) to capture every
+    // top-level statement as the user wrote it, including `src`
+    // directives. The loader rewrites `src` into the imported file's
+    // content before parsing `program.source`, so the loader-expanded
+    // document no longer contains a Stmt::Command for `src @foo`.
+    // We need that statement to drive the `--load` echo path.
+    let entry_top_level: Vec<Origin> = {
+        let entry_parsed = vw_htcl::parse(input);
+        let entry_idx = LineIndex::new(input);
+        let mut out = Vec::new();
+        for stmt in &entry_parsed.document.stmts {
+            let vw_htcl::Stmt::Command(cmd) = stmt else {
+                continue;
+            };
+            let (line, _) = entry_idx.range(cmd.span);
+            let snippet = input[cmd.span.start as usize..cmd.span.end as usize]
+                .trim_end()
+                .to_string();
+            out.push(Origin {
+                file: None,
+                line: line.line + 1,
+                snippet,
+                via: Vec::new(),
+            });
+        }
+        out
+    };
+
     let mut commands = Vec::new();
     let mut extern_names: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
@@ -221,6 +257,13 @@ pub fn prepare_with_observer(
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
         };
+        let (line_one_based, _) = line_index.range(cmd.span);
+        let origin = build_origin(
+            &program,
+            cmd.span,
+            line_one_based.line + 1,
+            &scratch.path,
+        );
         let lowered_raw = vw_htcl::lower_command(cmd, &program.source, &table);
         let rewritten = vw_htcl::rewrite_externs(&lowered_raw);
         for name in rewritten.names {
@@ -229,13 +272,6 @@ pub fn prepare_with_observer(
         if rewritten.text.trim().is_empty() {
             continue;
         }
-        let (line_one_based, _) = line_index.range(cmd.span);
-        let origin = build_origin(
-            &program,
-            cmd.span,
-            line_one_based.line + 1,
-            &scratch.path,
-        );
         commands.push(PreparedCommand {
             tcl: rewritten.text,
             origin,
@@ -265,6 +301,7 @@ pub fn prepare_with_observer(
             procs,
         },
         warnings,
+        entry_top_level,
     })
 }
 

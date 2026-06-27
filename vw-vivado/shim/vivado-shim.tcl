@@ -388,6 +388,24 @@ proc ::vw::format_frame {frame level_args} {
         set proc [lindex $level_args 0]
     }
 
+    # Drop frames that are part of our own plumbing — they're
+    # always noise to the user. The signal in a stack trace is
+    # "which line of MY code led to this message"; frames in
+    # the shim file, the ::vw:: namespace, our send_msg_id
+    # override, or the ::log:: helpers are all infrastructure.
+    if {[string match "*vivado-shim.tcl" $file]} {
+        return ""
+    }
+    if {[string match "::vw::*" $proc]} {
+        return ""
+    }
+    if {$proc eq "::common::send_msg_id"} {
+        return ""
+    }
+    if {[string match "::log::*" $proc]} {
+        return ""
+    }
+
     set location ""
     if {$file ne "" && $line ne ""} {
         set location "${file}:${line}"
@@ -498,6 +516,54 @@ proc ::vw::install_send_msg_override {} {
     ::vw::log "installed send_msg_id override"
 }
 
+# Wrap `::set_property` so we can attach a Tcl call stack to the
+# warnings Vivado emits from its C++ property-validation path.
+# Those warnings (notably `[IP_Flow 19-7090] Invalid parameter
+# '…' provided, Ignoring`) bypass `::common::send_msg_id` and
+# write directly through Vivado's internal message bus to the
+# PTY — there's no Tcl frame to grab by the time the bytes arrive
+# at the Rust worker. So we capture the stack here, while the
+# Tcl interpreter is *about* to enter `set_property`'s C++,
+# emit it as a marker the worker recognizes and strips, then
+# the worker tags any warnings that arrive while the marker is
+# active. Markers go via `::vw::real_puts stdout` so they
+# bypass our own `puts` override and land on the PTY directly.
+proc ::vw::install_set_property_context {} {
+    if {[info commands ::vw::orig_set_property_for_ctx] ne ""} {
+        return
+    }
+    if {[info commands ::set_property] eq ""} { return }
+    rename ::set_property ::vw::orig_set_property_for_ctx
+    proc ::set_property {args} {
+        # Skip 1 = this wrapper's own frame.
+        set frames [::vw::capture_stack 1]
+        ::vw::emit_pty_ctx_begin $frames
+        set rc [catch {
+            uplevel 1 [list ::vw::orig_set_property_for_ctx {*}$args]
+        } result options]
+        ::vw::emit_pty_ctx_end
+        return -options $options $result
+    }
+    ::vw::log "installed set_property context wrap"
+}
+
+# Push a context marker onto the PTY. Format: a sentinel-prefixed
+# line per frame plus begin/end bookends, so the Rust PTY filter
+# can match line-by-line without needing a base64 decoder.
+proc ::vw::emit_pty_ctx_begin {frames} {
+    ::vw::real_puts stdout "__VW_CTX_BEGIN__"
+    foreach f $frames {
+        ::vw::real_puts stdout "__VW_CTX_FRAME__:$f"
+    }
+    ::vw::real_puts stdout "__VW_CTX_READY__"
+    flush stdout
+}
+
+proc ::vw::emit_pty_ctx_end {} {
+    ::vw::real_puts stdout "__VW_CTX_END__"
+    flush stdout
+}
+
 # ---------- dispatch ----------
 
 proc ::vw::dispatch {line} {
@@ -570,6 +636,7 @@ fconfigure $sock -buffering line -translation lf
 # headless / minimal-mode configurations), the override will be
 # re-attempted on the first eval — it's idempotent.
 catch {::vw::install_send_msg_override}
+catch {::vw::install_set_property_context}
 
 while {1} {
     if {[gets $sock line] < 0} {
@@ -581,9 +648,10 @@ while {1} {
     }
     set line [string trim $line]
     if {$line eq ""} { continue }
-    # Retry the override install on each eval until it succeeds —
-    # the proc bails out cheaply once installed.
+    # Retry installs on each eval until they succeed — both procs
+    # bail out cheaply once installed.
     catch {::vw::install_send_msg_override}
+    catch {::vw::install_set_property_context}
     ::vw::dispatch $line
 }
 

@@ -28,7 +28,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use tui_textarea::TextArea;
 
-use crate::app::{App, ReverseSearch, ScrollbackEntry, ScrollbackKind};
+use crate::app::{App, ReverseSearch};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let layout = Layout::default()
@@ -50,77 +50,56 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn input_height(app: &App) -> u16 {
-    // Grow with the buffer up to a sensible cap so very long
-    // multi-line entries don't squeeze the scrollback out.
-    let lines = app.input_line_count().clamp(1, 12) as u16;
+    // Start at a 5-line minimum so the user has room to draft a
+    // multi-statement entry without the input box flickering taller
+    // mid-typing. Grows past 5 with the buffer, capped at 12 so
+    // very long entries don't squeeze the scrollback out.
+    let lines = app.input_line_count().clamp(5, 12) as u16;
     lines + 2 // +2 for the top/bottom block border
 }
 
-fn draw_scrollback(f: &mut Frame, area: Rect, app: &App) {
+fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
+    // Hand the area back to App so mouse-event handlers can
+    // translate screen coords into scrollback rows.
+    app.set_scrollback_area(area);
+
     let mut lines: Vec<Line> = Vec::new();
     for entry in app.scrollback() {
-        for line in entry_lines(entry) {
+        for line in crate::render::entry_lines(entry) {
             lines.push(line);
         }
     }
-    let scroll_offset = app.scrollback_scroll();
+    // Pre-wrap to area width so screen-row maps 1:1 to a `Line` in
+    // the output Vec — that's what makes selection extraction
+    // straightforward (vs replaying ratatui's word-wrap to recover
+    // the same mapping).
+    let mut wrapped = crate::render::wrap_lines(lines, area.width);
+    if let Some(sel) = app.selection() {
+        let (start, end) = sel.ordered();
+        crate::render::apply_selection_highlight(&mut wrapped, start, end);
+    }
+    // Tail-follow: in follow mode the effective scroll is
+    // computed each frame from the wrapped row total — free here
+    // because `wrapped` is already built — rather than recomputing
+    // it on every `push()`. The renderer also writes back the
+    // chosen offset so the manual scroll handlers can anchor their
+    // deltas off the actually-rendered position.
+    let max_scroll = wrapped.len().saturating_sub(area.height as usize) as u16;
+    let scroll_offset = if app.scrollback_follow() {
+        max_scroll
+    } else {
+        app.scrollback_scroll().min(max_scroll)
+    };
+    app.set_last_rendered_scroll(scroll_offset);
     // No surrounding block: the scrollback's main job is to be
     // copy-pastable. A box-drawing border around each visible row
-    // means any terminal-selection that spans full lines pulls in
-    // `│` chars at the start and end of every pasted line, which
-    // is what the user reads. The input box below the scrollback
-    // still has its own border, which provides enough visual
-    // separation between the two regions.
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_offset, 0));
+    // means any selection that spans full lines pulls in `│` chars
+    // at the start and end of every line, which is what the user
+    // reads. The input box below the scrollback still has its own
+    // border, which provides enough visual separation between the
+    // two regions.
+    let paragraph = Paragraph::new(wrapped).scroll((scroll_offset, 0));
     f.render_widget(paragraph, area);
-}
-
-fn entry_lines(entry: &ScrollbackEntry) -> Vec<Line<'static>> {
-    let orange = Color::Rgb(255, 140, 0);
-    let (prefix, prefix_style) = match entry.kind {
-        ScrollbackKind::Input => (
-            "› ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        ScrollbackKind::Result => ("  ", Style::default().fg(Color::Gray)),
-        ScrollbackKind::Stdout => ("  ", Style::default().fg(Color::White)),
-        ScrollbackKind::Error => (
-            "✗ ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        ScrollbackKind::Warning => (
-            "⚠ ",
-            Style::default().fg(orange).add_modifier(Modifier::BOLD),
-        ),
-        ScrollbackKind::Notice => ("· ", Style::default().fg(Color::DarkGray)),
-    };
-    let body_style = match entry.kind {
-        ScrollbackKind::Input => Style::default().fg(Color::White),
-        ScrollbackKind::Result => Style::default().fg(Color::Gray),
-        ScrollbackKind::Stdout => Style::default().fg(Color::White),
-        ScrollbackKind::Error => Style::default().fg(Color::Red),
-        ScrollbackKind::Warning => Style::default().fg(orange),
-        ScrollbackKind::Notice => Style::default().fg(Color::DarkGray),
-    };
-    let mut out = Vec::new();
-    for (i, line) in entry.text.lines().enumerate() {
-        let leading = if i == 0 { prefix } else { "  " };
-        out.push(Line::from(vec![
-            Span::styled(leading.to_string(), prefix_style),
-            Span::styled(line.to_string(), body_style),
-        ]));
-    }
-    if out.is_empty() {
-        out.push(Line::from(vec![Span::styled(
-            prefix.to_string(),
-            prefix_style,
-        )]));
-    }
-    out
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
@@ -162,9 +141,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         WorkerStatusView::Down => (" vivado: down ", Color::Rgb(255, 140, 0)),
     };
     let hint = if app.reverse_search().is_some() {
-        "Esc cancel · Enter accept · Ctrl-R older"
+        "Esc cancel · Enter accept · Ctrl-R older".to_string()
     } else {
-        "Ctrl-D exit · Ctrl-R search · Ctrl-↑/↓ scroll · :load <file> · :quit"
+        let mouse = if app.mouse_capture() {
+            "F2 terminal-sel"
+        } else {
+            "F2 mouse-on"
+        };
+        format!(
+            "Ctrl-D exit · Ctrl-P/N history · Ctrl-R search · \
+             Ctrl-K/J or wheel scroll · \
+             drag to copy · {mouse} · :load <file> · :quit"
+        )
     };
     // Split the status bar into [hint (left, fills) | status
     // indicator (right, fixed width)] so the status badge always

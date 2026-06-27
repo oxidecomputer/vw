@@ -149,6 +149,21 @@ pub struct VivadoBackend {
     /// Brief-buffer classifier for multi-line PTY warnings. See
     /// [`PtyClassifier`] for the merging semantics.
     pty_classifier: PtyClassifier,
+    /// Stack frames the shim sent via `__VW_CTX_*` PTY markers
+    /// while the most recent `set_property` is in flight. When
+    /// non-empty, every Warning/Error chunk that lands here gets
+    /// these frames appended as `\n  at <frame>` lines — that's
+    /// what lets the REPL show "this IP_Flow warning came from
+    /// configure_cips → create_versal_cips → set_property" even
+    /// though Vivado's C++ never went through our Tcl stack
+    /// capture.
+    active_pty_context: Vec<String>,
+    /// Frames currently being assembled between
+    /// `__VW_CTX_BEGIN__` and `__VW_CTX_READY__`. Swapped into
+    /// `active_pty_context` atomically on READY so a partial
+    /// marker stream can't leak half-formed traces into emitted
+    /// warnings.
+    building_pty_context: Vec<String>,
     _shim_dir: TempDir,
     _scratch_dir: Option<TempDir>,
 }
@@ -271,6 +286,8 @@ impl VivadoBackend {
             verbose_log,
             trace_message_sources,
             pty_classifier: PtyClassifier::new(PTY_CONTINUATION_WINDOW),
+            active_pty_context: Vec::new(),
+            building_pty_context: Vec::new(),
             _shim_dir: shim_dir,
             _scratch_dir: scratch_dir,
         })
@@ -442,6 +459,9 @@ impl VivadoBackend {
         line: &str,
         accumulated: &mut String,
     ) {
+        if self.consume_ctx_marker(line) {
+            return;
+        }
         let outcome =
             self.pty_classifier.handle(line, std::time::Instant::now());
         for (kind, text) in outcome.chunks {
@@ -449,6 +469,39 @@ impl VivadoBackend {
         }
         if !outcome.absorbed && self.verbose {
             self.write_verbose_line(line);
+        }
+    }
+
+    /// Recognize one of the `__VW_CTX_*` lines the shim emits
+    /// around `set_property`. Returns `true` if the line was a
+    /// marker (and should be swallowed); `false` if it's a normal
+    /// PTY line for the classifier.
+    fn consume_ctx_marker(&mut self, line: &str) -> bool {
+        let stripped = line.trim_end_matches(['\r', '\n']);
+        match stripped {
+            "__VW_CTX_BEGIN__" => {
+                self.building_pty_context.clear();
+                true
+            }
+            "__VW_CTX_READY__" => {
+                self.active_pty_context =
+                    std::mem::take(&mut self.building_pty_context);
+                true
+            }
+            "__VW_CTX_END__" => {
+                self.active_pty_context.clear();
+                self.building_pty_context.clear();
+                true
+            }
+            _ => {
+                if let Some(frame) = stripped.strip_prefix("__VW_CTX_FRAME__:")
+                {
+                    self.building_pty_context.push(frame.to_string());
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -478,6 +531,9 @@ impl VivadoBackend {
             self.emit_pty_chunk(kind, &text, &mut sink_void);
         }
         while let Ok(line) = self.pty_rx.try_recv() {
+            if self.consume_ctx_marker(&line) {
+                continue;
+            }
             let outcome =
                 self.pty_classifier.handle(&line, std::time::Instant::now());
             for (kind, text) in outcome.chunks {
@@ -532,6 +588,35 @@ impl VivadoBackend {
         if !self.trace_message_sources && is_vw_log_chunk(text) {
             return;
         }
+        // Tag warnings/errors that arrived without a trace with the
+        // current `set_property` context (frames captured by the
+        // shim around the in-flight C++ call). This is the path
+        // that resolves "IP_Flow 19-7090" and friends — they go
+        // straight from Vivado's C++ to the PTY, bypassing every
+        // Tcl-side stack-capture hook.
+        let tagged: String;
+        let payload: &str =
+            if matches!(kind, StreamKind::Warning | StreamKind::Error)
+                && !self.active_pty_context.is_empty()
+                && !text.contains("\n  at ")
+            {
+                let trimmed = text.trim_end_matches('\n');
+                let mut buf = String::with_capacity(text.len() + 80);
+                buf.push_str(trimmed);
+                for frame in &self.active_pty_context {
+                    buf.push_str("\n  at ");
+                    buf.push_str(frame);
+                }
+                // Restore the trailing newline if the caller had one
+                // — downstream chunk handling assumes line-terminated.
+                if text.ends_with('\n') {
+                    buf.push('\n');
+                }
+                tagged = buf;
+                &tagged
+            } else {
+                text
+            };
         if let Some(sink) = self.stdout_sink.as_mut() {
             if self.trace_message_sources {
                 sink(
@@ -539,9 +624,9 @@ impl VivadoBackend {
                     &format!("[vw-pty] classified-as={kind:?}\n"),
                 );
             }
-            sink(kind, text);
+            sink(kind, payload);
         } else {
-            accumulated.push_str(text);
+            accumulated.push_str(payload);
         }
     }
 }

@@ -177,17 +177,42 @@ fn lower_proc_decl(
     // newlines as command separators, which silently splits a
     // multi-line `set x [ foo \n  -a 1 \n  -b 2 \n]` into four
     // separate calls and drops every flag arg.
+    //
+    // Critically, we pad the emitted body with blank lines so
+    // each lowered statement lands on the SAME line it occupied
+    // in the source. Tcl's `info frame` reports body lines
+    // relative to the script text it was given — without padding,
+    // collapsing a 5-line `[ ... ]` to one line shifts every
+    // subsequent statement upward and the stack trace's
+    // "line N in proc X" ends up pointing at unrelated source
+    // lines. With padding, Tcl's body line N == source body
+    // line N == `body_start_file_line + N - 1`, which is what
+    // the REPL's `ProcLocation::resolve_body_line` already
+    // assumes.
+    let line_idx = crate::line_index::LineIndex::new(source);
+    let body_open_line = line_idx.position(proc.body_span.start).line; // 0-based
     let body = if proc.body.is_empty() {
         proc.body_span.slice(source).to_string()
     } else {
         let mut out = String::new();
+        // First emitted body line corresponds to one line after
+        // the line containing `{`. We track 0-based file lines
+        // throughout.
+        let mut cur_line = body_open_line + 1;
         for stmt in &proc.body {
             let Stmt::Command(cmd) = stmt else { continue };
-            let line = lower_command(cmd, source, table);
-            if !line.is_empty() {
-                out.push_str(&line);
+            let stmt_line = line_idx.position(cmd.span.start).line;
+            while cur_line < stmt_line {
                 out.push('\n');
+                cur_line += 1;
             }
+            let line = lower_command(cmd, source, table);
+            if line.is_empty() {
+                continue;
+            }
+            out.push_str(&line);
+            out.push('\n');
+            cur_line += 1 + line.matches('\n').count() as u32;
         }
         out
     };
@@ -200,8 +225,14 @@ fn lower_proc_decl(
         return format!("proc {name} {{{args_list}}} {{{body}}}");
     };
     let sig_dict = build_kwargs_sig_dict(sig);
+    // Put `::vw::kwargs` on the SAME line as the opening `{` so
+    // it doesn't eat the first source line of the body and shift
+    // subsequent statements. Tcl treats "the line containing `{`"
+    // as body line 1 — putting the kwargs preamble there means
+    // body line 2 onward maps 1:1 to source lines, matching
+    // what the padding loop above produced.
     format!(
-        "proc {name} {{args}} {{\n  ::vw::kwargs $args {{{sig_dict}}}\n{body}}}"
+        "proc {name} {{args}} {{ ::vw::kwargs $args {{{sig_dict}}}\n{body}}}"
     )
 }
 
