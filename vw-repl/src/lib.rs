@@ -20,15 +20,21 @@
 
 mod app;
 mod history;
-mod lower;
+pub mod lower;
 mod render;
 mod session;
+pub mod trace;
 mod ui;
 
 use camino::Utf8PathBuf;
 use thiserror::Error;
 
 pub use app::App;
+pub use lower::{build_proc_locations, Origin, OriginFrame, ProcLocation};
+pub use session::Session;
+pub use trace::{
+    display_path, resolve_stack_frames_with, rewrite_stack_line, RewrittenFrame,
+};
 
 #[derive(Debug, Error)]
 pub enum ReplError {

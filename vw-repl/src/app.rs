@@ -1479,131 +1479,26 @@ struct TclProcFrame {
 }
 
 /// Rewrite `<input>:N in ::procname` frames in a Vivado message to
-/// point at the actual htcl source file and line. The shim appends
-/// a stack trace below WARNING / ERROR lines with one
-/// `  at <location> in <proc>` entry per frame; when the proc was
-/// declared in user htcl we know its body's absolute
-/// `(file, body_start_line)`, so we can map the `<input>:body-line`
-/// Tcl reported back to a concrete file location. Frames we can't
-/// resolve (Vivado builtins, anonymous `uplevel`, etc.) pass through
-/// unchanged.
-///
-/// Also folds consecutive frames pointing at the same proc into a
-/// single entry — Tcl reports the proc-decl line AND the in-body
-/// call line as separate frames, but they're the same call from
-/// the user's perspective.
+/// point at the actual htcl source file and line. Delegates the
+/// per-line parsing + dedup to [`crate::trace`], which is shared
+/// with the `vw run` CLI driver so both surfaces render the same.
+/// This wrapper closes over the REPL's session+pending proc lookup.
 fn resolve_stack_frames(
     msg: &str,
     session: &Session,
     pending: Option<&SessionBatch>,
     input_file: Option<&std::path::Path>,
 ) -> String {
-    let mut out = String::with_capacity(msg.len());
-    let mut last_resolved_key: Option<(String, u32)> = None;
-    for (i, line) in msg.lines().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let Some(rewritten) =
-            rewrite_stack_line(line, session, pending, input_file)
-        else {
-            out.push_str(line);
-            last_resolved_key = None;
-            continue;
-        };
-        let key = (rewritten.proc.clone(), rewritten.line);
-        if last_resolved_key.as_ref() == Some(&key) {
-            if out.ends_with('\n') {
-                out.pop();
-            }
-            continue;
-        }
-        last_resolved_key = Some(key);
-        out.push_str(&rewritten.formatted);
-    }
-    out
-}
-
-/// One stack-frame line in a Vivado message, after we've mapped
-/// `<input>:body-line in ::procname` back to the absolute htcl
-/// `(file, line)` of that proc declaration.
-struct RewrittenFrame {
-    proc: String,
-    line: u32,
-    formatted: String,
-}
-
-/// Parse a single line like `  at <input>:14 in ::configure_cips`
-/// and rewrite it to point at the user's actual htcl source.
-/// Returns `None` when the line isn't a stack frame in that shape
-/// (just regular message text) or when the proc isn't one we know
-/// about (Vivado builtins, dynamic procs, etc.) — caller passes
-/// such lines through unchanged.
-fn rewrite_stack_line(
-    line: &str,
-    session: &Session,
-    pending: Option<&SessionBatch>,
-    input_file: Option<&std::path::Path>,
-) -> Option<RewrittenFrame> {
-    // Grammar emitted by `vw::format_frame`:
-    //   "  at <input>:N in ::procname"  ← lookup ProcLocation by name
-    //   "  at <file>:N in ::procname"   ← already absolute
-    //   "  at <file>:N"                 ← anonymous eval / top-level
-    //   "  at <procname>"               ← location-less
-    let rest = line.strip_prefix("  at ")?;
-    // Split into "<location>" and optional " in <proc>" tail.
-    let (loc, proc_part) = match rest.split_once(" in ") {
-        Some((l, p)) => (l, Some(p.trim().to_string())),
-        None => (rest, None),
-    };
-    let (file_part, line_part) = loc.rsplit_once(':')?;
-    let body_line: u32 = line_part.parse().ok()?;
-
-    // Top-level `<input>:N` frame (no proc). In `--load` mode the
-    // scratch contains the load file verbatim, so scratch:N maps
-    // 1:1 to the user's path — substitute it.
-    let Some(proc) = proc_part else {
-        if file_part != "<input>" {
-            return None;
-        }
-        let path = input_file?;
-        return Some(RewrittenFrame {
-            proc: String::new(),
-            line: body_line,
-            formatted: format!("  at {}:{body_line}", display_path(path)),
-        });
-    };
-
-    // Already-absolute frames don't need rewriting, but we still
-    // want them deduped — return them with the parsed proc/line.
-    if file_part != "<input>" {
-        return Some(RewrittenFrame {
-            proc,
-            line: body_line,
-            formatted: line.to_string(),
-        });
-    }
-    // `<input>:N` with a proc — Tcl reports "line N of the proc
-    // body." Resolve through the proc table. Tcl always reports
-    // fully-qualified names (leading `::`); the proc table indexes
-    // them without (see `lower::qualify`), so strip before lookup.
-    let lookup_name = proc.strip_prefix("::").unwrap_or(&proc);
-    let loc = pending
-        .and_then(|b| b.procs.get(lookup_name))
-        .or_else(|| session.lookup_proc(lookup_name))?;
-    let (abs_line, _content) = loc.resolve_body_line(body_line)?;
-    let path_str = match loc.file.as_deref() {
-        Some(p) => display_path(p),
-        None => match input_file {
-            Some(p) => display_path(p),
-            None => "<input>".to_string(),
+    crate::trace::resolve_stack_frames_with(
+        msg,
+        |name| {
+            pending
+                .and_then(|b| b.procs.get(name))
+                .or_else(|| session.lookup_proc(name))
+                .cloned()
         },
-    };
-    Some(RewrittenFrame {
-        proc: proc.clone(),
-        line: abs_line,
-        formatted: format!("  at {path_str}:{abs_line} in {proc}"),
-    })
+        input_file,
+    )
 }
 
 /// If `text` looks like a Tcl key-value list (an even number of
@@ -1865,10 +1760,9 @@ mod tests {
             95,
             (0..30).map(|i| format!("body line {i}")).collect(),
         );
-        let frame = rewrite_stack_line(
+        let frame = crate::trace::rewrite_stack_line(
             "  at <input>:14 in ::configure_cips",
-            &session,
-            None,
+            |name| session.lookup_proc(name).cloned(),
             None,
         )
         .expect("should resolve");
@@ -1891,10 +1785,9 @@ mod tests {
             70,
             (0..10).map(|i| format!("line {i}")).collect(),
         );
-        let frame = rewrite_stack_line(
+        let frame = crate::trace::rewrite_stack_line(
             "  at <input>:5 in ::port::plumb_if_pin",
-            &session,
-            None,
+            |name| session.lookup_proc(name).cloned(),
             None,
         )
         .expect("should resolve namespaced proc");
@@ -1908,10 +1801,9 @@ mod tests {
     #[test]
     fn rewrite_passes_unknown_proc_through() {
         let session = Session::new();
-        assert!(rewrite_stack_line(
+        assert!(crate::trace::rewrite_stack_line(
             "  at <input>:14 in ::vivado_builtin_thing",
-            &session,
-            None,
+            |name| session.lookup_proc(name).cloned(),
             None,
         )
         .is_none());
@@ -1920,14 +1812,18 @@ mod tests {
     #[test]
     fn rewrite_skips_non_frame_lines() {
         let session = Session::new();
-        assert!(rewrite_stack_line(
+        assert!(crate::trace::rewrite_stack_line(
             "WARNING: [Common 17-1] something",
-            &session,
-            None,
+            |name| session.lookup_proc(name).cloned(),
             None,
         )
         .is_none());
-        assert!(rewrite_stack_line("", &session, None, None).is_none());
+        assert!(crate::trace::rewrite_stack_line(
+            "",
+            |name| session.lookup_proc(name).cloned(),
+            None,
+        )
+        .is_none());
     }
 
     #[test]

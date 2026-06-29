@@ -416,7 +416,7 @@ pub fn prepare_with_observer(
 /// `vw_htcl::validate::collect_signatures` — kept in sync by
 /// convention rather than refactor so this crate stays a leaf
 /// consumer of vw-htcl.
-fn build_proc_locations(
+pub fn build_proc_locations(
     doc: &vw_htcl::Document,
     program: &vw_htcl::LoadedProgram,
     scratch_path: &Path,

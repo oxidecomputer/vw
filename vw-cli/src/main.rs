@@ -912,6 +912,106 @@ fn render_path(
 /// the backend exactly once. Dedup is owned by the caller so
 /// repeated invocations across signatures don't re-ship the same
 /// proc.
+/// Stream-sink rendering for `vw run`. Mirrors the REPL's
+/// scrollback colors + stack-frame rewriting so both surfaces
+/// look the same:
+///
+/// - **Stream kind → ANSI color/prefix**
+///   - `Error`   → `✗ ` red bold
+///   - `Warning` → `⚠ ` orange (Rgb 255,140,0)
+///   - `Info`    → `· ` dark gray
+///   - `Stdout`  → no prefix, no color
+///
+/// - **Stack-frame rewriting**: lines matching `  at <input>:N
+///   in ::proc` are mapped to the real htcl source via
+///   [`vw_repl::resolve_stack_frames_with`] + `proc_table`.
+///   Adjacent frames pointing at the same proc collapse to one.
+///
+/// - **Origin tagging**: warnings/errors that arrive without an
+///   `\n  at …` trace get one appended pointing at the
+///   currently-executing top-level statement (`origin`). Mirrors
+///   the REPL's `tag_streamed_message` — Vivado C++ paths
+///   bypass `::common::send_msg_id` and emit traceless messages
+///   we'd otherwise have no anchor for.
+fn render_chunk(
+    kind: vw_vivado::StreamKind,
+    chunk: &str,
+    proc_table: &std::collections::HashMap<String, vw_repl::ProcLocation>,
+    origin: Option<&vw_repl::Origin>,
+    input_file: Option<&std::path::Path>,
+) {
+    use colored::Colorize;
+    use std::io::Write;
+    // Drop a single trailing newline so the per-message layout
+    // doesn't insert a blank gap. The shim's `puts` already
+    // preserves user-side newlines inside the message.
+    let trimmed = chunk.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        return;
+    }
+    let resolved = vw_repl::resolve_stack_frames_with(
+        trimmed,
+        |name| proc_table.get(name).cloned(),
+        input_file,
+    );
+    // Tag traceless warnings/errors with the currently-executing
+    // statement's origin.
+    let tagged = match kind {
+        vw_vivado::StreamKind::Warning | vw_vivado::StreamKind::Error
+            if !resolved.contains("\n  at ") =>
+        {
+            match origin {
+                Some(o) => {
+                    let path = o
+                        .file
+                        .as_deref()
+                        .map(vw_repl::display_path)
+                        .unwrap_or_else(|| {
+                            input_file
+                                .map(vw_repl::display_path)
+                                .unwrap_or_else(|| "<input>".into())
+                        });
+                    format!("{resolved}\n  at {path}:{}", o.line)
+                }
+                None => resolved,
+            }
+        }
+        _ => resolved,
+    };
+    let prefix = match kind {
+        vw_vivado::StreamKind::Error => "✗ ",
+        vw_vivado::StreamKind::Warning => "⚠ ",
+        vw_vivado::StreamKind::Info => "· ",
+        vw_vivado::StreamKind::Stdout => "",
+    };
+    let mut out = std::io::stdout().lock();
+    for (i, line) in tagged.lines().enumerate() {
+        let leading = if i == 0 || prefix.is_empty() {
+            prefix
+        } else {
+            "  "
+        };
+        let styled_prefix: String = match kind {
+            vw_vivado::StreamKind::Error => leading.red().bold().to_string(),
+            vw_vivado::StreamKind::Warning => {
+                leading.truecolor(255, 140, 0).bold().to_string()
+            }
+            vw_vivado::StreamKind::Info => leading.bright_black().to_string(),
+            vw_vivado::StreamKind::Stdout => leading.to_string(),
+        };
+        let styled_line: String = match kind {
+            vw_vivado::StreamKind::Error => line.red().to_string(),
+            vw_vivado::StreamKind::Warning => {
+                line.truecolor(255, 140, 0).to_string()
+            }
+            vw_vivado::StreamKind::Info => line.bright_black().to_string(),
+            vw_vivado::StreamKind::Stdout => line.to_string(),
+        };
+        let _ = writeln!(out, "{styled_prefix}{styled_line}");
+    }
+    let _ = out.flush();
+}
+
 async fn ship_generic_reprs(
     backend: &mut vw_vivado::VivadoBackend,
     ty: &vw_htcl::TypeExpr,
@@ -969,7 +1069,10 @@ async fn run_htcl(
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let program = load_htcl_program(file)?;
-    let source = program.source;
+    // Keep `program` alive — the stack-frame rewriting needs the
+    // LoadedProgram for body-span resolution. We borrow `source`
+    // from it instead of moving.
+    let source = program.source.clone();
     let parsed = vw_htcl::parse(&source);
     let line_index = vw_htcl::LineIndex::new(&source);
 
@@ -1015,18 +1118,42 @@ async fn run_htcl(
         })
         .await
         .map_err(|e| format!("failed to start Vivado worker: {e}"))?;
-    // Stream user puts output (and Vivado's own WARNING/ERROR/INFO
-    // lines) as they're produced rather than buffering until each
-    // eval completes — necessary for long-running commands like
-    // `synth_design` where the user wants to see progress live.
-    // `vw run` is a script driver; it doesn't distinguish the
-    // stream kinds and passes every chunk through unchanged.
-    backend.set_stdout_sink(|_kind, chunk: &str| {
-        use std::io::Write;
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(chunk.as_bytes());
-        let _ = out.flush();
-    });
+
+    // Build the proc-location table the stream sink uses to map
+    // Tcl `<input>:N in ::proc` frames back to real htcl source.
+    // Mirrors what `vw-repl` does per batch — we use the same
+    // shared helpers (`vw_repl::trace::*`) so REPL and CLI render
+    // the same. The entry file IS the scratch from build_proc_locations'
+    // perspective.
+    let entry_std_path = std::path::Path::new(file.as_str()).to_path_buf();
+    let proc_table = std::sync::Arc::new(vw_repl::build_proc_locations(
+        &parsed.document,
+        &program,
+        &entry_std_path,
+    ));
+    let input_file_for_stack = std::sync::Arc::new(entry_std_path.clone());
+    // Shared between the main loop (writes the current origin
+    // before each eval) and the stream sink (reads it to tag
+    // unattributed warnings — e.g. Vivado IP-Flow C++ messages
+    // that bypass `::common::send_msg_id`). Same trick the REPL
+    // uses with `pending_origins[pending_eval_index]`.
+    let current_origin =
+        std::sync::Arc::new(std::sync::Mutex::new(None::<vw_repl::Origin>));
+    {
+        let procs = std::sync::Arc::clone(&proc_table);
+        let input_file = std::sync::Arc::clone(&input_file_for_stack);
+        let origin = std::sync::Arc::clone(&current_origin);
+        backend.set_stdout_sink(move |kind, chunk: &str| {
+            let cur_origin = origin.lock().ok().and_then(|g| g.clone());
+            render_chunk(
+                kind,
+                chunk,
+                &procs,
+                cur_origin.as_ref(),
+                Some(input_file.as_path()),
+            );
+        });
+    }
 
     // Lower structured proc declarations and call sites to plain Tcl
     // before sending. Generic commands pass through unchanged.
@@ -1092,10 +1219,36 @@ async fn run_htcl(
             }
         }
     }
+    let line_index = vw_htcl::LineIndex::new(&source);
     for stmt in &parsed.document.stmts {
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
         };
+        // Snapshot the origin of THIS statement before shipping
+        // it, so the stream sink can tag any traceless warning
+        // Vivado emits during the eval with the right "what was
+        // running" anchor. Mirrors the REPL's pending_origins +
+        // pending_eval_index mechanism.
+        {
+            let (line, _) = line_index.range(cmd.span);
+            let snippet = source
+                [cmd.span.start as usize..cmd.span.end as usize]
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let file_path = program
+                .locate_span(cmd.span)
+                .map(|(idx, _)| program.files[idx].path.clone());
+            if let Ok(mut g) = current_origin.lock() {
+                *g = Some(vw_repl::Origin {
+                    file: file_path,
+                    line: line.line + 1,
+                    snippet,
+                    via: Vec::new(),
+                });
+            }
+        }
         // Overload specializations lower under their mangled
         // names so the dispatcher's switch arms can find them.
         let lowered = match overload_specialization_mangle(cmd, &overload_table)
