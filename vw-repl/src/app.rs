@@ -61,10 +61,41 @@ pub enum ScrollbackKind {
     Notice,
 }
 
+/// Tracks where each echoed top-level statement's Input entry
+/// lives in scrollback AND which lowered command-index in the
+/// batch is its last. When that command finishes evaluating, the
+/// Input entry's timer freezes — giving accurate per-statement
+/// durations in multi-statement load batches instead of all
+/// entries sharing the whole-batch wall time.
+#[derive(Clone, Debug)]
+struct InputBoundary {
+    scrollback_idx: usize,
+    /// Eval-index in `pending_origins` of the last lowered
+    /// command that originated from this top-level statement.
+    /// When `pending_eval_index` reaches this value (i.e. the
+    /// command at this index has just finished), the entry's
+    /// timer should freeze.
+    last_command_idx: usize,
+    /// Set to true once we've stamped this entry's `completed_at`,
+    /// so we don't re-stamp on subsequent EvalDones.
+    completed: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScrollbackEntry {
     pub kind: ScrollbackKind,
     pub text: String,
+    /// When this entry was pushed. Only set for `Input` entries
+    /// — used by the renderer to right-justify a `Ns` /
+    /// `M:SS` / `H:MM:SS` elapsed-time marker on the first
+    /// line. Non-input entries don't get timed and leave this
+    /// `None`.
+    pub started_at: Option<std::time::Instant>,
+    /// When the corresponding eval finished. `None` while the
+    /// eval is still running (renderer shows live-updating
+    /// elapsed time from `started_at`); `Some(t)` freezes the
+    /// timer at the final duration once the batch completes.
+    pub completed_at: Option<std::time::Instant>,
 }
 
 /// Drag-selection over scrollback rows. Coordinates are `(row, col)`
@@ -172,6 +203,16 @@ pub struct App {
     /// Tcl, and (b) suppress the Result push entirely for
     /// `unit`-typed expressions.
     pending_return_types: Vec<Option<vw_htcl::TypeExpr>>,
+    /// For per-Input-entry timer freezing: one entry per
+    /// echoed top-level statement in the current batch, in
+    /// source order. Each carries the scrollback index of its
+    /// Input entry and the eval-index of the LAST lowered
+    /// command that came from that statement. When EvalDone
+    /// fires for that command index, we freeze the entry's
+    /// timer AND start the next entry's timer (so per-statement
+    /// durations in a multi-statement load batch are accurate
+    /// instead of all reading the whole-batch wall time).
+    pending_input_boundaries: Vec<InputBoundary>,
     pending_eval_index: usize,
     /// The batch we shipped to the worker but haven't yet seen a
     /// result for. Held aside so a successful eval (and only a
@@ -316,6 +357,44 @@ async fn run_inner(
                 // animate even when nothing else is happening.
             }
         }
+        // Drain additional pending events from BOTH streams
+        // before the next draw. Without this, a burst of N
+        // mouse-wheel events or worker stream chunks each
+        // triggers its own draw — even though only the final
+        // state matters visually — and the queue bloats faster
+        // than draws can keep up.
+        //
+        // The biased `select!` plus a wildcard always-ready
+        // branch acts as a non-blocking "is anything pending?"
+        // check: if neither real branch is immediately ready,
+        // the wildcard wins and we break out. Capped at 256
+        // events per cycle so a sustained event firehose still
+        // yields back to drawing periodically (the user sees
+        // forward progress instead of "frozen until the whole
+        // burst is processed").
+        for _ in 0..256 {
+            let made_progress = tokio::select! {
+                biased;
+                Some(maybe_event) = crossterm_events.next() => {
+                    match maybe_event {
+                        Ok(ev) => app.handle_terminal_event(ev).await,
+                        Err(e) => app.push(
+                            ScrollbackKind::Error,
+                            format!("terminal: {e}"),
+                        ),
+                    }
+                    true
+                }
+                Some(event) = app.eval_rx.recv() => {
+                    app.handle_worker_event(event).await;
+                    true
+                }
+                _ = std::future::ready(()) => false,
+            };
+            if !made_progress {
+                break;
+            }
+        }
     }
 }
 
@@ -348,6 +427,7 @@ impl App {
             pending_batch: None,
             pending_origins: Vec::new(),
             pending_return_types: Vec::new(),
+            pending_input_boundaries: Vec::new(),
             pending_eval_index: 0,
             exit: false,
         }
@@ -535,6 +615,20 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left)
                 if self.selection.is_some() =>
             {
+                // Auto-scroll when the drag wanders past the
+                // top or bottom edge of the scrollback area so
+                // selections can extend beyond the current
+                // viewport. Crossterm fires drag events per
+                // cell of mouse movement, so the user wiggles
+                // the mouse at the edge to keep scrolling;
+                // simpler than tracking a "held at edge" timer
+                // and good enough for selection-extension UX.
+                let bottom = area.y + area.height;
+                if mouse.row >= bottom {
+                    self.scroll_by(3);
+                } else if mouse.row < area.y {
+                    self.scroll_by(-3);
+                }
                 // Clamp to the area: dragging outside still
                 // updates the cursor to the edge so selection
                 // can extend through the visible viewport even
@@ -588,7 +682,7 @@ impl App {
         };
         let mut flat: Vec<ratatui::text::Line<'static>> = Vec::new();
         for entry in &self.scrollback {
-            for line in crate::render::entry_lines(entry) {
+            for line in crate::render::entry_lines(entry, area.width) {
                 flat.push(line);
             }
         }
@@ -708,6 +802,17 @@ impl App {
             (KeyCode::PageDown, _)
             | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 self.scroll_by(5);
+            }
+            // Snap to bottom + re-engage tail-follow. Use End
+            // (when available) or Ctrl-G as the compact-keyboard
+            // alternative. After scrolling up to inspect old
+            // output the user explicitly requests "back to live"
+            // here; we no longer auto-re-engage on every scroll
+            // (that auto-engage was firing spuriously due to a
+            // raw-vs-wrapped line-count mismatch, making scroll
+            // appear dead on large outputs).
+            (KeyCode::End, _) | (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
+                self.scrollback_follow = true;
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 self.on_submit().await;
@@ -952,20 +1057,62 @@ impl App {
             return;
         }
 
+        // Build per-Input-entry timer boundaries before echo so
+        // we can map each echoed Input to its last lowered
+        // command. Empty when not in echo mode (the non-echo
+        // single-Input case uses the existing
+        // `mark_inputs_completed` end-of-batch path).
+        let mut input_boundaries: Vec<InputBoundary> = Vec::new();
         if echo {
-            // Echo every top-level statement from the entry file.
-            // `entry_top_level` is the full list — including `src`
-            // directives, which lower to empty Tcl (the loader has
-            // already consumed them) and therefore wouldn't appear
-            // if we walked `lowered.commands`. Statements pulled in
-            // via `src` are filtered out at capture time in
-            // `lower::prepare`, so e.g. `src @vivado-cmd` echoes
-            // its own line but not the 10k+ wrapper definitions
-            // it brings in.
+            // Push Input entries first, recording their
+            // scrollback indices for later timer freezing.
             for origin in &lowered.entry_top_level {
+                let idx = self.scrollback.len();
                 self.push(ScrollbackKind::Input, origin.snippet.clone());
+                input_boundaries.push(InputBoundary {
+                    scrollback_idx: idx,
+                    last_command_idx: 0, // filled below
+                    completed: false,
+                });
+            }
+            // For each entry-top-level Origin, find the LAST
+            // lowered command whose ultimate entry-file line
+            // matches it. A command's "entry line" is the line
+            // in the entry file it came from: directly when
+            // `origin.via` is empty (the command lives in the
+            // entry), or the bottom of the `via` chain (which
+            // lower.rs documents as "the last frame is the
+            // entry file / user input").
+            for (cmd_idx, cmd) in lowered.commands.iter().enumerate() {
+                let entry_line = match cmd.origin.via.last() {
+                    Some(f) => f.line,
+                    None => cmd.origin.line,
+                };
+                // Find which entry_top_level Origin this matches
+                // (linear scan — at most a handful of top-level
+                // statements per batch).
+                for (j, top) in lowered.entry_top_level.iter().enumerate() {
+                    if top.line == entry_line {
+                        if let Some(b) = input_boundaries.get_mut(j) {
+                            b.last_command_idx = cmd_idx;
+                        }
+                        break;
+                    }
+                }
+            }
+            // Reset the first entry's `started_at` to NOW —
+            // ensures the timer is anchored to dispatch time
+            // (mostly redundant with `push`-time stamping, but
+            // explicit). Subsequent entries' `started_at` is
+            // updated as the previous entry completes (see
+            // EvalDone handler).
+            if let Some(b) = input_boundaries.first() {
+                if let Some(entry) = self.scrollback.get_mut(b.scrollback_idx) {
+                    entry.started_at = Some(std::time::Instant::now());
+                }
             }
         }
+        self.pending_input_boundaries = input_boundaries;
 
         // Snapshot per-command origins + types for the stream-
         // tagging + result-display paths. EvalBatch consumes
@@ -1110,6 +1257,10 @@ impl App {
                     .get(self.pending_eval_index)
                     .cloned()
                     .flatten();
+                // Capture the just-finished command's eval-index
+                // before we advance — used to freeze any Input
+                // entry whose last-command boundary matches it.
+                let just_finished_idx = self.pending_eval_index;
                 // Advance past the command that just finished — the
                 // stream-tagging path uses `pending_origins[index]`
                 // to label warnings emitted by the *currently*
@@ -1117,9 +1268,20 @@ impl App {
                 // point at "in-flight," not "just done."
                 self.pending_eval_index =
                     self.pending_eval_index.saturating_add(1);
+                // Per-statement timer freezing: if any echoed
+                // Input entry's `last_command_idx` matches the
+                // just-finished command, stamp its
+                // `completed_at`. If there's a NEXT uncompleted
+                // boundary, anchor its `started_at` to now so
+                // its timer starts ticking from this point
+                // (rather than from batch-dispatch time, which
+                // would conflate it with the time spent on
+                // earlier statements).
+                self.advance_input_timers(just_finished_idx);
                 if last_in_batch {
                     self.pending_origins.clear();
                     self.pending_return_types.clear();
+                    self.pending_input_boundaries.clear();
                     self.pending_eval_index = 0;
                 }
                 match result {
@@ -1168,6 +1330,10 @@ impl App {
                                 self.session.commit(batch);
                             }
                             self.worker_state = WorkerState::Ready;
+                            // Freeze per-input timers at their
+                            // final duration now that the batch
+                            // has finished evaluating.
+                            self.mark_inputs_completed();
                         }
                     }
                     Err(err) => {
@@ -1179,6 +1345,10 @@ impl App {
                         // single result event).
                         render_eval_error(self, &origin, err);
                         self.pending_batch = None;
+                        // Failed evals also freeze their per-input
+                        // timer — otherwise the live counter would
+                        // tick forever on an error result.
+                        self.mark_inputs_completed();
                     }
                 }
             }
@@ -1191,7 +1361,94 @@ impl App {
         // doing it per-push was O(N) per call, making a long burst
         // of Vivado stream chunks O(N²) and freezing the REPL for
         // minutes during `src @vivado-cmd` style fan-outs.
-        self.scrollback.push(ScrollbackEntry { kind, text });
+        //
+        // Input entries get a start timestamp so the renderer can
+        // show a per-input timer (live while running, frozen on
+        // batch completion). Other kinds leave timing unset.
+        let started_at = if matches!(kind, ScrollbackKind::Input) {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        self.scrollback.push(ScrollbackEntry {
+            kind,
+            text,
+            started_at,
+            completed_at: None,
+        });
+    }
+
+    /// Per-Input-entry timer advance triggered by an EvalDone.
+    /// If `just_finished_idx` matches any uncompleted boundary's
+    /// `last_command_idx`, freeze its scrollback entry's
+    /// `completed_at` and anchor the next uncompleted boundary's
+    /// `started_at` to NOW so its timer begins fresh rather than
+    /// inheriting the elapsed time from earlier statements'
+    /// commands.
+    fn advance_input_timers(&mut self, just_finished_idx: usize) {
+        let now = std::time::Instant::now();
+        // Find the first uncompleted boundary whose
+        // last_command_idx matches. Multi-statement load
+        // batches process commands in order, so the matching
+        // boundary is always at the head of the uncompleted
+        // run.
+        let mut hit_position: Option<usize> = None;
+        for (i, b) in self.pending_input_boundaries.iter().enumerate() {
+            if b.completed {
+                continue;
+            }
+            if b.last_command_idx == just_finished_idx {
+                hit_position = Some(i);
+            }
+            break;
+        }
+        let Some(hit) = hit_position else { return };
+        // Mark this boundary complete + stamp its entry.
+        let scrollback_idx = self.pending_input_boundaries[hit].scrollback_idx;
+        self.pending_input_boundaries[hit].completed = true;
+        if let Some(entry) = self.scrollback.get_mut(scrollback_idx) {
+            if entry.completed_at.is_none() {
+                entry.completed_at = Some(now);
+            }
+        }
+        // Start the next uncompleted boundary's timer at NOW.
+        for next in &self.pending_input_boundaries[hit + 1..] {
+            if next.completed {
+                continue;
+            }
+            let next_idx = next.scrollback_idx;
+            if let Some(entry) = self.scrollback.get_mut(next_idx) {
+                entry.started_at = Some(now);
+            }
+            break;
+        }
+    }
+
+    /// Stamp `completed_at` on every still-running Input entry
+    /// from the most recent batch. Called from the `EvalDone`
+    /// handler on `last_in_batch` so the per-input timers freeze
+    /// at their final duration once the batch has finished
+    /// evaluating. For `--load` echoed batches with multiple
+    /// Input entries (one per top-level statement) all entries
+    /// freeze at the same wall time — finer-grained per-statement
+    /// timing would require carrying the eval-to-input mapping
+    /// through the worker round-trip, which is more plumbing
+    /// than the v1 timer needs.
+    fn mark_inputs_completed(&mut self) {
+        let now = std::time::Instant::now();
+        for entry in self.scrollback.iter_mut().rev() {
+            if matches!(entry.kind, ScrollbackKind::Input)
+                && entry.completed_at.is_none()
+            {
+                entry.completed_at = Some(now);
+            } else if entry.completed_at.is_some()
+                && matches!(entry.kind, ScrollbackKind::Input)
+            {
+                // Already-completed Input from a prior batch —
+                // we've walked past the current batch's inputs.
+                break;
+            }
+        }
     }
 
     /// Apply a signed scroll delta (positive = down toward newer
@@ -1215,29 +1472,30 @@ impl App {
             self.scrollback_follow = false;
         }
         self.scrollback_scroll = new;
-        // Re-engage tail-follow once the user scrolls back down to
-        // the bottom — clamped by the renderer next frame.
-        if self.scrollback_follow_threshold_reached(new) {
-            self.scrollback_follow = true;
-        }
-    }
-
-    fn scrollback_follow_threshold_reached(&self, offset: u16) -> bool {
-        let Some(area) = self.scrollback_area else {
-            return false;
-        };
-        // Cheap upper bound — we don't recompute wrapped rows here.
-        // If `offset` is bigger than the line count of scrollback
-        // (i.e. past the last source line, even before wrapping
-        // expands them), the user has definitely scrolled past the
-        // bottom; flip follow back on.
-        let upper = self
-            .scrollback
-            .iter()
-            .map(|e| e.text.lines().count().max(1))
-            .sum::<usize>()
-            .saturating_sub(area.height as usize) as u16;
-        offset >= upper
+        // Predictively mirror the new offset into
+        // `last_rendered_scroll`. Without this, drag-to-select
+        // auto-scrolls but the subsequent `cell_to_buffer` call
+        // in the same event still uses the previously-rendered
+        // value — so the selection cursor lags one drag event
+        // behind the scroll. The renderer will write the
+        // actually-rendered offset back next frame (which may
+        // clamp to max_scroll), so this is at worst a one-frame
+        // optimistic preview.
+        self.last_rendered_scroll = new;
+        // No auto-re-engage of tail-follow on scroll. The previous
+        // logic compared `offset` against a raw `text.lines().count()`
+        // sum, which dramatically underestimates the wrapped row
+        // count when entries wrap (a single multi-MB `puts` of a
+        // nested dict can wrap to tens of thousands of rows while
+        // contributing one raw line). The underestimate made the
+        // "are we at the bottom?" threshold fire on any scroll up
+        // from the bottom, instantly re-engaging follow and snapping
+        // the viewport back — scroll appeared dead.
+        //
+        // Tail-follow re-engages only via explicit user action: an
+        // `End` or `G` keypress jumps to bottom and reactivates it.
+        // The cost is that auto-snap-back after new output stops
+        // being free; the win is that scroll actually works at scale.
     }
 }
 

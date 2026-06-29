@@ -62,43 +62,96 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     // Hand the area back to App so mouse-event handlers can
     // translate screen coords into scrollback rows.
     app.set_scrollback_area(area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
 
-    let mut lines: Vec<Line> = Vec::new();
-    for entry in app.scrollback() {
-        for line in crate::render::entry_lines(entry) {
-            lines.push(line);
-        }
-    }
-    // Pre-wrap to area width so screen-row maps 1:1 to a `Line` in
-    // the output Vec — that's what makes selection extraction
-    // straightforward (vs replaying ratatui's word-wrap to recover
-    // the same mapping).
-    let mut wrapped = crate::render::wrap_lines(lines, area.width);
-    if let Some(sel) = app.selection() {
-        let (start, end) = sel.ordered();
-        crate::render::apply_selection_highlight(&mut wrapped, start, end);
-    }
-    // Tail-follow: in follow mode the effective scroll is
-    // computed each frame from the wrapped row total — free here
-    // because `wrapped` is already built — rather than recomputing
-    // it on every `push()`. The renderer also writes back the
-    // chosen offset so the manual scroll handlers can anchor their
-    // deltas off the actually-rendered position.
-    let max_scroll = wrapped.len().saturating_sub(area.height as usize) as u16;
+    // Pass 1: cheap per-entry wrapped-row count, no allocations.
+    // O(text length) for each, vs. the old approach which built
+    // and wrapped every entry per draw — turning a single huge
+    // entry into multi-MB of per-char allocation on every wheel
+    // tick. With this pass, total work per draw is O(scrollback)
+    // for counting + O(viewport) for actually wrapping the
+    // visible window.
+    let counts: Vec<u32> = app
+        .scrollback()
+        .iter()
+        .map(|e| crate::render::count_wrapped_rows(e, area.width))
+        .collect();
+    let total: u32 = counts.iter().fold(0u32, |a, b| a.saturating_add(*b));
+
+    let max_scroll = total.saturating_sub(area.height as u32);
     let scroll_offset = if app.scrollback_follow() {
         max_scroll
     } else {
-        app.scrollback_scroll().min(max_scroll)
+        u32::from(app.scrollback_scroll()).min(max_scroll)
     };
-    app.set_last_rendered_scroll(scroll_offset);
+    app.set_last_rendered_scroll(scroll_offset.min(u32::from(u16::MAX)) as u16);
+
+    // Pass 2: walk entries; build wrapped lines only for those
+    // intersecting the viewport. Entries entirely above viewport
+    // are skipped (their row count contributes to the offset we
+    // pass to ratatui's `Paragraph::scroll`). Entries entirely
+    // below viewport stop the walk.
+    let viewport_start = scroll_offset;
+    let viewport_end = viewport_start.saturating_add(area.height as u32);
+
+    let mut visible: Vec<Line<'static>> =
+        Vec::with_capacity(area.height as usize + 16);
+    let mut accumulated: u32 = 0;
+    let mut skipped_rows: u32 = 0;
+    {
+        let scrollback = app.scrollback();
+        for (entry, &count) in scrollback.iter().zip(counts.iter()) {
+            let entry_end = accumulated.saturating_add(count);
+            if entry_end <= viewport_start {
+                // Entirely above viewport — count its rows toward
+                // the local scroll offset and move on without
+                // wrapping.
+                skipped_rows = entry_end;
+                accumulated = entry_end;
+                continue;
+            }
+            if accumulated >= viewport_end {
+                break;
+            }
+            let lines = crate::render::entry_lines(entry, area.width);
+            let wrapped = crate::render::wrap_lines(lines, area.width);
+            visible.extend(wrapped);
+            accumulated = entry_end;
+        }
+    }
+
+    // Selection highlight: coords are global wrapped-row indices.
+    // Subtract `skipped_rows` so they index into the local
+    // `visible` Vec instead.
+    if let Some(sel) = app.selection() {
+        let (start, end) = sel.ordered();
+        let skipped = skipped_rows as usize;
+        let local_start = (start.0.saturating_sub(skipped), start.1);
+        let local_end = (end.0.saturating_sub(skipped), end.1);
+        crate::render::apply_selection_highlight(
+            &mut visible,
+            local_start,
+            local_end,
+        );
+    }
+
+    // We've already skipped entries above viewport; ratatui only
+    // needs to skip the remaining rows within the first visible
+    // entry (i.e. the offset from where that entry started to
+    // where the viewport actually begins).
+    let local_scroll = viewport_start
+        .saturating_sub(skipped_rows)
+        .min(u32::from(u16::MAX)) as u16;
+
     // No surrounding block: the scrollback's main job is to be
     // copy-pastable. A box-drawing border around each visible row
     // means any selection that spans full lines pulls in `│` chars
-    // at the start and end of every line, which is what the user
-    // reads. The input box below the scrollback still has its own
-    // border, which provides enough visual separation between the
-    // two regions.
-    let paragraph = Paragraph::new(wrapped).scroll((scroll_offset, 0));
+    // at the start and end of every line. The input box below the
+    // scrollback still has its own border, which provides enough
+    // visual separation between the two regions.
+    let paragraph = Paragraph::new(visible).scroll((local_scroll, 0));
     f.render_widget(paragraph, area);
 }
 

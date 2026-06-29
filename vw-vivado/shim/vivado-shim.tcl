@@ -97,27 +97,45 @@ proc puts {args} {
 
 # Hand-encode a string per RFC 8259. Vivado's bundled Tcllib doesn't
 # include `json::write`, so we provide the minimum we need.
+#
+# Implementation: `string map` does the bulk-substitution in one
+# native Tcl C call, vs. a per-char Tcl loop (which is what we
+# used to do). The difference is dramatic at scale — a 1MB puts
+# output (the kind `puts [util::props -object $cpm5]` produces)
+# went from minutes of per-char `string index`/`scan`/`switch`
+# iteration to ~100ms via `string map`. Rare control chars
+# (codepoints < 0x20 other than the named whitespace escapes)
+# trigger a slow per-char fallback; in practice Vivado property
+# values don't contain them, so the fast path covers everything.
 proc ::vw::json_string {value} {
+    # Order matters: backslash must be substituted FIRST so the
+    # backslashes we introduce for the other escapes aren't
+    # themselves re-escaped.
+    set escaped [string map [list \
+        "\\" "\\\\" \
+        "\"" "\\\"" \
+        "\b" "\\b" \
+        "\f" "\\f" \
+        "\n" "\\n" \
+        "\r" "\\r" \
+        "\t" "\\t"] $value]
+    # Fast path: no remaining control chars → just wrap in quotes.
+    if {![regexp {[\x00-\x08\x0B\x0E-\x1F]} $escaped]} {
+        return "\"$escaped\""
+    }
+    # Slow path: per-char loop for the remaining control chars.
+    # Only hit when the string contains rare control codepoints
+    # — Vivado property values shouldn't, but a user `puts` of
+    # binary-ish data might.
     set out "\""
-    set len [string length $value]
+    set len [string length $escaped]
     for {set i 0} {$i < $len} {incr i} {
-        set ch [string index $value $i]
+        set ch [string index $escaped $i]
         scan $ch %c codepoint
-        switch -- $ch {
-            "\\" { append out "\\\\" }
-            "\"" { append out "\\\"" }
-            "\b" { append out "\\b" }
-            "\f" { append out "\\f" }
-            "\n" { append out "\\n" }
-            "\r" { append out "\\r" }
-            "\t" { append out "\\t" }
-            default {
-                if {$codepoint < 0x20} {
-                    append out [format "\\u%04x" $codepoint]
-                } else {
-                    append out $ch
-                }
-            }
+        if {$codepoint < 0x20} {
+            append out [format "\\u%04x" $codepoint]
+        } else {
+            append out $ch
         }
     }
     append out "\""
@@ -255,6 +273,96 @@ proc ::vw::kwargs {argv sig} {
             incr i 2
         }
     }
+}
+
+# ---------- bulk property fetch ----------
+#
+# `::vw::props_dict <obj>` returns a paired Tcl list (NAME VAL
+# NAME VAL …) of every property on `<obj>`. The point is a
+# single Vivado RPC instead of N: htcl wrappers that want the
+# full property bag (e.g. `util::props`) would otherwise issue
+# one `extern::get_property` per property × hundreds of
+# properties on an IP cell. The PTY round-trip is the dominant
+# cost; doing the iteration entirely Vivado-side cuts it to
+# constant per call.
+proc ::vw::props_dict {obj} {
+    set out [list]
+    foreach name [list_property $obj] {
+        lappend out $name [get_property $name $obj]
+    }
+    return $out
+}
+
+# `::vw::props_nested <obj>` returns the FULL output `util::props`
+# wants — a nested `Properties` dict where dotted property names
+# (CONFIG.X.Y) expand into hierarchy, and each leaf value is
+# already a `[list Scalar <v>]` or `[list Nested <inner>]` tuple.
+#
+# Lives in the shim (plain Tcl) rather than in user-side htcl
+# because:
+#  - One Vivado RPC for the entire fetch + classification +
+#    nesting pipeline, vs. one RPC for the fetch + thousands
+#    of htcl-proc kwargs-envelope invocations per recursive
+#    sub-key for the post-processing.
+#  - CPM5 has ~200 top-level properties, each whose value is
+#    itself a paired-dict with dozens of sub-keys. The htcl-
+#    side post-processing was hitting tens of thousands of
+#    kwargs invocations × envelope overhead → minutes. Native
+#    Tcl inside Vivado does the same work in well under a
+#    second.
+#
+# The structural classifier (`::vw::_lift_value`) mirrors what
+# `lift::lift_recursive` did in user-htcl: pure shape inference,
+# no Vivado lookups. The wrap step (`::vw::_wrap_nested`) walks
+# the plain nested dict once and tags intermediate levels as
+# `Property::Nested(...)`. Leaves already carry their tag from
+# `_lift_value`.
+proc ::vw::props_nested {obj} {
+    set plain [dict create]
+    foreach name [list_property $obj] {
+        set raw [get_property $name $obj]
+        set leaf [::vw::_lift_value $raw]
+        dict set plain {*}[split $name "."] $leaf
+    }
+    return [::vw::_wrap_nested $plain]
+}
+
+# Structural inference on a raw property value. Returns a
+# `[list Scalar v]` or `[list Nested inner]` tuple. Mirror of
+# lift::looks_like_paired_dict + lift::lift_recursive in plain
+# Tcl with no kwargs envelope.
+proc ::vw::_lift_value {raw} {
+    if {[catch {llength $raw} n]} { return [list Scalar $raw] }
+    if {$n == 0 || $n % 2 != 0} { return [list Scalar $raw] }
+    foreach {k _v} $raw {
+        if {![regexp {^[A-Za-z_][A-Za-z0-9_.]*$} $k]} {
+            return [list Scalar $raw]
+        }
+    }
+    set inner [dict create]
+    foreach {k v} $raw {
+        dict set inner $k [::vw::_lift_value $v]
+    }
+    return [list Nested $inner]
+}
+
+# Walk a plain nested Tcl dict and wrap each intermediate
+# level as `[list Nested <inner>]`. A value is a leaf when
+# it's a 2-element list whose head is "Scalar" or "Nested"
+# (the existing Property tuple shape). Anything else is a
+# sub-dict to descend into.
+proc ::vw::_wrap_nested {plain} {
+    set out [dict create]
+    dict for {k v} $plain {
+        if {[llength $v] == 2 \
+            && ([lindex $v 0] eq "Scalar" \
+                || [lindex $v 0] eq "Nested")} {
+            dict set out $k $v
+        } else {
+            dict set out $k [list Nested [::vw::_wrap_nested $v]]
+        }
+    }
+    return $out
 }
 
 # ---------- send_msg_id override ----------

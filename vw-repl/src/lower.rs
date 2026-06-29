@@ -328,6 +328,69 @@ pub fn prepare_with_observer(
         });
     }
 
+    // Eagerly emit the primitive repr prelude (string/int/bool/
+    // unit) so user procs that call e.g. `extern::string::repr`
+    // from inside their bodies see those procs in scope. Without
+    // this, the primitives are only emitted by `wrap_with_repr`
+    // at top-level REPL eval sites, leaving inner uses dead.
+    for proc in vw_htcl::repr::emit_primitive_prelude() {
+        commands.push(PreparedCommand {
+            tcl: proc,
+            origin: Origin {
+                file: None,
+                line: 0,
+                snippet: "<primitive repr>".into(),
+                via: Vec::new(),
+            },
+            expected_return_type: None,
+        });
+    }
+
+    // Eagerly emit monomorphized generic reprs for every declared
+    // type alias whose underlying is a generic
+    // (`dict<…>` / `list<…>`). Without this, a user-written
+    // `T::repr` body that delegates to the compiler-synthesized
+    // monomorphized name (e.g. `Properties::repr` calling
+    // `extern::dict_string_Property::repr`) errors at runtime
+    // when invoked from inside a proc body — `wrap_with_repr`
+    // only emits the monomorphization chain at top-level REPL
+    // eval sites, not for inner uses. By emitting here, the
+    // procs are in scope everywhere within the session.
+    //
+    // Dedup-by-text within the batch prevents shipping the same
+    // monomorphization more than once when two type aliases
+    // resolve to the same underlying generic.
+    let mut emitted_mono_reprs: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for td in type_decl_table.values() {
+        let Some(underlying) = td.underlying.as_ref() else {
+            continue;
+        };
+        if !matches!(underlying, vw_htcl::TypeExpr::Generic { .. }) {
+            continue;
+        }
+        let emission =
+            vw_htcl::repr::emit_repr_with_types(underlying, &type_decl_table);
+        for proc in emission.procs {
+            if !emitted_mono_reprs.insert(proc.clone()) {
+                continue;
+            }
+            commands.push(PreparedCommand {
+                tcl: proc,
+                origin: Origin {
+                    file: None,
+                    line: 0,
+                    snippet: format!(
+                        "<mono repr for {}>",
+                        td.name.as_deref().unwrap_or("?")
+                    ),
+                    via: Vec::new(),
+                },
+                expected_return_type: None,
+            });
+        }
+    }
+
     for stmt in &parsed.document.stmts {
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
@@ -784,6 +847,19 @@ mod tests {
         Session::new()
     }
 
+    /// User-statement commands only — strips the synthetic
+    /// prelude entries (enum reprs, overload dispatchers,
+    /// primitive reprs, monomorphized generic reprs) the
+    /// preparer ships before each batch. Tests that assert
+    /// command count / shape only care about what the user
+    /// wrote, not the prelude scaffolding.
+    fn user_commands(prep: &Prepared) -> Vec<&PreparedCommand> {
+        prep.commands
+            .iter()
+            .filter(|c| !c.origin.snippet.starts_with('<'))
+            .collect()
+    }
+
     #[test]
     fn unknown_keyword_call_inside_bracket_errors() {
         // Mirrors the metroid project.htcl shape: a call to an
@@ -817,17 +893,14 @@ mod tests {
             &empty_session(),
         )
         .unwrap();
-        assert_eq!(prep.commands.len(), 1, "{:?}", prep.commands);
+        let cmds = user_commands(&prep);
+        assert_eq!(cmds.len(), 1, "{:?}", cmds);
         assert!(
-            prep.commands[0].tcl.contains("create_project -name foo"),
+            cmds[0].tcl.contains("create_project -name foo"),
             "{}",
-            prep.commands[0].tcl
+            cmds[0].tcl
         );
-        assert!(
-            !prep.commands[0].tcl.contains("extern::"),
-            "{}",
-            prep.commands[0].tcl
-        );
+        assert!(!cmds[0].tcl.contains("extern::"), "{}", cmds[0].tcl);
     }
 
     #[test]
@@ -876,11 +949,12 @@ mod tests {
         // prior batch's declaration.
         let prep =
             prepare("vivado::current_project\n", dir.path(), &session).unwrap();
-        assert_eq!(prep.commands.len(), 1, "{:?}", prep.commands);
+        let cmds = user_commands(&prep);
+        assert_eq!(cmds.len(), 1, "{:?}", cmds);
         assert!(
-            prep.commands[0].tcl.contains("vivado::current_project"),
+            cmds[0].tcl.contains("vivado::current_project"),
             "{}",
-            prep.commands[0].tcl
+            cmds[0].tcl
         );
         // And nothing in the new batch's source mentions the
         // wrapper body — we never re-parsed the prior batch.
@@ -909,12 +983,13 @@ mod tests {
     fn lowers_plain_proc_call_to_tcl() {
         let dir = tempfile::tempdir().unwrap();
         let prep = prepare("puts hello", dir.path(), &empty_session()).unwrap();
-        assert_eq!(prep.commands.len(), 1);
-        assert!(prep.commands[0].tcl.contains("puts hello"));
+        let cmds = user_commands(&prep);
+        assert_eq!(cmds.len(), 1);
+        assert!(cmds[0].tcl.contains("puts hello"));
         // Input is at line 1 of the buffer.
-        assert_eq!(prep.commands[0].origin.line, 1);
-        assert!(prep.commands[0].origin.file.is_none());
-        assert_eq!(prep.commands[0].origin.snippet, "puts hello");
+        assert_eq!(cmds[0].origin.line, 1);
+        assert!(cmds[0].origin.file.is_none());
+        assert_eq!(cmds[0].origin.snippet, "puts hello");
     }
 
     #[test]
@@ -923,10 +998,11 @@ mod tests {
         let prep =
             prepare("set x 1\nset y 2\nset z 3", dir.path(), &empty_session())
                 .unwrap();
-        assert_eq!(prep.commands.len(), 3);
-        assert_eq!(prep.commands[0].origin.line, 1);
-        assert_eq!(prep.commands[1].origin.line, 2);
-        assert_eq!(prep.commands[2].origin.line, 3);
+        let cmds = user_commands(&prep);
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0].origin.line, 1);
+        assert_eq!(cmds[1].origin.line, 2);
+        assert_eq!(cmds[2].origin.line, 3);
     }
 
     #[test]
@@ -999,8 +1075,9 @@ mod tests {
         .unwrap();
 
         let prep = prepare("src @mid", dir.path(), &empty_session()).unwrap();
-        assert_eq!(prep.commands.len(), 1);
-        let origin = &prep.commands[0].origin;
+        let cmds = user_commands(&prep);
+        assert_eq!(cmds.len(), 1);
+        let origin = &cmds[0].origin;
         // Leaf-most command lives in leaf_dep/module.htcl.
         assert!(
             origin
@@ -1049,14 +1126,15 @@ mod tests {
         // Two commands from the imported file: `proc hello` and the
         // bare `hello` call. Both must carry the imported file's
         // path as origin.
-        assert_eq!(prep.commands.len(), 2);
-        for cmd in &prep.commands {
+        let cmds = user_commands(&prep);
+        assert_eq!(cmds.len(), 2);
+        for cmd in &cmds {
             let file = cmd.origin.file.as_ref().expect("import has file");
             assert!(file.ends_with("dep/module.htcl"), "{:?}", file);
         }
         // Line numbers point into the imported file.
-        assert_eq!(prep.commands[0].origin.line, 1);
-        assert_eq!(prep.commands[1].origin.line, 2);
+        assert_eq!(cmds[0].origin.line, 1);
+        assert_eq!(cmds[1].origin.line, 2);
     }
 
     #[test]
