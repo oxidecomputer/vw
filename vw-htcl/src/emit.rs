@@ -239,6 +239,65 @@ impl_to_htcl_display!(u8, u16, u32, u64, u128, usize);
 impl_to_htcl_display!(f32, f64);
 
 // ---------------------------------------------------------------------------
+// ToTcl — interpolation interface for `quote_tcl!`.
+// ---------------------------------------------------------------------------
+
+/// Produce a [`Word`] for interpolation into emitted *pure Tcl*.
+///
+/// Distinct from [`ToHtcl`] so that compiler intrinsics (the `repr`
+/// codegen module, `kwargs` shim helpers, future ones) which emit
+/// Tcl bodies — not htcl — can carry an independent vocabulary if
+/// they grow it. For now the surface is intentionally identical:
+/// the same Rust value types yield the same [`Word`] under both
+/// traits. The split exists so future Tcl-only forms (typed
+/// `Tcl_Obj` handle quoting, namespaced-proc-name formatting,
+/// etc.) can land on `ToTcl` without changing `ToHtcl`'s contract.
+pub trait ToTcl {
+    fn to_tcl(&self) -> Word;
+}
+
+impl ToTcl for Word {
+    fn to_tcl(&self) -> Word {
+        self.clone()
+    }
+}
+impl ToTcl for str {
+    fn to_tcl(&self) -> Word {
+        Word::lit(self)
+    }
+}
+impl ToTcl for String {
+    fn to_tcl(&self) -> Word {
+        Word::lit(self.clone())
+    }
+}
+impl<T: ToTcl + ?Sized> ToTcl for &T {
+    fn to_tcl(&self) -> Word {
+        (*self).to_tcl()
+    }
+}
+impl ToTcl for bool {
+    fn to_tcl(&self) -> Word {
+        Word::Bare(if *self { "1".into() } else { "0".into() })
+    }
+}
+
+macro_rules! impl_to_tcl_display {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl ToTcl for $t {
+                fn to_tcl(&self) -> Word {
+                    Word::Bare(self.to_string())
+                }
+            }
+        )*
+    };
+}
+impl_to_tcl_display!(i8, i16, i32, i64, i128, isize);
+impl_to_tcl_display!(u8, u16, u32, u64, u128, usize);
+impl_to_tcl_display!(f32, f64);
+
+// ---------------------------------------------------------------------------
 // Emit — Display impls produce well-formed htcl text.
 // ---------------------------------------------------------------------------
 

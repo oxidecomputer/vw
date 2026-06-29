@@ -17,22 +17,34 @@
 //! proc grammar, modules, and dependency-aware imports come in later
 //! phases.
 
+// `quote_tcl!` (and `quote_htcl!`) generate code that names this
+// crate as `::vw_htcl::…`. Within the crate itself that path
+// doesn't resolve by default; this directive aliases the current
+// crate as `vw_htcl` so the macros work uniformly inside and
+// outside of vw-htcl. Standard Rust idiom for self-targeting
+// proc-macros.
+extern crate self as vw_htcl;
+
 pub mod ast;
 pub mod cmdline;
 pub mod complete;
 pub mod doc;
 pub mod emit;
+pub mod enum_parse;
 pub mod goto;
 pub mod hover;
 pub mod line_index;
 pub mod loader;
 pub mod lower;
+pub mod overload;
 pub mod parser;
 pub mod proc_args;
+pub mod repr;
 pub mod scope;
 pub mod signature_help;
 pub mod span;
 pub mod src_path;
+pub mod type_parse;
 pub mod validate;
 
 pub use complete::{complete_at, Completion, CompletionKind};
@@ -44,21 +56,29 @@ pub use loader::{
     SourceRegion,
 };
 pub use lower::{
-    extern_rename_prelude, is_extern_call, lower_command, rewrite_externs,
-    signature_table, ExternRewrite, SignatureTable, EXTERN_PREFIX,
+    extern_rename_prelude, is_extern_call, lower_command,
+    lower_proc_decl_with_name, rewrite_externs, signature_table, ExternRewrite,
+    SignatureTable, EXTERN_PREFIX,
+};
+pub use overload::emit_dispatcher;
+pub use repr::{
+    emit_enum_prelude, emit_primitive_prelude, emit_repr, emit_repr_with_types,
 };
 pub use signature_help::{signature_help_at, SignatureHelp};
 pub use src_path::{
     classify as classify_src_path, PathKind, ResolveError, Resolver,
 };
 pub use validate::{
-    validate, validate_with_signatures, Diagnostic as ValidatorDiagnostic,
-    Severity,
+    build_enum_decl_table, build_signature_table_with_overloads,
+    build_type_decl_table, mangle_specialization, validate,
+    validate_with_all_extras, validate_with_extras, validate_with_signatures,
+    Diagnostic as ValidatorDiagnostic, OverloadTable, Severity,
 };
 
 pub use ast::{
-    Attribute, AttributeValue, Command, CommandKind, Document, Proc, ProcArg,
-    ProcSignature, SrcImport, Stmt, Word, WordPart,
+    Attribute, AttributeValue, Command, CommandKind, Document, EnumDecl,
+    EnumVariant, OverloadInfo, OverloadVariant, Proc, ProcArg, ProcSignature,
+    SrcImport, Stmt, TypeDecl, TypeExpr, Word, WordPart,
 };
 pub use line_index::{LineCol, LineIndex};
 pub use parser::{parse, ParseError, ParseOutput};

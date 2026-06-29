@@ -50,11 +50,20 @@ pub fn parse_man_page(name: &str, text: &str) -> ManPage {
         .map(parse_see_also)
         .unwrap_or_default();
 
+    // The `Returns:` section is optional and usually one or two
+    // lines. Some pages spell it `Return Value` or `Return value`
+    // — accept both.
+    let returns = section_lines(&sections, "Returns")
+        .or_else(|| section_lines(&sections, "Return Value"))
+        .or_else(|| section_lines(&sections, "Return value"))
+        .map(dedent_block);
+
     let mut page = ManPage {
         name: name.to_string(),
         description,
         arguments,
         see_also,
+        returns,
     };
     finalize_arguments(&mut page);
     page

@@ -13,10 +13,25 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    Attribute, AttributeValue, Command, CommandKind, Document, ProcArg,
-    ProcSignature, Stmt, Word, WordPart,
+    Attribute, AttributeValue, Command, CommandKind, Document, EnumDecl,
+    OverloadInfo, OverloadVariant, Proc, ProcArg, ProcSignature, Stmt,
+    TypeDecl, TypeExpr, Word, WordPart,
 };
 use crate::span::Span;
+
+/// Side-table produced alongside the signature table by
+/// [`build_signature_table_with_overloads`]. Maps each public proc
+/// name that resolves to an enum-overload set to its [`OverloadInfo`].
+/// Names not in this map are regular (non-overloaded) procs.
+pub type OverloadTable = HashMap<String, OverloadInfo>;
+
+/// Mangle a specialization's internal name. Public name + variant
+/// short-name, joined with `__`. The leading `__` is reserved (the
+/// validator rejects user procs whose names start with `__`) so
+/// these don't collide with anything user-written.
+pub fn mangle_specialization(public_name: &str, variant: &str) -> String {
+    format!("__{public_name}__{variant}")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -53,13 +68,59 @@ pub fn validate_with_signatures<'doc>(
     source: &str,
     extra: &HashMap<String, &'doc ProcSignature>,
 ) -> Vec<Diagnostic> {
+    validate_with_extras(document, source, extra, &HashMap::new())
+}
+
+/// Full validation entry point: same as [`validate_with_signatures`]
+/// but also takes a pool of newtype declarations from prior session
+/// batches. Lets the REPL drop a `proc bd_cell::repr` in batch N
+/// without re-tripping "type bd_cell missing repr" diagnostics for
+/// the `type bd_cell = string` declaration in batch N-1.
+pub fn validate_with_extras<'doc>(
+    document: &'doc Document,
+    source: &str,
+    extra_sigs: &HashMap<String, &'doc ProcSignature>,
+    extra_types: &HashMap<String, &'doc TypeDecl>,
+) -> Vec<Diagnostic> {
+    validate_with_all_extras(
+        document,
+        source,
+        extra_sigs,
+        extra_types,
+        &HashMap::new(),
+    )
+}
+
+/// Full validation entry point. Accepts a prior-batch pool of
+/// signatures, type declarations, AND enum declarations, so the
+/// REPL can split an `enum E = …` decl across batches from the
+/// procs that dispatch on it.
+pub fn validate_with_all_extras<'doc>(
+    document: &'doc Document,
+    source: &str,
+    extra_sigs: &HashMap<String, &'doc ProcSignature>,
+    extra_types: &HashMap<String, &'doc TypeDecl>,
+    extra_enums: &HashMap<String, &'doc EnumDecl>,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    let mut table = build_signature_table(document, &mut diags);
+    let (mut table, _overloads) =
+        build_signature_table_with_overloads(document, &mut diags);
     // Prior-batch signatures fill in the gaps. The doc's own entries
     // win because `entry().or_insert(...)` is a no-op on present keys.
-    for (name, sig) in extra {
+    for (name, sig) in extra_sigs {
         table.entry(name.clone()).or_insert(*sig);
     }
+    let mut type_table = build_type_decl_table(document, &mut diags);
+    for (name, td) in extra_types {
+        type_table.entry(name.clone()).or_insert(*td);
+    }
+    let mut enum_table = build_enum_decl_table(document, &mut diags);
+    for (name, ed) in extra_enums {
+        enum_table.entry(name.clone()).or_insert(*ed);
+    }
+    validate_type_decl_triplets(&type_table, &table, &mut diags);
+    validate_enum_decls(&enum_table, &type_table, &mut diags);
+    validate_qualified_positions(document, &mut diags);
     validate_stmts(&document.stmts, source, &table, &mut diags);
     diags
 }
@@ -116,15 +177,139 @@ pub fn build_signature_table<'doc>(
     document: &'doc Document,
     diags: &mut Vec<Diagnostic>,
 ) -> HashMap<String, &'doc ProcSignature> {
-    let mut table = HashMap::new();
-    collect_signatures(&document.stmts, "", &mut table, diags);
+    let (table, _overloads) =
+        build_signature_table_with_overloads(document, diags);
     table
 }
 
-fn collect_signatures<'doc>(
+/// Same as [`build_signature_table`] but also returns the
+/// [`OverloadTable`] side-map. Callers that need to know whether a
+/// given proc name resolves through enum-overload dispatch (codegen,
+/// hover, signature help) consult this.
+pub fn build_signature_table_with_overloads<'doc>(
+    document: &'doc Document,
+    diags: &mut Vec<Diagnostic>,
+) -> (HashMap<String, &'doc ProcSignature>, OverloadTable) {
+    // First pass: collect every proc decl per qualified name,
+    // preserving order so a "first wins" / "last wins" choice is
+    // unambiguous when we have to make one. Multi-decl entries are
+    // candidate overload sets; single-decl entries are normal
+    // procs.
+    let mut multi: HashMap<String, Vec<(&'doc Proc, &'doc ProcSignature)>> =
+        HashMap::new();
+    collect_signatures_multi(&document.stmts, "", &mut multi, diags);
+
+    let mut table: HashMap<String, &'doc ProcSignature> = HashMap::new();
+    let mut overloads: OverloadTable = HashMap::new();
+
+    for (qualified, decls) in multi {
+        match decls.len() {
+            0 => { /* impossible */ }
+            1 => {
+                let (proc, sig) = decls[0];
+                check_reserved_proc_name(&qualified, proc.name_span, diags);
+                table.insert(qualified, sig);
+            }
+            _ => {
+                // Multi-decl: classify as enum-overload OR emit
+                // hard error for ad-hoc overloading.
+                match classify_overload_set(&qualified, &decls, diags) {
+                    Some(info) => {
+                        // Each specialization registers under its
+                        // mangled name so analyzer drill-down + the
+                        // dispatcher's runtime switch can find it.
+                        for v in &info.variants {
+                            // Find the decl whose first arg is this
+                            // variant. We computed the mangled name
+                            // from it during classify, so the order
+                            // matches by construction.
+                            for (_proc, sig) in &decls {
+                                let Some(first) = sig.args.first() else {
+                                    continue;
+                                };
+                                if matches!(
+                                    &first.type_annotation,
+                                    Some(TypeExpr::Qualified { variant, .. })
+                                        if variant == &v.variant_name
+                                ) {
+                                    // Mangled names are compiler-
+                                    // generated — they're allowed to
+                                    // start with `__` (that's the
+                                    // whole point). Skip the
+                                    // reserved-name check here.
+                                    table.insert(
+                                        v.mangled_proc_name.clone(),
+                                        sig,
+                                    );
+                                }
+                            }
+                        }
+                        // Public name resolves to the first overload's
+                        // sig as a representative. Analyzer / callers
+                        // that want the "true" public interface
+                        // consult `overloads`.
+                        let (proc, sig) = decls[0];
+                        check_reserved_proc_name(
+                            &qualified,
+                            proc.name_span,
+                            diags,
+                        );
+                        table.insert(qualified.clone(), sig);
+                        overloads.insert(qualified, info);
+                    }
+                    None => {
+                        // classify_overload_set already emitted the
+                        // diagnostic; for table consistency, fall
+                        // back to "last wins" so downstream
+                        // validation keeps working. Check the
+                        // reserved prefix on each.
+                        let (proc, sig) = *decls.last().unwrap();
+                        check_reserved_proc_name(
+                            &qualified,
+                            proc.name_span,
+                            diags,
+                        );
+                        table.insert(qualified, sig);
+                    }
+                }
+            }
+        }
+    }
+
+    (table, overloads)
+}
+
+/// User procs whose qualified name starts with `__` would collide
+/// with the compiler's overload-specialization mangling
+/// (`__<public>__<Variant>`). Reject them up front.
+fn check_reserved_proc_name(
+    qualified: &str,
+    name_span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // Look at the last segment after the final `::`. Tcl's
+    // namespace separator is part of the qualified name, so e.g.
+    // `vivado_cmd::__foo` has its "leaf" name as `__foo` — the
+    // collision risk is on the leaf, not the prefix.
+    let leaf = qualified.rsplit("::").next().unwrap_or(qualified);
+    if leaf.starts_with("__") {
+        diags.push(Diagnostic {
+            severity: Severity::Error,
+            message: format!(
+                "proc name `{qualified}` is reserved: names starting with \
+                 `__` are used by the compiler for overload-specialization \
+                 mangling (e.g. `__handle_prop__Scalar`). Rename to avoid \
+                 collisions."
+            ),
+            span: name_span,
+        });
+    }
+}
+
+fn collect_signatures_multi<'doc>(
     stmts: &'doc [Stmt],
     prefix: &str,
-    table: &mut HashMap<String, &'doc ProcSignature>,
+    multi: &mut HashMap<String, Vec<(&'doc Proc, &'doc ProcSignature)>>,
     diags: &mut Vec<Diagnostic>,
 ) {
     for stmt in stmts {
@@ -137,17 +322,35 @@ fn collect_signatures<'doc>(
                 let Some(sig) = proc.signature.as_ref() else {
                     continue;
                 };
-                let qualified = qualify(prefix, name);
-                if table.insert(qualified.clone(), sig).is_some() {
+                // v1 restriction: enum-overloaded procs must be
+                // declared at the top level. Inside a `namespace
+                // eval` block, the REPL's batch-prepare layer
+                // doesn't re-route to the mangled-name + dispatcher
+                // pipeline, so an overload arm inside a namespace
+                // would silently lose its dispatch semantics.
+                // Detect this here so the user gets a clear error
+                // instead of a confused runtime behavior.
+                let is_qualified_first = sig
+                    .args
+                    .first()
+                    .and_then(|a| a.type_annotation.as_ref())
+                    .map(|t| matches!(t, TypeExpr::Qualified { .. }))
+                    .unwrap_or(false);
+                if is_qualified_first && !prefix.is_empty() {
                     diags.push(Diagnostic {
-                        severity: Severity::Warning,
+                        severity: Severity::Error,
                         message: format!(
-                            "duplicate definition of proc {qualified}; \
-                             later definition wins"
+                            "overloaded proc `{name}` is declared inside \
+                             `namespace eval {prefix}` — v1 enum-overloads \
+                             must be declared at the top level. Move the \
+                             overload arms out of the namespace block."
                         ),
                         span: proc.name_span,
                     });
+                    continue;
                 }
+                let qualified = qualify(prefix, name);
+                multi.entry(qualified).or_default().push((proc, sig));
             }
             CommandKind::NamespaceEval(ns) => {
                 let Some(name) = ns.name.as_deref() else {
@@ -171,9 +374,626 @@ fn collect_signatures<'doc>(
                     continue;
                 }
                 let nested = qualify(prefix, name);
-                collect_signatures(&ns.body, &nested, table, diags);
+                collect_signatures_multi(&ns.body, &nested, multi, diags);
             }
             _ => {}
+        }
+    }
+}
+
+/// Classify a multi-decl proc-name set. Returns `Some(OverloadInfo)`
+/// if every member's first arg is a distinct variant of the same
+/// enum AND the tail args / return type agree; returns `None` and
+/// emits a diagnostic if it's not a valid overload (ad-hoc
+/// overloading, missing variant, tail mismatch, etc.).
+fn classify_overload_set<'doc>(
+    public_name: &str,
+    decls: &[(&'doc Proc, &'doc ProcSignature)],
+    diags: &mut Vec<Diagnostic>,
+) -> Option<OverloadInfo> {
+    // Each decl's first arg must be `Qualified { namespace: E, variant: V }`.
+    // Collect (enum_name, variant_name, dispatch_arg_span) per decl.
+    let mut dispatch_infos: Vec<(String, String, Span, &Proc, &ProcSignature)> =
+        Vec::with_capacity(decls.len());
+    for (proc, sig) in decls {
+        let Some(first) = sig.args.first() else {
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!(
+                    "proc `{public_name}` is declared multiple times; for \
+                     this to be a valid enum-overload set, every \
+                     declaration's first argument must be annotated with \
+                     a qualified variant type like `E::V`. This one has \
+                     no arguments."
+                ),
+                span: proc.name_span,
+            });
+            return None;
+        };
+        match &first.type_annotation {
+            Some(TypeExpr::Qualified {
+                namespace, variant, ..
+            }) => {
+                dispatch_infos.push((
+                    namespace.clone(),
+                    variant.clone(),
+                    first.name_span,
+                    proc,
+                    sig,
+                ));
+            }
+            _ => {
+                diags.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "proc `{public_name}` is declared multiple times \
+                         with first-arg types that aren't all variants \
+                         of a common enum; ad-hoc overloading on arbitrary \
+                         types is not supported. Use an enum or rename \
+                         one of the procs."
+                    ),
+                    span: first.name_span,
+                });
+                return None;
+            }
+        }
+    }
+    // All overloads must dispatch on the same enum.
+    let enum_name = dispatch_infos[0].0.clone();
+    for (ns, _, sp, _, _) in &dispatch_infos[1..] {
+        if ns != &enum_name {
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!(
+                    "overload set for proc `{public_name}` mixes enums: \
+                     `{enum_name}` and `{ns}`. All overloads in a set \
+                     must dispatch on the same enum."
+                ),
+                span: *sp,
+            });
+            return None;
+        }
+    }
+    // Variants must be distinct.
+    {
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for (_, v, sp, _, _) in &dispatch_infos {
+            if !seen.insert(v.as_str()) {
+                diags.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "overload set for proc `{public_name}` has two \
+                         arms dispatching on the same variant \
+                         `{enum_name}::{v}`. Each variant must have at \
+                         most one arm."
+                    ),
+                    span: *sp,
+                });
+                return None;
+            }
+        }
+    }
+    // Tail-arg agreement: v1 restricts every arm to exactly one
+    // arg (the dispatched variant). Multi-arg overloads are
+    // future work — kwargs / specialization-binding interactions
+    // get hairy and the property-display motivating case doesn't
+    // need them.
+    let (_, _, _, first_proc, first_sig) = &dispatch_infos[0];
+    if first_sig.args.len() != 1 {
+        diags.push(Diagnostic {
+            severity: Severity::Error,
+            message: format!(
+                "overload arm `{public_name}` declares {} args; v1 \
+                 enum-overloads support exactly ONE arg (the dispatched \
+                 variant). Additional tail args are future work — model \
+                 the tail as a payload field on the enum variant for now.",
+                first_sig.args.len()
+            ),
+            span: first_sig.span,
+        });
+        return None;
+    }
+    for (ns, v, _, _, sig) in &dispatch_infos[1..] {
+        if sig.args.len() != 1 {
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!(
+                    "overload arm `{public_name}` for `{ns}::{v}` declares \
+                     {} args; v1 enum-overloads support exactly ONE arg \
+                     (the dispatched variant).",
+                    sig.args.len()
+                ),
+                span: sig.span,
+            });
+            return None;
+        }
+    }
+    // Return-type agreement: every annotated return type must match.
+    // Mixed annotated/unannotated → error.
+    let first_ret = first_sig.return_type.as_ref();
+    for (ns, v, _, _, sig) in &dispatch_infos[1..] {
+        match (first_ret, sig.return_type.as_ref()) {
+            (None, None) => {}
+            (Some(a), Some(b)) if types_match(a, b) => {}
+            _ => {
+                diags.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "overload arm `{public_name}` for `{ns}::{v}` \
+                         declares a different return type than the other \
+                         arms. All arms must agree on the return type \
+                         (annotate every arm with the same type, or none)."
+                    ),
+                    span: sig.span,
+                });
+                return None;
+            }
+        }
+    }
+    // Arg-name agreement: every arm must use the same first-arg
+    // name so the dispatcher can pass the payload via kwargs as
+    // `-<shared_name> <payload>`. Cheaper than per-arm dispatch
+    // tracking and matches user convention (everyone writes `v`).
+    let dispatch_arg_name = first_sig.args[0].name.clone();
+    for (ns, v, _, _, sig) in &dispatch_infos[1..] {
+        if sig.args[0].name != dispatch_arg_name {
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!(
+                    "overload arm `{public_name}` for `{ns}::{v}` names its \
+                     dispatch arg `{}`; other arms name it `{dispatch_arg_name}`. \
+                     All arms must use the same arg name (convention: `v`).",
+                    sig.args[0].name
+                ),
+                span: sig.args[0].name_span,
+            });
+            return None;
+        }
+    }
+    // Build the OverloadInfo. Variant order matches source order
+    // of the overloads.
+    let variants = dispatch_infos
+        .iter()
+        .map(|(_, v, sp, _, _)| OverloadVariant {
+            variant_name: v.clone(),
+            mangled_proc_name: mangle_specialization(public_name, v),
+            dispatch_arg_span: *sp,
+        })
+        .collect();
+    Some(OverloadInfo {
+        public_name: public_name.to_string(),
+        enum_name,
+        dispatch_arg_name,
+        variants,
+        anchor_span: first_proc.name_span,
+    })
+}
+
+// `tails_match` / `attr_values_equal` lived here for the multi-arg
+// overload tail-agreement check. v1 restricts overloads to a single
+// arg (see `classify_overload_set`), so we don't compare tails. The
+// helpers are kept as a record in git history; restore when adding
+// multi-arg overloads.
+
+/// Collect every `type NAME = UNDERLYING` declaration in `document`,
+/// qualified by enclosing `namespace eval` prefix (so a `type widget`
+/// declared inside `namespace eval foo {}` registers as `foo::widget`,
+/// matching how procs already qualify). Duplicate declarations emit
+/// a warning and the later one wins — same shape as duplicate-proc
+/// handling above.
+pub fn build_type_decl_table<'doc>(
+    document: &'doc Document,
+    diags: &mut Vec<Diagnostic>,
+) -> HashMap<String, &'doc TypeDecl> {
+    let mut table = HashMap::new();
+    collect_type_decls(&document.stmts, "", &mut table, diags);
+    table
+}
+
+fn collect_type_decls<'doc>(
+    stmts: &'doc [Stmt],
+    prefix: &str,
+    table: &mut HashMap<String, &'doc TypeDecl>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        match &cmd.kind {
+            CommandKind::TypeDecl(td) => {
+                let Some(name) = td.name.as_deref() else {
+                    continue;
+                };
+                let qualified = qualify(prefix, name);
+                if table.insert(qualified.clone(), td).is_some() {
+                    diags.push(Diagnostic {
+                        severity: Severity::Warning,
+                        message: format!(
+                            "duplicate definition of type {qualified}; \
+                             later definition wins"
+                        ),
+                        span: td.name_span,
+                    });
+                }
+            }
+            CommandKind::NamespaceEval(ns) => {
+                let Some(name) = ns.name.as_deref() else {
+                    continue;
+                };
+                if name == "extern" {
+                    continue;
+                }
+                let nested = qualify(prefix, name);
+                collect_type_decls(&ns.body, &nested, table, diags);
+            }
+            CommandKind::Proc(proc) => {
+                // Nested type decls inside proc bodies are unusual
+                // but not illegal — walk them so they register.
+                collect_type_decls(&proc.body, prefix, table, diags);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Mirror of [`build_type_decl_table`] for `enum NAME = { ... }`
+/// declarations. Duplicate enums warn and the later one wins —
+/// same shape as type-decl handling.
+pub fn build_enum_decl_table<'doc>(
+    document: &'doc Document,
+    diags: &mut Vec<Diagnostic>,
+) -> HashMap<String, &'doc EnumDecl> {
+    let mut table = HashMap::new();
+    collect_enum_decls(&document.stmts, "", &mut table, diags);
+    table
+}
+
+fn collect_enum_decls<'doc>(
+    stmts: &'doc [Stmt],
+    prefix: &str,
+    table: &mut HashMap<String, &'doc EnumDecl>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        match &cmd.kind {
+            CommandKind::EnumDecl(ed) => {
+                let Some(name) = ed.name.as_deref() else {
+                    continue;
+                };
+                let qualified = qualify(prefix, name);
+                if table.insert(qualified.clone(), ed).is_some() {
+                    diags.push(Diagnostic {
+                        severity: Severity::Warning,
+                        message: format!(
+                            "duplicate definition of enum {qualified}; \
+                             later definition wins"
+                        ),
+                        span: ed.name_span,
+                    });
+                }
+            }
+            CommandKind::NamespaceEval(ns) => {
+                let Some(name) = ns.name.as_deref() else {
+                    continue;
+                };
+                if name == "extern" {
+                    continue;
+                }
+                let nested = qualify(prefix, name);
+                collect_enum_decls(&ns.body, &nested, table, diags);
+            }
+            CommandKind::Proc(proc) => {
+                collect_enum_decls(&proc.body, prefix, table, diags);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Per-enum sanity checks. v1: variants must have distinct names;
+/// payload types are syntactically valid (already enforced by
+/// `enum_parse`); a payload that references an unknown user type
+/// is a soft warning for now (could be defined cross-batch).
+fn validate_enum_decls(
+    enum_table: &HashMap<String, &EnumDecl>,
+    _type_table: &HashMap<String, &TypeDecl>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for (qualified, ed) in enum_table {
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for v in &ed.variants {
+            if !seen.insert(v.name.as_str()) {
+                diags.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "enum `{qualified}` declares variant `{}` more than \
+                         once. Each variant name must be unique within an \
+                         enum.",
+                        v.name
+                    ),
+                    span: v.name_span,
+                });
+            }
+        }
+    }
+}
+
+/// Walk the document and reject [`TypeExpr::Qualified`] anywhere
+/// other than as a proc's first-arg type annotation. Qualified
+/// types (`E::V`) are only meaningful as overload-dispatch
+/// indicators; they're nonsense as return types, generic args,
+/// nested type positions, or any non-first-arg slot.
+fn validate_qualified_positions(
+    document: &Document,
+    diags: &mut Vec<Diagnostic>,
+) {
+    fn walk_stmts(stmts: &[Stmt], diags: &mut Vec<Diagnostic>) {
+        for stmt in stmts {
+            let Stmt::Command(cmd) = stmt else { continue };
+            match &cmd.kind {
+                CommandKind::Proc(proc) => {
+                    if let Some(sig) = proc.signature.as_ref() {
+                        for (i, arg) in sig.args.iter().enumerate() {
+                            if let Some(ty) = arg.type_annotation.as_ref() {
+                                // The first arg may be Qualified;
+                                // tail args may NOT.
+                                let allow_qualified = i == 0;
+                                reject_nested_qualified(
+                                    ty,
+                                    allow_qualified,
+                                    diags,
+                                );
+                            }
+                        }
+                        if let Some(ret) = sig.return_type.as_ref() {
+                            reject_nested_qualified(ret, false, diags);
+                        }
+                    }
+                    walk_stmts(&proc.body, diags);
+                }
+                CommandKind::NamespaceEval(ns) => {
+                    walk_stmts(&ns.body, diags);
+                }
+                CommandKind::TypeDecl(td) => {
+                    if let Some(ty) = td.underlying.as_ref() {
+                        reject_nested_qualified(ty, false, diags);
+                    }
+                }
+                CommandKind::EnumDecl(ed) => {
+                    for v in &ed.variants {
+                        if let Some(ty) = v.payload.as_ref() {
+                            reject_nested_qualified(ty, false, diags);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk_stmts(&document.stmts, diags);
+}
+
+fn reject_nested_qualified(
+    ty: &TypeExpr,
+    allow_top_qualified: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match ty {
+        TypeExpr::Named { .. } => {}
+        TypeExpr::Generic { args, .. } => {
+            // Inside a generic, nested Qualified is never allowed.
+            for a in args {
+                reject_nested_qualified(a, false, diags);
+            }
+        }
+        TypeExpr::Qualified {
+            namespace,
+            variant,
+            span,
+            ..
+        } => {
+            if !allow_top_qualified {
+                diags.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "qualified type `{namespace}::{variant}` is only \
+                         legal as the first-argument type annotation on an \
+                         overloaded handler proc. It can't appear as a \
+                         return type, generic argument, type-decl \
+                         underlying, or enum-variant payload."
+                    ),
+                    span: *span,
+                });
+            }
+        }
+    }
+}
+
+/// For each newtype declaration `T`, verify the user provided the
+/// required `T::repr`, `T::from`, `T::to` procs with the correct
+/// shapes:
+///
+/// - `T::repr` takes one arg named `v` of type `T` (or untyped),
+///   returns `string` (or untyped).
+/// - `T::from` takes one arg named `v` of type `<underlying>` (or
+///   untyped), returns `T` (or untyped).
+/// - `T::to` takes one arg named `v` of type `T` (or untyped),
+///   returns `<underlying>` (or untyped).
+///
+/// Type annotations are *optional* on these procs — an untyped
+/// arg or return slot is accepted as a "trust the user" form
+/// (some procs ship pre-arg-types and were authored before the
+/// shape check existed). The arg COUNT and NAME (`v`) are
+/// always enforced; the type slots get a stricter check only
+/// when the user opted in by annotating them.
+fn validate_type_decl_triplets(
+    type_table: &HashMap<String, &TypeDecl>,
+    sig_table: &HashMap<String, &ProcSignature>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::ast::TypeExpr;
+    for (qualified_name, td) in type_table {
+        let underlying = td.underlying.as_ref();
+        let slots: &[(&str, Option<&TypeExpr>, Option<&str>)] = &[
+            // (slot, arg type expected, return type expected as
+            // type-name).  We pass the type-name via Option<&str>
+            // and compare with TypeExpr::Named's name; that's
+            // sufficient for the v1 set (all involved types are
+            // either named primitives or named newtypes; no
+            // generics in repr/from/to signatures).
+            (
+                "repr",
+                // arg should be T
+                Some(&named_lit(qualified_name)),
+                Some("string"),
+            ),
+            (
+                "from",
+                // arg should be <underlying>
+                underlying,
+                // return should be T
+                Some(qualified_name.as_str()),
+            ),
+            (
+                "to",
+                // arg should be T
+                Some(&named_lit(qualified_name)),
+                // return should be <underlying>
+                underlying.and_then(|u| match u {
+                    TypeExpr::Named { name, .. } => Some(name.as_str()),
+                    _ => None,
+                }),
+            ),
+        ];
+        for (slot, expected_arg, expected_ret) in slots {
+            let want = format!("{qualified_name}::{slot}");
+            let Some(sig) = sig_table.get(&want) else {
+                diags.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "newtype `{qualified_name}` is missing required \
+                         proc `{qualified_name}::{slot}` (see \
+                         docs/htcl-return-types.md)."
+                    ),
+                    span: td.name_span,
+                });
+                continue;
+            };
+            // Arg count + name.
+            if sig.args.len() != 1 || sig.args[0].name != "v" {
+                diags.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "newtype proc `{qualified_name}::{slot}` must \
+                         take exactly one argument named `v`"
+                    ),
+                    span: sig.span,
+                });
+                continue;
+            }
+            // Arg type — only checked when the user annotated it.
+            if let (Some(actual), Some(expected)) =
+                (sig.args[0].type_annotation.as_ref(), expected_arg)
+            {
+                if !types_match(actual, expected) {
+                    diags.push(Diagnostic {
+                        severity: Severity::Error,
+                        message: format!(
+                            "newtype proc `{qualified_name}::{slot}`: \
+                             arg `v` is declared `{}` but should be \
+                             `{}`",
+                            render_type_inline(actual),
+                            render_type_inline(expected)
+                        ),
+                        span: sig.args[0].name_span,
+                    });
+                }
+            }
+            // Return type — only checked when the user annotated it
+            // and we know what to compare against.
+            if let (Some(actual), Some(want_name)) =
+                (sig.return_type.as_ref(), expected_ret)
+            {
+                let actual_name = match actual {
+                    TypeExpr::Named { name, .. } => name.as_str(),
+                    TypeExpr::Generic { name, .. } => name.as_str(),
+                    // A qualified type like `E::V` shouldn't appear
+                    // as a newtype's return type — that's caught by
+                    // the dedicated Qualified-position validator
+                    // step. If it slips through, render the
+                    // namespace name so the user sees something
+                    // meaningful in the diagnostic.
+                    TypeExpr::Qualified { namespace, .. } => namespace.as_str(),
+                };
+                if actual_name != *want_name {
+                    diags.push(Diagnostic {
+                        severity: Severity::Error,
+                        message: format!(
+                            "newtype proc `{qualified_name}::{slot}` \
+                             returns `{}` but should return `{want_name}`",
+                            render_type_inline(actual)
+                        ),
+                        span: sig.span,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Build a one-shot `TypeExpr::Named` literal for comparison
+/// purposes. The span is meaningless here — we only ever
+/// inspect the name.
+fn named_lit(name: &str) -> crate::ast::TypeExpr {
+    crate::ast::TypeExpr::Named {
+        name: name.to_string(),
+        span: Span::new(0, 0),
+    }
+}
+
+/// Structural equality on type expressions, ignoring spans.
+fn types_match(a: &crate::ast::TypeExpr, b: &crate::ast::TypeExpr) -> bool {
+    use crate::ast::TypeExpr;
+    match (a, b) {
+        (
+            TypeExpr::Named { name: an, .. },
+            TypeExpr::Named { name: bn, .. },
+        ) => an == bn,
+        (
+            TypeExpr::Generic {
+                name: an, args: aa, ..
+            },
+            TypeExpr::Generic {
+                name: bn, args: ba, ..
+            },
+        ) => {
+            an == bn
+                && aa.len() == ba.len()
+                && aa.iter().zip(ba.iter()).all(|(x, y)| types_match(x, y))
+        }
+        _ => false,
+    }
+}
+
+/// Render a type expression for inclusion in a diagnostic message.
+/// Mirrors `vw-analyzer/src/htcl_backend.rs::render_type` — kept
+/// in sync by convention since the analyzer can't depend on
+/// validate.rs.
+fn render_type_inline(ty: &crate::ast::TypeExpr) -> String {
+    use crate::ast::TypeExpr;
+    match ty {
+        TypeExpr::Named { name, .. } => name.clone(),
+        TypeExpr::Generic { name, args, .. } => {
+            let inner: Vec<String> =
+                args.iter().map(render_type_inline).collect();
+            format!("{name}<{}>", inner.join(","))
+        }
+        TypeExpr::Qualified {
+            namespace, variant, ..
+        } => {
+            format!("{namespace}::{variant}")
         }
     }
 }
@@ -285,7 +1105,9 @@ fn validate_command(
         CommandKind::Proc(_)
         | CommandKind::Set
         | CommandKind::Src(_)
-        | CommandKind::NamespaceEval(_) => {
+        | CommandKind::NamespaceEval(_)
+        | CommandKind::TypeDecl(_)
+        | CommandKind::EnumDecl(_) => {
             return;
         }
     };
@@ -1239,5 +2061,397 @@ namespace eval vivado {
         // errors — see `unknown_keyword_call_is_an_error`.
         let src = "axis_interface tkeep_yes 1\n";
         assert!(diags(src).is_empty());
+    }
+
+    // --- type-decl triplet enforcement (step 1b) ----------------
+
+    /// Build a valid type+triplet block — bd_cell with all three
+    /// procs present so the validator should accept it.
+    fn full_triplet_src() -> &'static str {
+        "type bd_cell = string\n\
+         proc bd_cell::repr {v} { return $v }\n\
+         proc bd_cell::from {v} { return $v }\n\
+         proc bd_cell::to {v} { return $v }\n"
+    }
+
+    #[test]
+    fn type_decl_with_full_triplet_passes() {
+        let src = full_triplet_src();
+        let d = diags(src);
+        assert!(
+            d.iter().all(|d| !d.message.contains("missing required")),
+            "unexpected diagnostics: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn type_decl_missing_repr_emits_diagnostic() {
+        let src = "type bd_cell = string\n\
+                   proc bd_cell::from {v} { return $v }\n\
+                   proc bd_cell::to {v} { return $v }\n";
+        let d = diags(src);
+        let hit = d
+            .iter()
+            .find(|d| d.message.contains("missing required"))
+            .expect("expected diagnostic");
+        assert!(hit.message.contains("bd_cell::repr"), "{:?}", hit);
+        assert_eq!(hit.severity, Severity::Error);
+    }
+
+    #[test]
+    fn type_decl_missing_all_three_lists_each() {
+        let src = "type widget = string\n";
+        let d = diags(src);
+        // Now each missing slot emits its own diagnostic, so we
+        // assert each one shows up separately.
+        let missing: Vec<&str> = d
+            .iter()
+            .filter(|d| d.message.contains("missing required proc"))
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(missing.iter().any(|m| m.contains("widget::repr")));
+        assert!(missing.iter().any(|m| m.contains("widget::from")));
+        assert!(missing.iter().any(|m| m.contains("widget::to")));
+    }
+
+    #[test]
+    fn type_decl_wrong_arg_type_emits_diagnostic() {
+        // Annotate the v arg with the wrong type and expect a
+        // shape-mismatch diagnostic.
+        let src = "type widget = string\n\
+                   proc widget::repr {v: int} string { return $v }\n\
+                   proc widget::from {v: string} widget { return $v }\n\
+                   proc widget::to {v: widget} string { return $v }\n";
+        let d = diags(src);
+        let hit = d
+            .iter()
+            .find(|d| d.message.contains("widget::repr"))
+            .expect("expected mismatch diagnostic");
+        assert!(
+            hit.message.contains("`int`") || hit.message.contains("int"),
+            "{:?}",
+            hit
+        );
+        assert!(hit.message.contains("widget"), "{:?}", hit);
+    }
+
+    #[test]
+    fn type_decl_wrong_return_type_emits_diagnostic() {
+        let src = "type widget = string\n\
+                   proc widget::repr {v: widget} int { return 0 }\n\
+                   proc widget::from {v: string} widget { return $v }\n\
+                   proc widget::to {v: widget} string { return $v }\n";
+        let d = diags(src);
+        let hit = d
+            .iter()
+            .find(|d| d.message.contains("returns"))
+            .expect("expected return-type mismatch diagnostic");
+        assert!(hit.message.contains("widget::repr"), "{:?}", hit);
+        assert!(hit.message.contains("string"), "{:?}", hit);
+    }
+
+    #[test]
+    fn type_decl_unannotated_triplet_still_passes() {
+        // Existence-only check stays a fallback when the user
+        // hasn't annotated the procs yet.
+        let src = "type widget = string\n\
+                   proc widget::repr {v} { return $v }\n\
+                   proc widget::from {v} { return $v }\n\
+                   proc widget::to {v} { return $v }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|d| d.severity != Severity::Error),
+            "got: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn type_decl_in_namespace_qualifies() {
+        let src = "namespace eval x {\n\
+                     type widget = string\n\
+                   }\n";
+        let d = diags(src);
+        let hit = d
+            .iter()
+            .find(|d| d.message.contains("missing required"))
+            .expect("expected diagnostic");
+        // The namespace-qualified name should appear in the message.
+        assert!(hit.message.contains("x::widget"), "{:?}", hit);
+        assert!(hit.message.contains("x::widget::repr"));
+    }
+
+    #[test]
+    fn prior_batch_procs_satisfy_current_batch_type_decl() {
+        // Batch 1: just declares the procs.
+        let prior_src = "proc bd_cell::repr {v} { return $v }\n\
+                         proc bd_cell::from {v} { return $v }\n\
+                         proc bd_cell::to {v} { return $v }\n";
+        let prior = parse(prior_src);
+        let mut prior_diags = Vec::new();
+        let prior_sigs =
+            build_signature_table(&prior.document, &mut prior_diags);
+        // Batch 2: declares the type — should NOT complain because
+        // the procs live in the prior batch's signature table.
+        let new_src = "type bd_cell = string\n";
+        let new_parsed = parse(new_src);
+        let diags = validate_with_signatures(
+            &new_parsed.document,
+            new_src,
+            &prior_sigs,
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|d| !d.message.contains("missing required")),
+            "got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn prior_batch_type_decl_does_not_re_trigger_in_current_batch() {
+        // Batch 1: declares the type, no procs yet (would error
+        // in isolation).
+        let prior_src = "type bd_cell = string\n";
+        let prior = parse(prior_src);
+        let mut prior_diags = Vec::new();
+        let prior_types =
+            build_type_decl_table(&prior.document, &mut prior_diags);
+        // Batch 2: adds the procs. The type is in `extra_types`,
+        // and the procs are in batch 2's signature table. Putting
+        // them together via validate_with_extras should pass.
+        let new_src = "proc bd_cell::repr {v} { return $v }\n\
+                       proc bd_cell::from {v} { return $v }\n\
+                       proc bd_cell::to {v} { return $v }\n";
+        let new_parsed = parse(new_src);
+        let empty_sigs: HashMap<String, &ProcSignature> = HashMap::new();
+        let d = validate_with_extras(
+            &new_parsed.document,
+            new_src,
+            &empty_sigs,
+            &prior_types,
+        );
+        assert!(
+            d.iter().all(|d| !d.message.contains("missing required")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    // --- enum + overload classifier (step 3) ----------------------
+
+    #[test]
+    fn enum_decl_with_unique_variants_passes() {
+        let src = "enum Direction = {\n  North\n  South\n  East\n  West\n}\n";
+        let d = diags(src);
+        assert!(d.is_empty(), "got: {:?}", d);
+    }
+
+    #[test]
+    fn enum_decl_with_duplicate_variants_errors() {
+        let src = "enum Bad = {\n  A: int\n  B: string\n  A: bool\n}\n";
+        let d = diags(src);
+        let hit = d
+            .iter()
+            .find(|d| {
+                d.severity == Severity::Error
+                    && d.message.contains("variant `A`")
+            })
+            .expect("expected duplicate-variant diagnostic");
+        assert!(hit.message.contains("more than once"), "{:?}", hit);
+    }
+
+    #[test]
+    fn overload_set_with_exhaustive_arms_classifies() {
+        let src = "\
+enum Property = {\n  Scalar: string\n  Nested: int\n}\n\
+proc handle {v: Property::Scalar} { return $v }\n\
+proc handle {v: Property::Nested} { return $v }\n";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut diags = Vec::new();
+        let (sig_table, overloads) =
+            build_signature_table_with_overloads(&parsed.document, &mut diags);
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "got: {:?}",
+            diags
+        );
+        let info = overloads.get("handle").expect("overload info for `handle`");
+        assert_eq!(info.enum_name, "Property");
+        assert_eq!(info.variants.len(), 2);
+        let names: Vec<&str> = info
+            .variants
+            .iter()
+            .map(|v| v.variant_name.as_str())
+            .collect();
+        assert!(names.contains(&"Scalar"));
+        assert!(names.contains(&"Nested"));
+        // Public-name entry exists in the sig table.
+        assert!(sig_table.contains_key("handle"));
+        // Specializations also register under mangled names so
+        // analyzer drill-down works.
+        assert!(sig_table.contains_key("__handle__Scalar"));
+        assert!(sig_table.contains_key("__handle__Nested"));
+    }
+
+    #[test]
+    fn ad_hoc_overload_emits_hard_error() {
+        let src = "\
+proc foo {v: int} { return $v }\n\
+proc foo {v: string} { return $v }\n";
+        let d = diags(src);
+        let hit = d
+            .iter()
+            .find(|d| {
+                d.severity == Severity::Error
+                    && d.message.contains("ad-hoc overloading")
+            })
+            .expect("expected ad-hoc-overloading diagnostic");
+        assert!(hit.message.contains("foo"), "{:?}", hit);
+    }
+
+    #[test]
+    fn overload_with_mismatched_enums_errors() {
+        let src = "\
+enum A = {\n  X\n  Y\n}\n\
+enum B = {\n  P\n  Q\n}\n\
+proc foo {v: A::X} { }\n\
+proc foo {v: B::P} { }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("mixes enums")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn overload_with_duplicate_variant_errors() {
+        let src = "\
+enum E = {\n  A: int\n  B: int\n}\n\
+proc foo {v: E::A} { }\n\
+proc foo {v: E::A} { }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("two")
+                && d.message.contains("E::A")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn overload_with_extra_args_errors() {
+        // v1 restricts overloaded procs to exactly one arg (the
+        // dispatched variant). Extra tail args trip the arity
+        // check.
+        let src = "\
+enum E = {\n  A: int\n  B: int\n}\n\
+proc foo {\n  v: E::A\n  x\n} { }\n\
+proc foo {\n  v: E::B\n  y\n} { }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("exactly ONE arg")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn overload_with_mismatched_return_type_errors() {
+        let src = "\
+enum E = {\n  A: int\n  B: int\n}\n\
+proc foo {v: E::A} int { return 0 }\n\
+proc foo {v: E::B} string { return \"\" }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("return type")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn reserved_prefix_user_proc_errors() {
+        let src = "proc __foo {v} { return $v }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("reserved")
+                && d.message.contains("__")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn qualified_type_in_return_position_errors() {
+        let src = "\
+enum E = {\n  A\n}\n\
+proc bad {} E::A { }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("qualified")
+                && d.message.contains("only legal")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn qualified_type_in_tail_arg_errors() {
+        let src = "\
+enum E = {\n  A\n  B\n}\n\
+proc bad {\n  v: E::A\n  x: E::B\n} { }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("qualified")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn qualified_type_inside_generic_errors() {
+        let src = "\
+enum E = {\n  A\n}\n\
+proc bad {x: list<E::A>} { }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("qualified")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn recursive_enum_passes() {
+        // Inner generic with whitespace needs brace-wrapping at
+        // the word level — that's the existing type-decl rule.
+        let src = "\
+enum Property = {\n  Scalar: string\n  Nested: Properties\n}\n\
+type Properties = {dict<string, Property>}\n\
+proc Properties::repr {v} { return $v }\n\
+proc Properties::from {v} { return $v }\n\
+proc Properties::to {v} { return $v }\n";
+        let d = diags(src);
+        // No errors — Property/Properties cycle is fine (Tcl
+        // resolves at call time) and the triplet exists for the
+        // type-decl side.
+        assert!(
+            d.iter().all(|d| d.severity != Severity::Error),
+            "got: {:?}",
+            d
+        );
     }
 }

@@ -139,7 +139,12 @@ fn emit_dict_sub_proc(
     ));
     doc.push(Item::Command(Command {
         doc_comments: Vec::new(),
-        words: vec![Word::Bare("cell".into())],
+        // `cell: bd_cell` — typed arg. The parser tokenizes the
+        // ident `cell`, the `:` separator, and the type word
+        // `bd_cell` separately; emitting them as two adjacent
+        // bare words renders the source the way a human would
+        // write it (`cell: bd_cell`).
+        words: vec![Word::Bare("cell:".into()), Word::Bare("bd_cell".into())],
         body: None,
     }));
     if !schema.fields.is_empty() {
@@ -177,7 +182,10 @@ fn emit_dict_sub_proc(
     )
     .unwrap();
     writeln!(body, "}}").unwrap();
-    emit_proc(out, &sub_name, &doc, &body);
+    // Dict-sub procs configure an existing cell; they don't
+    // produce a new one. Return type is `unit` so the REPL
+    // suppresses the (meaningless) empty-string result.
+    emit_proc(out, &sub_name, &doc, Some("unit"), &body);
 }
 
 fn emit_dict_field_arg(
@@ -259,7 +267,8 @@ fn generate_single(
     }
 
     let body = build_single_body(&vlnv, parameters);
-    emit_proc(&mut out, &proc_name, &proc_doc, &body);
+    // The single-shape proc creates a bd_cell and `return $cell`s.
+    emit_proc(&mut out, &proc_name, &proc_doc, Some("bd_cell"), &body);
     out
 }
 
@@ -359,7 +368,8 @@ fn generate_split(
         write_set_property_dict(&mut top_body, &tree.direct, "");
     }
     writeln!(top_body, "return $cell").unwrap();
-    emit_proc(&mut out, &top_proc, &top_doc, &top_body);
+    // Top split-shape proc: creates the bd_cell.
+    emit_proc(&mut out, &top_proc, &top_doc, Some("bd_cell"), &top_body);
 
     // One proc per non-root node that has direct parameters.
     for n in emit_nodes.iter().filter(|n| !n.label.is_empty()) {
@@ -372,8 +382,8 @@ fn generate_split(
             "Block-design cell handle returned by `{top_proc}`.",
         )));
         sub_doc.push(Item::Command(Command::call(
-            "cell",
-            std::iter::empty::<Word>(),
+            "cell:",
+            std::iter::once(Word::Bare("bd_cell".into())),
         )));
         if !n.direct.is_empty() {
             sub_doc.push(Item::Blank);
@@ -388,7 +398,8 @@ fn generate_split(
         // -cell $cell ...]` round-trip the handle for downstream calls and
         // avoids `$x = ""` when the conditional-dict had zero supplied args.
         writeln!(body, "return $cell").unwrap();
-        emit_proc(&mut out, &sub_name, &sub_doc, &body);
+        // Sub-procs propagate the bd_cell they were handed.
+        emit_proc(&mut out, &sub_name, &sub_doc, Some("bd_cell"), &body);
     }
 
     out
@@ -439,9 +450,16 @@ fn emit_file_header(out: &mut String, component: &Component, vlnv: &str) {
     writeln!(out, "## Source IP-XACT: {vlnv}").unwrap();
 }
 
-/// Emit `proc <name> { <args> } { <body> }` with the args and body
-/// indented two spaces each.
-fn emit_proc(out: &mut String, name: &str, args: &Doc, body: &str) {
+/// Emit `proc <name> { <args> } <type>? { <body> }` with the args
+/// and body indented two spaces each. When `return_type` is Some,
+/// emits it as the 4th htcl word between args and body.
+fn emit_proc(
+    out: &mut String,
+    name: &str,
+    args: &Doc,
+    return_type: Option<&str>,
+    body: &str,
+) {
     let args_text = args.to_string();
     writeln!(out, "proc {name} {{").unwrap();
     for line in args_text.lines() {
@@ -451,7 +469,19 @@ fn emit_proc(out: &mut String, name: &str, args: &Doc, body: &str) {
             writeln!(out, "  {line}").unwrap();
         }
     }
-    writeln!(out, "}} {{").unwrap();
+    match return_type {
+        Some(ty) => {
+            let needs_brace = ty.chars().any(char::is_whitespace);
+            if needs_brace {
+                writeln!(out, "}} {{{ty}}} {{").unwrap();
+            } else {
+                writeln!(out, "}} {ty} {{").unwrap();
+            }
+        }
+        None => {
+            writeln!(out, "}} {{").unwrap();
+        }
+    }
     for line in body.lines() {
         if line.is_empty() {
             writeln!(out).unwrap();

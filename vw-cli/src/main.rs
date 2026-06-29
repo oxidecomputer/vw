@@ -907,6 +907,62 @@ fn render_path(
     path.display().to_string()
 }
 
+/// For every monomorphized generic encountered while walking `ty`
+/// (recursing through user-newtype underlyings), emit its repr to
+/// the backend exactly once. Dedup is owned by the caller so
+/// repeated invocations across signatures don't re-ship the same
+/// proc.
+async fn ship_generic_reprs(
+    backend: &mut vw_vivado::VivadoBackend,
+    ty: &vw_htcl::TypeExpr,
+    types: &std::collections::HashMap<String, &vw_htcl::TypeDecl>,
+    emitted: &mut std::collections::HashSet<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // TypeExpr::Qualified appears only on overloaded-handler
+    // first-args; the validator forbids it anywhere else, and
+    // codegen doesn't need a repr for it.
+    if matches!(ty, vw_htcl::TypeExpr::Qualified { .. }) {
+        return Ok(());
+    }
+    let emission = vw_htcl::emit_repr_with_types(ty, types);
+    for p in &emission.procs {
+        // The procs are emitted in dependency order; the body of
+        // each instantiation may reference earlier ones in the
+        // same emission, so we ship them sequentially through
+        // the same eval channel.
+        if emitted.insert(p.clone()) {
+            backend.eval(p).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Mirror of `vw-repl/src/lower.rs::overload_specialization_mangle`.
+/// If `cmd` is a top-level `proc` whose name is an overload public
+/// name AND whose first arg is a qualified-variant annotation,
+/// return the mangled internal name to lower it under. Keeps
+/// `vw run` in step with the REPL's specialization-rerouting.
+fn overload_specialization_mangle(
+    cmd: &vw_htcl::Command,
+    overloads: &vw_htcl::OverloadTable,
+) -> Option<String> {
+    let vw_htcl::CommandKind::Proc(proc) = &cmd.kind else {
+        return None;
+    };
+    let name = proc.name.as_deref()?;
+    if !overloads.contains_key(name) {
+        return None;
+    }
+    let sig = proc.signature.as_ref()?;
+    let first = sig.args.first()?;
+    let vw_htcl::TypeExpr::Qualified { variant, .. } =
+        first.type_annotation.as_ref()?
+    else {
+        return None;
+    };
+    Some(vw_htcl::mangle_specialization(name, variant))
+}
+
 async fn run_htcl(
     file: &camino::Utf8Path,
     check_only: bool,
@@ -975,11 +1031,88 @@ async fn run_htcl(
     // Lower structured proc declarations and call sites to plain Tcl
     // before sending. Generic commands pass through unchanged.
     let table = vw_htcl::signature_table(&parsed.document);
+    // Ship enum preludes + overload dispatchers before any user
+    // statements run — same shape as the REPL's prepare path.
+    // Without these, calls to `Property::Scalar` or to an
+    // overloaded `handle` would fail at runtime with `invalid
+    // command name`.
+    let mut _ignored = Vec::new();
+    let enum_decl_table =
+        vw_htcl::build_enum_decl_table(&parsed.document, &mut _ignored);
+    let type_decl_table =
+        vw_htcl::build_type_decl_table(&parsed.document, &mut _ignored);
+    let (full_sigs, overload_table) =
+        vw_htcl::build_signature_table_with_overloads(
+            &parsed.document,
+            &mut _ignored,
+        );
+    // Always ship the primitive prelude so user-written newtype
+    // reprs can call e.g. `string::repr -v $v` for their inner
+    // values.
+    for p in vw_htcl::emit_primitive_prelude() {
+        let _ = backend.eval(&p).await?;
+    }
+    for ed in enum_decl_table.values() {
+        let prelude = vw_htcl::emit_enum_prelude(ed);
+        if !prelude.trim().is_empty() {
+            let _ = backend.eval(&prelude).await?;
+        }
+    }
+    for info in overload_table.values() {
+        let dispatcher = vw_htcl::emit_dispatcher(info);
+        let _ = backend.eval(&dispatcher).await?;
+    }
+    // Ship monomorphized generic reprs for every type expression
+    // referenced in any proc signature. This covers user newtypes
+    // that delegate to a generic repr (e.g. `Properties::repr`
+    // delegates to `dict_string_Property::repr`); without these
+    // the user's repr body errors at runtime with `invalid
+    // command name`.
+    let mut emitted_generics: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for sig in full_sigs.values() {
+        if let Some(ret) = sig.return_type.as_ref() {
+            ship_generic_reprs(
+                &mut backend,
+                ret,
+                &type_decl_table,
+                &mut emitted_generics,
+            )
+            .await?;
+        }
+        for arg in &sig.args {
+            if let Some(ty) = arg.type_annotation.as_ref() {
+                ship_generic_reprs(
+                    &mut backend,
+                    ty,
+                    &type_decl_table,
+                    &mut emitted_generics,
+                )
+                .await?;
+            }
+        }
+    }
     for stmt in &parsed.document.stmts {
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
         };
-        let lowered = vw_htcl::lower_command(cmd, &source, &table);
+        // Overload specializations lower under their mangled
+        // names so the dispatcher's switch arms can find them.
+        let lowered = match overload_specialization_mangle(cmd, &overload_table)
+        {
+            Some(mangled) => {
+                let vw_htcl::CommandKind::Proc(proc) = &cmd.kind else {
+                    unreachable!()
+                };
+                vw_htcl::lower_proc_decl_with_name(
+                    proc,
+                    &source,
+                    &table,
+                    Some(&mangled),
+                )
+            }
+            None => vw_htcl::lower_command(cmd, &source, &table),
+        };
         // Rewrite `extern::name` → `::name` (the textual pass the
         // REPL also runs) so calls to runtime-Tcl/Vivado procs
         // reach Vivado as the bare native name instead of the

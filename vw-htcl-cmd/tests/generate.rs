@@ -220,3 +220,91 @@ fn real_man_pages_reparse() {
         failures.join("\n")
     );
 }
+
+// --- return-type emission (step 5) -----------------------------------------
+
+#[test]
+fn returns_section_emits_type_annotation() {
+    let src = "
+Description:
+
+  Returns a list of cells matching the search.
+
+Arguments:
+
+  -hierarchical - (Optional) Search hierarchically.
+
+Returns:
+
+  a list of cells
+
+See Also:
+
+   *  get_cells
+";
+    let page = parse_man_page("get_things", src);
+    assert!(page.returns.is_some(), "Returns: section should be parsed");
+    let htcl = generate(&page, &GenerateOptions::default());
+    assert_reparses(&htcl);
+    // The `proc get_things { … } list<bd_cell> { … }` shape.
+    assert!(
+        htcl.contains("list<bd_cell> {"),
+        "expected return-type annotation in: {htcl}"
+    );
+}
+
+#[test]
+fn returns_section_nothing_emits_unit() {
+    let src = "
+Description:
+
+  Sets things.
+
+Arguments:
+
+  -quiet - (Optional) Quiet.
+
+Returns:
+
+  Returns nothing.
+
+See Also:
+
+   *  unset_things
+";
+    let page = parse_man_page("set_things", src);
+    let htcl = generate(&page, &GenerateOptions::default());
+    assert_reparses(&htcl);
+    assert!(
+        htcl.contains(" unit {"),
+        "expected `unit` return annotation in: {htcl}"
+    );
+}
+
+#[test]
+fn page_without_returns_section_emits_no_annotation() {
+    let src = "
+Description:
+
+  Does a thing.
+
+Arguments:
+
+  -x - (Required) Thing.
+
+See Also:
+
+   *  other
+";
+    let page = parse_man_page("do_a_thing", src);
+    assert!(page.returns.is_none());
+    let htcl = generate(&page, &GenerateOptions::default());
+    assert_reparses(&htcl);
+    // No return-type annotation present.
+    assert!(
+        !htcl.contains("unit {")
+            && !htcl.contains("bd_cell {")
+            && !htcl.contains("list<"),
+        "unannotated page should not synthesize a return type: {htcl}"
+    );
+}

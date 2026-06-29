@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use vw_htcl::{Document, LoadedProgram, ProcSignature};
+use vw_htcl::{Document, LoadedProgram, ProcSignature, TypeDecl};
 
 use crate::lower::ProcLocation;
 
@@ -84,6 +84,26 @@ impl Session {
             let batch_table = vw_htcl::signature_table(&batch.document);
             for (name, sig) in batch_table {
                 table.insert(name, sig);
+            }
+        }
+        table
+    }
+
+    /// Same as [`signature_table`] but for `type NAME = …`
+    /// declarations. Needed when wrapping a typed expression's
+    /// result through its `repr` proc — the dispatch type may be
+    /// a newtype declared in a prior batch (e.g. `Properties`
+    /// from a sourced `@vivado-cmd` library), and the repr
+    /// codegen walks the underlying to emit the dependent generic
+    /// repr (`dict_string_Property::repr` in that case).
+    pub fn type_decl_table(&self) -> HashMap<String, &TypeDecl> {
+        let mut table: HashMap<String, &TypeDecl> = HashMap::new();
+        for batch in &self.batches {
+            let mut diags = Vec::new();
+            let batch_table =
+                vw_htcl::build_type_decl_table(&batch.document, &mut diags);
+            for (name, td) in batch_table {
+                table.insert(name, td);
             }
         }
         table

@@ -99,6 +99,16 @@ pub fn lower_command(
             let path = import.path.as_deref().unwrap_or("<dynamic>");
             format!("# vw: unresolved `src {path}` — loader bypass")
         }
+        // Newtype declarations are compile-time only — they feed the
+        // analyzer / printer machinery but ship nothing to Vivado.
+        // Drop entirely (empty Tcl, no whitespace).
+        CommandKind::TypeDecl(_) => String::new(),
+        // Enum declarations are also compile-time-only at this
+        // layer — the codegen path (vw-htcl/src/repr.rs) emits the
+        // auto-generated `namespace eval <Enum>` block separately
+        // through the same wrap-with-repr pipeline used for the
+        // primitive prelude. The decl itself ships nothing.
+        CommandKind::EnumDecl(_) => String::new(),
         _ => {
             // Verbatim, but reconstructed word-by-word so that any
             // `[ … ]` substitution inside the command gets its own
@@ -169,7 +179,23 @@ fn lower_proc_decl(
     source: &str,
     table: &SignatureTable<'_>,
 ) -> String {
-    let name = proc.name.as_deref().unwrap_or("");
+    lower_proc_decl_with_name(proc, source, table, None)
+}
+
+/// Like [`lower_proc_decl`] but uses `name_override` as the emitted
+/// proc name instead of `proc.name`. Used by the REPL when lowering
+/// an enum-overload specialization under its mangled name
+/// (`__<public>__<Variant>`) — the source name on the parsed proc
+/// is the user-visible public name (`handle_prop`), but the
+/// dispatcher needs the specialization to live under its mangled
+/// alias so the runtime switch can find it.
+pub fn lower_proc_decl_with_name(
+    proc: &Proc,
+    source: &str,
+    table: &SignatureTable<'_>,
+    name_override: Option<&str>,
+) -> String {
+    let name = name_override.or(proc.name.as_deref()).unwrap_or("");
     // Re-emit the body by walking its parsed statements rather
     // than slicing raw text. This is what gives htcl's "newlines
     // inside `[ … ]` are whitespace" semantics inside proc bodies

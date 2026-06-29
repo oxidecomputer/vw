@@ -105,6 +105,29 @@ fn populate_procs(
                 errors.extend(errs);
                 proc.signature = Some(sig);
 
+                // Parse the return-type annotation if the outer
+                // parse recorded one. We have `source` and the
+                // error sink here, so this is the right place to
+                // do it — `classify_command` only recorded the
+                // (inner, brace-stripped) span.
+                if let Some(rt_span) = proc.return_type_span {
+                    let text = rt_span.slice(source);
+                    match crate::type_parse::parse(text, rt_span.start) {
+                        Ok(ty) => proc.return_type = Some(ty),
+                        Err(e) => errors.push(ParseError {
+                            message: e.message,
+                            span: e.span,
+                        }),
+                    }
+                }
+                // Mirror the return type onto the signature so the
+                // signature-table-based lookup paths (REPL repr
+                // formatter, hover) see it without re-walking
+                // back to the Proc node.
+                if let Some(sig) = proc.signature.as_mut() {
+                    sig.return_type = proc.return_type.clone();
+                }
+
                 let delta = proc.body_span.start;
                 let body_text = proc.body_span.slice(source);
                 // Proc bodies are scripts — newlines still terminate
@@ -123,6 +146,26 @@ fn populate_procs(
                 // Spans are now absolute, so nested procs can be processed
                 // against the same `source`.
                 populate_procs(&mut proc.body, source, errors);
+            }
+            CommandKind::TypeDecl(td) => {
+                let text = td.underlying_span.slice(source);
+                match crate::type_parse::parse(text, td.underlying_span.start) {
+                    Ok(ty) => td.underlying = Some(ty),
+                    Err(e) => errors.push(ParseError {
+                        message: e.message,
+                        span: e.span,
+                    }),
+                }
+            }
+            CommandKind::EnumDecl(ed) => {
+                let text = ed.body_span.slice(source);
+                match crate::enum_parse::parse(text, ed.body_span.start) {
+                    Ok(vs) => ed.variants = vs,
+                    Err(e) => errors.push(ParseError {
+                        message: e.message,
+                        span: e.span,
+                    }),
+                }
             }
             CommandKind::NamespaceEval(ns) => {
                 // Same body-recursion as `proc` — the braced body is
@@ -216,10 +259,27 @@ fn shift_command(cmd: &mut Command, delta: u32) {
             proc.name_span = proc.name_span.shifted(delta);
             proc.args_span = proc.args_span.shifted(delta);
             proc.body_span = proc.body_span.shifted(delta);
+            if let Some(ref mut s) = proc.return_type_span {
+                *s = s.shifted(delta);
+            }
+            // `return_type` is None at this point (parsed later in
+            // `populate_procs` using the now-absolute span), so
+            // there's nothing to shift inside it.
         }
         CommandKind::NamespaceEval(ns) => {
             ns.name_span = ns.name_span.shifted(delta);
             ns.body_span = ns.body_span.shifted(delta);
+        }
+        CommandKind::TypeDecl(td) => {
+            td.name_span = td.name_span.shifted(delta);
+            td.underlying_span = td.underlying_span.shifted(delta);
+        }
+        CommandKind::EnumDecl(ed) => {
+            ed.name_span = ed.name_span.shifted(delta);
+            ed.body_span = ed.body_span.shifted(delta);
+            // Variants are filled later by `populate_procs` using
+            // the now-absolute body_span, so there's nothing to
+            // shift inside them yet.
         }
         _ => {}
     }
@@ -425,7 +485,20 @@ fn classify_command(words: &[Word]) -> CommandKind {
         Some("proc") if words.len() >= 4 => {
             let name_word = &words[1];
             let args_word = &words[2];
-            let body_word = &words[3];
+            // 5 words = return-type slot present:
+            //   proc NAME { args } TYPE { body }
+            // 4 words = no return type:
+            //   proc NAME { args } { body }
+            // (>5 words is treated as 5+ junk; the body is taken
+            //  from words[4] and the rest is silently ignored.
+            //  The return-type slot is parsed in `populate_procs`
+            //  where we have `source` and an error sink — we only
+            //  record the span here.)
+            let (return_type_span, body_word) = if words.len() >= 5 {
+                (Some(inner_text_span(&words[3])), &words[4])
+            } else {
+                (None, &words[3])
+            };
             let name = name_word.as_text().map(|s| s.to_string());
             CommandKind::Proc(Proc {
                 name,
@@ -433,7 +506,50 @@ fn classify_command(words: &[Word]) -> CommandKind {
                 args_span: inner_text_span(args_word),
                 body_span: inner_text_span(body_word),
                 signature: None,
+                return_type: None,
+                return_type_span,
                 body: Vec::new(),
+            })
+        }
+        // `type NAME = UNDERLYING` newtype declaration. The `=` may
+        // be its own word (`type T = U`) or fused (`type T=U`) —
+        // Tcl word splitting is whitespace-driven, so we accept
+        // either by checking the third word. The underlying type
+        // is parsed in `populate_procs`'s second pass (same
+        // rationale as `proc`'s return type).
+        Some("type") if words.len() >= 3 => {
+            let name_word = &words[1];
+            let underlying_word =
+                if words.len() >= 4 && words[2].as_text() == Some("=") {
+                    &words[3]
+                } else {
+                    &words[2]
+                };
+            CommandKind::TypeDecl(crate::ast::TypeDecl {
+                name: name_word.as_text().map(String::from),
+                name_span: name_word.span,
+                underlying: None,
+                underlying_span: inner_text_span(underlying_word),
+            })
+        }
+        // `enum NAME = { …variants… }` sum-type declaration.
+        // Same `=`-may-or-may-not-be-its-own-word convention as
+        // `type`. The body word is brace-wrapped; its contents
+        // (the variant list) are parsed in `populate_procs`'s
+        // second pass, when we have the source + error sink.
+        Some("enum") if words.len() >= 3 => {
+            let name_word = &words[1];
+            let body_word =
+                if words.len() >= 4 && words[2].as_text() == Some("=") {
+                    &words[3]
+                } else {
+                    &words[2]
+                };
+            CommandKind::EnumDecl(crate::ast::EnumDecl {
+                name: name_word.as_text().map(String::from),
+                name_span: name_word.span,
+                variants: Vec::new(),
+                body_span: inner_text_span(body_word),
             })
         }
         Some("namespace")
@@ -871,6 +987,298 @@ mod tests {
         let body = proc.body_span.slice(src);
         assert_eq!(args, "name");
         assert!(body.contains("puts"));
+        // No return type slot.
+        assert!(proc.return_type.is_none());
+        assert!(proc.return_type_span.is_none());
+    }
+
+    #[test]
+    fn parse_proc_with_return_type_named() {
+        let src = "proc f {} string { return foo }\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            panic!()
+        };
+        assert_eq!(proc.name.as_deref(), Some("f"));
+        let body = proc.body_span.slice(src);
+        assert!(body.contains("return foo"));
+        let ty = proc.return_type.as_ref().expect("return type set");
+        assert_eq!(ty.name(), "string");
+        match ty {
+            crate::ast::TypeExpr::Named { .. } => {}
+            _ => panic!("expected Named"),
+        }
+    }
+
+    #[test]
+    fn parse_proc_with_return_type_generic_no_whitespace() {
+        let src = "proc f {} list<bd_cell> { return {} }\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            panic!()
+        };
+        let ty = proc.return_type.as_ref().unwrap();
+        let crate::ast::TypeExpr::Generic { name, args, .. } = ty else {
+            panic!("expected Generic")
+        };
+        assert_eq!(name, "list");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].name(), "bd_cell");
+    }
+
+    #[test]
+    fn parse_proc_with_return_type_nested_generic() {
+        let src = "proc f {} list<dict<string,bd_cell>> { return {} }\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            panic!()
+        };
+        let ty = proc.return_type.as_ref().unwrap();
+        let crate::ast::TypeExpr::Generic { args, .. } = ty else {
+            panic!()
+        };
+        let crate::ast::TypeExpr::Generic {
+            name: inner_name,
+            args: inner_args,
+            ..
+        } = &args[0]
+        else {
+            panic!("expected nested Generic")
+        };
+        assert_eq!(inner_name, "dict");
+        assert_eq!(inner_args.len(), 2);
+    }
+
+    #[test]
+    fn parse_proc_with_return_type_bracketed_whitespace() {
+        let src = "proc f {} {dict<string, int>} { return {} }\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            panic!()
+        };
+        let ty = proc.return_type.as_ref().unwrap();
+        let crate::ast::TypeExpr::Generic { name, args, .. } = ty else {
+            panic!()
+        };
+        assert_eq!(name, "dict");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].name(), "string");
+        assert_eq!(args[1].name(), "int");
+    }
+
+    #[test]
+    fn parse_proc_with_invalid_return_type_emits_diagnostic() {
+        let src = "proc f {} list< { return {} }\n";
+        let out = parse(src);
+        assert!(
+            !out.errors.is_empty(),
+            "expected a parse-error diagnostic for bad type"
+        );
+        assert!(out.errors.iter().any(|e| e.message.contains("expected")
+            || e.message.contains("unterminated")));
+    }
+
+    #[test]
+    fn parse_type_decl_named() {
+        let src = "type bd_cell = string\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::TypeDecl(td) = &cmd.kind else {
+            panic!("expected TypeDecl, got {:?}", cmd.kind)
+        };
+        assert_eq!(td.name.as_deref(), Some("bd_cell"));
+        let underlying = td.underlying.as_ref().unwrap();
+        assert_eq!(underlying.name(), "string");
+    }
+
+    #[test]
+    fn parse_type_decl_generic_underlying() {
+        let src = "type fancy_dict = {dict<string, int>}\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::TypeDecl(td) = &cmd.kind else {
+            panic!()
+        };
+        let crate::ast::TypeExpr::Generic { name, args, .. } =
+            td.underlying.as_ref().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(name, "dict");
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn parse_type_decl_without_equals_works() {
+        // `type T U` (no `=`) is also accepted — the `=` is sugar.
+        let src = "type widget string\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::TypeDecl(td) = &cmd.kind else {
+            panic!()
+        };
+        assert_eq!(td.name.as_deref(), Some("widget"));
+        assert_eq!(td.underlying.as_ref().unwrap().name(), "string");
+    }
+
+    #[test]
+    fn parse_type_decl_with_bad_underlying_emits_diagnostic() {
+        let src = "type foo = <bad>\n";
+        let out = parse(src);
+        assert!(
+            !out.errors.is_empty(),
+            "expected diagnostic for malformed underlying type"
+        );
+    }
+
+    // --- enum declarations -----------------------------------------
+
+    #[test]
+    fn parse_enum_decl_simple() {
+        let src = "enum Direction = {\n  North\n  South\n  East\n  West\n}\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::EnumDecl(ed) = &cmd.kind else {
+            panic!("expected EnumDecl, got {:?}", cmd.kind);
+        };
+        assert_eq!(ed.name.as_deref(), Some("Direction"));
+        assert_eq!(ed.variants.len(), 4);
+        for v in &ed.variants {
+            assert!(v.payload.is_none(), "expected empty-payload variant");
+        }
+        let names: Vec<&str> =
+            ed.variants.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["North", "South", "East", "West"]);
+    }
+
+    #[test]
+    fn parse_enum_decl_with_payloads() {
+        let src = "enum Property = {\n  Scalar: string\n  Nested: dict<string,Property>\n}\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::EnumDecl(ed) = &cmd.kind else {
+            panic!()
+        };
+        assert_eq!(ed.name.as_deref(), Some("Property"));
+        assert_eq!(ed.variants.len(), 2);
+        assert_eq!(ed.variants[0].name, "Scalar");
+        assert_eq!(ed.variants[0].payload.as_ref().unwrap().name(), "string");
+        assert_eq!(ed.variants[1].name, "Nested");
+        let crate::ast::TypeExpr::Generic { name, args, .. } =
+            ed.variants[1].payload.as_ref().unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(name, "dict");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].name(), "string");
+        assert_eq!(args[1].name(), "Property");
+    }
+
+    #[test]
+    fn parse_enum_decl_mixed_payload_and_empty() {
+        let src =
+            "enum Mix = {\n  Empty\n  WithInt: int\n  Other\n  WithList: list<bd_cell>\n}\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::EnumDecl(ed) = &cmd.kind else {
+            panic!()
+        };
+        assert_eq!(ed.variants.len(), 4);
+        assert!(ed.variants[0].payload.is_none());
+        assert_eq!(ed.variants[1].payload.as_ref().unwrap().name(), "int");
+        assert!(ed.variants[2].payload.is_none());
+        assert_eq!(ed.variants[3].payload.as_ref().unwrap().name(), "list");
+    }
+
+    #[test]
+    fn parse_enum_decl_without_equals() {
+        let src = "enum Color {\n  Red\n  Green\n  Blue\n}\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::EnumDecl(ed) = &cmd.kind else {
+            panic!()
+        };
+        assert_eq!(ed.name.as_deref(), Some("Color"));
+        assert_eq!(ed.variants.len(), 3);
+    }
+
+    #[test]
+    fn parse_enum_decl_with_bad_variant_emits_diagnostic() {
+        // 123Foo is not a valid identifier — should diagnose.
+        let src = "enum Bad = {\n  123Foo: int\n}\n";
+        let out = parse(src);
+        assert!(
+            !out.errors.is_empty(),
+            "expected diagnostic for malformed variant"
+        );
+    }
+
+    #[test]
+    fn parse_proc_with_qualified_arg_type() {
+        // The `E::V` qualified syntax for overloaded handler args.
+        let src =
+            "proc handle_prop {v: Property::Scalar} string { return $v }\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!()
+        };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            panic!()
+        };
+        let sig = proc.signature.as_ref().unwrap();
+        assert_eq!(sig.args.len(), 1);
+        let arg = &sig.args[0];
+        assert_eq!(arg.name, "v");
+        let crate::ast::TypeExpr::Qualified {
+            namespace, variant, ..
+        } = arg.type_annotation.as_ref().unwrap()
+        else {
+            panic!(
+                "expected Qualified type annotation, got {:?}",
+                arg.type_annotation
+            );
+        };
+        assert_eq!(namespace, "Property");
+        assert_eq!(variant, "Scalar");
     }
 
     #[test]

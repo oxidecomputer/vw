@@ -88,7 +88,9 @@ fn local_def_target(cmd: &Command, name: &str) -> Option<Span> {
         }
         CommandKind::Proc(_)
         | CommandKind::Src(_)
-        | CommandKind::NamespaceEval(_) => None,
+        | CommandKind::NamespaceEval(_)
+        | CommandKind::TypeDecl(_)
+        | CommandKind::EnumDecl(_) => None,
     }
 }
 

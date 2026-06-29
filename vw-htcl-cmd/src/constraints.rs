@@ -91,6 +91,15 @@ pub struct ArgOverride {
     /// `set_property -objects` reject the stringified path.
     #[serde(default)]
     pub typed: Option<bool>,
+
+    /// Per-arg type annotation: any valid htcl type expression
+    /// (`bd_cell`, `list<bd_pin>`, `string`, etc.). Wins over
+    /// the inferred type from the typed-handle name table when
+    /// both are present. Set when an arg's name doesn't match
+    /// the table's plural-aware heuristic, or when the man-page
+    /// `object` placeholder is actually a specific type.
+    #[serde(default, rename = "type")]
+    pub arg_type: Option<String>,
 }
 
 /// All overrides for one command, indexed by arg ident.
@@ -100,6 +109,15 @@ pub struct CommandOverride {
     /// (matches `Argument::ident`).
     #[serde(default)]
     pub args: HashMap<String, ArgOverride>,
+    /// Override the command's return type. The string is taken
+    /// verbatim and emitted as the proc's 4th-word annotation
+    /// (`proc NAME { args } <returns> { body }`), so any valid
+    /// htcl type expression works: `bd_cell`, `list<bd_pin>`,
+    /// `dict<string,int>`, `unit`. Use this when the Returns:
+    /// phrase auto-mapping is ambiguous or wrong for a specific
+    /// command.
+    #[serde(default)]
+    pub returns: Option<String>,
 }
 
 /// The complete set of overrides loaded from the constraints file.

@@ -45,6 +45,12 @@ pub struct ManPage {
     pub arguments: Vec<Argument>,
     /// Command names listed under `See Also:`.
     pub see_also: Vec<String>,
+    /// The raw `Returns:` prose, one entry per source line. Many
+    /// Vivado man pages don't include this section — it's `None`
+    /// in that case, and the generator emits the wrapper without
+    /// a return-type annotation (the REPL falls back to the
+    /// untyped heuristic for those).
+    pub returns: Option<Vec<String>>,
 }
 
 /// How an argument maps onto the underlying Vivado command line.

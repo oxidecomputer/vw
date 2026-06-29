@@ -14,10 +14,15 @@
 //!
 //! ```text
 //! args      := arg_item*
-//! arg_item  := doc_comment* attribute* IDENT
+//! arg_item  := doc_comment* attribute* IDENT ( ':' TYPE )?
 //! attribute := '@' IDENT ( '(' value ( ',' value )* ')' )?
 //! value     := integer | string | ident
+//! TYPE      := IDENT ( '<' TYPE ( ',' TYPE )* '>' )?
 //! ```
+//!
+//! The optional `: TYPE` slot turns an arg from an opaque
+//! identifier into a typed one. Adoption is gradual — existing
+//! libraries without annotations still parse identically.
 //!
 //! Whitespace, blank lines, and non-doc comments are skippable
 //! between items.
@@ -44,6 +49,9 @@ pub fn parse_proc_args(
         ProcSignature {
             args,
             span: args_span,
+            // Filled in later by the parser's `populate_procs`
+            // pass once the return-type annotation has been parsed.
+            return_type: None,
         },
         errors,
     )
@@ -197,12 +205,50 @@ impl<'a> State<'a> {
                 continue;
             }
             let name_span = Span::new(name_start, self.abs());
+            // Optional `: TYPE` annotation. Tcl strings allow `:`
+            // in bare words, but we're in the structured-args
+            // sub-grammar — distinct rules apply here. A `:`
+            // immediately after the arg name (with optional
+            // horizontal whitespace) opens the annotation slot.
+            self.skip_horizontal_ws();
+            let type_annotation = if !self.at_eof() && self.current() == ':' {
+                self.bump(); // ':'
+                self.skip_horizontal_ws();
+                let ty_start = self.abs();
+                // Consume up to whitespace or end of arg. The type
+                // mini-parser handles its own internal grammar
+                // (idents, '<', ',', '>'); we just need to slice
+                // the right text out of the source.
+                while !self.at_eof() {
+                    let c = self.current();
+                    if c.is_whitespace() || c == '#' {
+                        break;
+                    }
+                    self.bump();
+                }
+                let ty_end = self.abs();
+                let text = &self.inner[(ty_start - self.base) as usize
+                    ..(ty_end - self.base) as usize];
+                match crate::type_parse::parse(text, ty_start) {
+                    Ok(ty) => Some(ty),
+                    Err(e) => {
+                        self.errors.push(ParseError {
+                            message: e.message,
+                            span: e.span,
+                        });
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let span = Span::new(item_start, self.abs());
             out.push(ProcArg {
                 name,
                 name_span,
                 doc_comments: docs,
                 attributes,
+                type_annotation,
                 span,
             });
         }
@@ -400,6 +446,64 @@ mod tests {
         let names: Vec<&str> =
             sig.args.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn arg_with_named_type_annotation() {
+        let (sig, errs) = parse("object: bd_cell");
+        assert!(errs.is_empty(), "{:?}", errs);
+        assert_eq!(sig.args.len(), 1);
+        let a = &sig.args[0];
+        assert_eq!(a.name, "object");
+        let ty = a.type_annotation.as_ref().expect("type set");
+        assert_eq!(ty.name(), "bd_cell");
+    }
+
+    #[test]
+    fn arg_with_generic_type_annotation() {
+        let (sig, errs) = parse("cells: list<bd_cell>");
+        assert!(errs.is_empty(), "{:?}", errs);
+        let a = &sig.args[0];
+        let crate::ast::TypeExpr::Generic { name, args, .. } =
+            a.type_annotation.as_ref().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(name, "list");
+        assert_eq!(args[0].name(), "bd_cell");
+    }
+
+    #[test]
+    fn typed_and_untyped_args_mix() {
+        let (sig, errs) = parse("a b: string c");
+        assert!(errs.is_empty(), "{:?}", errs);
+        assert_eq!(sig.args.len(), 3);
+        assert!(sig.args[0].type_annotation.is_none());
+        assert_eq!(
+            sig.args[1].type_annotation.as_ref().unwrap().name(),
+            "string"
+        );
+        assert!(sig.args[2].type_annotation.is_none());
+    }
+
+    #[test]
+    fn arg_with_attrs_and_type() {
+        let (sig, errs) = parse("@default(0) count: int");
+        assert!(errs.is_empty(), "{:?}", errs);
+        let a = &sig.args[0];
+        assert_eq!(a.name, "count");
+        assert_eq!(a.attributes.len(), 1);
+        assert_eq!(a.attributes[0].name, "default");
+        assert_eq!(a.type_annotation.as_ref().unwrap().name(), "int");
+    }
+
+    #[test]
+    fn arg_with_invalid_type_emits_diagnostic() {
+        let (_sig, errs) = parse("v: <bad");
+        assert!(
+            !errs.is_empty(),
+            "expected a diagnostic for a malformed type"
+        );
     }
 
     #[test]

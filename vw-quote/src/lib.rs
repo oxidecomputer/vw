@@ -51,6 +51,33 @@ use syn::{parse_macro_input, Expr, LitStr};
 
 #[proc_macro]
 pub fn quote_htcl(input: TokenStream) -> TokenStream {
+    expand(input, Dialect::Htcl)
+}
+
+/// Same template grammar as [`quote_htcl!`], but routes interpolated
+/// values through [`vw_htcl::emit::ToTcl`] and produces pure Tcl
+/// (no htcl-specific attribute handling). Use for compiler-emitted
+/// runtime helpers — `repr` procs, `kwargs` shim glue, anything that
+/// lives in the Tcl interpreter and should never look like htcl.
+///
+/// The split exists so future Tcl-only behavior (typed `Tcl_Obj`
+/// handle quoting, etc.) can land on `ToTcl` without changing
+/// `quote_htcl!`'s contract.
+#[proc_macro]
+pub fn quote_tcl(input: TokenStream) -> TokenStream {
+    expand(input, Dialect::Tcl)
+}
+
+/// Which interpolation trait the macro routes through. The template
+/// parsing is shared verbatim — the only thing that differs is the
+/// trait + method name used in the generated `format!` arguments.
+#[derive(Clone, Copy)]
+enum Dialect {
+    Htcl,
+    Tcl,
+}
+
+fn expand(input: TokenStream, dialect: Dialect) -> TokenStream {
     let lit = parse_macro_input!(input as LitStr);
     let template_text = lit.value();
     let lit_span = lit.span();
@@ -68,16 +95,26 @@ pub fn quote_htcl(input: TokenStream) -> TokenStream {
     let exprs: Vec<TokenStream2> =
         exprs.into_iter().map(|e| e.to_token_stream()).collect();
 
-    let out = quote! {{
-        // Bring the trait into scope so `(&expr).to_htcl()` resolves
-        // without the caller needing to import it.
-        #[allow(unused_imports)]
-        use ::vw_htcl::emit::ToHtcl as _;
-        ::std::format!(
-            #format_lit,
-            #( (&{ #exprs }).to_htcl() ),*
-        )
-    }};
+    let out = match dialect {
+        Dialect::Htcl => quote! {{
+            // Bring the trait into scope so `(&expr).to_htcl()` resolves
+            // without the caller needing to import it.
+            #[allow(unused_imports)]
+            use ::vw_htcl::emit::ToHtcl as _;
+            ::std::format!(
+                #format_lit,
+                #( (&{ #exprs }).to_htcl() ),*
+            )
+        }},
+        Dialect::Tcl => quote! {{
+            #[allow(unused_imports)]
+            use ::vw_htcl::emit::ToTcl as _;
+            ::std::format!(
+                #format_lit,
+                #( (&{ #exprs }).to_tcl() ),*
+            )
+        }},
+    };
     out.into()
 }
 

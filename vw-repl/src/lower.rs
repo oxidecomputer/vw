@@ -70,6 +70,15 @@ pub struct OriginFrame {
 pub struct PreparedCommand {
     pub tcl: String,
     pub origin: Origin,
+    /// Declared return type of the expression this command
+    /// evaluates, when knowable from static analysis. `None` for
+    /// expressions whose head we couldn't resolve to a known proc
+    /// (untyped calls, control flow, raw Tcl, etc.). The App uses
+    /// this to suppress the Result push entirely on `unit` and to
+    /// skip the heuristic fallback formatter on every other typed
+    /// case (since the wrapped `tcl` already returns a formatted
+    /// string from the type's `repr` proc).
+    pub expected_return_type: Option<vw_htcl::TypeExpr>,
 }
 
 #[derive(Debug)]
@@ -253,6 +262,72 @@ pub fn prepare_with_observer(
     let mut commands = Vec::new();
     let mut extern_names: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+
+    // Auto-emit machinery for enums + overload dispatchers. Both
+    // ship as synthetic PreparedCommand entries up front so the
+    // user's statements (which may construct enum values or call
+    // overloaded procs) find the supporting Tcl already in scope.
+    // The classification + overload-table build also re-runs the
+    // multi-decl signature collection — diagnostics from THAT pass
+    // already fired through the validator above, so we discard
+    // them here.
+    let mut _ignored_diags = Vec::new();
+    let enum_decl_table =
+        vw_htcl::build_enum_decl_table(&parsed.document, &mut _ignored_diags);
+    // Merge prior-batch type declarations so wrap_with_repr can
+    // see newtypes declared in earlier `src @lib` batches (e.g.
+    // `type Properties = dict<string,Property>` from
+    // @vivado-cmd, when the user types
+    // `util::props -object $cips` at a later REPL prompt).
+    // Without this merge, the wrap can't recurse into
+    // Properties's underlying to ship
+    // `dict_string_Property::repr`, and the user's
+    // `Properties::repr` body fails with `invalid command
+    // name`.
+    let mut type_decl_table = session.type_decl_table();
+    let batch_type_decls =
+        vw_htcl::build_type_decl_table(&parsed.document, &mut _ignored_diags);
+    for (name, td) in batch_type_decls {
+        type_decl_table.insert(name, td);
+    }
+    let (_full_sig_table, overload_table) =
+        vw_htcl::build_signature_table_with_overloads(
+            &parsed.document,
+            &mut _ignored_diags,
+        );
+    for ed in enum_decl_table.values() {
+        let prelude = vw_htcl::emit_enum_prelude(ed);
+        if prelude.is_empty() {
+            continue;
+        }
+        commands.push(PreparedCommand {
+            tcl: prelude,
+            origin: Origin {
+                file: None,
+                line: 0,
+                snippet: format!(
+                    "<enum {}>",
+                    ed.name.as_deref().unwrap_or("?")
+                ),
+                via: Vec::new(),
+            },
+            expected_return_type: None,
+        });
+    }
+    for info in overload_table.values() {
+        let dispatcher = vw_htcl::emit_dispatcher(info);
+        commands.push(PreparedCommand {
+            tcl: dispatcher,
+            origin: Origin {
+                file: None,
+                line: 0,
+                snippet: format!("<dispatcher {}>", info.public_name),
+                via: Vec::new(),
+            },
+            expected_return_type: None,
+        });
+    }
+
     for stmt in &parsed.document.stmts {
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
@@ -264,7 +339,25 @@ pub fn prepare_with_observer(
             line_one_based.line + 1,
             &scratch.path,
         );
-        let lowered_raw = vw_htcl::lower_command(cmd, &program.source, &table);
+        // If this command is a proc that's been classified as an
+        // overload specialization, lower it under its mangled name
+        // so the dispatcher (shipped above) can find it. Otherwise
+        // take the normal path.
+        let lowered_raw =
+            match overload_specialization_mangle(cmd, &overload_table) {
+                Some(mangled) => {
+                    let vw_htcl::CommandKind::Proc(proc) = &cmd.kind else {
+                        unreachable!()
+                    };
+                    vw_htcl::lower_proc_decl_with_name(
+                        proc,
+                        &program.source,
+                        &table,
+                        Some(&mangled),
+                    )
+                }
+                None => vw_htcl::lower_command(cmd, &program.source, &table),
+            };
         let rewritten = vw_htcl::rewrite_externs(&lowered_raw);
         for name in rewritten.names {
             extern_names.insert(name);
@@ -272,9 +365,21 @@ pub fn prepare_with_observer(
         if rewritten.text.trim().is_empty() {
             continue;
         }
+        // Resolve the command's expected return type and, if any,
+        // wrap the lowered Tcl so it dispatches through the type's
+        // `repr` proc. The wrapped form runs the user's expression
+        // into a sentinel local then formats via the repr; the
+        // sentinel-binding step preserves `set var [...]`-style
+        // bindings (the user's `$var` still gets the raw value).
+        let expected_return_type = resolve_return_type(cmd, &table);
+        let final_tcl = match expected_return_type.as_ref() {
+            Some(ty) => wrap_with_repr(&rewritten.text, ty, &type_decl_table),
+            None => rewritten.text,
+        };
         commands.push(PreparedCommand {
-            tcl: rewritten.text,
+            tcl: final_tcl,
             origin,
+            expected_return_type,
         });
     }
 
@@ -405,6 +510,128 @@ fn proc_body_location(
         body_start_line,
         body_lines,
     })
+}
+
+/// Return the declared return type of `cmd`'s head call, when we
+/// can resolve it from the signature table. Currently handles two
+/// shapes:
+///
+/// - Direct call: `proc-name arg arg …` → look up `proc-name`'s
+///   return type in the table.
+/// - Bracket-bound assignment: `set var [proc-name …]` → look up
+///   the inner bracketed call's return type (since `set` returns
+///   the value being set, which is the type of the inner call).
+///
+/// Anything else (control flow, variable substitution, raw Tcl,
+/// unknown commands) returns `None`. The App falls back to the
+/// untyped-display path for those.
+fn resolve_return_type(
+    cmd: &vw_htcl::ast::Command,
+    table: &std::collections::HashMap<String, &vw_htcl::ProcSignature>,
+) -> Option<vw_htcl::TypeExpr> {
+    let head = cmd.words.first()?.as_text()?;
+    if head == "set" {
+        // `set var [EXPR]` → recurse into the bracketed
+        // expression on the third word (words[2]). Other `set`
+        // shapes (set var literal, set var $other) leave the
+        // type unknown — we'd need real expression type-inference
+        // to do better, and that's out of scope for v1.
+        let val_word = cmd.words.get(2)?;
+        // Look for a CmdSubst part — `[…]` — at the top of the
+        // value word. If found, recurse into the bracketed
+        // command's first statement.
+        for part in &val_word.parts {
+            if let vw_htcl::WordPart::CmdSubst { body, .. } = part {
+                let vw_htcl::Stmt::Command(inner) = body.first()? else {
+                    continue;
+                };
+                return resolve_return_type(inner, table);
+            }
+        }
+        return None;
+    }
+    let sig = table.get(head)?;
+    sig.return_type.clone()
+}
+
+/// Wrap the lowered Tcl `inner` so that, after evaluating it, the
+/// result is fed through `<ty>::repr` (or the appropriate
+/// monomorphized generic repr) to produce a display string.
+///
+/// Prepends:
+///   1. The primitive prelude (`string` / `int` / `bool` / `unit`
+///      triplets) — cheap to redefine per-eval; Tcl `proc`
+///      redefinition is idempotent.
+///   2. Any per-instantiation generic reprs needed for `ty`, in
+///      topological order so each proc is defined before its
+///      dependents call it.
+///   3. `set __vw_result [<inner>]` — captures the user expression's
+///      raw value into a sentinel local. This preserves any
+///      `set var [...]` bindings the user wrote, since `set`'s
+///      side effect runs before our sentinel-capture wraps it.
+///   4. `<dispatch> $__vw_result` — calls the type's repr proc on
+///      the captured value. The eval returns this formatted string.
+fn wrap_with_repr(
+    inner: &str,
+    ty: &vw_htcl::TypeExpr,
+    types: &std::collections::HashMap<String, &vw_htcl::TypeDecl>,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for p in vw_htcl::repr::emit_primitive_prelude() {
+        out.push_str(&p);
+    }
+    // Walks the dispatch type's underlying when `ty` is a newtype
+    // — necessary for `Properties` (newtype wrapping
+    // `dict<string,Property>`) so the body of `Properties::repr`
+    // can call the monomorphized `dict_string_Property::repr`.
+    let emission = vw_htcl::repr::emit_repr_with_types(ty, types);
+    for p in &emission.procs {
+        out.push_str(p);
+    }
+    writeln!(out, "set __vw_result [{}]", inner.trim_end())
+        .expect("writeln to String never fails");
+    // All reprs (compiler-emitted primitives + generics + user-
+    // written newtype reprs + auto-generated enum reprs) share a
+    // single `{args}` envelope that uses `::vw::kwargs` to bind
+    // `$v`. The dispatch site always calls them as
+    // `<dispatch> -v <val>` so the kwargs envelope binds
+    // uniformly regardless of which class of repr is being
+    // invoked.
+    write!(out, "{} -v $__vw_result", emission.dispatch)
+        .expect("write to String never fails");
+    out
+}
+
+/// If `cmd` is a top-level `proc` whose name appears in the
+/// overload table AND whose first arg is a qualified-variant
+/// annotation, return the mangled internal name that this
+/// specialization should lower under. Otherwise `None`.
+///
+/// This is what reroutes user-written `proc handle_prop {v:
+/// Property::Scalar} { … }` from emitting under the literal
+/// `handle_prop` name (which would collide with the synthesized
+/// dispatcher) to emitting under `__handle_prop__Scalar` (which
+/// the dispatcher's switch arm calls).
+fn overload_specialization_mangle(
+    cmd: &vw_htcl::Command,
+    overloads: &vw_htcl::OverloadTable,
+) -> Option<String> {
+    let vw_htcl::CommandKind::Proc(proc) = &cmd.kind else {
+        return None;
+    };
+    let name = proc.name.as_deref()?;
+    if !overloads.contains_key(name) {
+        return None;
+    }
+    let sig = proc.signature.as_ref()?;
+    let first = sig.args.first()?;
+    let vw_htcl::TypeExpr::Qualified { variant, .. } =
+        first.type_annotation.as_ref()?
+    else {
+        return None;
+    };
+    Some(vw_htcl::mangle_specialization(name, variant))
 }
 
 fn build_origin(
@@ -988,6 +1215,296 @@ mod tests {
             "body_start_line should be a small file-local number, \
              got {}",
             loc.body_start_line
+        );
+    }
+
+    // --- typed-expression wrap (step 3) ----------------------------
+
+    #[test]
+    fn typed_proc_call_wraps_with_repr_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        // A proc annotated dict<string,string>, called bare. The
+        // wrap should:
+        //   - capture the call's result into __vw_result
+        //   - invoke the monomorphized dict repr proc on it
+        // PreparedCommand.expected_return_type carries the type.
+        let prep = prepare(
+            "proc props {} dict<string,string> { return {} }\n\
+             props\n",
+            dir.path(),
+            &empty_session(),
+        )
+        .unwrap();
+        // Two commands: proc decl (drops to empty Tcl) + call.
+        // proc decl ships as a regular command; the call should
+        // be wrapped.
+        let call = prep
+            .commands
+            .iter()
+            .find(|c| c.tcl.contains("__vw_result"))
+            .expect("expected the `props` call to be repr-wrapped");
+        assert!(
+            call.tcl.contains("set __vw_result [props]"),
+            "tcl: {}",
+            call.tcl
+        );
+        assert!(
+            call.tcl
+                .contains("dict_string_string::repr -v $__vw_result"),
+            "tcl: {}",
+            call.tcl
+        );
+        // Primitive prelude is included so the dict repr's
+        // element calls (string::repr) resolve. Both the
+        // primitive procs and the monomorphized generic procs
+        // are wrapped in explicit `namespace eval` blocks so
+        // Tcl's namespace-conflict heuristic doesn't reject the
+        // declaration (the bare `proc string::repr` form trips
+        // over Tcl's built-in `string` command).
+        assert!(
+            call.tcl.contains("namespace eval string"),
+            "expected primitive prelude in wrapped tcl: {}",
+            call.tcl
+        );
+        // Plus the dict repr itself.
+        assert!(
+            call.tcl.contains("namespace eval dict_string_string"),
+            "expected monomorphized dict repr: {}",
+            call.tcl
+        );
+        // The expected_return_type rides along for App-side use.
+        let ty = call
+            .expected_return_type
+            .as_ref()
+            .expect("expected_return_type set");
+        match ty {
+            vw_htcl::TypeExpr::Generic { name, args, .. } => {
+                assert_eq!(name, "dict");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("expected Generic, got {:?}", ty),
+        }
+    }
+
+    #[test]
+    fn set_var_call_inherits_inner_return_type() {
+        // `set cips [props]` — `set` returns the value being set,
+        // so its type is whatever `props` returns. The wrap should
+        // bind `$cips` correctly AND dispatch on the inner call's
+        // declared type.
+        let dir = tempfile::tempdir().unwrap();
+        let prep = prepare(
+            "proc props {} dict<string,string> { return {} }\n\
+             set x [props]\n",
+            dir.path(),
+            &empty_session(),
+        )
+        .unwrap();
+        let set_cmd = prep
+            .commands
+            .iter()
+            .find(|c| c.tcl.contains("__vw_result"))
+            .expect("expected the `set x [...]` to be repr-wrapped");
+        assert!(
+            set_cmd.tcl.contains("set __vw_result [set x [props]]"),
+            "expected the original set to be inner-wrapped: {}",
+            set_cmd.tcl
+        );
+        assert!(
+            set_cmd
+                .tcl
+                .contains("dict_string_string::repr -v $__vw_result"),
+            "tcl: {}",
+            set_cmd.tcl
+        );
+    }
+
+    #[test]
+    fn unannotated_call_is_not_wrapped() {
+        // No return type → no wrap, no `__vw_result` capture,
+        // and `expected_return_type` is None.
+        let dir = tempfile::tempdir().unwrap();
+        let prep = prepare(
+            "proc plain {} { return whatever }\n\
+             plain\n",
+            dir.path(),
+            &empty_session(),
+        )
+        .unwrap();
+        let plain_call = prep
+            .commands
+            .iter()
+            .find(|c| c.tcl.trim() == "plain")
+            .expect("expected raw `plain` call without wrap");
+        assert!(plain_call.expected_return_type.is_none());
+        assert!(
+            !plain_call.tcl.contains("__vw_result"),
+            "unannotated calls shouldn't get the repr wrap: {}",
+            plain_call.tcl
+        );
+    }
+
+    #[test]
+    fn unit_typed_call_is_wrapped_with_unit_dispatch() {
+        // `unit`-typed expressions still get wrapped — the wrap
+        // returns the empty string from `unit::repr`. The App's
+        // EvalDone handler is what suppresses the Result push;
+        // the lowerer is uniform.
+        let dir = tempfile::tempdir().unwrap();
+        let prep = prepare(
+            "proc do_thing {} unit { puts hi }\n\
+             do_thing\n",
+            dir.path(),
+            &empty_session(),
+        )
+        .unwrap();
+        let call = prep
+            .commands
+            .iter()
+            .find(|c| c.tcl.contains("__vw_result"))
+            .expect("expected repr-wrap on unit-typed call");
+        assert!(call.tcl.contains("unit::repr -v $__vw_result"));
+        let ty = call.expected_return_type.as_ref().unwrap();
+        match ty {
+            vw_htcl::TypeExpr::Named { name, .. } => {
+                assert_eq!(name, "unit");
+            }
+            _ => panic!(),
+        }
+    }
+
+    // --- enum / overload pipeline (step 5) -------------------------
+
+    #[test]
+    fn enum_decl_ships_namespace_eval_prelude() {
+        let dir = tempfile::tempdir().unwrap();
+        let prep = prepare(
+            "enum Direction = {\n  North\n  South\n}\n",
+            dir.path(),
+            &empty_session(),
+        )
+        .unwrap();
+        // The prelude is shipped as a synthetic PreparedCommand.
+        let prelude = prep
+            .commands
+            .iter()
+            .find(|c| c.tcl.contains("namespace eval Direction"))
+            .expect("expected enum prelude in prepared commands");
+        assert!(prelude.tcl.contains("proc North {}"));
+        assert!(prelude.tcl.contains("proc South {}"));
+        assert!(prelude.tcl.contains("proc tag {v}"));
+        assert!(prelude.tcl.contains("proc payload {v}"));
+        assert!(prelude.tcl.contains("proc repr {args}"));
+    }
+
+    #[test]
+    fn overload_set_ships_dispatcher_and_mangled_specializations() {
+        let dir = tempfile::tempdir().unwrap();
+        let prep = prepare(
+            "enum E = {\n  A: string\n  B: int\n}\n\
+             proc f {v: E::A} string { return $v }\n\
+             proc f {v: E::B} string { return $v }\n",
+            dir.path(),
+            &empty_session(),
+        )
+        .unwrap();
+        // Dispatcher emitted with the switch body. The dispatcher
+        // takes the standard kwargs envelope (`{args}`), walks
+        // kwargs for `-v <enum-value>`, then switches on the
+        // tag.
+        let dispatcher = prep
+            .commands
+            .iter()
+            .find(|c| {
+                c.tcl.contains("proc f {args}")
+                    && c.tcl.contains("switch")
+                    && c.tcl.contains("__f__")
+            })
+            .expect("expected dispatcher for `f`");
+        assert!(dispatcher.tcl.contains("__f__A"));
+        assert!(dispatcher.tcl.contains("__f__B"));
+        // Specializations emitted under mangled names — look for
+        // the `proc __f__A` declaration (rather than `proc f`).
+        assert!(
+            prep.commands
+                .iter()
+                .any(|c| c.tcl.contains("proc __f__A {args}")),
+            "expected specialization under __f__A: tcls={:?}",
+            prep.commands.iter().map(|c| &c.tcl).collect::<Vec<_>>()
+        );
+        assert!(
+            prep.commands
+                .iter()
+                .any(|c| c.tcl.contains("proc __f__B {args}")),
+            "expected specialization under __f__B"
+        );
+        // The user-visible name `f` should NOT appear as a
+        // user-procedure declaration — only as the dispatcher.
+        // (The dispatcher's body has `proc f {v args}` which we
+        // already accounted for above; what we're guarding
+        // against is a leaked `proc f {args} { ::vw::kwargs ... }`
+        // specialization.)
+        let leaked_f = prep
+            .commands
+            .iter()
+            .filter(|c| c.tcl.contains("proc f {args} { ::vw::kwargs"))
+            .count();
+        assert_eq!(
+            leaked_f, 0,
+            "specialization should NOT have leaked under public name `f`"
+        );
+    }
+
+    #[test]
+    fn cross_batch_newtype_recursion_emits_generic_repr() {
+        // Reproduces the user-reported regression: batch 1
+        // declares `type Properties = dict<string,string>` and a
+        // proc returning Properties; batch 2 calls that proc.
+        // The wrap_with_repr in batch 2 should walk Properties's
+        // underlying (the dict generic) and emit
+        // `dict_string_string::repr` so the user's
+        // `Properties::repr` body can find it.
+        //
+        // Pre-fix: type_decl_table was per-batch, so batch 2
+        // couldn't see Properties; the recursion didn't fire;
+        // dict_string_string::repr was never emitted; the
+        // user's body errored with `invalid command name`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        let first = prepare(
+            "type Properties = {dict<string,string>}\n\
+             proc Properties::repr {v} { return $v }\n\
+             proc Properties::from {v} { return $v }\n\
+             proc Properties::to {v} { return $v }\n\
+             proc get_props {} Properties { return {a 1 b 2} }\n",
+            dir.path(),
+            &session,
+        )
+        .unwrap();
+        session.commit(first.batch);
+
+        // Batch 2: just the call. parsed.document doesn't have
+        // the type decl — it must come from `session`.
+        let second = prepare("get_props\n", dir.path(), &session).unwrap();
+        let call = second
+            .commands
+            .iter()
+            .find(|c| c.tcl.contains("__vw_result"))
+            .expect("expected wrapped call to get_props");
+        // The wrap must include the monomorphized dict repr
+        // (reached by recursing through Properties's underlying).
+        assert!(
+            call.tcl.contains("namespace eval dict_string_string"),
+            "expected dict_string_string::repr in wrap (newtype \
+             recursion across batches): {}",
+            call.tcl
+        );
+        // And the top-level dispatch goes through Properties::repr
+        // with the `-v` form, not positional.
+        assert!(
+            call.tcl.contains("Properties::repr -v $__vw_result"),
+            "expected Properties::repr dispatch via -v form: {}",
+            call.tcl
         );
     }
 }

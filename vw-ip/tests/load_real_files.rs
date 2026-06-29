@@ -115,7 +115,13 @@ fn generates_cpm5_wrapper_in_split_mode() {
         {
             current = Some((name.to_string(), 0));
             in_args = true;
-        } else if line == "} {" {
+        } else if line == "} {"
+            || (line.starts_with("} ") && line.ends_with(" {"))
+        {
+            // `} {` is the old (untyped) body opener; `} TYPE {`
+            // (e.g. `} bd_cell {`, `} unit {`) is the new
+            // type-annotated form added in step 6 of the
+            // return-type rollout. Either ends the args block.
             if let Some(c) = current.take() {
                 proc_sizes.push(c);
             }

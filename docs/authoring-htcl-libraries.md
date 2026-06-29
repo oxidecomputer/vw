@@ -222,6 +222,72 @@ value that is itself an interpolation (`$var`, `[cmd]`) is not
 statically checkable and silently passes — the runtime sees
 whatever the interpolation produces.
 
+### 2.5.0a Argument types
+
+An argument may carry a type annotation in a `: TYPE` suffix on
+the arg name:
+
+```
+proc plumb_pin {
+  ## What to name the external port.
+  name: string
+
+  ## Identity of the pin to make external.
+  pin: bd_pin
+} unit {
+  …
+}
+```
+
+The annotation uses the same type vocabulary as the return-type
+slot (§2.5.1) — primitives (`string`, `int`, `bool`, `unit`),
+newtypes (`bd_cell`, `bd_pin`, …), and generics (`list<T>`,
+`dict<K, V>`, with arbitrary nesting). Compatible with the
+existing attribute grammar (`@default(0) count: int`).
+
+Annotations are optional — untyped args still parse. The
+analyzer shows annotated args as `-name: TYPE` in hover and
+signature help; the validator uses them to shape-check newtype
+`<T>::repr` / `from` / `to` triplets.
+
+See [htcl-return-types.md](htcl-return-types.md) for the full
+type vocabulary, newtype declaration syntax, and worked
+examples. For values that can take one of several shapes
+(e.g. heterogeneous EDA return values), see
+[htcl-enums.md](htcl-enums.md) for tagged sum types with
+auto-generated constructors, repr, and overload dispatch.
+
+### 2.5.1 Return types
+
+A proc may carry a return-type annotation in a 4th-word slot
+between the args block and the body:
+
+```
+proc make_widget { @arg(name) ... } widget {
+  …body…
+}
+```
+
+The annotation drives the REPL printer (the result is formatted
+through the type's `repr` proc) and the analyzer's hover /
+signature-help (`proc NAME → TYPE`). Procs without an annotation
+parse and behave identically to today — adoption is gradual.
+
+Available shapes:
+
+- Primitives: `string`, `int`, `bool`, `unit`. Built into the
+  compiler; no declaration needed.
+- Generics: `list<T>`, `dict<K, V>`, with arbitrary nesting.
+- User newtypes: any identifier introduced via `type NAME =
+  UNDERLYING`, accompanied by `<NAME>::repr` / `from` / `to`.
+
+`unit` is the type for side-effecting procs that don't return a
+meaningful value (logging, configuring, connecting). The REPL
+suppresses the empty Result entry on `unit`-typed expressions.
+
+See [htcl-return-types.md](htcl-return-types.md) for the full
+type vocabulary, newtype declaration syntax, and worked examples.
+
 ### 2.6 Call sites
 
 The canonical call-site shape is `set <name> [<call> <args…>]` —

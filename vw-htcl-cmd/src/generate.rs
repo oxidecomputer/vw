@@ -72,12 +72,48 @@ const TYPED_ARG_NAMES: &[&str] = &[
     "intf_ports",
     "net",
     "nets",
+    "intf_net",
+    "intf_nets",
 ];
 
 fn is_typed_arg(name: &str, override_: Option<bool>) -> bool {
     match override_ {
         Some(t) => t,
         None => TYPED_ARG_NAMES.contains(&name),
+    }
+}
+
+/// Map a typed-arg name to its concrete `TypeExpr` text, when
+/// known. Drives the `name: TYPE` annotation emitted in the
+/// generated proc args. Plural names (`cells`, `pins`) map to
+/// `list<bd_*>`; singulars (`cell`, `pin`) map to the bd_* type
+/// directly. Generic catch-alls (`object`, `objects`,
+/// `of_objects`) can refer to any Vivado handle class, so we
+/// leave them untyped at this layer — the type system doesn't
+/// have unions in v1.
+///
+/// Returning `None` means "the arg is typed (don't list-wrap in
+/// the body) but we don't have a precise type expression for
+/// it" — the generator emits the arg without an annotation.
+fn typed_arg_type(name: &str) -> Option<&'static str> {
+    match name {
+        "cell" => Some("bd_cell"),
+        "cells" => Some("list<bd_cell>"),
+        "pin" => Some("bd_pin"),
+        "pins" => Some("list<bd_pin>"),
+        "port" => Some("bd_port"),
+        "ports" => Some("list<bd_port>"),
+        "net" => Some("bd_net"),
+        "nets" => Some("list<bd_net>"),
+        "intf_pin" => Some("bd_intf_pin"),
+        "intf_pins" => Some("list<bd_intf_pin>"),
+        "intf_port" => Some("bd_intf_port"),
+        "intf_ports" => Some("list<bd_intf_port>"),
+        "intf_net" => Some("bd_intf_net"),
+        "intf_nets" => Some("list<bd_intf_net>"),
+        // object / objects / of_objects: any handle class — no
+        // precise type until we have unions.
+        _ => None,
     }
 }
 
@@ -150,7 +186,19 @@ pub fn generate(page: &ManPage, opts: &GenerateOptions) -> String {
     // Proc args (structured) and body (compact Tcl).
     let args = build_args(page, &effective);
     let body = build_body(&forwarded, &effective);
-    emit_proc(&mut out, cmd, &args, &body);
+    // Resolve return type. Priority:
+    //   1. Explicit override in `cmd-constraints.toml`.
+    //   2. The page's `Returns:` section, if present.
+    //   3. Phrases in the `Description:` section — Vivado very
+    //      rarely uses a dedicated Returns: header, so this is
+    //      actually the common path. The phrase table is the same
+    //      either way.
+    let return_type = overrides
+        .and_then(|o| o.returns.as_deref())
+        .map(String::from)
+        .or_else(|| infer_return_type(page.returns.as_deref()))
+        .or_else(|| infer_return_type(Some(page.description.as_slice())));
+    emit_proc(&mut out, cmd, &args, return_type.as_deref(), &body);
 
     writeln!(out).unwrap();
     writeln!(out, "}}").unwrap();
@@ -249,6 +297,12 @@ struct EffectiveArg {
     /// — body emission passes it directly (`-flag $value`) rather
     /// than threading it through a list. See [`TYPED_ARG_NAMES`].
     typed: bool,
+    /// The arg's declared type expression, if known. Emitted in
+    /// the proc args as `name: TYPE`. Set from
+    /// [`typed_arg_type`] for the typed-handle allowlist; an
+    /// explicit per-arg `type = "..."` override in
+    /// `cmd-constraints.toml` wins over the inferred value.
+    arg_type: Option<String>,
 }
 
 fn effective_args(
@@ -307,6 +361,10 @@ fn effective_arg(arg: &Argument, over: Option<&ArgOverride>) -> EffectiveArg {
     };
 
     let typed = is_typed_arg(&arg.ident, over.typed);
+    let arg_type = over
+        .arg_type
+        .clone()
+        .or_else(|| typed_arg_type(&arg.ident).map(String::from));
 
     EffectiveArg {
         ident: arg.ident.clone(),
@@ -319,6 +377,7 @@ fn effective_arg(arg: &Argument, over: Option<&ArgOverride>) -> EffectiveArg {
         conflicts: over.conflicts.clone(),
         description: arg.description.clone(),
         typed,
+        arg_type,
     }
 }
 
@@ -393,7 +452,19 @@ fn effective_attr_words(arg: &EffectiveArg) -> Vec<Word> {
             arg.conflicts.join(", ")
         )));
     }
-    words.push(Word::Bare(arg.ident.clone()));
+    match arg.arg_type.as_deref() {
+        Some(ty) => {
+            // Emit `name: TYPE` as two adjacent bare words. The
+            // proc-args parser tokenizes `name`, `:`, and TYPE
+            // independently — the layout reads as the user would
+            // write it.
+            words.push(Word::Bare(format!("{}:", arg.ident)));
+            words.push(Word::Bare(ty.to_string()));
+        }
+        None => {
+            words.push(Word::Bare(arg.ident.clone()));
+        }
+    }
     words
 }
 
@@ -594,9 +665,18 @@ fn emit_typed_invocation_with(
     }
 }
 
-/// Emit `proc <name> { <args> } { <body> }` with args and body each
-/// indented two spaces. Mirrors the helper in `vw_ip::generate`.
-fn emit_proc(out: &mut String, name: &str, args: &Doc, body: &str) {
+/// Emit `proc <name> { <args> } <type>? { <body> }` with args and
+/// body each indented two spaces. When `return_type` is Some, emits
+/// it as the 4th htcl word between the args block and the body —
+/// brace-wrapping if the type expression contains whitespace so it
+/// parses as a single word.
+fn emit_proc(
+    out: &mut String,
+    name: &str,
+    args: &Doc,
+    return_type: Option<&str>,
+    body: &str,
+) {
     let args_text = args.to_string();
     writeln!(out, "proc {name} {{").unwrap();
     for line in args_text.lines() {
@@ -606,7 +686,22 @@ fn emit_proc(out: &mut String, name: &str, args: &Doc, body: &str) {
             writeln!(out, "  {line}").unwrap();
         }
     }
-    writeln!(out, "}} {{").unwrap();
+    match return_type {
+        Some(ty) => {
+            // Wrap with `{ … }` if the type expression contains
+            // whitespace (the htcl parser would otherwise see
+            // multiple words).
+            let needs_brace = ty.chars().any(char::is_whitespace);
+            if needs_brace {
+                writeln!(out, "}} {{{ty}}} {{").unwrap();
+            } else {
+                writeln!(out, "}} {ty} {{").unwrap();
+            }
+        }
+        None => {
+            writeln!(out, "}} {{").unwrap();
+        }
+    }
     for line in body.lines() {
         if line.is_empty() {
             writeln!(out).unwrap();
@@ -615,6 +710,67 @@ fn emit_proc(out: &mut String, name: &str, args: &Doc, body: &str) {
         }
     }
     writeln!(out, "}}").unwrap();
+}
+
+/// Infer a return-type annotation from the Vivado man-page's
+/// `Returns:` prose. The phrase-table is intentionally small —
+/// matches the recurring shapes Vivado uses across hundreds of
+/// commands. Unmatched phrasings return `None`; the
+/// `cmd-constraints.toml` `returns = "…"` override picks up
+/// whatever doesn't match.
+///
+/// Matched on the joined, lowercased text — Vivado's prose is
+/// short (usually one or two lines) so we don't need a real NLP
+/// pipeline.
+fn infer_return_type(returns: Option<&[String]>) -> Option<String> {
+    let lines = returns?;
+    let joined = lines.join(" ").to_ascii_lowercase();
+    let text = joined.trim();
+    if text.is_empty() {
+        return None;
+    }
+    // Order matters: more-specific phrases first. Each entry is
+    // (substring needle, type). A real future implementation
+    // could swap in regex; substring search is good enough for
+    // the v1 phrase set.
+    let table: &[(&str, &str)] = &[
+        // "nothing" / "Tcl_OK on success" — side-effecting commands.
+        ("returns nothing", "unit"),
+        ("nothing", "unit"),
+        // Lists of typed handles.
+        ("a list of cells", "list<bd_cell>"),
+        ("a list of bd_cells", "list<bd_cell>"),
+        ("list of cell objects", "list<bd_cell>"),
+        ("a list of pins", "list<bd_pin>"),
+        ("a list of bd_pins", "list<bd_pin>"),
+        ("a list of intf_pins", "list<bd_intf_pin>"),
+        ("a list of interface pins", "list<bd_intf_pin>"),
+        ("a list of intf_ports", "list<bd_intf_port>"),
+        ("a list of interface ports", "list<bd_intf_port>"),
+        ("a list of ports", "list<bd_port>"),
+        ("a list of nets", "list<bd_net>"),
+        ("a list of intf_nets", "list<bd_intf_net>"),
+        ("a list of interface nets", "list<bd_intf_net>"),
+        // Singular handles.
+        ("the cell created", "bd_cell"),
+        ("the new cell", "bd_cell"),
+        ("the pin created", "bd_pin"),
+        ("the port created", "bd_port"),
+        ("the net created", "bd_net"),
+        // Property values.
+        ("the property value", "string"),
+        ("the value of the property", "string"),
+        ("a list of properties", "list<string>"),
+        // Generic strings (catch-all when prose says "string"
+        // explicitly).
+        ("returns a string", "string"),
+    ];
+    for (needle, ty) in table {
+        if text.contains(needle) {
+            return Some((*ty).into());
+        }
+    }
+    None
 }
 
 /// Make doc-comment text safe to embed inside the proc arg-list braces.

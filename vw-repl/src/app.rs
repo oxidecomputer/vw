@@ -165,6 +165,13 @@ pub struct App {
     /// fires — without this fallback those warnings would arrive
     /// stack-less).
     pending_origins: Vec<Origin>,
+    /// Parallel to `pending_origins`: the expected return type of
+    /// each shipped command, when statically resolvable. Used by
+    /// the `EvalDone` handler to (a) skip the heuristic formatter
+    /// when the value is already type-formatted by the wrapped
+    /// Tcl, and (b) suppress the Result push entirely for
+    /// `unit`-typed expressions.
+    pending_return_types: Vec<Option<vw_htcl::TypeExpr>>,
     pending_eval_index: usize,
     /// The batch we shipped to the worker but haven't yet seen a
     /// result for. Held aside so a successful eval (and only a
@@ -340,6 +347,7 @@ impl App {
             eval_rx,
             pending_batch: None,
             pending_origins: Vec::new(),
+            pending_return_types: Vec::new(),
             pending_eval_index: 0,
             exit: false,
         }
@@ -959,11 +967,16 @@ impl App {
             }
         }
 
-        // Snapshot per-command origins for the stream-tagging path.
-        // EvalBatch consumes `lowered.commands` below, so we have to
-        // grab the origins first.
+        // Snapshot per-command origins + types for the stream-
+        // tagging + result-display paths. EvalBatch consumes
+        // `lowered.commands` below, so we grab both first.
         self.pending_origins =
             lowered.commands.iter().map(|c| c.origin.clone()).collect();
+        self.pending_return_types = lowered
+            .commands
+            .iter()
+            .map(|c| c.expected_return_type.clone())
+            .collect();
         self.pending_eval_index = 0;
 
         // Commit to the session only after every command in the
@@ -1089,6 +1102,14 @@ impl App {
                 result,
                 last_in_batch,
             } => {
+                // Grab the return type for THIS command (the one
+                // that just finished) before we advance the index
+                // and possibly clear the buffer.
+                let finished_return_type = self
+                    .pending_return_types
+                    .get(self.pending_eval_index)
+                    .cloned()
+                    .flatten();
                 // Advance past the command that just finished — the
                 // stream-tagging path uses `pending_origins[index]`
                 // to label warnings emitted by the *currently*
@@ -1098,6 +1119,7 @@ impl App {
                     self.pending_eval_index.saturating_add(1);
                 if last_in_batch {
                     self.pending_origins.clear();
+                    self.pending_return_types.clear();
                     self.pending_eval_index = 0;
                 }
                 match result {
@@ -1117,15 +1139,29 @@ impl App {
                                         .to_string(),
                                 );
                             }
-                            if !out.value.is_empty() {
-                                // If the return looks like a Tcl
-                                // KEY VAL KEY VAL … dict (common
-                                // for property reports, `dict get`,
-                                // `array get`, etc.) reflow it to
-                                // one pair per line. Falls back to
-                                // the raw string for anything else.
-                                let text = pretty_kv_list(&out.value)
-                                    .unwrap_or_else(|| out.value.clone());
+                            // Result-rendering policy:
+                            //   - `unit`-typed expressions push nothing
+                            //     (the value is meaningless by design).
+                            //   - Other typed expressions push verbatim
+                            //     — the wrapped Tcl already ran the
+                            //     type's `repr` proc, so `out.value`
+                            //     is the formatted display string.
+                            //   - Untyped expressions fall back to the
+                            //     legacy heuristic, kept for now while
+                            //     the wrapper libraries grow
+                            //     annotations.
+                            let suppress = matches!(
+                                finished_return_type.as_ref(),
+                                Some(vw_htcl::TypeExpr::Named { name, .. })
+                                    if name == "unit"
+                            );
+                            if !suppress && !out.value.is_empty() {
+                                let text = if finished_return_type.is_some() {
+                                    out.value.clone()
+                                } else {
+                                    pretty_kv_list(&out.value)
+                                        .unwrap_or_else(|| out.value.clone())
+                                };
                                 self.push(ScrollbackKind::Result, text);
                             }
                             if let Some(batch) = self.pending_batch.take() {

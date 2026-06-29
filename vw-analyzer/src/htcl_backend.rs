@@ -403,12 +403,22 @@ fn signature_help_response(help: &vw_htcl::SignatureHelp<'_>) -> SignatureHelp {
         let start = label.chars().count() as u32;
         label.push('-');
         label.push_str(&arg.name);
+        if let Some(ty) = arg.type_annotation.as_ref() {
+            label.push_str(": ");
+            label.push_str(&render_type(ty));
+        }
         let end = label.chars().count() as u32;
         parameters.push(ParameterInformation {
             label: ParameterLabel::LabelOffsets([start, end]),
             documentation: vw_htcl::doc::brief(&arg.doc_comments)
                 .map(Documentation::String),
         });
+    }
+    // Append the return type to the signature label when present.
+    // Renders as `proc-name -arg1 -arg2 → bd_cell`.
+    if let Some(ty) = help.signature.return_type.as_ref() {
+        label.push_str(" → ");
+        label.push_str(&render_type(ty));
     }
 
     let reflowed = vw_htcl::doc::reflow_doc_comments(help.doc_comments);
@@ -538,6 +548,25 @@ fn proc_doc_comments_by_name_in(
     None
 }
 
+/// Render a type expression in the canonical user-facing form —
+/// `dict<string,bd_cell>`, `list<int>`, etc. Used by hover and
+/// signature-help so the displayed type matches what the user
+/// would write in source.
+fn render_type(ty: &vw_htcl::TypeExpr) -> String {
+    match ty {
+        vw_htcl::TypeExpr::Named { name, .. } => name.clone(),
+        vw_htcl::TypeExpr::Generic { name, args, .. } => {
+            let inner: Vec<String> = args.iter().map(render_type).collect();
+            format!("{name}<{}>", inner.join(","))
+        }
+        vw_htcl::TypeExpr::Qualified {
+            namespace, variant, ..
+        } => {
+            format!("{namespace}::{variant}")
+        }
+    }
+}
+
 // --- markdown formatters --------------------------------------------------
 
 fn format_hover(target: &HoverTarget, proc_doc_comments: &[String]) -> String {
@@ -555,7 +584,30 @@ fn format_hover(target: &HoverTarget, proc_doc_comments: &[String]) -> String {
         HoverTarget::ProcArgDef { arg, .. }
         | HoverTarget::CallArg { arg, .. } => format_arg(arg),
         HoverTarget::LocalVar { name, .. } => format_local_var(name),
+        HoverTarget::EnumDef { decl, .. } => format_enum(decl),
     }
+}
+
+fn format_enum(decl: &vw_htcl::EnumDecl) -> String {
+    let mut out = String::new();
+    let name = decl.name.as_deref().unwrap_or("<enum>");
+    writeln!(out, "```htcl").unwrap();
+    writeln!(out, "enum {name} = {{").unwrap();
+    for v in &decl.variants {
+        match v.payload.as_ref() {
+            Some(p) => {
+                writeln!(out, "  {}: {}", v.name, render_type(p)).unwrap()
+            }
+            None => writeln!(out, "  {}", v.name).unwrap(),
+        }
+    }
+    writeln!(out, "}}").unwrap();
+    writeln!(out, "```").unwrap();
+    out.push_str("\nTagged sum type. The compiler auto-generates ");
+    out.push_str("constructors (`<Enum>::<Variant>`), repr, and ");
+    out.push_str("`tag`/`payload` accessors. See ");
+    out.push_str("docs/htcl-enums.md for the full semantics.\n");
+    out
 }
 
 fn format_local_var(name: &str) -> String {
@@ -574,7 +626,18 @@ fn format_proc(
 ) -> String {
     let mut out = String::new();
     writeln!(out, "```htcl").unwrap();
-    writeln!(out, "proc {name}").unwrap();
+    // Include the return type in the proc header when annotated:
+    //   proc foo → string
+    // Unannotated procs render unchanged (`proc foo`).
+    let return_ty = signature.and_then(|s| s.return_type.as_ref());
+    match return_ty {
+        Some(ty) => {
+            writeln!(out, "proc {name} → {}", render_type(ty)).unwrap();
+        }
+        None => {
+            writeln!(out, "proc {name}").unwrap();
+        }
+    }
     writeln!(out, "```").unwrap();
     let reflowed = vw_htcl::doc::reflow_doc_comments(proc_doc_comments);
     if !reflowed.is_empty() {
@@ -586,7 +649,15 @@ fn format_proc(
         if !sig.args.is_empty() {
             out.push_str("\n### Parameters\n\n");
             for arg in &sig.args {
-                write!(out, "- `-{}`", arg.name).unwrap();
+                match arg.type_annotation.as_ref() {
+                    Some(ty) => {
+                        write!(out, "- `-{}: {}`", arg.name, render_type(ty))
+                            .unwrap();
+                    }
+                    None => {
+                        write!(out, "- `-{}`", arg.name).unwrap();
+                    }
+                }
                 let reflowed =
                     vw_htcl::doc::reflow_doc_comments(&arg.doc_comments);
                 let mut paragraphs = reflowed.split("\n\n");
@@ -610,7 +681,12 @@ fn format_proc(
 fn format_arg(arg: &ProcArg) -> String {
     let mut out = String::new();
     writeln!(out, "```htcl").unwrap();
-    writeln!(out, "-{}", arg.name).unwrap();
+    match arg.type_annotation.as_ref() {
+        Some(ty) => {
+            writeln!(out, "-{}: {}", arg.name, render_type(ty)).unwrap()
+        }
+        None => writeln!(out, "-{}", arg.name).unwrap(),
+    }
     writeln!(out, "```").unwrap();
     let reflowed = vw_htcl::doc::reflow_doc_comments(&arg.doc_comments);
     if !reflowed.is_empty() {
@@ -920,6 +996,86 @@ cfg -depth \n";
                 assert!(m.value.contains("Configure the bus."), "{}", m.value);
             }
             other => panic!("expected markup documentation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signature_help_includes_return_type_arrow() {
+        let backend = HtclBackend::new();
+        let src = "\
+proc make_widget {} bd_cell { return foo }\n\
+make_widget \n";
+        backend.set_text(uri(), src.into()).await;
+        let help = backend
+            .signature_help(
+                &uri(),
+                Position {
+                    line: 1,
+                    character: 12,
+                },
+            )
+            .await
+            .expect("signature help expected");
+        let info = &help.signatures[0];
+        // Label should carry the `→ bd_cell` suffix.
+        assert!(info.label.contains("→ bd_cell"), "{}", info.label);
+    }
+
+    #[tokio::test]
+    async fn hover_on_enum_decl_shows_variants() {
+        let backend = HtclBackend::new();
+        let src = "\
+enum Property = {\n  Scalar: string\n  Nested: int\n}\n";
+        backend.set_text(uri(), src.into()).await;
+        // Cursor on the enum name (line 0, col 5: 'Property').
+        let hover = backend
+            .hover(
+                &uri(),
+                Position {
+                    line: 0,
+                    character: 7,
+                },
+            )
+            .await
+            .expect("hover on enum decl name");
+        if let HoverContents::Markup(MarkupContent { value, .. }) =
+            hover.contents
+        {
+            assert!(value.contains("enum Property"), "{value}");
+            assert!(value.contains("Scalar: string"), "{value}");
+            assert!(value.contains("Nested: int"), "{value}");
+        } else {
+            panic!("expected Markup hover");
+        }
+    }
+
+    #[tokio::test]
+    async fn hover_proc_def_includes_return_type() {
+        let backend = HtclBackend::new();
+        let src = "\
+## Builds a widget.\n\
+proc make_widget {} dict<string,bd_cell> { return {} }\n";
+        backend.set_text(uri(), src.into()).await;
+        // Hover on the proc name `make_widget` at line 1.
+        let hover = backend
+            .hover(
+                &uri(),
+                Position {
+                    line: 1,
+                    character: 8,
+                },
+            )
+            .await
+            .expect("hover expected on proc def");
+        if let HoverContents::Markup(MarkupContent { value, .. }) =
+            hover.contents
+        {
+            assert!(
+                value.contains("→ dict<string,bd_cell>"),
+                "expected return type in hover: {value}"
+            );
+        } else {
+            panic!("expected Markup hover contents");
         }
     }
 

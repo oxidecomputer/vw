@@ -11,6 +11,7 @@ serde.workspace = true
 thiserror.workspace = true
 winnow.workspace = true
 camino.workspace = true
+vw-quote = { path = "../vw-quote" }
 
 [dev-dependencies]
 tempfile.workspace = true

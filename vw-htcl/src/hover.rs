@@ -49,6 +49,12 @@ pub enum HoverTarget<'a> {
     /// (`set`/`variable`) rather than a parameter. The span is the
     /// reference itself.
     LocalVar { name: String, span: Span },
+    /// Cursor is on the name of an `enum` declaration. Shows the
+    /// variants block as a hover popup.
+    EnumDef {
+        decl: &'a crate::ast::EnumDecl,
+        span: Span,
+    },
 }
 
 impl HoverTarget<'_> {
@@ -58,7 +64,8 @@ impl HoverTarget<'_> {
             | HoverTarget::ProcArgDef { span, .. }
             | HoverTarget::CallSite { span, .. }
             | HoverTarget::CallArg { span, .. }
-            | HoverTarget::LocalVar { span, .. } => *span,
+            | HoverTarget::LocalVar { span, .. }
+            | HoverTarget::EnumDef { span, .. } => *span,
         }
     }
 }
@@ -127,6 +134,17 @@ fn hover_in_command<'a>(
             // Cursor isn't on the proc's name or an arg — look inside
             // the body.
             .or_else(|| hover_in_stmts(&proc.body, table, offset)),
+        CommandKind::EnumDecl(decl) => {
+            // Cursor on the enum's name → show the variants.
+            if decl.name_span.contains(offset) {
+                Some(HoverTarget::EnumDef {
+                    decl,
+                    span: decl.name_span,
+                })
+            } else {
+                None
+            }
+        }
         _ => hover_in_call(cmd, table, offset),
     };
     primary.or_else(|| hover_in_cmd_substs(&cmd.words, table, offset))
