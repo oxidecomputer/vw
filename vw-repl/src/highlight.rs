@@ -96,7 +96,9 @@ fn parse_line(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
     spans.push(Span::styled(key.to_string(), key_style()));
     let sp = take_while(1.., |c: char| c == ' ').parse_next(input)?;
     spans.push(Span::raw(sp.to_string()));
-    let value_spans = parse_value(input)?;
+    // Top-level: require the value to use parens to avoid false-
+    // positives on plain prose `puts "Word Other"` Stdout lines.
+    let value_spans = parse_value(input, true)?;
     spans.extend(value_spans);
     Ok(spans)
 }
@@ -104,13 +106,27 @@ fn parse_line(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
 // VALUE is one of:
 //   IDENT '(' INNER ')'   — single-line variant call with payload
 //   IDENT '('             — multi-line open (line ends after `(`)
-//   IDENT                 — empty-payload variant (rare)
-fn parse_value(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
+//   IDENT                 — empty-payload variant
+//
+// `require_parens = true` rejects the bare-IDENT form. We use that
+// at the TOP LEVEL of a Stdout/Result line, where "KEY VARIANT"
+// without parens is far more often plain prose (e.g.
+// `puts "Configuring CIPS"` → `Configuring CIPS`) than an actual
+// repr — styling that prose as if it were a typed value produces
+// distracting false-positives. Inside an inline payload (sub-entries
+// like `Nested(K1 Empty K2 Other(x))`) we accept bare IDENT because
+// we've already seen the surrounding `Nested(`, so the context is
+// unambiguous.
+fn parse_value(
+    input: &mut &str,
+    require_parens: bool,
+) -> ModalResult<Vec<Span<'static>>> {
     let variant = parse_ident(input)?;
     let mut out = vec![Span::styled(variant.to_string(), variant_style())];
     if !input.starts_with('(') {
-        // Empty-payload variant — variant name alone (e.g. a
-        // bare `North` from `enum Direction = {North; South}`).
+        if require_parens {
+            return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
+        }
         return Ok(out);
     }
     *input = &input[1..];
@@ -180,7 +196,9 @@ fn parse_sub_entry(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
     out.push(Span::styled(key.to_string(), key_style()));
     let sp = take_while(1.., |c: char| c == ' ').parse_next(input)?;
     out.push(Span::raw(sp.to_string()));
-    let value_spans = parse_value(input)?;
+    // Sub-entry: bare-ident variant allowed (we're already inside
+    // an established `Variant(...)` so the context is unambiguous).
+    let value_spans = parse_value(input, false)?;
     out.extend(value_spans);
     Ok(out)
 }
@@ -308,5 +326,15 @@ mod tests {
         assert!(highlight_line("INFO: vivado started").is_none());
         assert!(highlight_line("just some random text").is_none());
         assert!(highlight_line("").is_none());
+    }
+
+    #[test]
+    fn plain_two_word_prose_not_styled_as_repr() {
+        // Regression: stdout text like `puts "Configuring CIPS"` used
+        // to match the `KEY EmptyVariant` shape and get colored. The
+        // top-level parser must require parens to avoid this.
+        assert!(highlight_line("Configuring CIPS").is_none());
+        assert!(highlight_line("CPM 5 USER PROPS").is_none());
+        assert!(highlight_line("Hello World").is_none());
     }
 }

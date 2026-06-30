@@ -123,6 +123,26 @@ impl Selection {
     }
 }
 
+/// REPL meta-command catalog. Each entry is `(label, hint)` where
+/// `label` is the full `:command` token (including the leading
+/// colon, since that's what the user types and what Tab-completion
+/// replaces) and `hint` is a one-line description shown in the
+/// completion popup.
+///
+/// Keep in sync with the `match` in [`App::run_meta_command`] and
+/// with the cheat-sheet rows in [`crate::popup::HELP_ROWS`].
+pub const META_COMMANDS: &[(&str, &str)] = &[
+    (":load", "evaluate a file's contents in this session"),
+    (":libs", "list loaded libraries + symbol counts"),
+    (":quit", "exit the REPL"),
+    (":exit", "exit the REPL (alias of :quit)"),
+    (":q", "exit the REPL (alias of :quit)"),
+    (
+        ":restart",
+        "restart the Vivado worker (not yet implemented)",
+    ),
+];
+
 #[derive(Clone, Debug)]
 pub struct ReverseSearch {
     /// The substring the user is searching for.
@@ -183,6 +203,11 @@ pub struct App {
     /// `scrollback_scroll`.
     last_rendered_scroll: u16,
     reverse_search: Option<ReverseSearch>,
+    /// Active LSP-style popup over the input editor (completion,
+    /// signature help, hover). When `Some`, the key handler routes
+    /// navigation / dismissal keys to the popup BEFORE the catch-all
+    /// editor handoff. See [`crate::popup`].
+    popup: Option<crate::popup::PopupState>,
     worker_state: WorkerState,
     worker_tx: mpsc::Sender<WorkerCmd>,
     eval_rx: mpsc::UnboundedReceiver<WorkerEvent>,
@@ -338,6 +363,17 @@ async fn run_inner(
         }
 
         tokio::select! {
+            // Bias toward user input over worker events. Without
+            // this, a streaming eval (hundreds of stream chunks per
+            // second from Vivado) drowns out individual keystrokes:
+            // tokio::select! picks randomly when multiple branches
+            // are ready, and the worker channel is ready far more
+            // often. Result: Tab during eval looks dead because the
+            // keypress queues behind a long run of worker events.
+            // Biased order guarantees a ready crossterm event always
+            // wins, then the drain phase below catches up on worker
+            // events before the next draw.
+            biased;
             maybe_event = crossterm_events.next() => {
                 match maybe_event {
                     Some(Ok(ev)) => app.handle_terminal_event(ev).await,
@@ -421,6 +457,7 @@ impl App {
             scrollback_follow: true,
             last_rendered_scroll: 0,
             reverse_search: None,
+            popup: None,
             worker_state: WorkerState::Starting,
             worker_tx,
             eval_rx,
@@ -509,6 +546,653 @@ impl App {
 
     fn current_input_text(&self) -> String {
         self.input.lines().join("\n")
+    }
+
+    /// Translate the input editor's `(row, col)` cursor into a byte
+    /// offset within `current_input_text()`. Returns `None` when the
+    /// cursor is past EOF (shouldn't happen — TextArea keeps it in
+    /// bounds — but defensive).
+    fn cursor_byte_offset(&self) -> Option<u32> {
+        let (row, col) = self.input.cursor();
+        let buffer = self.current_input_text();
+        let line_idx = vw_htcl::line_index::LineIndex::new(&buffer);
+        Some(line_idx.offset_of(vw_htcl::line_index::LineCol {
+            line: row as u32,
+            character: col as u32,
+        }))
+    }
+
+    /// Map an input-buffer (row, col) to a screen cell within the
+    /// input editor's rendered area. Used to anchor popups (slice 4+)
+    /// just below the cursor. Returns `None` when no scrollback area
+    /// has been captured yet (shouldn't happen post-first-render but
+    /// defensive against early key events).
+    fn cursor_screen_cell(&self) -> Option<(u16, u16)> {
+        // We don't have direct access to the input area Rect here
+        // (only the scrollback's). The popup anchor instead uses a
+        // best-effort approximation: assume the input area starts
+        // just below the scrollback and the popup will clamp to the
+        // frame in the renderer. Concretely: row = bottom of the
+        // visible scrollback (where the input border sits) + cursor
+        // row in the editor, col = cursor col + the input area's
+        // left edge (we use scrollback's x which they share).
+        let area = self.scrollback_area?;
+        let (row, col) = self.input.cursor();
+        // +1 to step past the input box's top border, +area.y to land
+        // inside the input region. The renderer's popup positioning
+        // does additional clamping so over- and under-shoots are safe.
+        let screen_y = area.y + area.height + 1 + row as u16;
+        let screen_x = area.x + 1 + col as u16;
+        Some((screen_x, screen_y))
+    }
+
+    /// Trigger a completion popup at the current cursor position. No-op
+    /// when there are no completions to show. Called from the Tab key
+    /// handler.
+    fn trigger_completion(&mut self) {
+        let input = self.current_input_text();
+        let Some(offset) = self.cursor_byte_offset() else {
+            return;
+        };
+        // Parse ONLY the in-flight input. Earlier we tried merging
+        // session.merged_source() (~6MB after `src @vivado-cmd`)
+        // into the analysis source so `util::<Tab>` would see
+        // session-known procs. That had two fatal problems:
+        //
+        //  1. Per-Tab cost was a multi-MB parse + a multi-MB
+        //     `cmdline::analyze` walk-back. The UI froze for
+        //     seconds; queued keypresses (ctrl-D, backspace)
+        //     drained after the parse finished.
+        //  2. `cmdline::analyze` balances `[` / `]` but doesn't
+        //     know about `#` comments. The auto-generated Vivado
+        //     docs contain `[get_hw_sysmons]`, `[Common 17-39]`,
+        //     etc. inside `## doc-comment` blocks; an unmatched
+        //     bracket in those docs put the analyzer in
+        //     "inside-a-substitution" state forever, blowing past
+        //     every newline and never finding the command
+        //     boundary. End result: `partial="util::"` but
+        //     `head_words` was the entire 6 MB session.
+        //
+        // Cheaper, correct approach: analyze only the in-flight
+        // input (small, fast, no rogue brackets), then pull
+        // candidate proc names directly out of
+        // `Session::signature_table()` — that's a HashMap built
+        // from already-parsed batches; O(N) iteration over
+        // existing data instead of an MB-scale reparse + walk.
+        let parsed = vw_htcl::parser::parse(&input);
+        let cmd_line = vw_htcl::cmdline::analyze(&input, offset);
+        let session_sigs = self.session.signature_table();
+        let input_sigs = vw_htcl::signature_table(&parsed.document);
+        // The currently-shipping batch hasn't committed yet — session
+        // commit only happens on EvalDone(last_in_batch=true). During
+        // the prime.htcl load (e.g. `src @vivado-cmd` taking 50+
+        // seconds), every proc the user wants to complete on (util::*,
+        // create_*, …) lives in `pending_batch.document` but NOT in
+        // session.signature_table(). Surface those too — they're
+        // already parsed; cost is one `signature_table` walk over the
+        // in-flight document's stmts.
+        let pending_sigs: std::collections::HashMap<
+            String,
+            &vw_htcl::ProcSignature,
+        > = self
+            .pending_batch
+            .as_ref()
+            .map(|b| vw_htcl::signature_table(&b.document))
+            .unwrap_or_default();
+        let mut items: Vec<vw_htcl::complete::Completion> = Vec::new();
+        // Meta-command branch: `:load`, `:quit`, etc. Detected by
+        // a leading `:` on the partial — these are App-side
+        // commands, not htcl, so they live above the cmdline
+        // analyzer's notion of command position.
+        if cmd_line.partial.starts_with(':') {
+            for (label, hint) in META_COMMANDS {
+                if label.starts_with(cmd_line.partial) {
+                    items.push(vw_htcl::complete::Completion {
+                        label: label.to_string(),
+                        kind: vw_htcl::complete::CompletionKind::Proc,
+                        detail: Some(hint.to_string()),
+                        documentation: None,
+                        replace: cmd_line.partial_span,
+                    });
+                }
+            }
+        } else if cmd_line.in_command_position() {
+            // Proc-name completion: union of session + pending +
+            // in-flight proc names, filtered by the partial prefix.
+            let mut names: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for name in session_sigs.keys() {
+                names.insert(name.clone());
+            }
+            for name in pending_sigs.keys() {
+                names.insert(name.clone());
+            }
+            for name in input_sigs.keys() {
+                names.insert(name.clone());
+            }
+            for name in names {
+                if name.starts_with(cmd_line.partial) {
+                    items.push(vw_htcl::complete::Completion {
+                        label: name,
+                        kind: vw_htcl::complete::CompletionKind::Proc,
+                        detail: None,
+                        documentation: None,
+                        replace: cmd_line.partial_span,
+                    });
+                }
+            }
+        } else if let Some(cmd_name) = cmd_line.command_name() {
+            // Flag completion: look up the called proc's signature
+            // in either source and emit its flag args. Matches the
+            // shape of `vw_htcl::complete::complete_at`'s flag path
+            // but uses our union of session+input signatures.
+            let sig = session_sigs
+                .get(cmd_name)
+                .copied()
+                .or_else(|| pending_sigs.get(cmd_name).copied())
+                .or_else(|| input_sigs.get(cmd_name).copied());
+            if let Some(sig) = sig {
+                let used: Vec<&str> = cmd_line.used_flags().collect();
+                let needle_no_dash = cmd_line
+                    .partial
+                    .strip_prefix('-')
+                    .unwrap_or(cmd_line.partial);
+                // Required (no @default) flags first, then optional,
+                // alphabetical within each group. Matches the
+                // signature-help popup's ordering so the user sees
+                // the same priority across surfaces.
+                for &i in &sorted_arg_indices(sig) {
+                    let arg = &sig.args[i];
+                    let label = format!("-{}", arg.name);
+                    if used.contains(&label.as_str()) {
+                        continue;
+                    }
+                    if arg.name.starts_with(needle_no_dash) {
+                        // Detail shows the type + default when
+                        // available, so the completion popup row
+                        // hints at what each flag expects without
+                        // requiring the user to open hover. Format
+                        // mirrors the sig-help line: `type = value`.
+                        let detail = build_flag_detail(arg);
+                        items.push(vw_htcl::complete::Completion {
+                            label,
+                            kind: vw_htcl::complete::CompletionKind::Flag,
+                            detail,
+                            documentation: None,
+                            replace: cmd_line.partial_span,
+                        });
+                    }
+                }
+            }
+        }
+        let anchor = self.cursor_screen_cell().unwrap_or((0, 0));
+        if let Some(popup) = crate::popup::CompletionPopup::new(items, anchor) {
+            self.popup = Some(crate::popup::PopupState::Completion(popup));
+        }
+    }
+
+    /// Route a key event to the active popup. Returns `true` when the
+    /// key was consumed (navigation / accept / dismiss); `false` lets
+    /// the key fall through to the rest of the handler.
+    fn handle_popup_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::KeyCode;
+        let Some(popup) = self.popup.as_mut() else {
+            return false;
+        };
+        match popup {
+            crate::popup::PopupState::Completion(comp) => {
+                match key.code {
+                    KeyCode::Up => {
+                        comp.move_up();
+                        true
+                    }
+                    KeyCode::Down => {
+                        comp.move_down();
+                        true
+                    }
+                    KeyCode::Esc => {
+                        self.popup = None;
+                        true
+                    }
+                    KeyCode::Enter => {
+                        if let Some(item) = comp.current().cloned() {
+                            self.apply_completion(&item);
+                        }
+                        self.popup = None;
+                        true
+                    }
+                    KeyCode::Tab => {
+                        // Tab re-triggers — just cycle for now.
+                        comp.move_down();
+                        true
+                    }
+                    _ => {
+                        // Any other key dismisses the popup and falls
+                        // through to the editor — typical IDE
+                        // behavior where you can keep typing past the
+                        // popup to refine your input.
+                        self.popup = None;
+                        false
+                    }
+                }
+            }
+            crate::popup::PopupState::Help(_) => {
+                // Any keystroke dismisses the help modal. We CONSUME
+                // the dismissing key (return true) so it doesn't
+                // also act on the input — pressing Ctrl-H to open
+                // then any other key to close shouldn't accidentally
+                // type the close key into the editor.
+                self.popup = None;
+                true
+            }
+            crate::popup::PopupState::SignatureHelp(sig) => {
+                // Signature help is the background auto-show; it
+                // doesn't consume keys, falls through to the editor.
+                // Esc lets users hide it without clearing input.
+                if key.code == KeyCode::Esc {
+                    self.popup = None;
+                    return true;
+                }
+                // Shift-↑ / Shift-↓: scroll through args when the
+                // signature is too tall to fit. Picked over
+                // Ctrl-↑/Ctrl-↓ because macOS reserves those for
+                // Mission Control. We consume these chords (return
+                // true) so they don't ALSO scroll the scrollback.
+                // Step by 1 — fine-grained because each arg is a
+                // self-contained row.
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    match key.code {
+                        KeyCode::Up => {
+                            sig.scroll_offset =
+                                sig.scroll_offset.saturating_sub(1);
+                            return true;
+                        }
+                        KeyCode::Down => {
+                            sig.scroll_offset =
+                                sig.scroll_offset.saturating_add(1);
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                false
+            }
+            crate::popup::PopupState::Hover(_) => {
+                // Hover dismisses on any keystroke. We consume the
+                // key so the dismissing keystroke doesn't also act
+                // on the input — Ctrl-Y to open + any key to close
+                // shouldn't smuggle that key into the buffer.
+                self.popup = None;
+                true
+            }
+            crate::popup::PopupState::SymbolSearch(picker) => {
+                use crate::symbol_search::PickerView;
+                match key.code {
+                    KeyCode::Esc => {
+                        self.popup = None;
+                        true
+                    }
+                    KeyCode::Up => {
+                        picker.move_up();
+                        true
+                    }
+                    KeyCode::Down => {
+                        picker.move_down();
+                        true
+                    }
+                    KeyCode::Tab => {
+                        picker.toggle_view();
+                        true
+                    }
+                    KeyCode::Backspace => {
+                        if picker.view == PickerView::Symbols {
+                            picker.pop_char();
+                        }
+                        true
+                    }
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && picker.view == PickerView::Symbols =>
+                    {
+                        picker.push_char(c);
+                        true
+                    }
+                    KeyCode::Enter => {
+                        match picker.view {
+                            PickerView::Symbols => {
+                                if let Some(sym) =
+                                    picker.current_symbol().cloned()
+                                {
+                                    self.popup = None;
+                                    self.insert_at_cursor_replacing_word(
+                                        &sym.name,
+                                    );
+                                } else {
+                                    self.popup = None;
+                                }
+                            }
+                            PickerView::Libraries => {
+                                picker.apply_library_filter();
+                            }
+                        }
+                        true
+                    }
+                    _ => true, // swallow other keys; popup stays open
+                }
+            }
+        }
+    }
+
+    /// Insert / replace text from a chosen completion. Replaces the
+    /// byte range `item.replace` (the partial word under the cursor,
+    /// or a zero-width insertion point) with `item.label`.
+    fn apply_completion(&mut self, item: &vw_htcl::complete::Completion) {
+        let buffer = self.current_input_text();
+        let start = item.replace.start as usize;
+        let end = (item.replace.end as usize).min(buffer.len());
+        if start > buffer.len() {
+            return;
+        }
+        let mut new_buffer = String::with_capacity(
+            buffer.len() - (end - start) + item.label.len(),
+        );
+        new_buffer.push_str(&buffer[..start]);
+        new_buffer.push_str(&item.label);
+        new_buffer.push_str(&buffer[end..]);
+        // Place cursor just after the inserted label.
+        let new_cursor_byte = start + item.label.len();
+        self.replace_input_with_cursor(new_buffer, new_cursor_byte);
+    }
+
+    /// Replace the input buffer with `text` and move the cursor to
+    /// the byte offset `cursor_byte`. Cursor offset is translated to
+    /// (row, col) via `LineIndex`. Used by completion accept.
+    fn replace_input_with_cursor(&mut self, text: String, cursor_byte: usize) {
+        use tui_textarea::TextArea;
+        let line_idx = vw_htcl::line_index::LineIndex::new(&text);
+        // Build the textarea fresh from the new content (tui-textarea
+        // doesn't offer a "replace everything" API; recreating is the
+        // documented way per its issue tracker).
+        let lines: Vec<String> =
+            text.split('\n').map(|s| s.to_string()).collect();
+        let mut ta = TextArea::new(lines);
+        ta.set_cursor_line_style(ratatui::style::Style::default());
+        // Position cursor.
+        let lc = line_idx.position(cursor_byte as u32);
+        let target_row = lc.line as usize;
+        let target_col = lc.character as usize;
+        // Use the textarea's `move_cursor` API.
+        while ta.cursor().0 < target_row {
+            ta.move_cursor(tui_textarea::CursorMove::Down);
+        }
+        while ta.cursor().0 > target_row {
+            ta.move_cursor(tui_textarea::CursorMove::Up);
+        }
+        while ta.cursor().1 < target_col {
+            ta.move_cursor(tui_textarea::CursorMove::Forward);
+        }
+        while ta.cursor().1 > target_col {
+            ta.move_cursor(tui_textarea::CursorMove::Back);
+        }
+        self.input = ta;
+        self.history_cursor = None;
+    }
+
+    /// Whether a popup is currently open (renderer queries this to
+    /// decide whether to draw the popup overlay layer).
+    pub fn popup_state(&self) -> Option<&crate::popup::PopupState> {
+        self.popup.as_ref()
+    }
+
+    /// Refresh signature help after a buffer-mutating keystroke.
+    /// Looks up the proc the cursor sits in by name across session,
+    /// pending batch, and in-flight input; populates a
+    /// `PopupState::SignatureHelp` with its args + active parameter.
+    /// Dismisses any existing sig-help popup when nothing matches.
+    ///
+    /// Coexistence rule: never displaces a Completion or Help popup
+    /// (the user explicitly opened those; sig-help is the background
+    /// auto-show).
+    fn refresh_signature_help(&mut self) {
+        // Don't fight explicit popups.
+        if matches!(
+            self.popup,
+            Some(crate::popup::PopupState::Completion(_))
+                | Some(crate::popup::PopupState::Help(_))
+        ) {
+            return;
+        }
+        let input = self.current_input_text();
+        let Some(offset) = self.cursor_byte_offset() else {
+            self.dismiss_signature_help();
+            return;
+        };
+        let cmd_line = vw_htcl::cmdline::analyze(&input, offset);
+        let Some(name) = cmd_line.command_name() else {
+            self.dismiss_signature_help();
+            return;
+        };
+        // Find the proc's signature + doc comments. Signatures live
+        // in session.signature_table() / pending / in-flight; doc
+        // comments require walking the source document (kept on the
+        // Command, not the ProcSignature).
+        let parsed = vw_htcl::parser::parse(&input);
+        let session_sigs = self.session.signature_table();
+        let input_sigs = vw_htcl::signature_table(&parsed.document);
+        let pending_doc = self.pending_batch.as_ref().map(|b| &b.document);
+        let pending_sigs = pending_doc
+            .map(|d| vw_htcl::signature_table(d))
+            .unwrap_or_default();
+        let sig = session_sigs
+            .get(name)
+            .copied()
+            .or_else(|| pending_sigs.get(name).copied())
+            .or_else(|| input_sigs.get(name).copied());
+        let Some(sig) = sig else {
+            self.dismiss_signature_help();
+            return;
+        };
+        // Look up doc comments by walking docs in priority order
+        // (input → pending → session). Most recent wins, which
+        // matches Tcl's "later proc shadows earlier" semantics that
+        // the lowerer already uses.
+        let mut doc_comments: &[String] = &[];
+        if let Some(d) = lookup_proc_doc_comments(&parsed.document, name) {
+            doc_comments = d;
+        } else if let Some(doc) = pending_doc {
+            if let Some(d) = lookup_proc_doc_comments(doc, name) {
+                doc_comments = d;
+            }
+        } else {
+            // Walk session batches in reverse (newest first).
+            for batch in self.session.batches_for_doc_search() {
+                if let Some(d) = lookup_proc_doc_comments(&batch.document, name)
+                {
+                    doc_comments = d;
+                    break;
+                }
+            }
+        }
+        // Build the display permutation (required → optional,
+        // alphabetical within each group) and reorder args + the
+        // active-parameter index accordingly.
+        let display_order = sorted_arg_indices(sig);
+        let active_decl = compute_active_parameter(sig, &cmd_line);
+        let active = active_decl.and_then(|orig| {
+            display_order
+                .iter()
+                .position(|&i| i == orig as usize)
+                .map(|i| i as u32)
+        });
+        let args: Vec<crate::popup::SigHelpArg> = display_order
+            .iter()
+            .map(|&i| {
+                let a = &sig.args[i];
+                crate::popup::SigHelpArg {
+                    name: a.name.clone(),
+                    type_str: a.type_annotation.as_ref().map(render_type),
+                    default_str: format_default_value(a),
+                }
+            })
+            .collect();
+        let return_type = sig.return_type.as_ref().map(render_type);
+        let doc_brief = vw_htcl::doc::brief(doc_comments);
+        let anchor = self.cursor_screen_cell().unwrap_or((0, 0));
+        // Preserve any user-set scroll offset across refreshes —
+        // manual Ctrl-↑/↓ scrolling shouldn't be reset by every
+        // keystroke. The renderer clamps the offset to a valid
+        // range, so an offset that's stale for the new arg list
+        // (e.g. switching to a smaller proc) silently snaps back.
+        let prev_scroll = match self.popup.as_ref() {
+            Some(crate::popup::PopupState::SignatureHelp(p)) => p.scroll_offset,
+            _ => 0,
+        };
+        let popup = crate::popup::SignatureHelpPopup {
+            proc_name: name.to_string(),
+            args,
+            return_type,
+            doc_brief,
+            active: active.map(|a| a as usize),
+            anchor,
+            scroll_offset: prev_scroll,
+        };
+        self.popup = Some(crate::popup::PopupState::SignatureHelp(popup));
+    }
+
+    /// Open the fuzzy symbol picker (Ctrl-T). Builds a fresh
+    /// `SymbolIndex` snapshot at open time — it stays stable while
+    /// the popup is alive so the result-row indices don't shift
+    /// out from under the user. The index is small to build
+    /// (walks already-parsed Documents) so per-open cost is fine.
+    fn trigger_symbol_search(&mut self) {
+        let input = self.current_input_text();
+        let parsed = vw_htcl::parser::parse(&input);
+        let index =
+            std::sync::Arc::new(crate::symbol_index::SymbolIndex::build(
+                &self.session,
+                self.pending_batch.as_ref(),
+                Some(&parsed.document),
+            ));
+        let picker = crate::symbol_search::SymbolPicker::new(index);
+        self.popup = Some(crate::popup::PopupState::SymbolSearch(picker));
+    }
+
+    /// Insert `text` at the current cursor position, replacing the
+    /// identifier-under-cursor (if any). Used by the symbol-picker
+    /// Enter handler to insert a chosen symbol name in place of the
+    /// partial word the user is typing.
+    fn insert_at_cursor_replacing_word(&mut self, text: &str) {
+        let buffer = self.current_input_text();
+        let Some(offset) = self.cursor_byte_offset() else {
+            return;
+        };
+        let off = offset as usize;
+        // Find word boundaries around the cursor (same rule as
+        // `ident_under_cursor`).
+        let bytes = buffer.as_bytes();
+        let is_word_byte = |b: u8| -> bool {
+            b.is_ascii_alphanumeric() || b == b'_' || b == b':'
+        };
+        let mut start = off;
+        while start > 0 && is_word_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = off;
+        while end < bytes.len() && is_word_byte(bytes[end]) {
+            end += 1;
+        }
+        let mut new_buffer =
+            String::with_capacity(buffer.len() - (end - start) + text.len());
+        new_buffer.push_str(&buffer[..start]);
+        new_buffer.push_str(text);
+        new_buffer.push_str(&buffer[end..]);
+        let new_cursor = start + text.len();
+        self.replace_input_with_cursor(new_buffer, new_cursor);
+    }
+
+    /// Hover-under-cursor: open a popup showing the proc /
+    /// variable / enum the cursor is on. Tries
+    /// [`vw_htcl::hover_at`] on the in-flight input first (catches
+    /// local vars, in-buffer proc decls, enum decls). Falls back to
+    /// a session-aware lookup: extracts the identifier under the
+    /// cursor and resolves it against
+    /// `Session::signature_table()` / pending / in-flight, so
+    /// `Ctrl-Y` on a `util::props` call surfaces the library's docs
+    /// even though the proc was defined in a separate session
+    /// batch.
+    fn trigger_hover(&mut self) {
+        let input = self.current_input_text();
+        let Some(offset) = self.cursor_byte_offset() else {
+            return;
+        };
+        let parsed = vw_htcl::parser::parse(&input);
+        let anchor = self.cursor_screen_cell().unwrap_or((0, 0));
+        // Pass 1: in-document hover. Handles ProcDef, ProcArgDef,
+        // CallSite when the proc is in the buffer, CallArg,
+        // LocalVar, EnumDef.
+        if let Some(target) =
+            vw_htcl::hover_at(&parsed.document, &input, offset)
+        {
+            if let Some(popup) = hover_target_to_popup(target, anchor) {
+                self.popup = Some(crate::popup::PopupState::Hover(popup));
+                return;
+            }
+        }
+        // Pass 2: session-aware proc lookup by identifier under
+        // cursor. Covers the common REPL case: cursor on a name
+        // referencing a session-loaded library proc.
+        let Some(name) = ident_under_cursor(&input, offset) else {
+            return;
+        };
+        let session_sigs = self.session.signature_table();
+        let pending_doc = self.pending_batch.as_ref().map(|b| &b.document);
+        let pending_sigs = pending_doc
+            .map(|d| vw_htcl::signature_table(d))
+            .unwrap_or_default();
+        let input_sigs = vw_htcl::signature_table(&parsed.document);
+        let sig = session_sigs
+            .get(name)
+            .copied()
+            .or_else(|| pending_sigs.get(name).copied())
+            .or_else(|| input_sigs.get(name).copied());
+        let Some(sig) = sig else { return };
+        // Doc comments: walk newest source first (input → pending →
+        // session newest-first).
+        let mut doc_comments: &[String] = &[];
+        if let Some(d) = lookup_proc_doc_comments(&parsed.document, name) {
+            doc_comments = d;
+        } else if let Some(doc) = pending_doc {
+            if let Some(d) = lookup_proc_doc_comments(doc, name) {
+                doc_comments = d;
+            }
+        } else {
+            for batch in self.session.batches_for_doc_search() {
+                if let Some(d) = lookup_proc_doc_comments(&batch.document, name)
+                {
+                    doc_comments = d;
+                    break;
+                }
+            }
+        }
+        let title = render_proc_title(name, sig);
+        let body = vw_htcl::doc::reflow_doc_comments(doc_comments);
+        self.popup =
+            Some(crate::popup::PopupState::Hover(crate::popup::HoverPopup {
+                title,
+                body,
+                anchor,
+            }));
+    }
+
+    /// Dismiss the signature-help popup if one is active. Leaves
+    /// Completion / Help popups alone.
+    fn dismiss_signature_help(&mut self) {
+        if matches!(
+            self.popup,
+            Some(crate::popup::PopupState::SignatureHelp(_))
+        ) {
+            self.popup = None;
+        }
     }
 
     /// Walk the input history by `delta` (negative = older,
@@ -748,12 +1432,24 @@ impl App {
             return;
         }
 
+        // Popup navigation / dismissal takes precedence over both
+        // app-level chords AND the catch-all editor handoff, so
+        // Up/Down/Enter/Esc go to the popup when one is open.
+        if self.popup.is_some() && self.handle_popup_key(key) {
+            return;
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                if self.input.is_empty() {
-                    self.push(ScrollbackKind::Notice, "exit".to_string());
-                    self.exit = true;
-                }
+                // Exit unconditionally. The original behavior required
+                // the input to be empty (readline convention), but
+                // for a REPL it's strictly an annoyance — you can't
+                // exit a misformed in-progress command without
+                // clearing it first. Ctrl-C is the right key to
+                // discard the current input, and we already bind it
+                // to that.
+                self.push(ScrollbackKind::Notice, "exit".to_string());
+                self.exit = true;
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 // Clear the current input (reedline convention). Once
@@ -777,6 +1473,30 @@ impl App {
                     match_index: None,
                     match_text: String::new(),
                 });
+            }
+            (KeyCode::Tab, _) => {
+                self.trigger_completion();
+            }
+            (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+                self.popup = Some(crate::popup::PopupState::Help(
+                    crate::popup::HelpPopup,
+                ));
+            }
+            (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+                // Hover under cursor. We use Ctrl-Y (not Ctrl-K,
+                // which is already scrollback-up) — picked because
+                // Ctrl-K is also commonly conflated with
+                // "kill-line" elsewhere. Y for "your symbol's docs."
+                self.trigger_hover();
+            }
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                // Fuzzy symbol picker over the session + pending +
+                // in-flight input. Opens centered; Tab toggles to
+                // the libraries view. (Ctrl-S over Ctrl-T because
+                // the latter often gets eaten by terminal
+                // multiplexers, and "S" for "search" is the more
+                // discoverable mnemonic.)
+                self.trigger_symbol_search();
             }
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 self.history_step(-1);
@@ -835,6 +1555,12 @@ impl App {
                 self.history_cursor = None;
                 let input: Input = key.into();
                 let _consumed = self.input.input(input);
+                // Auto-trigger signature help on every buffer-
+                // mutating keystroke. Costs one parse of the (small)
+                // in-flight input + a HashMap lookup; bails when the
+                // cursor isn't in a known call. Respects existing
+                // Completion / Help popups (won't displace them).
+                self.refresh_signature_help();
             }
         }
     }
@@ -1138,6 +1864,8 @@ impl App {
     }
 
     async fn run_meta_command(&mut self, cmd: &str) {
+        // Note for completion: keep [`META_COMMANDS`] in sync with
+        // the arms of this `match`.
         let mut parts = cmd.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
@@ -1150,6 +1878,66 @@ impl App {
                     ScrollbackKind::Notice,
                     "restart not yet implemented (stubbed for v1)".into(),
                 );
+            }
+            "libs" => {
+                // List every library the session knows about + its
+                // symbol count, sorted by descending count. Built
+                // from the same SymbolIndex the Ctrl-T picker uses,
+                // so the totals stay consistent across surfaces.
+                let parsed_input =
+                    vw_htcl::parser::parse(&self.current_input_text());
+                let index = crate::symbol_index::SymbolIndex::build(
+                    &self.session,
+                    self.pending_batch.as_ref(),
+                    Some(&parsed_input.document),
+                );
+                let libs = index.libraries();
+                if libs.is_empty() {
+                    self.push(
+                        ScrollbackKind::Notice,
+                        "no libraries loaded".to_string(),
+                    );
+                } else {
+                    // Column widths: count gets 5 cells, library
+                    // name takes the max of its actual lengths.
+                    let max_name = libs
+                        .iter()
+                        .map(|l| l.library.display().chars().count())
+                        .max()
+                        .unwrap_or(8);
+                    let mut out = String::new();
+                    out.push_str(&format!(
+                        "{:>5}  {:<width$}  path\n",
+                        "syms",
+                        "library",
+                        width = max_name
+                    ));
+                    out.push_str(&"─".repeat(max_name + 20));
+                    out.push('\n');
+                    for info in &libs {
+                        let name = info.library.display();
+                        let path = match &info.library {
+                            crate::symbol_index::LibraryRef::Entry => {
+                                "<typed at REPL>".to_string()
+                            }
+                            crate::symbol_index::LibraryRef::Import {
+                                path,
+                                ..
+                            } => path.display().to_string(),
+                        };
+                        out.push_str(&format!(
+                            "{:>5}  {:<width$}  {}\n",
+                            info.symbol_count,
+                            name,
+                            path,
+                            width = max_name
+                        ));
+                    }
+                    self.push(
+                        ScrollbackKind::Notice,
+                        out.trim_end().to_string(),
+                    );
+                }
             }
             "load" => {
                 if arg.is_empty() {
@@ -1935,6 +2723,294 @@ fn send_osc52(text: &str) {
 /// (unterminated brace, etc.). We re-use the htcl parser since
 /// it already understands every multi-line construct (procs,
 /// `[ … ]` substitutions, braced groups).
+/// Walk a Document looking for `proc <name>` (recursing into
+/// `namespace eval` blocks). Returns the `Command.doc_comments`
+/// slice when found. Used by the signature-help lookup path to
+/// surface the proc's `##` docs alongside its argument list.
+///
+/// Matches the recursion shape that `vw_htcl::signature_table`
+/// uses — qualified names like `util::props` resolve to a proc
+/// declared inside `namespace eval util { … }`.
+fn lookup_proc_doc_comments<'a>(
+    doc: &'a vw_htcl::Document,
+    qualified_name: &str,
+) -> Option<&'a [String]> {
+    lookup_in_stmts(&doc.stmts, "", qualified_name)
+}
+
+fn lookup_in_stmts<'a>(
+    stmts: &'a [vw_htcl::Stmt],
+    prefix: &str,
+    qualified_name: &str,
+) -> Option<&'a [String]> {
+    use vw_htcl::CommandKind;
+    for stmt in stmts {
+        let vw_htcl::Stmt::Command(cmd) = stmt else {
+            continue;
+        };
+        match &cmd.kind {
+            CommandKind::Proc(proc) => {
+                if let Some(name) = proc.name.as_deref() {
+                    let qualified = if prefix.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{prefix}::{name}")
+                    };
+                    if qualified == qualified_name {
+                        return Some(&cmd.doc_comments);
+                    }
+                }
+            }
+            CommandKind::NamespaceEval(ns) => {
+                if let Some(name) = ns.name.as_deref() {
+                    let nested = if prefix.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{prefix}::{name}")
+                    };
+                    if let Some(d) =
+                        lookup_in_stmts(&ns.body, &nested, qualified_name)
+                    {
+                        return Some(d);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Index of the parameter the cursor is on within `sig.args`.
+/// Mirrors the logic in `vw_htcl::signature_help::active_parameter`:
+/// the active arg is whichever `-flag` was most recently completed
+/// on the line, or — when the partial is still being typed — the
+/// first arg whose name has the partial as a prefix.
+fn compute_active_parameter(
+    sig: &vw_htcl::ProcSignature,
+    line: &vw_htcl::cmdline::CmdLine<'_>,
+) -> Option<u32> {
+    let mut active = None;
+    for word in line.words.iter().skip(1) {
+        if let Some(flag) = word.strip_prefix('-') {
+            if let Some(i) = sig.args.iter().position(|a| a.name == flag) {
+                active = Some(i as u32);
+            }
+        }
+    }
+    if let Some(flag) = line.partial.strip_prefix('-') {
+        if !flag.is_empty() {
+            if let Some(i) =
+                sig.args.iter().position(|a| a.name.starts_with(flag))
+            {
+                return Some(i as u32);
+            }
+        }
+    }
+    active
+}
+
+/// Identifier under the cursor — bare-word-shape including the `::`
+/// namespace separator so `util::props` resolves as one symbol.
+/// Used by the hover lookup path to find what the user is pointing
+/// at when [`vw_htcl::hover_at`] can't see the proc (because it's
+/// defined in a session batch, not the in-flight input).
+fn ident_under_cursor(text: &str, offset: u32) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let o = (offset as usize).min(bytes.len());
+    let is_word_byte =
+        |b: u8| -> bool { b.is_ascii_alphanumeric() || b == b'_' || b == b':' };
+    let mut start = o;
+    while start > 0 && is_word_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = o;
+    while end < bytes.len() && is_word_byte(bytes[end]) {
+        end += 1;
+    }
+    if start < end {
+        Some(&text[start..end])
+    } else {
+        None
+    }
+}
+
+/// Build the title line for a hover popup that points at a proc —
+/// shows the proc's name plus its signature in compact one-line form
+/// (`name -arg1: type -arg2: type → ret`). The body of the popup is
+/// the reflowed doc-comment block.
+fn render_proc_title(name: &str, sig: &vw_htcl::ProcSignature) -> String {
+    let mut out = name.to_string();
+    for arg in &sig.args {
+        out.push_str(" -");
+        out.push_str(&arg.name);
+        if let Some(ty) = arg.type_annotation.as_ref() {
+            out.push_str(": ");
+            out.push_str(&render_type(ty));
+        }
+        if let Some(default) = format_default_value(arg) {
+            out.push_str(" = ");
+            out.push_str(&default);
+        }
+    }
+    if let Some(ret) = sig.return_type.as_ref() {
+        out.push_str(" → ");
+        out.push_str(&render_type(ret));
+    }
+    out
+}
+
+/// Convert a [`vw_htcl::hover::HoverTarget`] into our owned
+/// [`crate::popup::HoverPopup`]. Returns `None` when the target
+/// can't be rendered usefully (anonymous procs, missing signatures).
+fn hover_target_to_popup(
+    target: vw_htcl::HoverTarget<'_>,
+    anchor: (u16, u16),
+) -> Option<crate::popup::HoverPopup> {
+    use vw_htcl::HoverTarget;
+    let (title, body) = match target {
+        HoverTarget::ProcDef { proc, .. } => {
+            let name = proc.name.clone()?;
+            let sig = proc.signature.as_ref()?;
+            // Doc comments live on the enclosing Command. The hover
+            // module doesn't surface them here — accept that we
+            // show only the signature for in-buffer proc decls;
+            // the user can re-hover the call site for full docs.
+            (render_proc_title(&name, sig), String::new())
+        }
+        HoverTarget::ProcArgDef { arg, .. } => {
+            let mut title = format!("-{}", arg.name);
+            if let Some(ty) = arg.type_annotation.as_ref() {
+                title.push_str(": ");
+                title.push_str(&render_type(ty));
+            }
+            let body = vw_htcl::doc::reflow_doc_comments(&arg.doc_comments);
+            (title, body)
+        }
+        HoverTarget::CallSite {
+            proc_name,
+            signature,
+            ..
+        } => (render_proc_title(&proc_name, signature), String::new()),
+        HoverTarget::CallArg { arg, .. } => {
+            let mut title = format!("-{}", arg.name);
+            if let Some(ty) = arg.type_annotation.as_ref() {
+                title.push_str(": ");
+                title.push_str(&render_type(ty));
+            }
+            let body = vw_htcl::doc::reflow_doc_comments(&arg.doc_comments);
+            (title, body)
+        }
+        HoverTarget::LocalVar { name, .. } => {
+            (format!("${name}"), String::from("local variable"))
+        }
+        HoverTarget::EnumDef { decl, .. } => {
+            let name = decl.name.clone()?;
+            let variants: Vec<String> = decl
+                .variants
+                .iter()
+                .map(|v| {
+                    if let Some(ty) = v.payload.as_ref() {
+                        format!("{}: {}", v.name, render_type(ty))
+                    } else {
+                        v.name.clone()
+                    }
+                })
+                .collect();
+            let title = format!("enum {name}");
+            let body = format!("{{ {} }}", variants.join("; "));
+            (title, body)
+        }
+    };
+    Some(crate::popup::HoverPopup {
+        title,
+        body,
+        anchor,
+    })
+}
+
+/// Return the indices of `sig.args` in completion-popup /
+/// signature-help **display order**: required arguments (no
+/// `@default(...)` attribute) first, then optional ones, both
+/// groups sorted alphabetically within. Source declaration order
+/// often follows IP-XACT or generator conventions that don't match
+/// what users want to scan visually — surfacing required args at
+/// the top makes "what MUST I supply?" answerable at a glance.
+///
+/// The display order is just a permutation of `sig.args` indices;
+/// callers map the `active_parameter` (which is computed in
+/// declaration-order space) into display space via `.position()`.
+fn sorted_arg_indices(sig: &vw_htcl::ProcSignature) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..sig.args.len()).collect();
+    indices.sort_by(|&a, &b| {
+        let a_arg = &sig.args[a];
+        let b_arg = &sig.args[b];
+        let a_has_default = a_arg.attribute("default").is_some();
+        let b_has_default = b_arg.attribute("default").is_some();
+        // false < true → no-default (required) sorts before has-default.
+        a_has_default
+            .cmp(&b_has_default)
+            .then_with(|| a_arg.name.cmp(&b_arg.name))
+    });
+    indices
+}
+
+/// Detail string shown next to a `-flag` row in the completion popup.
+/// Combines the arg's type annotation (when present) with its
+/// `@default(...)` value (when present). Returns `None` when the
+/// arg has neither so the popup row stays compact for untyped
+/// undefaulted args.
+fn build_flag_detail(arg: &vw_htcl::ast::ProcArg) -> Option<String> {
+    let ty = arg.type_annotation.as_ref().map(render_type);
+    let default = format_default_value(arg);
+    match (ty, default) {
+        (None, None) => None,
+        (Some(t), None) => Some(t),
+        (None, Some(d)) => Some(format!("= {d}")),
+        (Some(t), Some(d)) => Some(format!("{t} = {d}")),
+    }
+}
+
+/// Extract a proc arg's `@default(...)` value, formatted as a short
+/// display string. Returns `None` when the arg has no default. Long
+/// values (multi-KB paired-dict literals from IP-XACT generators)
+/// are truncated to the first ~32 chars with an ellipsis so the
+/// signature-help / hover / completion popups don't blow wide.
+pub fn format_default_value(arg: &vw_htcl::ast::ProcArg) -> Option<String> {
+    use vw_htcl::ast::AttributeValue;
+    let attr = arg.attribute("default")?;
+    let first = attr.values.first()?;
+    let raw = match first {
+        AttributeValue::Integer { value, .. } => value.to_string(),
+        AttributeValue::Ident { value, .. } => value.clone(),
+        AttributeValue::String { value, .. } => format!("\"{value}\""),
+    };
+    const MAX: usize = 32;
+    if raw.chars().count() > MAX {
+        let truncated: String = raw.chars().take(MAX - 1).collect();
+        Some(format!("{truncated}…"))
+    } else {
+        Some(raw)
+    }
+}
+
+/// One-line rendering of a `TypeExpr` — `string`, `dict<K, V>`, etc.
+/// Used by the signature-help popup to show arg + return types
+/// alongside the names.
+fn render_type(ty: &vw_htcl::TypeExpr) -> String {
+    use vw_htcl::TypeExpr;
+    match ty {
+        TypeExpr::Named { name, .. } => name.clone(),
+        TypeExpr::Generic { name, args, .. } => {
+            let inner: Vec<String> = args.iter().map(render_type).collect();
+            format!("{name}<{}>", inner.join(", "))
+        }
+        TypeExpr::Qualified {
+            namespace, variant, ..
+        } => format!("{namespace}::{variant}"),
+    }
+}
+
 fn is_buffer_complete(text: &str) -> bool {
     let parsed = vw_htcl::parse(text);
     !parsed

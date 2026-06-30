@@ -67,24 +67,40 @@ pub fn entry_lines(
     // right on the first line. Color follows whether it's still
     // running (dim while live) vs. completed (subtle gray).
     let timer = timer_for(entry);
-    // Highlighter is opt-in per kind: typed Result entries and
-    // captured Stdout lines both can carry compiler-emitted repr
-    // output (the auto-generated `<Enum>::repr` shape with `KEY
-    // Variant(...)` and multi-line nested blocks). Try parsing
-    // each line as a repr; on match, emit per-token styled spans
-    // (key=blue, variant=teal, punct=dim, scalar=green). Lines
-    // that don't parse (raw `puts hi`, error continuations, etc.)
-    // fall back to the entry's body style. Input/Error/Warning/
-    // Notice keep their single-color body rendering — those are
-    // not repr-formatted.
-    let highlight =
+    // Highlighting strategy per kind:
+    //   - Result / Stdout: repr highlighter (per-line shape recognition
+    //     for compiler-emitted enum reprs).
+    //   - Input: htcl-source highlighter (whole-entry parse, per-line
+    //     span slicing) — colors keywords, calls, $vars, types,
+    //     comments etc. the same as the input editor.
+    //   - Error / Warning / Notice: single body color (not repr-formatted).
+    let repr_highlight =
         matches!(entry.kind, ScrollbackKind::Result | ScrollbackKind::Stdout);
+    let input_highlight = matches!(entry.kind, ScrollbackKind::Input);
+    // Input entries: parse the whole entry text once and slice per-line.
+    // The body_style on Input is the bright cyan we'd otherwise apply
+    // flatly; the htcl highlighter overrides it for recognized tokens
+    // and leaves it for the gaps.
+    let input_per_line: Option<Vec<Vec<Span<'static>>>> = if input_highlight {
+        Some(crate::highlight_htcl::highlight_per_line(
+            &entry.text,
+            body_style,
+        ))
+    } else {
+        None
+    };
     let mut out = Vec::new();
     for (i, line) in entry.text.lines().enumerate() {
         let leading = if i == 0 { prefix } else { "  " };
         let mut spans: Vec<Span<'static>> =
             vec![Span::styled(leading.to_string(), prefix_style)];
-        if highlight {
+        if let Some(per_line) = input_per_line.as_ref() {
+            if let Some(line_spans) = per_line.get(i) {
+                spans.extend(line_spans.iter().cloned());
+            } else {
+                spans.push(Span::styled(line.to_string(), body_style));
+            }
+        } else if repr_highlight {
             if let Some(highlighted) = crate::highlight::highlight_line(line) {
                 spans.extend(highlighted);
             } else {

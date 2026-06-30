@@ -20,10 +20,14 @@
 
 mod app;
 mod highlight;
+mod highlight_htcl;
 mod history;
 pub mod lower;
+mod popup;
 mod render;
 mod session;
+mod symbol_index;
+mod symbol_search;
 pub mod trace;
 mod ui;
 

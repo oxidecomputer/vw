@@ -114,6 +114,17 @@ impl Session {
     /// error renderer's drill-down path silently skips such frames
     /// (Tcl proc frames for builtins, dynamically-defined procs,
     /// etc.).
+    /// Iterate committed batches newest-first. Used by the
+    /// signature-help / hover paths to walk back through documents
+    /// looking for a proc's doc comments — Tcl's "later proc
+    /// shadows earlier" semantics mean the most-recent definition
+    /// is the one the user expects to see described.
+    pub fn batches_for_doc_search(
+        &self,
+    ) -> impl Iterator<Item = &SessionBatch> {
+        self.batches.iter().rev()
+    }
+
     pub fn lookup_proc(&self, name: &str) -> Option<&ProcLocation> {
         for batch in self.batches.iter().rev() {
             if let Some(loc) = batch.procs.get(name) {

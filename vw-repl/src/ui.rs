@@ -21,14 +21,12 @@
 //! When Ctrl-R is active, a centered overlay replaces the input area
 //! with the search query and the matching history entry.
 
+use crate::app::{App, ReverseSearch};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
-use tui_textarea::TextArea;
-
-use crate::app::{App, ReverseSearch};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let layout = Layout::default()
@@ -46,6 +44,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if let Some(rs) = app.reverse_search() {
         draw_reverse_search(f, layout[1], rs);
+    }
+    if let Some(popup) = app.popup_state() {
+        match popup {
+            crate::popup::PopupState::Completion(c) => {
+                crate::popup::draw_completion_popup(f, c, f.area());
+            }
+            crate::popup::PopupState::SignatureHelp(s) => {
+                crate::popup::draw_signature_help_popup(f, s, f.area());
+            }
+            crate::popup::PopupState::Hover(h) => {
+                crate::popup::draw_hover_popup(f, h, f.area());
+            }
+            crate::popup::PopupState::Help(_) => {
+                crate::popup::draw_help_popup(f, f.area());
+            }
+            crate::popup::PopupState::SymbolSearch(p) => {
+                crate::symbol_search::draw_symbol_picker(f, p);
+            }
+        }
     }
 }
 
@@ -156,14 +173,76 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
-    // tui-textarea renders itself with its current cursor; the
-    // surrounding block provides a visual frame.
+    // TextArea remains the editing model (every keystroke still flows
+    // through `ta.input(key)` in `handle_terminal_event`'s catch-all
+    // arm). We replace ONLY the visual rendering layer here so we can
+    // paint per-token highlighter spans — tui-textarea's built-in
+    // renderer is monochrome and its `line_spans` is `pub(crate)`, so
+    // there's no hook for syntax styling without taking over the
+    // viewport ourselves.
     let block = Block::default()
         .borders(Borders::ALL)
         .title(input_title(app));
-    let ta: &mut TextArea<'static> = app.input_mut();
-    ta.set_block(block);
-    f.render_widget(&*ta, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let ta = app.input_mut();
+    let lines: Vec<String> = ta.lines().to_vec();
+    let (cursor_row, cursor_col) = ta.cursor();
+
+    // Run the htcl highlighter on the full buffer in one parse, then
+    // slice per-line for rendering. Per-frame cost is one
+    // `vw_htcl::parse` over the input text — fine for typical REPL
+    // inputs (tens of lines); revisit if it shows up in a profile.
+    let body_style =
+        ratatui::style::Style::default().fg(ratatui::style::Color::White);
+    let buffer = lines.join("\n");
+    let highlighted =
+        crate::highlight_htcl::highlight_per_line(&buffer, body_style);
+
+    // Vertical viewport: anchor so the cursor stays visible. When the
+    // buffer fits, anchor at top; when it overflows, scroll so cursor
+    // is on the last visible row.
+    let view_h = inner.height as usize;
+    let scroll_top = if lines.len() <= view_h {
+        0
+    } else {
+        cursor_row.saturating_sub(view_h.saturating_sub(1))
+    };
+
+    // Render each visible line as a single-row Paragraph.
+    for (visible_idx, line_idx) in (scroll_top..lines.len()).enumerate() {
+        if visible_idx >= view_h {
+            break;
+        }
+        let row = inner.y + visible_idx as u16;
+        let line_spans = highlighted.get(line_idx).cloned().unwrap_or_default();
+        let line_widget = Paragraph::new(ratatui::text::Line::from(line_spans));
+        let line_area = Rect {
+            x: inner.x,
+            y: row,
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(line_widget, line_area);
+    }
+
+    // Position the terminal-native text cursor so the user sees their
+    // edit point. Only set when the cursor row is visible — when
+    // scrolled away (shouldn't happen given the viewport math above,
+    // but defensive), we just leave the cursor hidden.
+    if cursor_row >= scroll_top && cursor_row < scroll_top + view_h {
+        let cursor_screen_row = inner.y + (cursor_row - scroll_top) as u16;
+        // Horizontal: clamp to area width. Cursor positions past the
+        // visible width get pinned to the last column rather than
+        // drifting off the block border.
+        let cursor_screen_col =
+            inner.x + (cursor_col as u16).min(inner.width.saturating_sub(1));
+        f.set_cursor_position((cursor_screen_col, cursor_screen_row));
+    }
 }
 
 fn input_title(app: &App) -> String {
@@ -196,16 +275,10 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let hint = if app.reverse_search().is_some() {
         "Esc cancel · Enter accept · Ctrl-R older".to_string()
     } else {
-        let mouse = if app.mouse_capture() {
-            "F2 terminal-sel"
-        } else {
-            "F2 mouse-on"
-        };
-        format!(
-            "Ctrl-D exit · Ctrl-P/N history · Ctrl-R search · \
-             Ctrl-K/J or wheel scroll · \
-             drag to copy · {mouse} · :load <file> · :quit"
-        )
+        // Single key-chord hint — the full cheat-sheet lives in
+        // the Ctrl-H modal so we don't have to keep this row in
+        // sync with every binding we add or change.
+        "Ctrl-H for help".to_string()
     };
     // Split the status bar into [hint (left, fills) | status
     // indicator (right, fixed width)] so the status badge always
