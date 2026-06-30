@@ -512,10 +512,21 @@ fn write_set_property_dict(
     writeln!(out, "set _vw_d [list]").unwrap();
     for p in parameters {
         let arg = lowercase_ident(strip_prefix(&p.name, prefix_to_strip));
+        // Properties-typed args (paired-dict-shaped defaults; see
+        // [`emit_arg_decl`]) get unwrapped through `Properties::to_raw`
+        // before flowing into `set_property -dict`. Vivado expects
+        // a bare paired-list of keys + values for CONFIG.* dict
+        // slots — without the unwrap, the tagged tuple
+        // (`Nested {... Scalar X ...}`) would be passed verbatim.
+        let value_expr = if is_properties_shaped(p.value.default_value()) {
+            format!("[Properties::to_raw -v ${arg}]")
+        } else {
+            format!("${arg}")
+        };
         writeln!(
             out,
             "if {{${{__vw_kw_{arg}_set}}}} \
-             {{ lappend _vw_d CONFIG.{} ${arg} }}",
+             {{ lappend _vw_d CONFIG.{} {value_expr} }}",
             p.name
         )
         .unwrap();
@@ -561,7 +572,21 @@ fn emit_arg_decl(
         )));
     }
     let lowered = lowercase_ident(strip_prefix(&p.name, prefix_to_strip));
-    words.push(Word::Bare(lowered));
+    // Type the arg as `Properties` when the default value parses as
+    // a paired-dict (even-length list with identifier keys) —
+    // Vivado's IP-customization slots like `cpm_config` / `ps_pmc_config`
+    // consume a CONFIG.* dict, and typing them as `Properties`
+    // lets callers pass typed values from `util::props` /
+    // dict-traversal. The wrapper body wraps the arg with
+    // `Properties::to_raw` at the `set_property -dict` call
+    // (see [`write_set_property_dict`]) so the boundary
+    // strips the tags before Vivado sees them.
+    let typed_name = if is_properties_shaped(default) {
+        format!("{lowered}: Properties")
+    } else {
+        lowered
+    };
+    words.push(Word::Bare(typed_name));
     doc.push(Item::Command(Command {
         doc_comments: Vec::new(),
         words,
@@ -600,6 +625,49 @@ fn enum_values_for(
         }
     }
     out
+}
+
+/// True when the default value parses as a paired-dict Tcl-list
+/// shape — i.e. has an even number of whitespace-separated tokens
+/// (≥ 2) with identifier-shaped keys at every even index. Used by
+/// [`emit_arg_decl`] / [`write_set_property_dict`] to decide which
+/// wrapper args get the typed `Properties` annotation + automatic
+/// `Properties::to_raw` unwrap at the extern boundary.
+///
+/// Vivado IP-XACT defaults for CONFIG.* dict slots typically look
+/// like `"KEY1 VAL1 KEY2 VAL2"` (e.g. `CPM_PCIE0_MODES None`,
+/// `SMON_ALARMS Set_Alarms_On SMON_ENABLE_TEMP_AVERAGING 0`),
+/// while scalar params look like `Custom` or `0` or
+/// `versal_cips_v3_4`. Two-pair-shaped strings whose keys happen
+/// to be bare-identifier-shaped slip through as Properties even
+/// when the IP author meant them as a scalar — unlikely enough
+/// to be acceptable noise; the wrapper still works when the
+/// caller passes a string-shaped raw value (it round-trips through
+/// `Properties::to_raw` returning the same paired list).
+fn is_properties_shaped(default: &str) -> bool {
+    let tokens: Vec<&str> = default.split_whitespace().collect();
+    if tokens.len() < 2 || !tokens.len().is_multiple_of(2) {
+        return false;
+    }
+    for (i, t) in tokens.iter().enumerate() {
+        if i % 2 != 0 {
+            continue;
+        }
+        let mut chars = t.chars();
+        let first = match chars.next() {
+            Some(c) => c,
+            None => return false,
+        };
+        if !first.is_ascii_alphabetic() && first != '_' {
+            return false;
+        }
+        for c in chars {
+            if !(c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Lowercase an IP-XACT parameter name into a valid htcl argument

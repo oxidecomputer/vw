@@ -25,12 +25,25 @@ use crate::span::Span;
 /// Names not in this map are regular (non-overloaded) procs.
 pub type OverloadTable = HashMap<String, OverloadInfo>;
 
-/// Mangle a specialization's internal name. Public name + variant
-/// short-name, joined with `__`. The leading `__` is reserved (the
-/// validator rejects user procs whose names start with `__`) so
-/// these don't collide with anything user-written.
+/// Mangle a specialization's internal name. The `__` prefix is
+/// reserved (the validator rejects user procs whose names start
+/// with `__`) so mangled names don't collide with anything
+/// user-written.
+///
+/// For namespaced public names (`Property::as_nested`), the
+/// prefix goes on the LEAF, not the whole name — otherwise the
+/// mangled form (`__Property::as_nested__Nested`) puts the proc
+/// in a fictional `__Property` namespace Tcl hasn't created, and
+/// `proc` errors with "unknown namespace." Keeping the leaf-only
+/// prefix (`Property::__as_nested__Nested`) places the
+/// specialization inside the SAME namespace as its public
+/// dispatcher, which the enum prelude or user `namespace eval`
+/// already declared.
 pub fn mangle_specialization(public_name: &str, variant: &str) -> String {
-    format!("__{public_name}__{variant}")
+    match public_name.rsplit_once("::") {
+        Some((ns, leaf)) => format!("{ns}::__{leaf}__{variant}"),
+        None => format!("__{public_name}__{variant}"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

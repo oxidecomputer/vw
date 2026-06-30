@@ -67,13 +67,32 @@ pub fn entry_lines(
     // right on the first line. Color follows whether it's still
     // running (dim while live) vs. completed (subtle gray).
     let timer = timer_for(entry);
+    // Highlighter is opt-in per kind: typed Result entries and
+    // captured Stdout lines both can carry compiler-emitted repr
+    // output (the auto-generated `<Enum>::repr` shape with `KEY
+    // Variant(...)` and multi-line nested blocks). Try parsing
+    // each line as a repr; on match, emit per-token styled spans
+    // (key=blue, variant=teal, punct=dim, scalar=green). Lines
+    // that don't parse (raw `puts hi`, error continuations, etc.)
+    // fall back to the entry's body style. Input/Error/Warning/
+    // Notice keep their single-color body rendering — those are
+    // not repr-formatted.
+    let highlight =
+        matches!(entry.kind, ScrollbackKind::Result | ScrollbackKind::Stdout);
     let mut out = Vec::new();
     for (i, line) in entry.text.lines().enumerate() {
         let leading = if i == 0 { prefix } else { "  " };
-        let mut spans = vec![
-            Span::styled(leading.to_string(), prefix_style),
-            Span::styled(line.to_string(), body_style),
-        ];
+        let mut spans: Vec<Span<'static>> =
+            vec![Span::styled(leading.to_string(), prefix_style)];
+        if highlight {
+            if let Some(highlighted) = crate::highlight::highlight_line(line) {
+                spans.extend(highlighted);
+            } else {
+                spans.push(Span::styled(line.to_string(), body_style));
+            }
+        } else {
+            spans.push(Span::styled(line.to_string(), body_style));
+        }
         if i == 0 {
             if let Some((label, label_style)) = timer.as_ref() {
                 let used: usize =

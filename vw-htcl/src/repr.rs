@@ -87,6 +87,23 @@ pub fn dispatch_name(ty: &TypeExpr) -> String {
     format!("{}::repr", mangle(ty))
 }
 
+/// Fully-qualified Tcl name of `ty`'s `to_raw` proc — the
+/// boundary-lowering helper that flattens a typed htcl value
+/// down to the bare-Tcl form Vivado consumes through `extern::`.
+/// Used by [`emit_to_raw_arm`] and by wrappers that explicitly
+/// invoke a type's lowering on a typed arg before forwarding to
+/// `extern::`.
+pub fn to_raw_dispatch_name(ty: &TypeExpr) -> String {
+    format!("{}::to_raw", mangle(ty))
+}
+
+/// Fully-qualified Tcl name of `ty`'s `from_raw` proc — the
+/// boundary-lifting helper that wraps a raw extern-returned
+/// value into the typed form htcl downstream consumes.
+pub fn from_raw_dispatch_name(ty: &TypeExpr) -> String {
+    format!("{}::from_raw", mangle(ty))
+}
+
 /// Whether `name` is a primitive type the compiler ships repr for.
 /// Anything else is either a user-declared newtype (whose triplet is
 /// validated separately) or a generic instantiation (whose repr is
@@ -122,28 +139,38 @@ pub fn emit_primitive_prelude() -> Vec<String> {
     // Without this uniformity, user-written reprs (which can't
     // avoid the kwargs wrap) would error on positional calls.
     vec![
-        // string: identity at every slot.
+        // string: identity at every slot — including to_raw / from_raw,
+        // since the Tcl runtime representation of a string IS the raw
+        // value the extern boundary expects.
         quote_tcl!(
             "namespace eval string {\n  \
                 proc repr {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
                 proc from {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
-                proc to {args} { ::vw::kwargs $args {v \"\"}; return $v }\n\
+                proc to {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
+                proc to_raw {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
+                proc from_raw {args} { ::vw::kwargs $args {v \"\"}; return $v }\n\
             }\n"
         ),
-        // int: format / coerce.
+        // int: format / coerce. to_raw / from_raw mirror to / from
+        // since Vivado consumes integer-shaped strings.
         quote_tcl!(
             "namespace eval int {\n  \
                 proc repr {args} { ::vw::kwargs $args {v \"\"}; return [format %d $v] }\n  \
                 proc from {args} { ::vw::kwargs $args {v \"\"}; return [expr {int($v)}] }\n  \
-                proc to {args} { ::vw::kwargs $args {v \"\"}; return [expr {int($v)}] }\n\
+                proc to {args} { ::vw::kwargs $args {v \"\"}; return [expr {int($v)}] }\n  \
+                proc to_raw {args} { ::vw::kwargs $args {v \"\"}; return [expr {int($v)}] }\n  \
+                proc from_raw {args} { ::vw::kwargs $args {v \"\"}; return [expr {int($v)}] }\n\
             }\n"
         ),
-        // bool: textual form; 0/1 round-trip for from/to.
+        // bool: textual form; 0/1 round-trip for from/to. to_raw /
+        // from_raw use the same 0/1 form Vivado expects.
         quote_tcl!(
             "namespace eval bool {\n  \
                 proc repr {args} { ::vw::kwargs $args {v \"\"}; return [expr {$v ? \"true\" : \"false\"}] }\n  \
                 proc from {args} { ::vw::kwargs $args {v \"\"}; return [expr {$v ? 1 : 0}] }\n  \
-                proc to {args} { ::vw::kwargs $args {v \"\"}; return [expr {$v ? 1 : 0}] }\n\
+                proc to {args} { ::vw::kwargs $args {v \"\"}; return [expr {$v ? 1 : 0}] }\n  \
+                proc to_raw {args} { ::vw::kwargs $args {v \"\"}; return [expr {$v ? 1 : 0}] }\n  \
+                proc from_raw {args} { ::vw::kwargs $args {v \"\"}; return [expr {$v ? 1 : 0}] }\n\
             }\n"
         ),
         // unit: empty value. The App suppresses on the *type*, not
@@ -153,7 +180,9 @@ pub fn emit_primitive_prelude() -> Vec<String> {
             "namespace eval unit {\n  \
                 proc repr {args} { ::vw::kwargs $args {v \"\"}; return \"\" }\n  \
                 proc from {args} { ::vw::kwargs $args {v \"\"}; return \"\" }\n  \
-                proc to {args} { ::vw::kwargs $args {v \"\"}; return \"\" }\n\
+                proc to {args} { ::vw::kwargs $args {v \"\"}; return \"\" }\n  \
+                proc to_raw {args} { ::vw::kwargs $args {v \"\"}; return \"\" }\n  \
+                proc from_raw {args} { ::vw::kwargs $args {v \"\"}; return \"\" }\n\
             }\n"
         ),
     ]
@@ -253,8 +282,88 @@ pub fn emit_enum_prelude(enum_decl: &EnumDecl) -> String {
     body.push_str(
         "  proc to {args} { ::vw::kwargs $args {v \"\"}; return $v }\n",
     );
+    // to_raw: lower the tagged enum value to its raw extern-side
+    // representation. Switch on variant tag; for payload variants
+    // recurse via the payload type's to_raw; for empty variants
+    // emit the variant name (the convention extern Vivado calls
+    // recognize for tag-style values). See [docs/htcl-extern-boundary.md]
+    // for the rationale on this being mechanical / compiler-emitted.
+    body.push_str("  proc to_raw {args} {\n");
+    body.push_str("    ::vw::kwargs $args {v \"\"}\n");
+    body.push_str("    switch -- [lindex $v 0] {\n");
+    for v in &enum_decl.variants {
+        emit_to_raw_arm(&mut body, v);
+    }
+    body.push_str(
+        "      default { error \"unknown variant: [lindex $v 0]\" }\n",
+    );
+    body.push_str("    }\n");
+    body.push_str("  }\n");
+    // from_raw: default lift wraps the raw value as the FIRST
+    // variant. For sum types where the right variant depends on
+    // the value's shape (e.g. Property — Scalar vs Nested
+    // chosen by structural inference), users override via
+    // `proc <Enum>::from_raw` AFTER the compiler-emitted prelude;
+    // Tcl's last-`proc`-wins lets the user override take
+    // precedence.
+    if let Some(first) = enum_decl.variants.first() {
+        emit_from_raw_default(&mut body, first);
+    } else {
+        body.push_str(
+            "  proc from_raw {args} { ::vw::kwargs $args {v \"\"}; return \"\" }\n",
+        );
+    }
     body.push_str("}\n");
     body
+}
+
+/// Emit one arm of `<Enum>::to_raw`'s `switch -- [lindex $v 0]`
+/// body: for payload variants, recurse via the payload type's
+/// `to_raw`; for empty variants, emit the variant name as the
+/// raw value (matches how extern Vivado callers receive bare
+/// enum-style tags).
+fn emit_to_raw_arm(out: &mut String, v: &EnumVariant) {
+    let variant = &v.name;
+    match &v.payload {
+        None => {
+            out.push_str(&format!(
+                "      {variant} {{ return \"{variant}\" }}\n"
+            ));
+        }
+        Some(payload_ty) => {
+            let dispatch = to_raw_dispatch_name(payload_ty);
+            out.push_str(&format!(
+                "      {variant} {{ return [{dispatch} -v [lindex $v 1]] }}\n"
+            ));
+        }
+    }
+}
+
+/// Default `<Enum>::from_raw` body — wrap input as the first
+/// variant. For payload variants, the input flows through the
+/// payload type's `from_raw` first. For empty variants, the
+/// input is ignored and we return the bare-variant constructor.
+fn emit_from_raw_default(out: &mut String, first: &EnumVariant) {
+    let variant = &first.name;
+    match &first.payload {
+        None => {
+            out.push_str(&format!(
+                "  proc from_raw {{args}} {{\n    \
+                    ::vw::kwargs $args {{v \"\"}}\n    \
+                    return [list {variant}]\n  \
+                }}\n",
+            ));
+        }
+        Some(payload_ty) => {
+            let dispatch = from_raw_dispatch_name(payload_ty);
+            out.push_str(&format!(
+                "  proc from_raw {{args}} {{\n    \
+                    ::vw::kwargs $args {{v \"\"}}\n    \
+                    return [list {variant} [{dispatch} -v $v]]\n  \
+                }}\n",
+            ));
+        }
+    }
 }
 
 fn emit_constructor(out: &mut String, variant: &str, has_payload: bool) {
@@ -279,29 +388,33 @@ fn emit_repr_arm(out: &mut String, v: &EnumVariant) {
             ));
         }
         Some(payload_ty) => {
-            // Payload variant: `<Variant>(<inner>)`. When the
-            // inner repr is multi-line (nested dicts / lists /
-            // enums), indent each continuation line by two
-            // spaces so the structure visually nests under the
-            // variant name. Single-line inners stay compact.
+            // Payload variant: `<Variant>(<inner>)`. Formatting
+            // depends on whether the inner repr fits on one line:
             //
-            // We use an intermediate `set __vw_inner ...` rather
-            // than inlining the `string map` inside a quoted
-            // string — embedding a Tcl `[list "\n" "\n  "]`
-            // inside `"..."` requires escaping the inner `"`s
-            // and reasoning about whether the outer quote
-            // context bleeds into the command substitution.
-            // Splitting into two statements sidesteps that
-            // entirely.
+            //   single-line:  `Variant(inner)`
+            //   multi-line:   `Variant(\n  line1\n  line2\n)`
             //
-            // `\n` (bare word) and `"\n  "` (quoted) both
-            // backslash-substitute to a newline character; the
-            // bare form keeps the source readable.
+            // The multi-line shape (opening paren followed by
+            // newline + 2-space indent for the first child,
+            // closing paren on its own line, every inner line
+            // indented one extra level) keeps deeply-nested
+            // values readable instead of arrowing off the right
+            // margin.
+            //
+            // 2-space indent applies to ALL inner lines
+            // (including their pre-existing continuation indents),
+            // so each nesting level adds exactly 2 spaces of
+            // indent uniformly.
             let dispatch = dispatch_name(payload_ty);
             out.push_str(&format!(
                 "      {variant} {{\n        \
-                    set __vw_inner [string map [list \\n \"\\n  \"] [{dispatch} -v [lindex $v 1]]]\n        \
-                    return \"{variant}($__vw_inner)\"\n      \
+                    set __vw_inner [{dispatch} -v [lindex $v 1]]\n        \
+                    if {{[string first \"\\n\" $__vw_inner] >= 0}} {{\n          \
+                        set __vw_indented [string map [list \\n \"\\n  \"] $__vw_inner]\n          \
+                        return \"{variant}(\\n  $__vw_indented\\n)\"\n        \
+                    }} else {{\n          \
+                        return \"{variant}($__vw_inner)\"\n        \
+                    }}\n      \
                 }}\n"
             ));
         }
@@ -375,10 +488,22 @@ fn emit_recursive(
 fn emit_dict_repr(mangled: &str, k: &TypeExpr, v: &TypeExpr) -> String {
     let key_repr = dispatch_name(k);
     let val_repr = dispatch_name(v);
+    let key_to_raw = to_raw_dispatch_name(k);
+    let val_to_raw = to_raw_dispatch_name(v);
+    let key_from_raw = from_raw_dispatch_name(k);
+    let val_from_raw = from_raw_dispatch_name(v);
     // Uses the same kwargs envelope as `emit_primitive_prelude`
     // so the dispatch site can uniformly call all reprs with
     // `-v <val>`. Sub-element reprs are invoked through the
     // same `-v` convention.
+    //
+    // to_raw / from_raw are emitted in the SAME namespace so
+    // callers can dispatch via `<mangle>::{repr,to_raw,from_raw}`
+    // uniformly. to_raw walks the dict, applying K::to_raw and
+    // V::to_raw element-wise and rebuilding as a flat paired
+    // list (the shape Vivado consumes). from_raw is the inverse
+    // — walks a paired list, applies K::from_raw / V::from_raw
+    // element-wise, builds a typed dict.
     format!(
         "namespace eval {ns} {{\n  \
             proc repr {{args}} {{\n    \
@@ -388,9 +513,23 @@ fn emit_dict_repr(mangled: &str, k: &TypeExpr, v: &TypeExpr) -> String {
                 foreach {{k val}} $v {{\n      \
                     if {{!$first}} {{ append out \"\\n\" }}\n      \
                     set first 0\n      \
-                    set __vw_kr [string map [list \\n \"\\n  \"] [{kr} -v $k]]\n      \
-                    set __vw_vr [string map [list \\n \"\\n  \"] [{vr} -v $val]]\n      \
-                    append out $__vw_kr \" \" $__vw_vr\n    \
+                    append out [{kr} -v $k] \" \" [{vr} -v $val]\n    \
+                }}\n    \
+                return $out\n  \
+            }}\n  \
+            proc to_raw {{args}} {{\n    \
+                ::vw::kwargs $args {{v \"\"}}\n    \
+                set out [list]\n    \
+                foreach {{k val}} $v {{\n      \
+                    lappend out [{ktr} -v $k] [{vtr} -v $val]\n    \
+                }}\n    \
+                return $out\n  \
+            }}\n  \
+            proc from_raw {{args}} {{\n    \
+                ::vw::kwargs $args {{v \"\"}}\n    \
+                set out [dict create]\n    \
+                foreach {{k val}} $v {{\n      \
+                    dict set out [{kfr} -v $k] [{vfr} -v $val]\n    \
                 }}\n    \
                 return $out\n  \
             }}\n\
@@ -398,13 +537,20 @@ fn emit_dict_repr(mangled: &str, k: &TypeExpr, v: &TypeExpr) -> String {
         ns = mangled,
         kr = key_repr,
         vr = val_repr,
+        ktr = key_to_raw,
+        vtr = val_to_raw,
+        kfr = key_from_raw,
+        vfr = val_from_raw,
     )
 }
 
 /// `list<T>::repr` — iterate elements, format each via `T::repr`,
-/// join with newlines.
+/// join with newlines. Also emits `to_raw` / `from_raw` element-
+/// wise dispatching through `T::to_raw` / `T::from_raw`.
 fn emit_list_repr(mangled: &str, elem: &TypeExpr) -> String {
     let elem_repr = dispatch_name(elem);
+    let elem_to_raw = to_raw_dispatch_name(elem);
+    let elem_from_raw = from_raw_dispatch_name(elem);
     format!(
         "namespace eval {ns} {{\n  \
             proc repr {{args}} {{\n    \
@@ -414,14 +560,31 @@ fn emit_list_repr(mangled: &str, elem: &TypeExpr) -> String {
                 foreach item $v {{\n      \
                     if {{!$first}} {{ append out \"\\n\" }}\n      \
                     set first 0\n      \
-                    set __vw_er [string map [list \\n \"\\n  \"] [{er} -v $item]]\n      \
-                    append out $__vw_er\n    \
+                    append out [{er} -v $item]\n    \
+                }}\n    \
+                return $out\n  \
+            }}\n  \
+            proc to_raw {{args}} {{\n    \
+                ::vw::kwargs $args {{v \"\"}}\n    \
+                set out [list]\n    \
+                foreach item $v {{\n      \
+                    lappend out [{etr} -v $item]\n    \
+                }}\n    \
+                return $out\n  \
+            }}\n  \
+            proc from_raw {{args}} {{\n    \
+                ::vw::kwargs $args {{v \"\"}}\n    \
+                set out [list]\n    \
+                foreach item $v {{\n      \
+                    lappend out [{efr} -v $item]\n    \
                 }}\n    \
                 return $out\n  \
             }}\n\
         }}\n",
         ns = mangled,
         er = elem_repr,
+        etr = elem_to_raw,
+        efr = elem_from_raw,
     )
 }
 
@@ -433,6 +596,8 @@ fn emit_unknown_generic_repr(mangled: &str) -> String {
     format!(
         "namespace eval {mangled} {{ \
             proc repr {{args}} {{ ::vw::kwargs $args {{v \"\"}}; return $v }} \
+            proc to_raw {{args}} {{ ::vw::kwargs $args {{v \"\"}}; return $v }} \
+            proc from_raw {{args}} {{ ::vw::kwargs $args {{v \"\"}}; return $v }} \
         }}\n"
     )
 }

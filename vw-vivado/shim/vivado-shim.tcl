@@ -293,6 +293,98 @@ proc ::vw::props_dict {obj} {
     return $out
 }
 
+# ---------- user-set property tracking ----------
+#
+# Vivado offers no per-property "is this at the default?" API
+# accessible from Tcl (`get_property`, `list_property`,
+# `report_property -all`, `bd::get_properties` all return every
+# property's current value with no user-vs-default distinction).
+# The only system-of-record is `write_bd_tcl`'s output, which
+# requires a full BD serialization round-trip per query.
+#
+# Instead we keep our own tally: every time
+# `vivado_cmd::set_property` is invoked (the htcl-level chokepoint
+# all wrappers and user code go through), it records the
+# (object, name, value) triples here. `::vw::user_props_dict` /
+# `::vw::user_props_nested` read back from this side-channel —
+# returning ONLY the properties the user / wrapper explicitly
+# pushed, never the ones Vivado cascaded as derived defaults.
+#
+# Cost: O(properties set) for record (dict insertion), O(props
+# returned) for retrieval (dict walk). No file I/O, no full-
+# design serialization. Persists across batches in the worker
+# until `:restart`.
+#
+# Caveat: tracks only properties set via the
+# `vivado_cmd::set_property` wrapper. Direct `extern::set_property`
+# bypasses the recording. That's by design — the wrappers are
+# the documented boundary, and bypassing them is an explicit
+# opt-out of the tracking machinery.
+
+namespace eval ::vw {
+    variable user_set_props
+}
+
+# Record one or more (name, value) pairs as user-set on `obj`.
+# `args` is the paired list (name1 val1 name2 val2 …) — same
+# shape the wrapper builds before calling `set_property -dict`.
+# Last-set wins per property name within an object.
+proc ::vw::record_user_props {obj args} {
+    variable user_set_props
+    if {![info exists user_set_props]} {
+        array set user_set_props {}
+    }
+    set key [::vw::_user_props_key $obj]
+    if {![info exists user_set_props($key)]} {
+        set user_set_props($key) [dict create]
+    }
+    set current $user_set_props($key)
+    foreach {n v} $args {
+        dict set current $n $v
+    }
+    set user_set_props($key) $current
+}
+
+# Canonical key for the per-object side-channel storage. Vivado's
+# `PATH` property gives a unique BD-cell identifier across the
+# design; falls back to the raw object string when PATH isn't
+# queryable (e.g. for non-BD objects passed through accidentally).
+proc ::vw::_user_props_key {obj} {
+    if {[catch {get_property PATH $obj} p]} {
+        return $obj
+    }
+    return $p
+}
+
+# Return the recorded (name, value) paired list for `obj`. Empty
+# list when nothing has been recorded.
+proc ::vw::user_props_dict {obj} {
+    variable user_set_props
+    if {![info exists user_set_props]} { return [list] }
+    set key [::vw::_user_props_key $obj]
+    if {![info exists user_set_props($key)]} { return [list] }
+    set out [list]
+    dict for {k v} $user_set_props($key) {
+        lappend out $k $v
+    }
+    return $out
+}
+
+# Same shape as `::vw::props_nested` but seeded from the recorded
+# user-set property tally instead of from `list_property` +
+# `get_property`. Each value is classified via the structural
+# `_lift_value` helper and inserted by dot-split path so the
+# result is a nested `Properties` with only the explicitly-set
+# sub-keys present.
+proc ::vw::user_props_nested {obj} {
+    set plain [dict create]
+    foreach {name raw} [::vw::user_props_dict $obj] {
+        set leaf [::vw::_lift_value $raw]
+        dict set plain {*}[split $name "."] $leaf
+    }
+    return [::vw::_wrap_nested $plain]
+}
+
 # `::vw::props_nested <obj>` returns the FULL output `util::props`
 # wants — a nested `Properties` dict where dotted property names
 # (CONFIG.X.Y) expand into hierarchy, and each leaf value is

@@ -19,6 +19,7 @@
 //! slices.
 
 mod app;
+mod highlight;
 mod history;
 pub mod lower;
 mod render;

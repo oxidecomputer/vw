@@ -2841,6 +2841,7 @@ dependencies = [
  "vw-htcl",
  "vw-lib",
  "vw-vivado",
+ "winnow 0.6.26",
 ]
 
 [[package]]
