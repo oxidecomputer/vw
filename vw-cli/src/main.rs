@@ -748,11 +748,92 @@ fn run_ip_generate(
     };
     let text = vw_ip::generate(&component, &presets, &dict_schemas, &opts);
     match output {
-        Some(path) => std::fs::write(path, &text)
-            .map_err(|e| format!("writing {path}: {e}"))?,
+        Some(path) => {
+            std::fs::write(path, &text)
+                .map_err(|e| format!("writing {path}: {e}"))?;
+            // Generated IP modules need a workspace toml so `vw test`,
+            // `vw analyzer`, and the REPL can resolve `src @vivado-cmd`
+            // (and any other helpers the wrapper calls into). Seed a
+            // default one alongside `module.htcl` on first generation;
+            // never clobber an existing user-edited toml.
+            let module_dir = match path.parent() {
+                Some(p) if !p.as_str().is_empty() => p.to_path_buf(),
+                _ => Utf8PathBuf::from("."),
+            };
+            ensure_module_vw_toml(&module_dir)?;
+        }
         None => print!("{text}"),
     }
     Ok(())
+}
+
+/// Write a default `vw.toml` to `dir` if one doesn't already exist.
+///
+/// Generated IP wrappers all `src @vivado-cmd` for the `ip::check` /
+/// `log::error` / property-helper procs that drive their bodies, so
+/// every module dir needs a workspace toml that points at the
+/// vivado-cmd module. Without it, the analyzer and REPL flag
+/// `undefined proc ip::check` on the first line of every freshly-
+/// generated module.
+///
+/// The function is idempotent: an existing `vw.toml` is left alone so
+/// the user can edit it (add deps, rename the workspace) without
+/// having their changes overwritten the next time `regenerate.sh`
+/// runs.
+fn ensure_module_vw_toml(dir: &Utf8Path) -> Result<(), String> {
+    let toml_path = dir.join("vw.toml");
+    if toml_path.exists() {
+        return Ok(());
+    }
+    let name = dir
+        .canonicalize_utf8()
+        .ok()
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .or_else(|| dir.file_name())
+        .unwrap_or("module")
+        .to_string();
+    let (dep_line, note) = match discover_sibling_vivado_cmd(dir) {
+        Some(p) => (format!("path = \"{p}\""), None),
+        None => (
+            "path = \"../vivado-cmd\"".to_string(),
+            Some("# TODO: adjust to your vivado-cmd module path"),
+        ),
+    };
+    let mut content = format!(
+        "[workspace]\n\
+         name = \"{name}\"\n\
+         version = \"0.1.0\"\n\
+         \n\
+         [dependencies.vivado-cmd]\n"
+    );
+    if let Some(n) = note {
+        content.push_str(n);
+        content.push('\n');
+    }
+    content.push_str(&dep_line);
+    content.push('\n');
+    std::fs::write(&toml_path, content)
+        .map_err(|e| format!("writing {toml_path}: {e}"))?;
+    eprintln!("{:>12} {}", "Created".bright_green().bold(), toml_path);
+    Ok(())
+}
+
+/// Walk up from `start` looking for a sibling `vivado-cmd/vw.toml`.
+/// Returns the canonical absolute path to the directory if found.
+/// Used by [`ensure_module_vw_toml`] to seed the dep path for
+/// freshly-generated IP modules.
+fn discover_sibling_vivado_cmd(start: &Utf8Path) -> Option<Utf8PathBuf> {
+    let abs = start.canonicalize_utf8().ok()?;
+    let mut cur = abs.as_path();
+    while let Some(parent) = cur.parent() {
+        let candidate = parent.join("vivado-cmd");
+        if candidate.join("vw.toml").is_file() {
+            return Some(candidate);
+        }
+        cur = parent;
+    }
+    None
 }
 
 /// Read `entry` and recursively resolve its `src` imports. Looks for

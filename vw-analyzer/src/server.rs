@@ -57,6 +57,7 @@ impl LanguageServer for Analyzer {
                     TextDocumentSyncKind::FULL,
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
@@ -138,6 +139,25 @@ impl LanguageServer for Analyzer {
             Ok(None)
         } else {
             Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+        }
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let query = params.query;
+        // Walk every registered backend (today just one) and merge the
+        // matches — keeps the same dispatch shape as `backend_for` so
+        // adding a second language later doesn't need a refactor.
+        let mut symbols = Vec::new();
+        for backend in &self.backends {
+            symbols.extend(backend.workspace_symbols(&query).await);
+        }
+        if symbols.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(symbols))
         }
     }
 

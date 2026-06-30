@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use tower_lsp::lsp_types::{
     CompletionItem, Diagnostic, DocumentSymbol, Hover, Location, Position,
-    SignatureHelp, Url,
+    SignatureHelp, SymbolInformation, Url,
 };
 
 #[async_trait]
@@ -44,6 +44,15 @@ pub trait LanguageBackend: Send + Sync {
 
     /// Document symbols ("outline view") for `uri`.
     async fn document_symbols(&self, uri: &Url) -> Vec<DocumentSymbol>;
+
+    /// Workspace-wide symbol search for the LSP `workspace/symbol`
+    /// request. `query` is the user's filter text; the backend should
+    /// return at minimum every symbol whose name matches `query` (case-
+    /// insensitive substring is fine — the editor applies its own fuzzy
+    /// scoring on top). An empty `query` should return every symbol the
+    /// backend knows about (capped at a sensible upper bound to keep
+    /// the response small enough to render).
+    async fn workspace_symbols(&self, query: &str) -> Vec<SymbolInformation>;
 
     /// Hover content for the construct at `position`. Returns `None`
     /// if the cursor isn't on anything the backend has something to

@@ -14,8 +14,8 @@ use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity,
     DocumentSymbol, Documentation, Hover, HoverContents, InsertTextFormat,
     Location, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel,
-    Position, Range, SignatureHelp, SignatureInformation, SymbolKind, TextEdit,
-    Url,
+    Position, Range, SignatureHelp, SignatureInformation, SymbolInformation,
+    SymbolKind, TextEdit, Url,
 };
 use vw_htcl::{
     complete_at, definition_at, hover_at, parse, signature_help_at, validate,
@@ -153,6 +153,62 @@ impl LanguageBackend for HtclBackend {
             });
         }
         symbols
+    }
+
+    async fn workspace_symbols(&self, query: &str) -> Vec<SymbolInformation> {
+        // Cap the response so a wide picker scroll doesn't pay for
+        // thousands of entries when the user hasn't narrowed yet. The
+        // editor applies its own scoring on top, so any reasonable
+        // ceiling keeps the UX responsive.
+        const MAX_RESULTS: usize = 500;
+
+        let needle = query.to_ascii_lowercase();
+        let docs = self.docs.read().await;
+        // Files we've already harvested — dedupe so a header imported
+        // by multiple open docs doesn't double up. Keyed on the URI as
+        // a string for hashability.
+        let mut seen_files: HashMap<String, ()> = HashMap::new();
+        let mut out: Vec<SymbolInformation> = Vec::new();
+
+        for (uri, doc) in docs.iter() {
+            // Visit the open doc itself first, then everything it
+            // transitively `src`s. `build_view` already canonicalizes
+            // paths during the walk, so the import file_uris are
+            // stable across docs.
+            if seen_files.insert(uri.to_string(), ()).is_none() {
+                collect_workspace_symbols(
+                    uri,
+                    &doc.text,
+                    &needle,
+                    &mut out,
+                    MAX_RESULTS,
+                );
+                if out.len() >= MAX_RESULTS {
+                    return out;
+                }
+            }
+
+            let view = crate::workspace::build_view(uri, &doc.text);
+            for import in &view.imports {
+                let key = import.file_uri.to_string();
+                if seen_files.insert(key, ()).is_some() {
+                    continue;
+                }
+                let text = &view.view_source
+                    [import.start as usize..import.end as usize];
+                collect_workspace_symbols(
+                    &import.file_uri,
+                    text,
+                    &needle,
+                    &mut out,
+                    MAX_RESULTS,
+                );
+                if out.len() >= MAX_RESULTS {
+                    return out;
+                }
+            }
+        }
+        out
     }
 
     async fn goto_definition(
@@ -728,6 +784,123 @@ fn lc_to_pos(lc: LineCol) -> Position {
     }
 }
 
+/// Parse one htcl `text` and push every `proc` / `type` / `enum`
+/// declaration whose name contains `needle` (case-insensitive, empty
+/// `needle` matches all) into `out`. Stops as soon as `out` reaches
+/// `cap` entries so a `workspace/symbol` request never assembles an
+/// unbounded response. Variants of an enum are emitted as siblings
+/// with `container_name` set to the enum, matching how
+/// rust-analyzer surfaces variants in the workspace picker.
+fn collect_workspace_symbols(
+    uri: &Url,
+    text: &str,
+    needle: &str,
+    out: &mut Vec<SymbolInformation>,
+    cap: usize,
+) {
+    let parsed = parse(text);
+    let line_index = LineIndex::new(text);
+    for stmt in &parsed.document.stmts {
+        if out.len() >= cap {
+            return;
+        }
+        let Stmt::Command(cmd) = stmt else { continue };
+        match &cmd.kind {
+            CommandKind::Proc(proc) => {
+                if let Some(name) = proc.name.as_deref() {
+                    push_symbol(
+                        uri,
+                        &line_index,
+                        name,
+                        proc.name_span,
+                        SymbolKind::FUNCTION,
+                        None,
+                        needle,
+                        out,
+                    );
+                }
+            }
+            CommandKind::TypeDecl(td) => {
+                if let Some(name) = td.name.as_deref() {
+                    push_symbol(
+                        uri,
+                        &line_index,
+                        name,
+                        td.name_span,
+                        SymbolKind::STRUCT,
+                        None,
+                        needle,
+                        out,
+                    );
+                }
+            }
+            CommandKind::EnumDecl(ed) => {
+                let enum_name = ed.name.as_deref();
+                if let Some(name) = enum_name {
+                    push_symbol(
+                        uri,
+                        &line_index,
+                        name,
+                        ed.name_span,
+                        SymbolKind::ENUM,
+                        None,
+                        needle,
+                        out,
+                    );
+                }
+                for v in &ed.variants {
+                    if out.len() >= cap {
+                        return;
+                    }
+                    push_symbol(
+                        uri,
+                        &line_index,
+                        &v.name,
+                        v.name_span,
+                        SymbolKind::ENUM_MEMBER,
+                        enum_name.map(str::to_string),
+                        needle,
+                        out,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_symbol(
+    uri: &Url,
+    line_index: &LineIndex,
+    name: &str,
+    span: vw_htcl::Span,
+    kind: SymbolKind,
+    container_name: Option<String>,
+    needle: &str,
+    out: &mut Vec<SymbolInformation>,
+) {
+    if !needle.is_empty() && !name.to_ascii_lowercase().contains(needle) {
+        return;
+    }
+    let (start, end) = line_index.range(span);
+    #[allow(deprecated)]
+    out.push(SymbolInformation {
+        name: name.to_string(),
+        kind,
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri: uri.clone(),
+            range: Range {
+                start: lc_to_pos(start),
+                end: lc_to_pos(end),
+            },
+        },
+        container_name,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,6 +942,35 @@ mod tests {
         assert_eq!(symbols[0].name, "greet");
         assert_eq!(symbols[0].kind, SymbolKind::FUNCTION);
         assert_eq!(symbols[0].detail.as_deref(), Some("greet someone"));
+    }
+
+    #[tokio::test]
+    async fn workspace_symbols_surface_procs_types_and_enum_variants() {
+        let backend = HtclBackend::new();
+        backend
+            .set_text(
+                uri(),
+                "proc greet {name} { puts hi }\n\
+                 type Foo = int\n\
+                 enum Color = {\n  Red\n  Green\n  Blue\n}\n"
+                    .into(),
+            )
+            .await;
+        let all = backend.workspace_symbols("").await;
+        let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"greet"), "{names:?}");
+        assert!(names.contains(&"Foo"), "{names:?}");
+        assert!(names.contains(&"Color"), "{names:?}");
+        assert!(names.contains(&"Red"), "{names:?}");
+        let red = all.iter().find(|s| s.name == "Red").unwrap();
+        assert_eq!(red.kind, SymbolKind::ENUM_MEMBER);
+        assert_eq!(red.container_name.as_deref(), Some("Color"));
+
+        // Substring filter, case-insensitive.
+        let filtered = backend.workspace_symbols("gre").await;
+        assert!(filtered.iter().any(|s| s.name == "greet"));
+        assert!(filtered.iter().any(|s| s.name == "Green"));
+        assert!(!filtered.iter().any(|s| s.name == "Foo"));
     }
 
     #[tokio::test]
