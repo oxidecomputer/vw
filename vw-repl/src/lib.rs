@@ -61,6 +61,11 @@ pub struct ReplOptions {
     /// the Vivado worker comes up. Equivalent to typing `:load
     /// <path>` as the first input.
     pub initial_load: Option<Utf8PathBuf>,
+    /// If true, INFO-severity Vivado messages carry their full Tcl
+    /// stack frames into the scrollback. Off by default — INFO is
+    /// noisy enough without stack traces — but useful when diagnosing
+    /// where a particular INFO is emitted from.
+    pub info_with_stack: bool,
 }
 
 /// Run the REPL until the user exits. Owns the terminal alternate

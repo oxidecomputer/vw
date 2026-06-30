@@ -100,6 +100,17 @@ pub struct VivadoConfig {
     /// when set, lines stream into that file; when unset, they go
     /// to vw's stderr.
     pub verbose: bool,
+    /// When `true`, every Vivado-formatted message
+    /// (`INFO:`/`WARNING:`/`ERROR:`/`CRITICAL WARNING:`) gets the
+    /// Tcl call stack appended as `at <file>:<line> in ::proc`
+    /// continuation lines. When `false` (default), stacks are
+    /// attached only to WARNINGs and ERRORs — INFO messages render
+    /// as a single line. INFOs are noisy under heavy Vivado
+    /// activity (CIPS customization can emit dozens per call) and
+    /// the stack adds little signal compared to the message text;
+    /// power users diagnosing why a particular INFO fires can flip
+    /// this on with `--info-with-stack`.
+    pub info_with_stack: bool,
     /// Optional path to a log file for verbose output. When set,
     /// supersedes the default stderr destination — necessary for
     /// the REPL, which owns the terminal in alternate-screen mode
@@ -224,6 +235,13 @@ impl VivadoBackend {
         cmd.arg("-source");
         cmd.arg(&shim_path);
         cmd.env("VW_PROTOCOL_ADDR", local_addr.to_string());
+        // Read by the shim's `is_vivado_message` / stack-attach
+        // logic to decide whether INFO-level messages get stacks
+        // attached. WARNING / ERROR / CRITICAL always do.
+        cmd.env(
+            "VW_INFO_WITH_STACK",
+            if config.info_with_stack { "1" } else { "0" },
+        );
         cmd.cwd(&cwd);
 
         let child = pair.slave.spawn_command(cmd).map_err(|e| {

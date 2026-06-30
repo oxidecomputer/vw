@@ -146,6 +146,12 @@ enum Commands {
             help = "Forward Vivado's banner and info messages to stderr"
         )]
         verbose: bool,
+        #[arg(
+            long = "info-with-stack",
+            help = "Attach the Tcl call stack to INFO messages too \
+                    (WARNING / ERROR / CRITICAL always include the stack)"
+        )]
+        info_with_stack: bool,
     },
     #[command(about = "Launch the vw analyzer LSP server on stdio")]
     Analyzer,
@@ -165,6 +171,12 @@ enum Commands {
             help = "Source FILE into the session as soon as Vivado is up"
         )]
         initial_load: Option<Utf8PathBuf>,
+        #[arg(
+            long = "info-with-stack",
+            help = "Attach the Tcl call stack to INFO messages too \
+                    (WARNING / ERROR / CRITICAL always include the stack)"
+        )]
+        info_with_stack: bool,
     },
     #[command(
         about = "Parse and run analysis on htcl files without executing them"
@@ -567,8 +579,11 @@ async fn main() {
             file,
             check,
             verbose,
+            info_with_stack,
         } => {
-            if let Err(e) = run_htcl(&file, check, verbose).await {
+            if let Err(e) =
+                run_htcl(&file, check, verbose, info_with_stack).await
+            {
                 eprintln!("{} {e}", "error:".bright_red());
                 process::exit(1);
             }
@@ -580,10 +595,12 @@ async fn main() {
         Commands::Repl {
             verbose,
             initial_load,
+            info_with_stack,
         } => {
             if let Err(e) = vw_repl::run(vw_repl::ReplOptions {
                 verbose,
                 initial_load,
+                info_with_stack,
             })
             .await
             {
@@ -1067,6 +1084,7 @@ async fn run_htcl(
     file: &camino::Utf8Path,
     check_only: bool,
     verbose: bool,
+    info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let program = load_htcl_program(file)?;
     // Keep `program` alive — the stack-frame rewriting needs the
@@ -1114,6 +1132,7 @@ async fn run_htcl(
     let mut backend =
         vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
             verbose,
+            info_with_stack,
             ..Default::default()
         })
         .await

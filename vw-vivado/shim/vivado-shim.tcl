@@ -495,6 +495,24 @@ proc ::vw::is_vivado_message {str} {
     return 0
 }
 
+# Severity of a Vivado-style message: one of `ERROR`, `CRITICAL`,
+# `WARNING`, `INFO`. Returns empty for non-messages. Used by
+# `attach_stack_if_message` to decide whether the stack is worth
+# attaching (INFO is suppressed by default — see VW_INFO_WITH_STACK).
+proc ::vw::message_severity {str} {
+    set first $str
+    set nl [string first "\n" $str]
+    if {$nl >= 0} {
+        set first [string range $str 0 [expr {$nl - 1}]]
+    }
+    set trimmed [string trimleft $first]
+    if {[string match "ERROR:*" $trimmed]} { return "ERROR" }
+    if {[string match "CRITICAL WARNING:*" $trimmed]} { return "CRITICAL" }
+    if {[string match "WARNING:*" $trimmed]} { return "WARNING" }
+    if {[string match "INFO:*" $trimmed]} { return "INFO" }
+    return ""
+}
+
 # If `str` looks like a Vivado-style message, append the current
 # Tcl call stack as `\n  at <frame>` continuation lines and
 # return the augmented string. Otherwise return `str` unchanged.
@@ -506,6 +524,19 @@ proc ::vw::is_vivado_message {str} {
 proc ::vw::attach_stack_if_message {str skip_caller_frames} {
     if {![::vw::is_vivado_message $str]} {
         return $str
+    }
+    # INFO messages are noisy under heavy Vivado activity (CIPS
+    # customization emits dozens per call). By default we suppress
+    # their stack so the scrollback stays scannable. The user opts
+    # in with `vw repl --info-with-stack` (or the `vw run` flag),
+    # which sets VW_INFO_WITH_STACK=1 on the spawned process.
+    # WARNING / ERROR / CRITICAL always keep their stacks.
+    if {[::vw::message_severity $str] eq "INFO"} {
+        set env_default 0
+        catch { set env_default $::env(VW_INFO_WITH_STACK) }
+        if {$env_default ne "1"} {
+            return $str
+        }
     }
     set stack [::vw::capture_stack $skip_caller_frames]
     if {[llength $stack] == 0} {
@@ -687,13 +718,25 @@ proc ::vw::install_send_msg_override {} {
         set ::vw::in_send_msg_id 1
         set ok [catch {
             set sev_norm [::vw::normalize_severity $severity]
-            # Skip 1 caller frame so the deepest frame in the
-            # rendered stack is the one that called send_msg_id,
-            # not the user proc that called our wrapper.
-            set stack [::vw::capture_stack 1]
+            # INFO is noisy — suppress the stack by default, matching
+            # the puts-wrapper path. The user opts in with `vw repl
+            # --info-with-stack` (worker exports VW_INFO_WITH_STACK=1).
+            # WARNING / ERROR / CRITICAL always keep their stacks.
+            set attach_stack 1
+            if {$sev_norm eq "INFO"} {
+                set env_default 0
+                catch { set env_default $::env(VW_INFO_WITH_STACK) }
+                if {$env_default ne "1"} { set attach_stack 0 }
+            }
             set out "${sev_norm}: \[${id}\] ${msg}"
-            foreach frame $stack {
-                append out "\n  at ${frame}"
+            if {$attach_stack} {
+                # Skip 1 caller frame so the deepest frame in the
+                # rendered stack is the one that called send_msg_id,
+                # not the user proc that called our wrapper.
+                set stack [::vw::capture_stack 1]
+                foreach frame $stack {
+                    append out "\n  at ${frame}"
+                }
             }
             if {$::vw::capturing} {
                 ::vw::stream_stdout $::vw::current_eval_id "$out\n"

@@ -323,6 +323,7 @@ async fn run_inner(
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCmd>(8);
     let (event_tx, eval_rx) = mpsc::unbounded_channel::<WorkerEvent>();
     let verbose = opts.verbose;
+    let info_with_stack = opts.info_with_stack;
     // Verbose output can't go to stderr in REPL mode — that's the
     // same fd the TUI renders on, so any byte stomps through the
     // alternate-screen buffer. Route it to a per-process tempfile
@@ -340,6 +341,7 @@ async fn run_inner(
         event_tx,
         verbose,
         verbose_log_path.clone(),
+        info_with_stack,
     ));
 
     let mut app = App::new(opts, worker_tx, eval_rx);
@@ -2296,10 +2298,12 @@ async fn worker_task(
     tx: mpsc::UnboundedSender<WorkerEvent>,
     verbose: bool,
     verbose_log: Option<std::path::PathBuf>,
+    info_with_stack: bool,
 ) {
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
         verbose_log,
+        info_with_stack,
         ..Default::default()
     })
     .await;
