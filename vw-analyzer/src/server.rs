@@ -44,9 +44,20 @@ impl Analyzer {
 impl LanguageServer for Analyzer {
     async fn initialize(
         &self,
-        _params: InitializeParams,
+        params: InitializeParams,
     ) -> Result<InitializeResult> {
         info!("vw-analyzer initializing");
+        // Capture the editor's workspace roots so backends can use
+        // them as fallback dep-lookup dirs when analyzing files
+        // opened outside the nearest `vw.toml`. Newer LSP clients
+        // send `workspaceFolders`; older ones use `rootUri` — we
+        // accept whichever is present. Missing → empty (each
+        // file's own workspace still resolves in isolation, which
+        // was the pre-fallback behavior).
+        let roots = collect_workspace_roots(&params);
+        for backend in &self.backends {
+            backend.set_workspace_roots(roots.clone()).await;
+        }
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "vw-analyzer".into(),
@@ -87,6 +98,26 @@ impl LanguageServer for Analyzer {
 
     async fn initialized(&self, _: InitializedParams) {
         info!("vw-analyzer initialized");
+    }
+
+    async fn did_change_workspace_folders(
+        &self,
+        params: DidChangeWorkspaceFoldersParams,
+    ) {
+        // Rebuild the roots list from scratch on any change. We
+        // don't retain state between initialize and here, so an
+        // added-only event still tells us the FULL updated set —
+        // both `added` and `removed` are already applied by the
+        // client before this notification per LSP spec.
+        let added: Vec<std::path::PathBuf> = params
+            .event
+            .added
+            .iter()
+            .filter_map(|f| f.uri.to_file_path().ok())
+            .collect();
+        for backend in &self.backends {
+            backend.set_workspace_roots(added.clone()).await;
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -223,4 +254,33 @@ impl LanguageServer for Analyzer {
         };
         Ok(backend.signature_help(&uri, position).await)
     }
+}
+
+/// Extract workspace roots from an `initialize` request as
+/// filesystem paths. Prefers `workspaceFolders` (LSP 3.6+, sent
+/// by every modern client) and falls back to `rootUri` for older
+/// clients. Both may be absent — e.g. when the editor opens a
+/// file with no folder context — in which case we return an
+/// empty vec and each file's own `vw.toml` is the only source
+/// of dep names, matching the pre-fallback behavior.
+fn collect_workspace_roots(
+    params: &InitializeParams,
+) -> Vec<std::path::PathBuf> {
+    if let Some(folders) = params.workspace_folders.as_ref() {
+        if !folders.is_empty() {
+            return folders
+                .iter()
+                .filter_map(|f| f.uri.to_file_path().ok())
+                .collect();
+        }
+    }
+    // `root_uri` is deprecated but still what a lot of clients
+    // (including bare-bones LSP integrations) send.
+    #[allow(deprecated)]
+    if let Some(uri) = params.root_uri.as_ref() {
+        if let Ok(p) = uri.to_file_path() {
+            return vec![p];
+        }
+    }
+    Vec::new()
 }

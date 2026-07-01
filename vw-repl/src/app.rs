@@ -2076,13 +2076,23 @@ impl App {
                 // Per-statement timer freezing: if any echoed
                 // Input entry's `last_command_idx` matches the
                 // just-finished command, stamp its
-                // `completed_at`. If there's a NEXT uncompleted
-                // boundary, anchor its `started_at` to now so
-                // its timer starts ticking from this point
-                // (rather than from batch-dispatch time, which
-                // would conflate it with the time spent on
-                // earlier statements).
-                self.advance_input_timers(just_finished_idx);
+                // `completed_at`. On success we cascade — activate
+                // (echo + stamp `started_at` for) the next
+                // uncompleted boundary. On failure we do NOT
+                // cascade: the batch aborts here, and echoing the
+                // NEXT statement's `› …` line before the error
+                // trace we're about to render would make the trace
+                // look like it belonged to that statement. The
+                // ordering guarantee we're preserving is: an
+                // eval's output — including its error trace when
+                // the eval fails — appears between its own echo
+                // and the next one, if any next one appears at all.
+                match &result {
+                    Ok(_) => self.advance_input_timers(just_finished_idx),
+                    Err(_) => {
+                        self.freeze_input_boundary(just_finished_idx);
+                    }
+                }
                 if last_in_batch {
                     self.pending_origins.clear();
                     self.pending_return_types.clear();
@@ -2145,11 +2155,25 @@ impl App {
                         self.worker_state = WorkerState::Ready;
                         // Hold the pending batch for the renderer
                         // — drill-down lookups need its proc map.
-                        // It's cleared below once the trace is
-                        // emitted (a pending batch only outlives a
-                        // single result event).
+                        // Cleared below once the trace is emitted.
                         render_eval_error(self, &origin, err);
-                        self.pending_batch = None;
+                        // Commit the parsed batch to the session
+                        // even though the eval failed. The batch's
+                        // `Document` carries every proc, type, and
+                        // enum decl that the parser saw — including
+                        // whatever `src @vivado-cmd`, `src project`,
+                        // `src ip/cips`, etc. brought in *before*
+                        // the failing user command ran. Tab
+                        // completion, hover, and signature help all
+                        // query session-wide symbols, and dropping
+                        // the batch strands them with an empty
+                        // symbol table until the next successful
+                        // eval. The runtime state in Vivado may be
+                        // partial or wrong; that's a separate
+                        // concern from what the analyzer sees.
+                        if let Some(batch) = self.pending_batch.take() {
+                            self.session.commit(batch);
+                        }
                         // Failed evals also freeze their per-input
                         // timer — otherwise the live counter would
                         // tick forever on an error result.
@@ -2191,6 +2215,31 @@ impl App {
     /// inheriting the elapsed time from earlier statements'
     /// commands.
     fn advance_input_timers(&mut self, just_finished_idx: usize) {
+        if let Some(hit) = self.freeze_input_boundary(just_finished_idx) {
+            // Activate the next uncompleted boundary — pushes its
+            // echo and stamps `started_at`. Empty boundaries (no
+            // lowered commands attributed) get echoed + frozen
+            // instantly and we cascade to the next one; otherwise
+            // no EvalDone would ever close them and the batch would
+            // stall at that point in the visual trace.
+            self.activate_next_boundary(hit + 1);
+        }
+    }
+
+    /// Freeze the boundary whose `last_command_idx` matches
+    /// `just_finished_idx` without cascading to the next
+    /// statement. Used by the failing-eval path so an error trace
+    /// isn't visually preceded by the next boundary's echo — the
+    /// batch is aborting, the next echo would be misleading, and
+    /// (worse) it would appear BEFORE the failure explanation the
+    /// user needs to read. Returns the boundary's index in
+    /// `pending_input_boundaries` when found, or `None` when this
+    /// EvalDone doesn't close any boundary (e.g. a synthetic
+    /// prelude command).
+    fn freeze_input_boundary(
+        &mut self,
+        just_finished_idx: usize,
+    ) -> Option<usize> {
         let now = std::time::Instant::now();
         // Find the first uncompleted boundary whose
         // last_command_idx matches. Multi-statement load
@@ -2207,8 +2256,7 @@ impl App {
             }
             break;
         }
-        let Some(hit) = hit_position else { return };
-        // Mark this boundary complete + stamp its entry.
+        let hit = hit_position?;
         self.pending_input_boundaries[hit].completed = true;
         if let Some(idx) = self.pending_input_boundaries[hit].scrollback_idx {
             if let Some(entry) = self.scrollback.get_mut(idx) {
@@ -2217,13 +2265,7 @@ impl App {
                 }
             }
         }
-        // Activate the next uncompleted boundary — pushes its
-        // echo and stamps `started_at`. Empty boundaries (no
-        // lowered commands attributed) get echoed + frozen
-        // instantly and we cascade to the next one; otherwise
-        // no EvalDone would ever close them and the batch would
-        // stall at that point in the visual trace.
-        self.activate_next_boundary(hit + 1);
+        Some(hit)
     }
 
     /// Push the echo for the first uncompleted boundary starting
@@ -3308,5 +3350,111 @@ WARNING: [port::plumb_if_pin-1] skipping foo
         assert!(pretty_kv_list("hello world foo bar").is_some());
         // … but the same elements with one non-propname key fail.
         assert!(pretty_kv_list("hello world foo! bar").is_none());
+    }
+
+    // --- request/response ordering ---------------------------------
+
+    /// Regression: when a batch's Nth command fails, the (N+1)th
+    /// boundary's echo must NOT be pushed to scrollback ahead of the
+    /// error trace. The auto-load repro looked like this: `set cips
+    /// [configure_cips]` failed, then `› set clk [configure_clock]`
+    /// appeared, then the trace + error for `set cips`. The error
+    /// belongs to `set cips` and has to land BEFORE the next
+    /// statement's echo (or preferably: the next echo shouldn't
+    /// appear at all, since the batch aborts on failure).
+    #[tokio::test]
+    async fn failed_eval_does_not_activate_next_boundary_before_error() {
+        let (worker_tx, _worker_rx) =
+            tokio::sync::mpsc::channel::<WorkerCmd>(8);
+        let (_event_tx, event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<WorkerEvent>();
+        let mut app = App::new(ReplOptions::default(), worker_tx, event_rx);
+
+        // Two-boundary batch. Only boundary 0's echo lives in
+        // scrollback (deferred push means boundary 1 stays lazy
+        // until its predecessor closes).
+        app.push(
+            ScrollbackKind::Input,
+            "set cips [configure_cips]".to_string(),
+        );
+        app.pending_input_boundaries = vec![
+            InputBoundary {
+                scrollback_idx: Some(0),
+                snippet: "set cips [configure_cips]".to_string(),
+                last_command_idx: Some(0),
+                completed: false,
+            },
+            InputBoundary {
+                scrollback_idx: None,
+                snippet: "set clk [configure_clock]".to_string(),
+                last_command_idx: Some(1),
+                completed: false,
+            },
+        ];
+        let origin0 = crate::lower::Origin {
+            file: None,
+            line: 14,
+            snippet: "set cips [configure_cips]".to_string(),
+            via: Vec::new(),
+        };
+        app.pending_origins = vec![
+            origin0.clone(),
+            crate::lower::Origin {
+                file: None,
+                line: 15,
+                snippet: "set clk [configure_clock]".to_string(),
+                via: Vec::new(),
+            },
+        ];
+        app.pending_return_types = vec![None, None];
+
+        // Failed EvalDone for the first command, last_in_batch=true
+        // (mirrors what worker_task sends when it breaks on error).
+        let err = vw_eda::BackendError::Tcl {
+            message: "[Common 17-163] Missing value for option 'objects'"
+                .into(),
+            code: None,
+            info: None,
+            stdout: String::new(),
+        };
+        app.handle_worker_event(WorkerEvent::EvalDone {
+            origin: origin0,
+            result: Err(err),
+            last_in_batch: true,
+        })
+        .await;
+
+        // Walk scrollback and find the two positions we care about:
+        // the `set clk` Input entry (if any) and the Error entry
+        // carrying the failure message.
+        let clk_pos = app
+            .scrollback()
+            .iter()
+            .position(|e| e.text.contains("set clk"));
+        let err_pos = app.scrollback().iter().position(|e| {
+            matches!(e.kind, ScrollbackKind::Error)
+                && e.text.contains("Missing value")
+        });
+        assert!(
+            err_pos.is_some(),
+            "expected an Error entry, got scrollback: {:#?}",
+            app.scrollback()
+                .iter()
+                .map(|e| (e.kind, e.text.clone()))
+                .collect::<Vec<_>>()
+        );
+        if let Some(clk) = clk_pos {
+            let err = err_pos.unwrap();
+            assert!(
+                err < clk,
+                "error at {err} must land before `set clk` echo at \
+                 {clk} — the trace belongs to `set cips` which came \
+                 first. scrollback: {:#?}",
+                app.scrollback()
+                    .iter()
+                    .map(|e| (e.kind, e.text.clone()))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

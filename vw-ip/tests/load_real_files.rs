@@ -163,7 +163,11 @@ fn generates_cpm5_wrapper_in_split_mode() {
         "only {total_procs} procs — hierarchy isn't being built"
     );
 
-    assert!(out.contains("proc create_cpm5 {\n  ## Instance name"));
+    assert!(
+        out.contains("proc create_cpm5 {\n  ## Project-level IP module name"),
+        "{}",
+        &out[..out.find("\n}\n").unwrap_or(out.len().min(600)).min(600)]
+    );
     assert!(out.contains("proc create_cpm5_cpm_pcie0 "));
     assert!(out.contains("proc create_cpm5_cpm_pcie1 "));
 

@@ -28,6 +28,14 @@ use crate::backend::LanguageBackend;
 #[derive(Default)]
 pub struct HtclBackend {
     docs: Arc<RwLock<HashMap<Url, DocState>>>,
+    /// Editor-supplied workspace roots (LSP `rootUri` /
+    /// `workspaceFolders`). Consulted as a fallback when the file
+    /// currently being analyzed sits outside the enclosing
+    /// `vw.toml` — e.g. after a goto-def has taken the user into a
+    /// dep-cache dir. Without this, dep names declared only in the
+    /// editor-root workspace fail to resolve and every `@name/…`
+    /// import in the visited file goes dead.
+    workspace_roots: Arc<RwLock<Vec<std::path::PathBuf>>>,
 }
 
 struct DocState {
@@ -37,6 +45,38 @@ struct DocState {
 impl HtclBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot of the editor-supplied workspace roots. Callers
+    /// pass this into [`crate::workspace::build_view`] etc. as
+    /// fallback dep-lookup roots — see `workspace_roots`
+    /// on the struct for the rationale. Cloned so the lock isn't
+    /// held across the (potentially I/O-heavy) view build.
+    async fn workspace_roots_snapshot(&self) -> Vec<std::path::PathBuf> {
+        self.workspace_roots.read().await.clone()
+    }
+
+    /// Build a workspace view honoring the editor-supplied root
+    /// fallback. Convenience wrapper around
+    /// [`crate::workspace::build_view`].
+    async fn build_view(
+        &self,
+        uri: &Url,
+        text: &str,
+    ) -> crate::workspace::WorkspaceView {
+        let roots = self.workspace_roots_snapshot().await;
+        crate::workspace::build_view(uri, text, &roots)
+    }
+
+    /// Resolve a `src` import path from `entry_file`'s directory,
+    /// honoring the editor-supplied root fallback.
+    async fn resolve_import(
+        &self,
+        entry_file: &std::path::Path,
+        raw: &str,
+    ) -> Option<std::path::PathBuf> {
+        let roots = self.workspace_roots_snapshot().await;
+        crate::workspace::resolve_import(entry_file, raw, &roots)
     }
 }
 
@@ -52,6 +92,10 @@ impl LanguageBackend for HtclBackend {
 
     async fn set_text(&self, uri: Url, text: String) {
         self.docs.write().await.insert(uri, DocState { text });
+    }
+
+    async fn set_workspace_roots(&self, roots: Vec<std::path::PathBuf>) {
+        *self.workspace_roots.write().await = roots;
     }
 
     async fn close(&self, uri: &Url) {
@@ -88,7 +132,7 @@ impl LanguageBackend for HtclBackend {
         // diagnostics that land in this file. That way calling an
         // imported proc no longer reads as "unknown proc" but a typo
         // *in* this file still does.
-        let view = crate::workspace::build_view(uri, &doc.text);
+        let view = self.build_view(uri, &doc.text).await;
         let parsed_view = parse(&view.view_source);
         for d in validate(&parsed_view.document, &view.view_source) {
             if d.span.start >= view.local_len {
@@ -188,7 +232,7 @@ impl LanguageBackend for HtclBackend {
                 }
             }
 
-            let view = crate::workspace::build_view(uri, &doc.text);
+            let view = self.build_view(uri, &doc.text).await;
             for import in &view.imports {
                 let key = import.file_uri.to_string();
                 if seen_files.insert(key, ()).is_some() {
@@ -236,7 +280,7 @@ impl LanguageBackend for HtclBackend {
                     return Vec::new();
                 };
                 if let Some(resolved) =
-                    crate::workspace::resolve_import(&file_path, raw)
+                    self.resolve_import(&file_path, raw).await
                 {
                     if let Ok(target_uri) = Url::from_file_path(resolved) {
                         return vec![Location {
@@ -251,7 +295,7 @@ impl LanguageBackend for HtclBackend {
 
         // General case: resolve against the workspace view so calls to
         // imported procs jump to the right file.
-        let view = crate::workspace::build_view(uri, &doc.text);
+        let view = self.build_view(uri, &doc.text).await;
         let parsed_view = parse(&view.view_source);
         let Some(target_span) =
             definition_at(&parsed_view.document, &view.view_source, offset)
@@ -309,7 +353,7 @@ impl LanguageBackend for HtclBackend {
         });
         // Use the workspace view so a hover on a call to an imported
         // proc shows that proc's signature, not nothing.
-        let view = crate::workspace::build_view(uri, &doc.text);
+        let view = self.build_view(uri, &doc.text).await;
         let parsed = parse(&view.view_source);
         let target = hover_at(&parsed.document, &view.view_source, offset)?;
         // The hover span is in view-source coordinates; only translate
@@ -376,7 +420,7 @@ impl LanguageBackend for HtclBackend {
 
         // Workspace view here too: command-position completion picks
         // up imported proc names.
-        let view = crate::workspace::build_view(uri, &doc.text);
+        let view = self.build_view(uri, &doc.text).await;
         let parsed = parse(&view.view_source);
         complete_at(&parsed.document, &view.view_source, offset)
             .into_iter()
@@ -405,7 +449,7 @@ impl LanguageBackend for HtclBackend {
         // so the cmdline scan can step into a `[ … ]` substitution
         // (the parser now carries a `body` inside `CmdSubst` and the
         // scan already treats `[` as a command boundary).
-        let view = crate::workspace::build_view(uri, &doc.text);
+        let view = self.build_view(uri, &doc.text).await;
         let parsed = parse(&view.view_source);
         let help =
             signature_help_at(&parsed.document, &view.view_source, offset)?;
@@ -1380,6 +1424,414 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         // The declaration of `greet` is on lib.htcl line 1 col 5.
         assert_eq!(locs[0].range.start.line, 1);
         assert_eq!(locs[0].range.start.character, 5);
+    }
+
+    /// Regression: a call from inside an `if { … }` body should
+    /// still find its proc's declaration. The parser leaves the
+    /// brace-body as an opaque word, so without an explicit
+    /// reparse pass in [`vw_htcl::goto`] the search never reaches
+    /// the nested call.
+    #[tokio::test]
+    async fn goto_from_inside_if_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.htcl");
+        let src = "proc target { x } { }\n\
+                   proc caller { } {\n  \
+                   if {1} {\n    \
+                   target -x 1\n  \
+                   }\n\
+                   }\n";
+        std::fs::write(&path, src).unwrap();
+        let backend = HtclBackend::new();
+        let uri = Url::from_file_path(&path).unwrap();
+        backend.set_text(uri.clone(), src.into()).await;
+        let locs = backend
+            .goto_definition(
+                &uri,
+                Position {
+                    line: 3,
+                    character: 4,
+                },
+            )
+            .await;
+        assert!(
+            !locs.is_empty(),
+            "goto-def from inside `if {{…}}` body failed"
+        );
+    }
+
+    /// Regression: a call from inside `[…]` command substitution
+    /// inside `if {…} { … }` — the double-nested shape the IP
+    /// wrapper's `if {$bd} { set cell [create_bd_cell …] }
+    /// else { set cell [create_ip …] }` scaffold produces. The
+    /// reparse pass has to also run `populate_procs` so the
+    /// inner CmdSubst.body gets filled in.
+    #[tokio::test]
+    async fn goto_from_cmdsubst_inside_if_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.htcl");
+        let src = "proc target { x } { }\n\
+                   proc caller { } {\n  \
+                   if {1} {\n    \
+                   set cell [target -x 1]\n  \
+                   }\n\
+                   }\n";
+        std::fs::write(&path, src).unwrap();
+        let backend = HtclBackend::new();
+        let uri = Url::from_file_path(&path).unwrap();
+        backend.set_text(uri.clone(), src.into()).await;
+        // Cursor on `target` inside `[target -x 1]` on line 3.
+        // Line 3 is `    set cell [target -x 1]`; `target` starts
+        // at col 17.
+        let locs = backend
+            .goto_definition(
+                &uri,
+                Position {
+                    line: 3,
+                    character: 17,
+                },
+            )
+            .await;
+        assert!(
+            !locs.is_empty(),
+            "goto-def from inside `[[…]]`-inside-`if` failed"
+        );
+    }
+
+    /// Companion to [`goto_from_cmdsubst_inside_if_body`] for hover.
+    #[tokio::test]
+    async fn hover_from_cmdsubst_inside_if_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.htcl");
+        let src = "## Target proc doc.\n\
+                   proc target { x } { }\n\
+                   proc caller { } {\n  \
+                   if {1} {\n    \
+                   set cell [target -x 1]\n  \
+                   }\n\
+                   }\n";
+        std::fs::write(&path, src).unwrap();
+        let backend = HtclBackend::new();
+        let uri = Url::from_file_path(&path).unwrap();
+        backend.set_text(uri.clone(), src.into()).await;
+        // Cursor on `target` inside `[target -x 1]` on line 4.
+        let hover = backend
+            .hover(
+                &uri,
+                Position {
+                    line: 4,
+                    character: 17,
+                },
+            )
+            .await;
+        assert!(
+            hover.is_some(),
+            "hover from inside `[[…]]`-inside-`if` returned None"
+        );
+    }
+
+    /// Same regression as [`goto_from_inside_if_body`], but for
+    /// hover — the two share the "reparse brace-body" fix in
+    /// [`vw_htcl::goto`] / [`vw_htcl::hover`].
+    #[tokio::test]
+    async fn hover_from_inside_if_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.htcl");
+        let src = "## Target proc doc.\n\
+                   proc target { x } { }\n\
+                   proc caller { } {\n  \
+                   if {1} {\n    \
+                   target -x 1\n  \
+                   }\n\
+                   }\n";
+        std::fs::write(&path, src).unwrap();
+        let backend = HtclBackend::new();
+        let uri = Url::from_file_path(&path).unwrap();
+        backend.set_text(uri.clone(), src.into()).await;
+        let hover = backend
+            .hover(
+                &uri,
+                Position {
+                    line: 4,
+                    character: 4,
+                },
+            )
+            .await;
+        assert!(
+            hover.is_some(),
+            "hover from inside `if {{…}}` body returned None"
+        );
+    }
+
+    /// Reproduces the exact user scenario against the on-disk
+    /// `~/src/htcl/amd/` tree. Only runs when that path exists, so
+    /// the test is a no-op in CI / fresh checkouts.
+    #[tokio::test]
+    async fn goto_finds_sibling_workspace_dep_real_htcl_tree() {
+        let cpm5_module =
+            std::path::PathBuf::from("/home/ry/src/htcl/amd/cpm5/module.htcl");
+        if !cpm5_module.exists() {
+            eprintln!("skipping — {} not present", cpm5_module.display());
+            return;
+        }
+        let backend = HtclBackend::new();
+        let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
+        let text = std::fs::read_to_string(&cpm5_module).unwrap();
+        backend.set_text(cpm5_uri.clone(), text.clone()).await;
+
+        // Find the line + column of `vivado_cmd::set_property` —
+        // avoids hard-coding a line number that will drift as the
+        // wrapper regenerates.
+        let mut target_line = None;
+        for (i, line) in text.lines().enumerate() {
+            if let Some(col) = line.find("vivado_cmd::set_property") {
+                // Cursor on the `set_property` word, past the
+                // `vivado_cmd::` prefix (12 chars).
+                target_line = Some((i as u32, (col + 12) as u32));
+                break;
+            }
+        }
+        let Some((line, character)) = target_line else {
+            panic!("no `vivado_cmd::set_property` in cpm5/module.htcl");
+        };
+        let locs = backend
+            .goto_definition(&cpm5_uri, Position { line, character })
+            .await;
+        assert!(
+            !locs.is_empty(),
+            "goto-def against real htcl tree returned no location \
+             for cpm5/module.htcl:{line}:{character}"
+        );
+        let hit = &locs[0];
+        let path = hit.uri.to_file_path().unwrap();
+        assert!(
+            path.to_string_lossy().contains("vivado-cmd"),
+            "expected to land in the vivado-cmd tree, got {:?}",
+            hit
+        );
+    }
+
+    /// Regression against the on-disk cpm5 tree for BOTH goto and
+    /// hover on `vivado_cmd::create_bd_cell` and
+    /// `vivado_cmd::create_ip` — the two `[…]` calls inside the
+    /// `if {$bd} { … } else { … }` scaffold at the top of
+    /// `create_cpm5`.
+    #[tokio::test]
+    async fn goto_and_hover_on_create_bd_cell_and_create_ip_in_cpm5() {
+        let cpm5_module =
+            std::path::PathBuf::from("/home/ry/src/htcl/amd/cpm5/module.htcl");
+        if !cpm5_module.exists() {
+            return;
+        }
+        let backend = HtclBackend::new();
+        let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
+        let text = std::fs::read_to_string(&cpm5_module).unwrap();
+        backend.set_text(cpm5_uri.clone(), text.clone()).await;
+        for needle in &["vivado_cmd::create_bd_cell", "vivado_cmd::create_ip"] {
+            let (line, character) = text
+                .lines()
+                .enumerate()
+                .find_map(|(i, l)| {
+                    l.find(needle).map(|c| (i as u32, (c + 12) as u32))
+                })
+                .unwrap_or_else(|| panic!("no {needle} in cpm5/module.htcl"));
+            let locs = backend
+                .goto_definition(&cpm5_uri, Position { line, character })
+                .await;
+            assert!(
+                !locs.is_empty(),
+                "goto-def on {needle} at {line}:{character} returned nothing"
+            );
+            let hover =
+                backend.hover(&cpm5_uri, Position { line, character }).await;
+            assert!(
+                hover.is_some(),
+                "hover on {needle} at {line}:{character} returned None"
+            );
+        }
+    }
+
+    /// Companion to [`goto_finds_sibling_workspace_dep_real_htcl_tree`]
+    /// for hover — same file, same cursor position, same expected
+    /// outcome: the imported proc's signature resolves and hover
+    /// returns something rather than `None`.
+    #[tokio::test]
+    async fn hover_finds_imported_proc_real_htcl_tree() {
+        let cpm5_module =
+            std::path::PathBuf::from("/home/ry/src/htcl/amd/cpm5/module.htcl");
+        if !cpm5_module.exists() {
+            return;
+        }
+        let backend = HtclBackend::new();
+        let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
+        let text = std::fs::read_to_string(&cpm5_module).unwrap();
+        backend.set_text(cpm5_uri.clone(), text.clone()).await;
+        let target = text.lines().enumerate().find_map(|(i, line)| {
+            line.find("vivado_cmd::set_property")
+                .map(|col| (i as u32, (col + 12) as u32))
+        });
+        let Some((line, character)) = target else {
+            panic!("no `vivado_cmd::set_property` in cpm5/module.htcl");
+        };
+        let hover =
+            backend.hover(&cpm5_uri, Position { line, character }).await;
+        assert!(
+            hover.is_some(),
+            "hover against real htcl tree returned None \
+             for cpm5/module.htcl:{line}:{character}"
+        );
+    }
+
+    /// Sibling-workspace fallback with a NESTED src chain — mirrors
+    /// the real vivado-cmd layout where `module.htcl` re-sources
+    /// per-command files under `cmd/`. `set_property` doesn't live
+    /// in the module.htcl entry directly; it's reached through
+    /// `src "cmd/set_property.htcl"` inside the dep module. This
+    /// caught the actual reproduction case where a shallower test
+    /// (proc in the dep's module.htcl) passed but goto-def against
+    /// the real vivado-cmd tree still returned nothing.
+    #[tokio::test]
+    async fn goto_finds_sibling_workspace_dep_via_nested_src() {
+        let dir = tempfile::tempdir().unwrap();
+        let amd = dir.path().join("amd");
+        let cpm5 = amd.join("cpm5");
+        let vivado_cmd = amd.join("vivado-cmd");
+        let vivado_cmd_cmd = vivado_cmd.join("cmd");
+        std::fs::create_dir_all(&cpm5).unwrap();
+        std::fs::create_dir_all(&vivado_cmd_cmd).unwrap();
+        std::fs::write(
+            cpm5.join("vw.toml"),
+            "[workspace]\nname=\"cpm5\"\nversion=\"0.1.0\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vivado_cmd.join("vw.toml"),
+            "[workspace]\nname=\"vivado-cmd\"\nversion=\"0.1.0\"\n\n\
+             [dependencies]\n",
+        )
+        .unwrap();
+        // vivado-cmd/module.htcl re-sources set_property.htcl —
+        // matching the real layout.
+        std::fs::write(
+            vivado_cmd.join("module.htcl"),
+            "src \"cmd/set_property.htcl\"\n",
+        )
+        .unwrap();
+        // vivado-cmd/cmd/set_property.htcl defines the proc.
+        let set_property_path = vivado_cmd_cmd.join("set_property.htcl");
+        std::fs::write(
+            &set_property_path,
+            "namespace eval vivado_cmd {\n  \
+                proc set_property { args } { }\n}\n",
+        )
+        .unwrap();
+        let cpm5_module = cpm5.join("module.htcl");
+        std::fs::write(
+            &cpm5_module,
+            "src @vivado-cmd\nvivado_cmd::set_property -dict {} -objects x\n",
+        )
+        .unwrap();
+
+        let backend = HtclBackend::new();
+        let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
+        backend
+            .set_text(
+                cpm5_uri.clone(),
+                std::fs::read_to_string(&cpm5_module).unwrap(),
+            )
+            .await;
+        // Cursor on `set_property` — the call is
+        // `vivado_cmd::set_property ...` (col 0). `vivado_cmd::`
+        // is 12 chars; `set_property` starts at col 12.
+        let locs = backend
+            .goto_definition(
+                &cpm5_uri,
+                Position {
+                    line: 1,
+                    character: 12,
+                },
+            )
+            .await;
+        assert!(!locs.is_empty(), "goto-def returned no location");
+        let set_property_uri = Url::from_file_path(&set_property_path).unwrap();
+        assert_eq!(
+            locs[0].uri, set_property_uri,
+            "expected jump to {set_property_uri}, got {:?}",
+            locs[0]
+        );
+    }
+
+    /// Sibling-workspace fallback: when a file's own workspace
+    /// doesn't declare a `@dep/…` import but a sibling directory
+    /// under a shared parent DOES have its own `vw.toml` with a
+    /// matching basename, the resolver should still find it.
+    ///
+    /// Layout (mirrors `~/src/htcl/amd/{cpm5,vivado-cmd}` as the
+    /// user's actual reproduction):
+    ///
+    ///   <tmp>/amd/cpm5/vw.toml            # empty deps
+    ///        /amd/cpm5/module.htcl        # calls vivado_cmd::foo
+    ///        /amd/vivado-cmd/vw.toml
+    ///        /amd/vivado-cmd/module.htcl  # namespace eval vivado_cmd { proc foo … }
+    ///
+    /// Regression for "goto-def returns 'No definition found' once
+    /// I'm in a vw-tracked dependency."
+    #[tokio::test]
+    async fn goto_finds_sibling_workspace_dep() {
+        let dir = tempfile::tempdir().unwrap();
+        let amd = dir.path().join("amd");
+        let cpm5 = amd.join("cpm5");
+        let vivado_cmd = amd.join("vivado-cmd");
+        std::fs::create_dir_all(&cpm5).unwrap();
+        std::fs::create_dir_all(&vivado_cmd).unwrap();
+        std::fs::write(
+            cpm5.join("vw.toml"),
+            "[workspace]\nname=\"cpm5\"\nversion=\"0.1.0\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vivado_cmd.join("vw.toml"),
+            "[workspace]\nname=\"vivado-cmd\"\nversion=\"0.1.0\"\n\n\
+             [dependencies]\n",
+        )
+        .unwrap();
+        // The vivado-cmd module: define namespace `vivado_cmd` with
+        // a `foo` proc so a call to `vivado_cmd::foo` from cpm5 has
+        // somewhere to land.
+        let vivado_module = vivado_cmd.join("module.htcl");
+        std::fs::write(
+            &vivado_module,
+            "namespace eval vivado_cmd {\n  proc foo { x } { }\n}\n",
+        )
+        .unwrap();
+        let cpm5_module = cpm5.join("module.htcl");
+        std::fs::write(&cpm5_module, "src @vivado-cmd\nvivado_cmd::foo -x 1\n")
+            .unwrap();
+
+        let backend = HtclBackend::new();
+        let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
+        backend
+            .set_text(
+                cpm5_uri.clone(),
+                std::fs::read_to_string(&cpm5_module).unwrap(),
+            )
+            .await;
+
+        // Cursor on `foo` — line 1, at the start of the call word
+        // (`vivado_cmd::foo` starts at column 0, `foo` starts after
+        // `vivado_cmd::` which is 12 chars).
+        let locs = backend
+            .goto_definition(
+                &cpm5_uri,
+                Position {
+                    line: 1,
+                    character: 12,
+                },
+            )
+            .await;
+        assert!(!locs.is_empty(), "goto-def returned no location");
+        let vivado_uri = Url::from_file_path(&vivado_module).unwrap();
+        assert_eq!(locs[0].uri, vivado_uri, "landed on wrong file");
     }
 
     #[tokio::test]

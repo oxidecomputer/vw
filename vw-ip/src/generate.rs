@@ -128,14 +128,16 @@ fn emit_dict_sub_proc(
 
     let mut doc = Doc::new();
     doc.push(Item::DocComment(format!(
-        "Apply a `CONFIG.{param_name}` value to a block-design cell.",
+        "Apply a `CONFIG.{param_name}` value to the IP.",
     )));
     doc.push(Item::DocComment(format!(
-        "Pass the cell handle returned by `{top_proc}`.",
+        "Pass the handle returned by `{top_proc}` — a bd_cell path \
+         when the top proc ran in `-bd 1` mode, or the IP module name \
+         when it ran in `-bd 0` mode.",
     )));
     doc.push(Item::Blank);
     doc.push(Item::DocComment(
-        "Block-design cell to set the property on.".into(),
+        "Cell or IP module handle to set the property on.".into(),
     ));
     doc.push(Item::Command(Command {
         doc_comments: Vec::new(),
@@ -147,6 +149,7 @@ fn emit_dict_sub_proc(
         words: vec![Word::Bare("cell:".into()), Word::Bare("bd_cell".into())],
         body: None,
     }));
+    push_bd_switch_arg(&mut doc);
     if !schema.fields.is_empty() {
         doc.push(Item::Blank);
     }
@@ -174,13 +177,26 @@ fn emit_dict_sub_proc(
         )
         .unwrap();
     }
+    // Branch on `-bd` the same way `write_set_property_dict` does.
+    // In bd mode `$cell` is a bd_cell path we hand straight to
+    // `set_property`; in ip mode `$cell` is the module name and we
+    // resolve the IP object via `get_ips`.
     writeln!(body, "if {{[llength $_vw_inner] > 0}} {{").unwrap();
+    writeln!(body, "  if {{$bd}} {{").unwrap();
     writeln!(
         body,
-        "  vivado_cmd::set_property -dict \
+        "    vivado_cmd::set_property -dict \
          [list CONFIG.{param_name} $_vw_inner] -objects $cell"
     )
     .unwrap();
+    writeln!(body, "  }} else {{").unwrap();
+    writeln!(
+        body,
+        "    vivado_cmd::set_property -dict \
+         [list CONFIG.{param_name} $_vw_inner] -objects [get_ips $cell]"
+    )
+    .unwrap();
+    writeln!(body, "  }}").unwrap();
     writeln!(body, "}}").unwrap();
     // Dict-sub procs configure an existing cell; they don't
     // produce a new one. Return type is `unit` so the REPL
@@ -253,12 +269,15 @@ fn generate_single(
 
     let mut proc_doc = Doc::new();
     proc_doc.push(Item::DocComment(
-        "Instance name in the block design.".into(),
+        "Project-level IP module name, or (when `-bd 1`) the \
+         instance name in the block design."
+            .into(),
     ));
     proc_doc.push(Item::Command(Command::call(
         "name",
         std::iter::empty::<Word>(),
     )));
+    push_bd_switch_arg(&mut proc_doc);
     if !parameters.is_empty() {
         proc_doc.push(Item::Blank);
     }
@@ -272,24 +291,77 @@ fn generate_single(
     out
 }
 
+/// Emit the `-bd` switch as a proc-arg declaration.
+///
+/// `-bd 0` (default) → `create_ip` (project-level IP module);
+/// `-bd 1` → `create_bd_cell` (block-design cell). Project IP is
+/// the default because it's the shape Vivado's own
+/// `write_ip_tcl`-generated scripts use, and most external tools
+/// (simulators, downstream regeneration flows) expect wrappers
+/// that create discoverable IP source objects. Wrappers going
+/// into a block design still work — the caller just passes
+/// `-bd 1`. The bool-as-int shape (`@enum(0, 1)`) matches every
+/// other yes/no flag the generator emits.
+fn push_bd_switch_arg(doc: &mut Doc) {
+    doc.push(Item::Blank);
+    doc.push(Item::DocComment(
+        "Create the IP as a project-level module (`0`, default) via \
+         `create_ip`, or as a block-design cell (`1`) via \
+         `create_bd_cell`. The returned handle is compatible with the \
+         sub-procs either way — Vivado's `set_property -dict …` works \
+         on both IP objects and cell paths."
+            .into(),
+    ));
+    doc.push(Item::Command(Command {
+        doc_comments: Vec::new(),
+        words: vec![
+            Word::Raw("@enum(0, 1)".into()),
+            Word::Raw("@default(0)".into()),
+            Word::Bare("bd".into()),
+        ],
+        body: None,
+    }));
+}
+
 fn build_single_body(vlnv: &str, parameters: &[&Parameter]) -> String {
     let mut out = String::new();
+    // `-bd` switches between the two Vivado instantiation paths.
+    // Default (`-bd 1`) is `create_bd_cell` — the block-design
+    // shape most wrappers use. `-bd 0` calls `create_ip` and adds
+    // the IP as a project-level source object; the returned handle
+    // is still a set_property-compatible object, so downstream
+    // sub-procs work unchanged. This mirrors the split-shape body
+    // in `generate_split`.
+    writeln!(out, "if {{$bd}} {{").unwrap();
     writeln!(
         out,
-        "set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
+        "  set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
     )
     .unwrap();
+    writeln!(out, "}} else {{").unwrap();
+    writeln!(
+        out,
+        "  set cell [vivado_cmd::create_ip -vlnv {vlnv} -module_name $name]"
+    )
+    .unwrap();
+    writeln!(out, "}}").unwrap();
     if !parameters.is_empty() {
-        write_set_property_dict(&mut out, parameters, "");
+        write_set_property_dict(
+            &mut out,
+            parameters,
+            "",
+            PropDictSite::TopProc,
+        );
     }
-    // Every `create_<ip>` proc must return the cell handle so the
-    // caller can pass it back into the IP's sub-procs (or any other
-    // wrapper that takes `-cell $x`). Without the explicit return,
-    // the proc returns whatever its last statement returned — which
-    // is `""` for the empty-conditional-dict shape, breaking
-    // downstream callers with cryptic `Missing value for option
-    // 'objects'` errors.
-    writeln!(out, "return $cell").unwrap();
+    // Every `create_<ip>` proc must return an identifier the
+    // sub-procs can pass to their own `set_property` calls. In bd
+    // mode that's `$cell` (a bd_cell path). In ip mode we return
+    // `$name` instead — `$cell` is the XCI file path returned by
+    // `create_ip`, and downstream sub-procs need the IP's module
+    // name so they can look up the object with `[get_ips $cell]`.
+    // Same contract, one variable per branch.
+    writeln!(out, "if {{$bd}} {{ return $cell }} else {{ return $name }}")
+        .unwrap();
     out
 }
 
@@ -349,25 +421,55 @@ fn generate_split(
     // common first segment (CPM5, CIPS), the root has none.
     let mut top_doc = Doc::new();
     top_doc.push(Item::DocComment(
-        "Instance name in the block design.".into(),
+        "Project-level IP module name, or (when `-bd 1`) the \
+         instance name in the block design."
+            .into(),
     ));
     top_doc.push(Item::Command(Command::call(
         "name",
         std::iter::empty::<Word>(),
     )));
+    push_bd_switch_arg(&mut top_doc);
     if !tree.direct.is_empty() {
         top_doc.push(Item::Blank);
         for p in &tree.direct {
             emit_arg_decl(&mut top_doc, component, presets, p, opts, "");
         }
     }
-    let mut top_body = format!(
-        "set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]\n"
-    );
+    // Branch on `-bd` between block-design and project-IP shapes.
+    // See `build_single_body` for the rationale — same rule, just
+    // inline here because `generate_split` composes its top-body
+    // ad-hoc rather than through the shared helper.
+    let mut top_body = String::new();
+    writeln!(top_body, "if {{$bd}} {{").unwrap();
+    writeln!(
+        top_body,
+        "  set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
+    )
+    .unwrap();
+    writeln!(top_body, "}} else {{").unwrap();
+    writeln!(
+        top_body,
+        "  set cell [vivado_cmd::create_ip -vlnv {vlnv} -module_name $name]"
+    )
+    .unwrap();
+    writeln!(top_body, "}}").unwrap();
     if !tree.direct.is_empty() {
-        write_set_property_dict(&mut top_body, &tree.direct, "");
+        write_set_property_dict(
+            &mut top_body,
+            &tree.direct,
+            "",
+            PropDictSite::TopProc,
+        );
     }
-    writeln!(top_body, "return $cell").unwrap();
+    // Return the identifier callers pass to sub-procs — `$cell`
+    // (bd_cell path) in bd mode, `$name` (module name) in ip mode.
+    // See `build_single_body` for the two-mode contract.
+    writeln!(
+        top_body,
+        "if {{$bd}} {{ return $cell }} else {{ return $name }}"
+    )
+    .unwrap();
     // Top split-shape proc: creates the bd_cell.
     emit_proc(&mut out, &top_proc, &top_doc, Some("bd_cell"), &top_body);
 
@@ -379,12 +481,15 @@ fn generate_split(
 
         let mut sub_doc = Doc::new();
         sub_doc.push(Item::DocComment(format!(
-            "Block-design cell handle returned by `{top_proc}`.",
+            "Handle returned by `{top_proc}` — a bd_cell path when \
+             the top proc ran in `-bd 1` mode, or the IP module name \
+             when it ran in `-bd 0` mode.",
         )));
         sub_doc.push(Item::Command(Command::call(
             "cell:",
             std::iter::once(Word::Bare("bd_cell".into())),
         )));
+        push_bd_switch_arg(&mut sub_doc);
         if !n.direct.is_empty() {
             sub_doc.push(Item::Blank);
         }
@@ -393,12 +498,19 @@ fn generate_split(
         }
 
         let mut body = String::new();
-        write_set_property_dict(&mut body, &n.direct, &n.label);
-        // Return the cell the user passed in. Lets `set x [create_<ip>_<group>
-        // -cell $cell ...]` round-trip the handle for downstream calls and
-        // avoids `$x = ""` when the conditional-dict had zero supplied args.
+        write_set_property_dict(
+            &mut body,
+            &n.direct,
+            &n.label,
+            PropDictSite::SubProc,
+        );
+        // Return the handle the user passed in. Lets
+        // `set x [create_<ip>_<group> -cell $cell ...]` round-trip
+        // the handle for downstream calls and avoids `$x = ""` when
+        // the conditional-dict had zero supplied args.
         writeln!(body, "return $cell").unwrap();
-        // Sub-procs propagate the bd_cell they were handed.
+        // Sub-procs propagate whatever the caller handed them —
+        // either a bd_cell path or a module name.
         emit_proc(&mut out, &sub_name, &sub_doc, Some("bd_cell"), &body);
     }
 
@@ -497,10 +609,24 @@ fn emit_proc(
 /// IP-XACT name (so a `CPM_PCIE1_PF0_BAR0_ENABLED` parameter inside a
 /// proc scoped at `CPM_PCIE1_PF0_BAR0` reads back as `$enabled`),
 /// while the `CONFIG.<NAME>` key keeps the full name Vivado expects.
+/// Where the write is coming from — the top-level `create_<ip>`
+/// proc or one of its sub-procs. The distinction matters for the
+/// `-bd 0` (project-IP) branch: the top proc has `$name` (its
+/// declared arg) and uses `[get_ips $name]`; sub-procs don't get
+/// `$name`, and by contract their `-cell` arg carries the module
+/// name in `-bd 0` mode, so they use `[get_ips $cell]`. See
+/// [`push_bd_switch_arg`] for the two-mode contract.
+#[derive(Clone, Copy)]
+enum PropDictSite {
+    TopProc,
+    SubProc,
+}
+
 fn write_set_property_dict(
     out: &mut String,
     parameters: &[&Parameter],
     prefix_to_strip: &str,
+    site: PropDictSite,
 ) {
     // Build the dict conditionally so only user-supplied args reach
     // Vivado. See `emit_dict_proc` for the rationale — unconditionally
@@ -531,12 +657,30 @@ fn write_set_property_dict(
         )
         .unwrap();
     }
+    // `-bd 1` → cell handle is a bd_cell path, set_property targets
+    // it directly. `-bd 0` → cell handle came from `create_ip`,
+    // which returns an XCI file path (not a usable IP object). We
+    // resolve the IP through `get_ips`, keyed on either the top
+    // proc's `$name` (which was passed to `-module_name`) or the
+    // sub-proc's `$cell` (by the top-returns-$name contract).
+    let ip_ref = match site {
+        PropDictSite::TopProc => "[get_ips $name]",
+        PropDictSite::SubProc => "[get_ips $cell]",
+    };
     writeln!(out, "if {{[llength $_vw_d] > 0}} {{").unwrap();
+    writeln!(out, "  if {{$bd}} {{").unwrap();
     writeln!(
         out,
-        "  vivado_cmd::set_property -dict $_vw_d -objects $cell"
+        "    vivado_cmd::set_property -dict $_vw_d -objects $cell"
     )
     .unwrap();
+    writeln!(out, "  }} else {{").unwrap();
+    writeln!(
+        out,
+        "    vivado_cmd::set_property -dict $_vw_d -objects {ip_ref}"
+    )
+    .unwrap();
+    writeln!(out, "  }}").unwrap();
     writeln!(out, "}}").unwrap();
 }
 
@@ -896,9 +1040,9 @@ mod tests {
             &GenerateOptions::default(),
         );
         // Sub-proc args block starts with the `cell` arg.
-        assert!(out.contains(
-            "proc create_wide_big_one {\n  ## Block-design cell handle"
-        ));
+        assert!(
+            out.contains("proc create_wide_big_one {\n  ## Handle returned by")
+        );
         assert!(out.contains("cell\n"));
     }
 
@@ -1000,6 +1144,43 @@ mod tests {
             "parse errors: {:?}",
             parsed.errors
         );
+    }
+
+    #[test]
+    fn bd_switch_arg_toggles_construction() {
+        // Every generated wrapper — single-shape or split-shape —
+        // should carry the `-bd` arg and a Tcl `if {$bd}` block
+        // that picks between `create_bd_cell` (default) and
+        // `create_ip`. Regression test for the omission that had
+        // wrappers only supporting the block-design path.
+        for out in [
+            generate(
+                &mk_component(),
+                &Default::default(),
+                &::std::collections::HashMap::new(),
+                &GenerateOptions::default(),
+            ),
+            generate(
+                &mk_split_component(6),
+                &Default::default(),
+                &::std::collections::HashMap::new(),
+                &GenerateOptions {
+                    split_threshold: 5,
+                    ..GenerateOptions::default()
+                },
+            ),
+        ] {
+            assert!(out.contains("@enum(0, 1) @default(0) bd"), "{out}");
+            assert!(out.contains("if {$bd} {"), "{out}");
+            assert!(out.contains("create_bd_cell"), "{out}");
+            assert!(out.contains("create_ip -vlnv"), "{out}");
+            let parsed = vw_htcl::parse(&out);
+            assert!(
+                parsed.errors.is_empty(),
+                "wrapped output should parse cleanly: {:?}",
+                parsed.errors
+            );
+        }
     }
 
     #[test]

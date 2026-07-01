@@ -19,7 +19,7 @@
 
 use crate::ast::{
     AttributeValue, Command, CommandKind, Document, Proc, ProcArg,
-    ProcSignature, Stmt, WordPart,
+    ProcSignature, Stmt, WordForm, WordPart,
 };
 use crate::lower::{signature_table, SignatureTable};
 use crate::scope::{innermost_scope, resolve_var_def, scan_var_ref};
@@ -31,7 +31,7 @@ pub fn definition_at(
     offset: u32,
 ) -> Option<Span> {
     let table = signature_table(document);
-    definition_in_stmts(&document.stmts, None, document, &table, offset)
+    definition_in_stmts(&document.stmts, None, document, &table, source, offset)
         // Fallback: a `$var` the structured tree keeps opaque — inside
         // a command substitution or an `if`/`while` condition. Found by
         // scanning the source and resolving against the enclosing
@@ -60,6 +60,7 @@ fn definition_in_stmts<'a>(
     enclosing: Option<&'a Proc>,
     document: &'a Document,
     table: &SignatureTable<'a>,
+    source: &'a str,
     offset: u32,
 ) -> Option<Span> {
     for stmt in stmts {
@@ -88,6 +89,7 @@ fn definition_in_stmts<'a>(
                 Some(proc),
                 document,
                 table,
+                source,
                 offset,
             );
         }
@@ -107,7 +109,19 @@ fn definition_in_stmts<'a>(
         // Cursor inside a `[ … ]` command substitution → recurse into
         // its parsed body so goto works on calls written inline.
         if let Some(span) =
-            definition_in_cmd_substs(cmd, document, table, offset)
+            definition_in_cmd_substs(cmd, document, table, source, offset)
+        {
+            return Some(span);
+        }
+
+        // Cursor inside a `{ … }` control-flow body (the second word
+        // of `if`, the third of `while`, the body of `foreach`,
+        // etc.). The parser leaves those as opaque `Braced` words —
+        // they're semantically Tcl scripts, but there's no
+        // eager-parse pass like there is for `[ … ]`. So we reparse
+        // on demand when goto lands the cursor inside one.
+        if let Some(span) =
+            definition_in_braced_bodies(cmd, document, table, source, offset)
         {
             return Some(span);
         }
@@ -115,10 +129,116 @@ fn definition_in_stmts<'a>(
     None
 }
 
+/// When the cursor sits inside a `{ … }` word of a control-flow
+/// command, reparse that word's interior as a htcl fragment, shift
+/// all spans back into whole-source coordinates, and recurse into
+/// [`definition_in_stmts`]. Without this, `if { … <call> … }`,
+/// `while { … <call> … }`, `foreach x $xs { … <call> … }`, and
+/// friends never resolve their body calls — goto-def returns
+/// "no definition found" from inside every generated
+/// `if {[llength …]} { <wrapped_call> }` scaffold.
+///
+/// Only `Braced` words are considered; the enclosing command's
+/// head has to be one of a small list of body-hosts so we don't
+/// waste a parse on `list {a b c}`-style data braces (their content
+/// is a Tcl list, not a script).
+fn definition_in_braced_bodies<'a>(
+    cmd: &'a Command,
+    document: &'a Document,
+    table: &SignatureTable<'a>,
+    source: &'a str,
+    offset: u32,
+) -> Option<Span> {
+    let head = cmd.words.first().and_then(|w| w.as_text())?;
+    if !is_body_host(head) {
+        return None;
+    }
+    // The interior text lives in the source we're parsing against
+    // — we don't have that here directly, but we do have span
+    // access to the whole-source Command tree. Each `Braced` word's
+    // interior is `span.start+1 .. span.end-1` in the outer
+    // source. We recover it via the WordPart::Text that the parser
+    // populates for braced words.
+    for word in cmd.words.iter().skip(1) {
+        if !matches!(word.form, WordForm::Braced) {
+            continue;
+        }
+        if !word.span.contains(offset) {
+            continue;
+        }
+        // First-part Text carries the interior string with a span
+        // starting at word.span.start + 1 (the byte after `{`).
+        let Some(WordPart::Text {
+            value,
+            span: text_span,
+        }) = word.parts.first()
+        else {
+            continue;
+        };
+        // Reparse the body as a bracket-body-mode fragment so
+        // newlines are whitespace and multi-line control flow
+        // parses cleanly.
+        // Reparse the brace-body against `source` — the WHOLE
+        // outer document. That lets us pass `source` back into
+        // `populate_procs` below so nested `[ … ]` CmdSubst
+        // bodies get filled in against the same coordinate space
+        // the outer AST uses. Without the populate pass, a call
+        // like `set cell [vivado_cmd::create_bd_cell …]` inside
+        // `if {$bd} { … }` still has an empty CmdSubst.body and
+        // the recursion bottoms out at `set`.
+        //
+        // Order matters: shift first (spans become absolute), then
+        // populate — the shifted CmdSubst.span carries the
+        // absolute offset `populate_cmd_subst_parts` needs to shift
+        // its reparsed interior into place.
+        let (mut stmts, mut errs) = crate::parser::parse_fragment(
+            value.as_str(),
+            crate::parser::Mode::BracketBody,
+        );
+        let delta = text_span.start;
+        for s in &mut stmts {
+            crate::parser::shift_stmt(s, delta);
+        }
+        crate::parser::populate_procs(&mut stmts, source, &mut errs);
+        // Recurse into the reparsed stmts. Passing `None` as the
+        // enclosing proc mirrors what `definition_in_cmd_substs`
+        // does — variable resolution across a control-flow body
+        // is out of scope for this fix; the call-site → proc-decl
+        // path is what matters.
+        return definition_in_stmts(
+            &stmts, None, document, table, source, offset,
+        );
+    }
+    None
+}
+
+/// Command names whose brace-args hold Tcl scripts rather than
+/// data. Restricting the lookup to these keeps us from waking the
+/// parser on data braces (`list {a b c}`, `dict {k v}`, etc.).
+fn is_body_host(head: &str) -> bool {
+    matches!(
+        head,
+        "if" | "elseif"
+            | "else"
+            | "while"
+            | "for"
+            | "foreach"
+            | "catch"
+            | "try"
+            | "finally"
+            | "eval"
+            | "uplevel"
+            | "namespace"
+            | "on"
+            | "apply"
+    )
+}
+
 fn definition_in_cmd_substs<'a>(
     cmd: &'a Command,
     document: &'a Document,
     table: &SignatureTable<'a>,
+    source: &'a str,
     offset: u32,
 ) -> Option<Span> {
     for word in &cmd.words {
@@ -129,7 +249,7 @@ fn definition_in_cmd_substs<'a>(
             if let crate::ast::WordPart::CmdSubst { span, body, .. } = part {
                 if span.contains(offset) {
                     return definition_in_stmts(
-                        body, None, document, table, offset,
+                        body, None, document, table, source, offset,
                     );
                 }
             }

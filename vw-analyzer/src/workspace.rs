@@ -70,7 +70,18 @@ impl WorkspaceView {
 /// `src`s. Returns a view with `imports` empty when the entry can't be
 /// resolved to a filesystem path or has no imports — the analyzer can
 /// still use it; it just won't see anything cross-file.
-pub fn build_view(file_uri: &Url, local_text: &str) -> WorkspaceView {
+///
+/// `extra_roots` supplies fallback workspace roots (typically the
+/// editor's `rootUri` / `workspaceFolders`) so files opened outside
+/// the enclosing `vw.toml` — e.g. via goto-def into a dep cache
+/// dir — still resolve `@name/…` imports through the outer
+/// workspace's dep graph. Pass `&[]` when the caller doesn't have
+/// that context.
+pub fn build_view(
+    file_uri: &Url,
+    local_text: &str,
+    extra_roots: &[PathBuf],
+) -> WorkspaceView {
     let mut view = WorkspaceView {
         view_source: local_text.to_string(),
         local_len: local_text.len() as u32,
@@ -84,7 +95,7 @@ pub fn build_view(file_uri: &Url, local_text: &str) -> WorkspaceView {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let resolver = build_resolver(&file_path);
+    let resolver = build_resolver_with(&file_path, extra_roots);
 
     let mut loaded: HashSet<PathBuf> = HashSet::new();
     if let Ok(canonical) = file_path.canonicalize() {
@@ -125,26 +136,127 @@ pub fn build_view(file_uri: &Url, local_text: &str) -> WorkspaceView {
     view
 }
 
-/// Build a [`Resolver`] for the workspace that owns `entry_file`, by
-/// walking up to find `vw.toml` and pulling dep cache paths through
-/// `vw-lib`. Returns an empty resolver when no workspace is found —
-/// relative/absolute `src` imports still work; `@name/` ones won't.
+/// Build a [`Resolver`] for the workspace that owns `entry_file`.
+/// Convenience wrapper — see [`build_resolver_with`] for the full
+/// variant that also honors editor-supplied fallback workspace
+/// roots (LSP `rootUri` / `workspaceFolders`).
 pub fn build_resolver(entry_file: &Path) -> Resolver {
-    let mut resolver = Resolver::new();
-    let Some(workspace_dir) = find_workspace_dir(entry_file) else {
-        return resolver;
-    };
-    // Transitive: a library that does `src @other-lib/...` shouldn't
-    // force every consumer to redeclare `other-lib` in their own
-    // `vw.toml`. The walker pulls in each dep's own deps so the
-    // resolver sees the whole graph (Cargo-style first-seen-wins on
-    // name conflicts).
-    if let Ok(paths) = vw_lib::transitive_dep_cache_paths(&workspace_dir) {
-        for (name, path) in paths {
-            resolver = resolver.with_dep(name, path);
+    build_resolver_with(entry_file, &[])
+}
+
+/// Build a [`Resolver`] for `entry_file`, merging dep declarations
+/// from every source that could plausibly resolve a `@name/…`
+/// import when the file's own workspace doesn't declare it:
+///
+/// 1. The file's own workspace — walk up to the nearest `vw.toml`
+///    and expand its dep graph via
+///    [`vw_lib::transitive_dep_cache_paths`]. Highest precedence.
+/// 2. Each path in `extra_roots` — treated as a workspace directory
+///    and expanded the same way. Used to plumb the LSP's `rootUri`
+///    (or `workspaceFolders`) so a file opened via goto-def *out*
+///    of the editor's root workspace still inherits its dep names.
+/// 3. Sibling-workspace layout scan — for every ancestor directory
+///    of `entry_file`, treat each direct subdirectory that itself
+///    contains a `vw.toml` as an implicit dep whose name is the
+///    subdirectory basename. This lets a
+///    `~/src/htcl/amd/cpm5/module.htcl` still see `@vivado-cmd`
+///    at `~/src/htcl/amd/vivado-cmd/` even when neither its own
+///    workspace nor the editor's root declares the dep — a monorepo
+///    layout that's typical of a `foo-htcl` collection of siblings.
+///
+/// First-seen wins on name collisions in the order above, so the
+/// file's own workspace's choice never gets overridden.
+pub fn build_resolver_with(
+    entry_file: &Path,
+    extra_roots: &[PathBuf],
+) -> Resolver {
+    let mut merged: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
+    if let Some(workspace_dir) = find_workspace_dir(entry_file) {
+        // Transitive: a library that does `src @other-lib/...`
+        // shouldn't force every consumer to redeclare `other-lib`
+        // in their own `vw.toml`. The walker pulls in each dep's
+        // own deps so the resolver sees the whole graph
+        // (Cargo-style first-seen-wins on name conflicts).
+        if let Ok(paths) = vw_lib::transitive_dep_cache_paths(&workspace_dir) {
+            for (name, path) in paths {
+                merged.entry(name).or_insert(path);
+            }
         }
     }
+    for root in extra_roots {
+        let Ok(root_utf8) = Utf8PathBuf::from_path_buf(root.clone()) else {
+            continue;
+        };
+        if !root_utf8.join("vw.toml").exists() {
+            continue;
+        }
+        if let Ok(paths) = vw_lib::transitive_dep_cache_paths(&root_utf8) {
+            for (name, path) in paths {
+                merged.entry(name).or_insert(path);
+            }
+        }
+    }
+    collect_sibling_workspaces(entry_file, &mut merged);
+    let mut resolver = Resolver::new();
+    for (name, path) in merged {
+        resolver = resolver.with_dep(name, path);
+    }
     resolver
+}
+
+/// Walk up from `entry_file`, and at each ancestor directory add
+/// every subdirectory that contains its own `vw.toml` as an
+/// implicit dep — keyed by the subdirectory basename.
+///
+/// This mirrors a monorepo layout that's common for htcl workspaces:
+/// `~/src/htcl/amd/{cips,cpm5,clk-wizard,vivado-cmd}/`. From any
+/// one of those, the others are visible as siblings even when
+/// no `vw.toml` explicitly declares them. Without this heuristic,
+/// jumping into a dep-module file from an editor whose LSP has
+/// restarted rooted at that dep's own `vw.toml` (helix's
+/// `roots = ["vw.toml"]` behavior) would strand the analyzer with
+/// no way to resolve `@sibling-name/…` imports.
+///
+/// Stops at the filesystem root or after a handful of ancestors —
+/// scanning `~` or `/` for candidate workspaces would be both slow
+/// and semantically wrong.
+fn collect_sibling_workspaces(
+    entry_file: &Path,
+    merged: &mut std::collections::HashMap<String, PathBuf>,
+) {
+    // Cap the walk so we don't scan every level up to `/`. Six
+    // ancestors covers the typical `~/src/<org>/<repo>/<module>/`
+    // + a few extra tolerance for deeper nestings.
+    const MAX_ANCESTORS: usize = 6;
+    let mut cursor = match entry_file.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return,
+    };
+    for _ in 0..MAX_ANCESTORS {
+        let read_dir = match std::fs::read_dir(&cursor) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        for entry in read_dir.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_dir() {
+                continue;
+            }
+            let sub = entry.path();
+            if !sub.join("vw.toml").is_file() {
+                continue;
+            }
+            let Some(name) = sub.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            merged.entry(name.to_string()).or_insert(sub);
+        }
+        cursor = match cursor.parent() {
+            Some(p) => p.to_path_buf(),
+            None => break,
+        };
+    }
 }
 
 /// Walk up from `start`'s parent directory looking for a `vw.toml`.
@@ -194,9 +306,20 @@ fn collect_imports(
 /// Public helper: resolve the import at `raw` from `entry_file`'s
 /// directory. Used by goto-on-import-path so the analyzer can return
 /// a Location pointing at the imported file.
-pub fn resolve_import(entry_file: &Path, raw: &str) -> Option<PathBuf> {
+///
+/// `extra_roots` — see [`build_view`] for the same rationale — lets
+/// callers plumb through the editor's workspace roots so a
+/// `src @dep/file.htcl` in a file outside the enclosing workspace
+/// still resolves.
+pub fn resolve_import(
+    entry_file: &Path,
+    raw: &str,
+    extra_roots: &[PathBuf],
+) -> Option<PathBuf> {
     let parent = entry_file.parent()?;
-    build_resolver(entry_file).resolve(parent, raw).ok()
+    build_resolver_with(entry_file, extra_roots)
+        .resolve(parent, raw)
+        .ok()
 }
 
 /// Allow `&Utf8Path` callers to canonicalize through us.

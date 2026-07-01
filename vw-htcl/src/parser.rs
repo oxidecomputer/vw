@@ -65,7 +65,7 @@ pub fn parse(source: &str) -> ParseOutput {
 /// Multi-command `[…]` (rare in practice — only the last command's
 /// value flows out) still works via explicit `;`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     Toplevel,
     BracketBody,
 }
@@ -81,7 +81,7 @@ enum Mode {
 /// offset back into whole-source coordinates before being stored.
 /// After shifting they're absolute, which lets the recursion process
 /// nested procs against the original `source` uniformly.
-fn populate_procs(
+pub(crate) fn populate_procs(
     stmts: &mut [crate::ast::Stmt],
     source: &str,
     errors: &mut Vec<ParseError>,
@@ -227,7 +227,7 @@ fn populate_cmd_subst_parts(
 /// Parse a fragment of htcl (e.g. a proc body) into statements. Spans
 /// are relative to `text`; the caller shifts them into whole-source
 /// coordinates.
-fn parse_fragment(
+pub(crate) fn parse_fragment(
     text: &str,
     mode: Mode,
 ) -> (Vec<crate::ast::Stmt>, Vec<ParseError>) {
@@ -237,7 +237,7 @@ fn parse_fragment(
     (document.stmts, errors)
 }
 
-fn shift_stmt(stmt: &mut crate::ast::Stmt, delta: u32) {
+pub(crate) fn shift_stmt(stmt: &mut crate::ast::Stmt, delta: u32) {
     use crate::ast::Stmt;
     match stmt {
         Stmt::Command(cmd) => shift_command(cmd, delta),

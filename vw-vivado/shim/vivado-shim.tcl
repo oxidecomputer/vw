@@ -345,15 +345,130 @@ proc ::vw::record_user_props {obj args} {
     set user_set_props($key) $current
 }
 
-# Canonical key for the per-object side-channel storage. Vivado's
-# `PATH` property gives a unique BD-cell identifier across the
-# design; falls back to the raw object string when PATH isn't
-# queryable (e.g. for non-BD objects passed through accidentally).
+# Canonical key for the per-object side-channel storage.
+#
+# `PATH` uniquely identifies a BD cell (`/cips/cpm5` etc.), but
+# it's not defined on every Vivado object type — a project-level
+# IP handle from `create_ip` / `get_ips` doesn't have one, and
+# querying it emits `[Vivado 12-1341] Failed to get property
+# 'PATH' on IP 'foo'` via `send_msg_id`. Tcl's `catch` doesn't
+# suppress that because Vivado routes the error through the
+# message bus rather than returning a Tcl-level error. `-quiet`
+# on the getter does suppress it — that's why we use it here.
+#
+# The lookup falls through PATH → NAME → the raw object string
+# so any object type produces a stable key without noise.
 proc ::vw::_user_props_key {obj} {
-    if {[catch {get_property PATH $obj} p]} {
-        return $obj
+    set p ""
+    catch { set p [get_property -quiet PATH $obj] }
+    if {$p ne ""} { return $p }
+    catch { set p [get_property -quiet NAME $obj] }
+    if {$p ne ""} { return $p }
+    return $obj
+}
+
+# Parse a `::set_property` argv into (dict-pairs, objects) and
+# funnel each object's pairs into [`record_user_props`]. Called by
+# the [`install_set_property_recorder`] wrapper before the real
+# set_property runs — so the tally reflects what the caller *tried*
+# to set even if Vivado later rejects the write.
+#
+# Recognizes the two forms our IP wrappers actually emit:
+#
+#   set_property -dict {NAME1 VAL1 NAME2 VAL2 …} -objects $cell
+#   set_property -name NAME -value VAL -objects $cell
+#
+# Positional-form `set_property NAME VAL $obj` also works. Unknown
+# flags (`-quiet`, `-verbose`) are consumed silently. If we can't
+# recover both a name/value dict and an object list, we return
+# without recording — the write still happens; the tally just
+# stays where it was.
+proc ::vw::_record_set_property_call {args} {
+    set pairs [list]
+    set objects [list]
+    set positional [list]
+    set explicit_name ""
+    set explicit_value ""
+    set i 0
+    while {$i < [llength $args]} {
+        set tok [lindex $args $i]
+        switch -- $tok {
+            -dict {
+                foreach {n v} [lindex $args [expr {$i + 1}]] {
+                    lappend pairs $n $v
+                }
+                incr i 2
+            }
+            -objects {
+                set objects [lindex $args [expr {$i + 1}]]
+                incr i 2
+            }
+            -name {
+                set explicit_name [lindex $args [expr {$i + 1}]]
+                incr i 2
+            }
+            -value {
+                set explicit_value [lindex $args [expr {$i + 1}]]
+                incr i 2
+            }
+            -quiet -
+            -verbose {
+                incr i
+            }
+            default {
+                lappend positional $tok
+                incr i
+            }
+        }
     }
-    return $p
+    # Positional shape: `set_property NAME VALUE OBJECTS`.
+    if {[llength $positional] == 3 && [llength $pairs] == 0
+        && $explicit_name eq ""} {
+        lappend pairs [lindex $positional 0] [lindex $positional 1]
+        if {[llength $objects] == 0} {
+            set objects [lindex $positional 2]
+        }
+    }
+    # Trailing positional target: `set_property -dict {…} $cell`.
+    if {[llength $objects] == 0 && [llength $positional] == 1} {
+        set objects [lindex $positional 0]
+    }
+    if {$explicit_name ne "" && [llength $pairs] == 0} {
+        lappend pairs $explicit_name $explicit_value
+    }
+    if {[llength $pairs] == 0 || [llength $objects] == 0} {
+        return
+    }
+    foreach obj $objects {
+        catch { ::vw::record_user_props $obj {*}$pairs }
+    }
+}
+
+# Install a `::set_property` wrapper that funnels every write
+# through [`_record_set_property_call`] before delegating to
+# whatever `::set_property` currently is (Vivado's C++ builtin, or
+# the marker wrapper installed by
+# [`install_all_context_wrappers`]). Regeneration-proof — the
+# `vivado_cmd::set_property` htcl wrapper is generated from the
+# Vivado command reference and re-emitted by `regenerate.sh`, so
+# manual edits there don't survive. Keeping the recording here in
+# the shim means the side-channel tally stays populated regardless
+# of what the generated wrapper looks like.
+#
+# Called at startup AFTER [`install_all_context_wrappers`] so the
+# recorder ends up OUTSIDE the marker wrapper: recording happens
+# first, then BEGIN, then the real write, then END.
+proc ::vw::install_set_property_recorder {} {
+    if {[info commands ::vw::orig_set_property_for_record] ne ""} {
+        return
+    }
+    if {[info commands ::set_property] eq ""} { return }
+    rename ::set_property ::vw::orig_set_property_for_record
+    proc ::set_property {args} {
+        catch { ::vw::_record_set_property_call {*}$args }
+        uplevel 1 [list ::vw::orig_set_property_for_record {*}$args]
+    }
+    ::vw::log "installed set_property recorder"
 }
 
 # Return the recorded (name, value) paired list for `obj`. Empty
@@ -1003,6 +1118,7 @@ fconfigure $sock -buffering line -translation lf
 # re-attempted on the first eval — it's idempotent.
 catch {::vw::install_send_msg_override}
 catch {::vw::install_all_context_wrappers}
+catch {::vw::install_set_property_recorder}
 catch {::vw::install_proc_body_wrap}
 
 while {1} {
@@ -1019,6 +1135,7 @@ while {1} {
     # bail out cheaply once installed.
     catch {::vw::install_send_msg_override}
     catch {::vw::install_all_context_wrappers}
+catch {::vw::install_set_property_recorder}
 catch {::vw::install_proc_body_wrap}
     ::vw::dispatch $line
 }

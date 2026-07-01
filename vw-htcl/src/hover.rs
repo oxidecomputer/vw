@@ -12,6 +12,7 @@
 
 use crate::ast::{
     Command, CommandKind, Document, Proc, ProcArg, ProcSignature, Stmt, Word,
+    WordForm, WordPart,
 };
 use crate::lower::{signature_table, SignatureTable};
 use crate::scope::{innermost_scope, resolve_var_def, scan_var_ref, VarDef};
@@ -72,11 +73,11 @@ impl HoverTarget<'_> {
 
 pub fn hover_at<'a>(
     document: &'a Document,
-    source: &str,
+    source: &'a str,
     offset: u32,
 ) -> Option<HoverTarget<'a>> {
     let table = signature_table(document);
-    hover_in_stmts(&document.stmts, &table, offset)
+    hover_in_stmts(&document.stmts, &table, source, offset)
         // Fallback: a `$var` reference — including one buried in opaque
         // text (a command substitution or `if`/`while` condition).
         .or_else(|| hover_scanned_var(document, source, offset))
@@ -110,6 +111,7 @@ fn hover_scanned_var<'a>(
 fn hover_in_stmts<'a>(
     stmts: &'a [Stmt],
     table: &SignatureTable<'a>,
+    source: &'a str,
     offset: u32,
 ) -> Option<HoverTarget<'a>> {
     for stmt in stmts {
@@ -117,7 +119,7 @@ fn hover_in_stmts<'a>(
         if !cmd.span.contains(offset) {
             continue;
         }
-        if let Some(target) = hover_in_command(cmd, table, offset) {
+        if let Some(target) = hover_in_command(cmd, table, source, offset) {
             return Some(target);
         }
     }
@@ -127,13 +129,14 @@ fn hover_in_stmts<'a>(
 fn hover_in_command<'a>(
     cmd: &'a Command,
     table: &SignatureTable<'a>,
+    source: &'a str,
     offset: u32,
 ) -> Option<HoverTarget<'a>> {
     let primary = match &cmd.kind {
         CommandKind::Proc(proc) => hover_in_proc_decl(proc, offset)
             // Cursor isn't on the proc's name or an arg — look inside
             // the body.
-            .or_else(|| hover_in_stmts(&proc.body, table, offset)),
+            .or_else(|| hover_in_stmts(&proc.body, table, source, offset)),
         CommandKind::EnumDecl(decl) => {
             // Cursor on the enum's name → show the variants.
             if decl.name_span.contains(offset) {
@@ -147,7 +150,208 @@ fn hover_in_command<'a>(
         }
         _ => hover_in_call(cmd, table, offset),
     };
-    primary.or_else(|| hover_in_cmd_substs(&cmd.words, table, offset))
+    primary
+        .or_else(|| hover_in_cmd_substs(&cmd.words, table, source, offset))
+        .or_else(|| hover_in_braced_bodies(cmd, table, source, offset))
+}
+
+/// Cursor inside a `{ … }` control-flow body (the second word of
+/// `if`, the third of `while`, the body of `foreach`, etc.). The
+/// parser leaves those as opaque `Braced` words — semantically
+/// Tcl scripts, but no eager-parse pass like `[ … ]` gets. So we
+/// reparse the body on demand when hover lands the cursor inside
+/// one. Mirrors `goto::definition_in_braced_bodies` (same fix, same
+/// motivating case — IP-wrapper `set_property` calls sit inside
+/// `if {[llength $_vw_d] > 0} { … }` scaffolds).
+fn hover_in_braced_bodies<'a>(
+    cmd: &'a Command,
+    table: &SignatureTable<'a>,
+    source: &'a str,
+    offset: u32,
+) -> Option<HoverTarget<'a>> {
+    let head = cmd.words.first().and_then(|w| w.as_text())?;
+    if !is_body_host(head) {
+        return None;
+    }
+    for word in cmd.words.iter().skip(1) {
+        if !matches!(word.form, WordForm::Braced) {
+            continue;
+        }
+        if !word.span.contains(offset) {
+            continue;
+        }
+        let Some(WordPart::Text {
+            value,
+            span: text_span,
+        }) = word.parts.first()
+        else {
+            continue;
+        };
+        // Reparse against the fragment text; shift spans up to
+        // whole-source coordinates; THEN run `populate_procs` so
+        // nested `[ … ]` CmdSubst bodies inside the brace-body
+        // get their own recursive parse. Without the populate
+        // pass, a call like
+        // `set cell [vivado_cmd::create_bd_cell …]` inside an
+        // `if {$bd} { … }` branch has an empty CmdSubst body and
+        // the transient walker can't reach the call.
+        let (mut stmts, mut errs) = crate::parser::parse_fragment(
+            value.as_str(),
+            crate::parser::Mode::BracketBody,
+        );
+        let delta = text_span.start;
+        for s in &mut stmts {
+            crate::parser::shift_stmt(s, delta);
+        }
+        crate::parser::populate_procs(&mut stmts, source, &mut errs);
+        // NOTE: the reparsed stmts are owned by this call; but
+        // `HoverTarget` variants only borrow from `Command` /
+        // `Proc` / `ProcArg` / `ProcSignature` values that we've
+        // been threading via `&'a` from the outer document.
+        // Anything produced from the *reparsed* fragment would need
+        // its own owned storage — and there's nowhere to put it in
+        // the current HoverTarget shape. Rather than restructure
+        // that lifetime, we recurse only to look up calls that
+        // resolve through `table` (which lives at the top level
+        // and is already `'a`).
+        return hover_in_stmts_transient(&stmts, table, source, offset);
+    }
+    None
+}
+
+/// Sig-table-only pass over transient (locally-owned) stmts:
+/// only the `hover_in_call` branch that resolves through the
+/// document-level `SignatureTable<'a>` is reachable. See the
+/// comment in [`hover_in_braced_bodies`] for the lifetime story.
+fn hover_in_stmts_transient<'a>(
+    stmts: &[Stmt],
+    table: &SignatureTable<'a>,
+    source: &'a str,
+    offset: u32,
+) -> Option<HoverTarget<'a>> {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        if !cmd.span.contains(offset) {
+            continue;
+        }
+        // Cursor on a call name → hover its proc via `table`.
+        if let Some(target) = hover_call_via_table(cmd, table, offset) {
+            return Some(target);
+        }
+        // Nested `[ … ]` inside the reparsed body — recurse via
+        // the same transient walker so an `if { if { … [call] } }`
+        // chain works.
+        for word in &cmd.words {
+            if !word.span.contains(offset) {
+                continue;
+            }
+            for part in &word.parts {
+                if let WordPart::CmdSubst { span, body, .. } = part {
+                    if span.contains(offset) {
+                        return hover_in_stmts_transient(
+                            body, table, source, offset,
+                        );
+                    }
+                }
+            }
+        }
+        // Nested braced body inside the reparsed body — same idea.
+        let head = cmd.words.first().and_then(|w| w.as_text());
+        if let Some(head) = head {
+            if is_body_host(head) {
+                for word in cmd.words.iter().skip(1) {
+                    if !matches!(word.form, WordForm::Braced) {
+                        continue;
+                    }
+                    if !word.span.contains(offset) {
+                        continue;
+                    }
+                    let Some(WordPart::Text {
+                        value,
+                        span: text_span,
+                    }) = word.parts.first()
+                    else {
+                        continue;
+                    };
+                    let (mut inner, mut inner_errs) =
+                        crate::parser::parse_fragment(
+                            value.as_str(),
+                            crate::parser::Mode::BracketBody,
+                        );
+                    let delta = text_span.start;
+                    for s in &mut inner {
+                        crate::parser::shift_stmt(s, delta);
+                    }
+                    crate::parser::populate_procs(
+                        &mut inner,
+                        source,
+                        &mut inner_errs,
+                    );
+                    return hover_in_stmts_transient(
+                        &inner, table, source, offset,
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Sig-table-only variant of [`hover_in_call`] that avoids taking
+/// any borrow from `cmd` — returned data references only `'a`
+/// values that live in the outer document via the sig table.
+fn hover_call_via_table<'a>(
+    cmd: &Command,
+    table: &SignatureTable<'a>,
+    offset: u32,
+) -> Option<HoverTarget<'a>> {
+    let first = cmd.words.first()?;
+    let name_text = first.as_text()?;
+    let sig = *table.get(name_text)?;
+    // Cursor on the call name → the callee's signature.
+    if first.span.contains(offset) {
+        return Some(HoverTarget::CallSite {
+            proc_name: name_text.to_string(),
+            signature: sig,
+            span: first.span,
+        });
+    }
+    // Cursor on a `-flag` word → the corresponding arg's docs.
+    for word in cmd.words.iter().skip(1) {
+        if !word.span.contains(offset) {
+            continue;
+        }
+        let text = word.as_text()?;
+        let flag = text.strip_prefix('-')?;
+        let arg = sig.find(flag)?;
+        return Some(HoverTarget::CallArg {
+            proc_name: name_text.to_string(),
+            arg,
+            span: word.span,
+        });
+    }
+    None
+}
+
+/// Command names whose brace-args hold Tcl scripts rather than
+/// data. Same list as [`crate::goto`]'s counterpart.
+fn is_body_host(head: &str) -> bool {
+    matches!(
+        head,
+        "if" | "elseif"
+            | "else"
+            | "while"
+            | "for"
+            | "foreach"
+            | "catch"
+            | "try"
+            | "finally"
+            | "eval"
+            | "uplevel"
+            | "namespace"
+            | "on"
+            | "apply"
+    )
 }
 
 /// Descend into any `[ … ]` command substitutions on this command's
@@ -156,6 +360,7 @@ fn hover_in_command<'a>(
 fn hover_in_cmd_substs<'a>(
     words: &'a [Word],
     table: &SignatureTable<'a>,
+    source: &'a str,
     offset: u32,
 ) -> Option<HoverTarget<'a>> {
     for word in words {
@@ -165,7 +370,7 @@ fn hover_in_cmd_substs<'a>(
         for part in &word.parts {
             if let crate::ast::WordPart::CmdSubst { span, body, .. } = part {
                 if span.contains(offset) {
-                    return hover_in_stmts(body, table, offset);
+                    return hover_in_stmts(body, table, source, offset);
                 }
             }
         }

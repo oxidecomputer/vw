@@ -34,6 +34,16 @@ pub trait LanguageBackend: Send + Sync {
     /// (and cache) analysis results.
     async fn set_text(&self, uri: Url, text: String);
 
+    /// Editor-supplied workspace roots (from LSP `rootUri` /
+    /// `workspaceFolders`, plus updates via
+    /// `didChangeWorkspaceFolders`). Backends may use them as
+    /// fallback dep-lookup sources when a file being analyzed sits
+    /// outside the nearest `vw.toml` — e.g. a goto-def landed the
+    /// user in a dep cache dir whose own workspace doesn't declare
+    /// the same deps as the editor's root. Default impl is a no-op
+    /// because most backends won't care.
+    async fn set_workspace_roots(&self, _roots: Vec<std::path::PathBuf>) {}
+
     /// Forget any state for `uri`.
     async fn close(&self, uri: &Url);
 
