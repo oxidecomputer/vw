@@ -19,7 +19,8 @@
 use std::fmt::Write;
 
 use crate::ast::{
-    AttributeValue, CommandKind, Document, ProcArg, ProcSignature, Stmt,
+    Attribute, AttributeValue, CommandKind, Document, ProcArg, ProcSignature,
+    Stmt,
 };
 use crate::cmdline::{self, CmdLine};
 use crate::span::Span;
@@ -234,7 +235,7 @@ fn complete_flags(
             Some(Completion {
                 label,
                 kind: CompletionKind::Flag,
-                detail: first_doc_line(&arg.doc_comments),
+                detail: flag_detail(arg),
                 documentation: Some(arg_documentation(arg)),
                 replace: line.partial_span,
             })
@@ -346,9 +347,46 @@ fn arg_documentation(arg: &ProcArg) -> String {
         if !out.is_empty() {
             out.push('\n');
         }
-        write!(out, "- `@{}`", attr.name).unwrap();
+        write!(out, "- `{}`", render_attribute(attr)).unwrap();
     }
     out
+}
+
+/// Single-line label shown inline next to the flag in the completion
+/// popup. We prepend any `@enum(...)` / `@default(...)` constraint —
+/// rendered with its actual values rather than the bare attribute
+/// name — so the user sees *what's allowed* without having to expand
+/// the documentation pane. The doc-brief, if any, follows after a
+/// dash.
+fn flag_detail(arg: &ProcArg) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for attr in &arg.attributes {
+        parts.push(render_attribute(attr));
+    }
+    let brief = crate::doc::brief(&arg.doc_comments);
+    match (parts.is_empty(), brief) {
+        (true, b) => b,
+        (false, None) => Some(parts.join(" ")),
+        (false, Some(b)) => Some(format!("{} — {b}", parts.join(" "))),
+    }
+}
+
+/// `@name(value, value, ...)` if the attribute carries values,
+/// `@name` otherwise. Values are rendered via
+/// [`AttributeValue::to_tcl_literal`] so strings get quoted and
+/// integers/idents render as-is — same convention `proc_args` uses
+/// when echoing back a defaulted call site.
+fn render_attribute(attr: &Attribute) -> String {
+    if attr.values.is_empty() {
+        format!("@{}", attr.name)
+    } else {
+        let vals: Vec<String> = attr
+            .values
+            .iter()
+            .map(AttributeValue::to_tcl_literal)
+            .collect();
+        format!("@{}({})", attr.name, vals.join(", "))
+    }
 }
 
 #[cfg(test)]
@@ -521,10 +559,10 @@ cfg -mode -|\n";
 
     #[test]
     fn flag_completion_carries_doc_and_detail() {
-        // Multi-sentence doc: the brief sentence goes in `detail`,
-        // the rest goes in `documentation`. They must NOT overlap —
-        // an LSP client renders both, and a repeated leading
-        // sentence reads as a duplicate to the user.
+        // Multi-sentence doc: the brief sentence joins the attribute
+        // summary in `detail`, the rest goes in `documentation`. They
+        // must NOT overlap — an LSP client renders both, and a
+        // repeated leading sentence reads as a duplicate.
         let src = "\
 proc cfg {
   ## Bus width in bits. Must be a power of two.
@@ -537,13 +575,63 @@ cfg |
         let items = complete_at(&parsed.document, &s, off);
         let item = items.iter().find(|c| c.label == "-width").unwrap();
         assert_eq!(item.kind, CompletionKind::Flag);
-        assert_eq!(item.detail.as_deref(), Some("Bus width in bits."));
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("@default(8) — Bus width in bits.")
+        );
         let doc = item.documentation.as_deref().unwrap();
         assert!(doc.contains("Must be a power of two."), "{doc}");
         assert!(
             !doc.contains("Bus width in bits."),
             "documentation should not repeat the brief: {doc}"
         );
-        assert!(doc.contains("@default"), "{doc}");
+        assert!(doc.contains("@default(8)"), "{doc}");
+    }
+
+    #[test]
+    fn flag_detail_renders_enum_alternatives_and_default() {
+        // The whole point: a user scanning the completion list sees
+        // exactly which values are allowed (`@enum(...)`) and what
+        // ships by default (`@default(...)`) without having to expand
+        // the doc pane.
+        let src = "\
+proc cfg {
+  @enum(LOW, HIGH, OPTIMIZED) @default(OPTIMIZED) bandwidth
+} { }
+cfg |
+";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        let item = items.iter().find(|c| c.label == "-bandwidth").unwrap();
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("@enum(LOW, HIGH, OPTIMIZED) @default(OPTIMIZED)")
+        );
+        let doc = item.documentation.as_deref().unwrap();
+        assert!(doc.contains("@enum(LOW, HIGH, OPTIMIZED)"), "{doc}");
+        assert!(doc.contains("@default(OPTIMIZED)"), "{doc}");
+    }
+
+    #[test]
+    fn flag_detail_quotes_string_enum_values() {
+        // Values that started life as a quoted string in the source
+        // must stay quoted in the detail line — `"Master Mode"` not
+        // `Master Mode` — so the displayed text is what the user
+        // would type back as the value.
+        let src = "\
+proc cfg {
+  @enum(\"Master Mode\", \"Slave Mode\") role
+} { }
+cfg |
+";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        let item = items.iter().find(|c| c.label == "-role").unwrap();
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("@enum(\"Master Mode\", \"Slave Mode\")")
+        );
     }
 }

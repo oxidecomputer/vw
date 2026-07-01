@@ -86,7 +86,22 @@ pub fn analyze(source: &str, offset: u32) -> CmdLine<'_> {
                     break;
                 }
             }
-            b'\n' | b';' if depth == 0 && nearest_top_sep.is_none() => {
+            b'\n' | b';'
+                if depth == 0
+                    && nearest_top_sep.is_none()
+                    && !escaped_by_backslash(bytes, i) =>
+            {
+                // The `!escaped_by_backslash` guard above is Tcl's
+                // line-continuation rule: `\<newline>` and `\;` are
+                // escaped literals, not separators. Without it, a
+                // multi-line invocation like
+                //
+                //   create_clk_wizard_clkout \
+                //     -cell $clk \
+                //     -req<cursor>
+                //
+                // would have its completion fall off the cliff because
+                // the analyzer thought line 3 was a fresh command.
                 nearest_top_sep = Some(i + 1);
             }
             _ => {}
@@ -112,6 +127,18 @@ pub fn analyze(source: &str, offset: u32) -> CmdLine<'_> {
         partial,
         partial_span: Span::new((start + split) as u32, off as u32),
     }
+}
+
+/// True when the byte at `i` is preceded by an odd-length run of
+/// backslashes — Tcl's escape rule. `bytes[i]` itself is not consulted.
+fn escaped_by_backslash(bytes: &[u8], i: usize) -> bool {
+    let mut j = i;
+    let mut count = 0usize;
+    while j > 0 && bytes[j - 1] == b'\\' {
+        count += 1;
+        j -= 1;
+    }
+    count % 2 == 1
 }
 
 #[cfg(test)]
@@ -201,6 +228,36 @@ set x [
         let line = analyze(src, src.len() as u32);
         assert_eq!(line.command_name(), Some("create_cpm5_cpm_pcie0"));
         assert_eq!(line.partial, "-max_link_");
+    }
+
+    #[test]
+    fn backslash_newline_continuation_keeps_command_alive() {
+        // A `\<newline>` is Tcl's line continuation — the analyzer
+        // must look through it so the cursor at the end of line 3 is
+        // still "argument position of `create_clk_wizard_clkout`,"
+        // not a fresh top-level command.
+        let src = "\
+create_clk_wizard_clkout \\
+  -cell $clk \\
+  -req";
+        let line = analyze(src, src.len() as u32);
+        assert_eq!(line.command_name(), Some("create_clk_wizard_clkout"));
+        assert_eq!(line.partial, "-req");
+        let used: Vec<&str> = line.used_flags().collect();
+        assert_eq!(used, vec!["-cell"]);
+    }
+
+    #[test]
+    fn escaped_double_backslash_newline_still_separates() {
+        // `\\<newline>` ends with a literal backslash followed by a
+        // real command boundary — the second-to-last command is a
+        // separate statement.
+        let src = "set x foo\\\\\nbar";
+        let line = analyze(src, src.len() as u32);
+        // The trailing `\\` is a literal backslash, then `\n`
+        // separates, so `bar` is a fresh command.
+        assert!(line.in_command_position(), "{:?}", line.words);
+        assert_eq!(line.partial, "bar");
     }
 
     #[test]

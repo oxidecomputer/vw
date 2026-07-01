@@ -160,20 +160,28 @@ pub struct VivadoBackend {
     /// Brief-buffer classifier for multi-line PTY warnings. See
     /// [`PtyClassifier`] for the merging semantics.
     pty_classifier: PtyClassifier,
-    /// Stack frames the shim sent via `__VW_CTX_*` PTY markers
-    /// while the most recent `set_property` is in flight. When
-    /// non-empty, every Warning/Error chunk that lands here gets
-    /// these frames appended as `\n  at <frame>` lines — that's
-    /// what lets the REPL show "this IP_Flow warning came from
-    /// configure_cips → create_versal_cips → set_property" even
-    /// though Vivado's C++ never went through our Tcl stack
-    /// capture.
-    active_pty_context: Vec<String>,
+    /// Stack of ready-to-use frame sets sent by the shim via
+    /// `__VW_CTX_*` PTY markers. Each entry is a set of frames
+    /// captured at a nesting level: outer entries are older, the
+    /// top is the innermost currently-executing wrap (a user proc's
+    /// body, or a wrapped `set_property` / `generate_netlist_ip`
+    /// call). When a Warning/Error chunk lands without its own
+    /// trace, the top entry's frames get appended as `\n  at
+    /// <frame>` lines — that's what lets the REPL show "this
+    /// IP_Flow warning came from configure_cips →
+    /// create_versal_cips → set_property" even though Vivado's C++
+    /// never went through our Tcl stack capture. Nesting matters
+    /// because user procs call each other and each level's marker
+    /// wraps the next; a single active slot would clobber outer
+    /// context when the inner call returned mid-warning-emission.
+    pty_context_stack: Vec<Vec<String>>,
     /// Frames currently being assembled between
-    /// `__VW_CTX_BEGIN__` and `__VW_CTX_READY__`. Swapped into
-    /// `active_pty_context` atomically on READY so a partial
+    /// `__VW_CTX_BEGIN__` and `__VW_CTX_READY__`. Pushed onto
+    /// `pty_context_stack` atomically on READY so a partial
     /// marker stream can't leak half-formed traces into emitted
-    /// warnings.
+    /// warnings. Scalar (not per-nesting-level) because BEGIN and
+    /// READY are emitted synchronously in a single Tcl step — the
+    /// shim never emits a nested BEGIN before its outer READY.
     building_pty_context: Vec<String>,
     _shim_dir: TempDir,
     _scratch_dir: Option<TempDir>,
@@ -304,7 +312,7 @@ impl VivadoBackend {
             verbose_log,
             trace_message_sources,
             pty_classifier: PtyClassifier::new(PTY_CONTINUATION_WINDOW),
-            active_pty_context: Vec::new(),
+            pty_context_stack: Vec::new(),
             building_pty_context: Vec::new(),
             _shim_dir: shim_dir,
             _scratch_dir: scratch_dir,
@@ -491,9 +499,16 @@ impl VivadoBackend {
     }
 
     /// Recognize one of the `__VW_CTX_*` lines the shim emits
-    /// around `set_property`. Returns `true` if the line was a
-    /// marker (and should be swallowed); `false` if it's a normal
-    /// PTY line for the classifier.
+    /// around wrapped commands and user proc bodies. Returns
+    /// `true` if the line was a marker (and should be swallowed);
+    /// `false` if it's a normal PTY line for the classifier.
+    ///
+    /// The marker protocol is stack-based: BEGIN opens a new
+    /// entry, FRAME lines accumulate into it, READY seals it onto
+    /// `pty_context_stack`, END pops the top entry. Nested proc
+    /// calls produce nested BEGIN/END pairs, and the top of the
+    /// stack — the innermost wrap in flight — is what tags any
+    /// traceless warning/error that arrives while it's active.
     fn consume_ctx_marker(&mut self, line: &str) -> bool {
         let stripped = line.trim_end_matches(['\r', '\n']);
         match stripped {
@@ -502,12 +517,15 @@ impl VivadoBackend {
                 true
             }
             "__VW_CTX_READY__" => {
-                self.active_pty_context =
-                    std::mem::take(&mut self.building_pty_context);
+                let frames = std::mem::take(&mut self.building_pty_context);
+                self.pty_context_stack.push(frames);
                 true
             }
             "__VW_CTX_END__" => {
-                self.active_pty_context.clear();
+                self.pty_context_stack.pop();
+                // Defensively clear building too — a stray FRAME
+                // that arrived after END shouldn't leak into the
+                // next window.
                 self.building_pty_context.clear();
                 true
             }
@@ -607,34 +625,39 @@ impl VivadoBackend {
             return;
         }
         // Tag warnings/errors that arrived without a trace with the
-        // current `set_property` context (frames captured by the
-        // shim around the in-flight C++ call). This is the path
-        // that resolves "IP_Flow 19-7090" and friends — they go
-        // straight from Vivado's C++ to the PTY, bypassing every
-        // Tcl-side stack-capture hook.
+        // innermost active context (the top of `pty_context_stack`
+        // — frames captured by the shim around the in-flight C++
+        // call or user proc body). This is the path that resolves
+        // "IP_Flow 19-7090" and friends — they go straight from
+        // Vivado's C++ to the PTY, bypassing every Tcl-side
+        // stack-capture hook.
         let tagged: String;
-        let payload: &str =
-            if matches!(kind, StreamKind::Warning | StreamKind::Error)
-                && !self.active_pty_context.is_empty()
-                && !text.contains("\n  at ")
-            {
-                let trimmed = text.trim_end_matches('\n');
-                let mut buf = String::with_capacity(text.len() + 80);
-                buf.push_str(trimmed);
-                for frame in &self.active_pty_context {
-                    buf.push_str("\n  at ");
-                    buf.push_str(frame);
-                }
-                // Restore the trailing newline if the caller had one
-                // — downstream chunk handling assumes line-terminated.
-                if text.ends_with('\n') {
-                    buf.push('\n');
-                }
-                tagged = buf;
-                &tagged
-            } else {
-                text
-            };
+        let payload: &str = if let Some(frames) = self
+            .pty_context_stack
+            .last()
+            .filter(|_| {
+                matches!(kind, StreamKind::Warning | StreamKind::Error)
+                    && !text.contains("\n  at ")
+            })
+            .filter(|f| !f.is_empty())
+        {
+            let trimmed = text.trim_end_matches('\n');
+            let mut buf = String::with_capacity(text.len() + 80);
+            buf.push_str(trimmed);
+            for frame in frames {
+                buf.push_str("\n  at ");
+                buf.push_str(frame);
+            }
+            // Restore the trailing newline if the caller had one
+            // — downstream chunk handling assumes line-terminated.
+            if text.ends_with('\n') {
+                buf.push('\n');
+            }
+            tagged = buf;
+            &tagged
+        } else {
+            text
+        };
         if let Some(sink) = self.stdout_sink.as_mut() {
             if self.trace_message_sources {
                 sink(

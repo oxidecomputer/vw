@@ -759,35 +759,69 @@ proc ::vw::install_send_msg_override {} {
     ::vw::log "installed send_msg_id override"
 }
 
-# Wrap `::set_property` so we can attach a Tcl call stack to the
-# warnings Vivado emits from its C++ property-validation path.
-# Those warnings (notably `[IP_Flow 19-7090] Invalid parameter
-# '…' provided, Ignoring`) bypass `::common::send_msg_id` and
-# write directly through Vivado's internal message bus to the
-# PTY — there's no Tcl frame to grab by the time the bytes arrive
-# at the Rust worker. So we capture the stack here, while the
-# Tcl interpreter is *about* to enter `set_property`'s C++,
-# emit it as a marker the worker recognizes and strips, then
-# the worker tags any warnings that arrive while the marker is
-# active. Markers go via `::vw::real_puts stdout` so they
-# bypass our own `puts` override and land on the PTY directly.
-proc ::vw::install_set_property_context {} {
-    if {[info commands ::vw::orig_set_property_for_ctx] ne ""} {
+# Commands wrapped with [`install_command_context`] so any
+# traceless WARNINGs / ERRORs Vivado's C++ side emits during the
+# call get the Tcl call stack attached. Each name MUST be a global
+# Tcl command (no leading `::` — the wrapper installs as `::$name`).
+# The list is open-ended: add a command here whenever a user hits a
+# new noisy builtin and the worker filter shows the warning landing
+# without a stack. There's no observable cost — the wrapper is a
+# thin around-trace, only the message-tagging window is widened.
+set ::vw::context_wrapped_commands {
+    set_property
+    generate_netlist_ip
+}
+
+# Wrap a single Vivado command so we can attach the Tcl call stack
+# to warnings/errors its C++ implementation emits. The C++ paths
+# (notably `[IP_Flow 19-7090] Invalid parameter '…' provided,
+# Ignoring` for `set_property`, `[Coretcl 2-176] No IPs found` for
+# `generate_netlist_ip`) bypass `::common::send_msg_id` and write
+# directly through Vivado's internal message bus to the PTY —
+# there's no Tcl frame to grab by the time the bytes arrive at the
+# Rust worker. So we capture the stack here, while the Tcl
+# interpreter is *about* to enter the C++ command, emit it as a
+# marker the worker recognizes and strips, then the worker tags any
+# warnings that arrive while the marker is active. Markers go via
+# `::vw::real_puts stdout` so they bypass our own `puts` override
+# and land on the PTY directly. Idempotent — re-running this on
+# every eval is harmless once the wrapper is in place.
+proc ::vw::install_command_context {name} {
+    set orig "::vw::orig_${name}_for_ctx"
+    if {[info commands $orig] ne ""} {
         return
     }
-    if {[info commands ::set_property] eq ""} { return }
-    rename ::set_property ::vw::orig_set_property_for_ctx
-    proc ::set_property {args} {
-        # Skip 1 = this wrapper's own frame.
+    if {[info commands ::$name] eq ""} { return }
+    rename ::$name $orig
+    # Build the wrapper body with `$orig` interpolated, NOT
+    # `$name` — the wrapper has to forward to the renamed original
+    # without a name-lookup detour. `set rc` is computed and
+    # forwarded so the wrapped command's return value, error code,
+    # and -errorinfo all flow back unchanged to the caller.
+    proc ::$name {args} [string map [list @ORIG@ $orig] {
+        # Skip 1 = this wrapper's own frame, so the deepest reported
+        # frame is the user proc that called the wrapped command.
         set frames [::vw::capture_stack 1]
         ::vw::emit_pty_ctx_begin $frames
         set rc [catch {
-            uplevel 1 [list ::vw::orig_set_property_for_ctx {*}$args]
+            uplevel 1 [list @ORIG@ {*}$args]
         } result options]
         ::vw::emit_pty_ctx_end
         return -options $options $result
+    }]
+    ::vw::log "installed context wrap for ::$name"
+}
+
+# Install context wrappers for every command in
+# `::vw::context_wrapped_commands`. Called once after the protocol
+# socket opens and again at the top of every eval — each
+# `install_command_context` is idempotent, so re-attempts are cheap
+# once installed and recover gracefully when a command first
+# appears after a later library was sourced.
+proc ::vw::install_all_context_wrappers {} {
+    foreach name $::vw::context_wrapped_commands {
+        catch {::vw::install_command_context $name}
     }
-    ::vw::log "installed set_property context wrap"
 }
 
 # Push a context marker onto the PTY. Format: a sentinel-prefixed
@@ -805,6 +839,95 @@ proc ::vw::emit_pty_ctx_begin {frames} {
 proc ::vw::emit_pty_ctx_end {} {
     ::vw::real_puts stdout "__VW_CTX_END__"
     flush stdout
+}
+
+# ---------- user-proc body wrap ----------
+#
+# Traceless warnings from Vivado's C++ (e.g. `[Coretcl 2-176] No
+# IPs found`) bypass `::common::send_msg_id`, so the per-command
+# wrappers above only tag warnings emitted while THAT specific
+# command is in flight. Real-world Vivado calls are deeper — a
+# warning inside `generate_netlist_ip` may actually come from a
+# nested `get_ips` call inside the C++ path — and enumerating
+# every possible culprit isn't tractable.
+#
+# So we also instrument every USER-defined proc: rewrite each new
+# proc's body to emit a marker BEGIN/READY at entry (with
+# `capture_stack` from *inside* the body — the frame stack
+# includes the proc itself) and an END on exit. The Rust
+# marker-stack tracks nesting, so nested user procs each get their
+# own frames and the innermost wins for tagging. Result: a warning
+# fired anywhere under `configure_clock`'s call chain lands with
+# `at ip/clock.htcl:N in ::configure_clock` attached, even when
+# Vivado's C++ emits it silently.
+#
+# Only fires while `::vw::capturing == 1` — i.e. during a user
+# eval — so Vivado's own Tcl-lib initialization defines procs
+# unchanged. `::vw::*` procs are also skipped so our own plumbing
+# doesn't recurse into itself.
+
+# Compute the fully-qualified name a `proc NAME ...` invocation
+# would produce, given the caller's namespace. Used by the
+# ::proc override's filter — we only wrap user procs that end up
+# in the top-level `::` namespace, which is where htcl-lowered
+# procs live.
+proc ::vw::qualify_proc_name {name caller_ns} {
+    if {[string match ::* $name]} { return $name }
+    set caller_ns [string trimright $caller_ns ::]
+    if {$caller_ns eq ""} { return ::$name }
+    return ${caller_ns}::$name
+}
+
+# Install the ::proc override. Idempotent — re-running is cheap
+# once the wrapper is in place. The original `proc` is renamed to
+# `::vw::orig_proc_for_body_wrap` and delegated to.
+proc ::vw::install_proc_body_wrap {} {
+    if {[info commands ::vw::orig_proc_for_body_wrap] ne ""} {
+        return
+    }
+    rename ::proc ::vw::orig_proc_for_body_wrap
+    # Marker template: `@BODY@` gets literal-substituted with the
+    # user's body via `string map`, avoiding format/subst
+    # interpolation risks. `catch` preserves rc/result/errorcode/
+    # errorinfo across the wrap so the wrapped proc behaves
+    # identically to the unwrapped original.
+    variable proc_body_template {
+        ::vw::emit_pty_ctx_begin [::vw::capture_stack 0]
+        set _vw_ctx_rc [catch {@BODY@} _vw_ctx_result _vw_ctx_opts]
+        ::vw::emit_pty_ctx_end
+        return -options $_vw_ctx_opts $_vw_ctx_result
+    }
+    ::vw::orig_proc_for_body_wrap ::proc {name spec body} {
+        # Delegate straight through when we're not inside a user
+        # eval — Vivado's own lib procs go untouched.
+        if {!$::vw::capturing} {
+            return [uplevel 1 [list ::vw::orig_proc_for_body_wrap \
+                $name $spec $body]]
+        }
+        set caller_ns [uplevel 1 { namespace current }]
+        set qualified [::vw::qualify_proc_name $name $caller_ns]
+        # Skip our own helpers and any Vivado internal proc that a
+        # user eval might reach into. `::vw::*` covers our shim,
+        # `::tcl::*` guards Tcl's core, everything else in the
+        # top-level or user namespaces gets the wrap.
+        if {[string match ::vw::* $qualified]
+            || [string match ::tcl::* $qualified]} {
+            return [uplevel 1 [list ::vw::orig_proc_for_body_wrap \
+                $name $spec $body]]
+        }
+        # Detect a re-wrap: if the body already contains our
+        # marker call, don't stack another layer around it. Redefs
+        # of a user proc during eval (e.g. re-`src`ing a library)
+        # would otherwise nest wrappers on every reload.
+        if {[string first "::vw::emit_pty_ctx_begin" $body] >= 0} {
+            return [uplevel 1 [list ::vw::orig_proc_for_body_wrap \
+                $name $spec $body]]
+        }
+        set new_body [string map \
+            [list @BODY@ $body] $::vw::proc_body_template]
+        uplevel 1 [list ::vw::orig_proc_for_body_wrap $name $spec $new_body]
+    }
+    ::vw::log "installed ::proc body wrap"
 }
 
 # ---------- dispatch ----------
@@ -879,7 +1002,8 @@ fconfigure $sock -buffering line -translation lf
 # headless / minimal-mode configurations), the override will be
 # re-attempted on the first eval — it's idempotent.
 catch {::vw::install_send_msg_override}
-catch {::vw::install_set_property_context}
+catch {::vw::install_all_context_wrappers}
+catch {::vw::install_proc_body_wrap}
 
 while {1} {
     if {[gets $sock line] < 0} {
@@ -894,7 +1018,8 @@ while {1} {
     # Retry installs on each eval until they succeed — both procs
     # bail out cheaply once installed.
     catch {::vw::install_send_msg_override}
-    catch {::vw::install_set_property_context}
+    catch {::vw::install_all_context_wrappers}
+catch {::vw::install_proc_body_wrap}
     ::vw::dispatch $line
 }
 

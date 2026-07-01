@@ -1319,7 +1319,16 @@ async fn run_htcl(
             }
         }
     }
-    let line_index = vw_htcl::LineIndex::new(&source);
+    // Per-file LineIndex cache so traceless-warning origins can be
+    // reported in the *originating file's* coordinates rather than the
+    // flattened LoadedProgram's. Without this, a warning anchored at
+    // the entry file ends up rendered at the merged-source line
+    // (something like `prime.htcl:119767`), which is meaningless.
+    let merged_line_index = vw_htcl::LineIndex::new(&source);
+    let mut per_file_line_index: std::collections::HashMap<
+        usize,
+        vw_htcl::LineIndex,
+    > = std::collections::HashMap::new();
     for stmt in &parsed.document.stmts {
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
@@ -1330,20 +1339,45 @@ async fn run_htcl(
         // running" anchor. Mirrors the REPL's pending_origins +
         // pending_eval_index mechanism.
         {
-            let (line, _) = line_index.range(cmd.span);
-            let snippet = source
-                [cmd.span.start as usize..cmd.span.end as usize]
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let file_path = program
-                .locate_span(cmd.span)
-                .map(|(idx, _)| program.files[idx].path.clone());
+            let (file_path, line, snippet) = match program.locate_span(cmd.span)
+            {
+                Some((idx, local)) => {
+                    let file_src = &program.files[idx].source;
+                    let li = per_file_line_index
+                        .entry(idx)
+                        .or_insert_with(|| vw_htcl::LineIndex::new(file_src));
+                    let (lc, _) = li.range(local);
+                    let snippet = file_src
+                        [local.start as usize..local.end as usize]
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    (
+                        Some(program.files[idx].path.clone()),
+                        lc.line + 1,
+                        snippet,
+                    )
+                }
+                None => {
+                    // Synthetic span that doesn't lie in any loaded
+                    // file (e.g. a generated dispatcher). Fall back to
+                    // the merged-source line; the entry-file label is
+                    // attached by the renderer when `file` is None.
+                    let (lc, _) = merged_line_index.range(cmd.span);
+                    let snippet = source
+                        [cmd.span.start as usize..cmd.span.end as usize]
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    (None, lc.line + 1, snippet)
+                }
+            };
             if let Ok(mut g) = current_origin.lock() {
                 *g = Some(vw_repl::Origin {
                     file: file_path,
-                    line: line.line + 1,
+                    line,
                     snippet,
                     via: Vec::new(),
                 });

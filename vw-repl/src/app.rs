@@ -1839,6 +1839,18 @@ impl App {
                     entry.started_at = Some(std::time::Instant::now());
                 }
             }
+            // Subsequent boundaries are queued, not yet running —
+            // null out the `push`-time `started_at` they inherited so
+            // they don't tick alongside whichever statement is
+            // actually executing. `advance_input_timers` will anchor
+            // them to NOW when the prior boundary completes. Without
+            // this, a slow `set cips` would visually run "in parallel"
+            // with every queued statement after it.
+            for b in input_boundaries.iter().skip(1) {
+                if let Some(entry) = self.scrollback.get_mut(b.scrollback_idx) {
+                    entry.started_at = None;
+                }
+            }
         }
         self.pending_input_boundaries = input_boundaries;
 
