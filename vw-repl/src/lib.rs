@@ -41,6 +41,49 @@ pub use trace::{
     display_path, resolve_stack_frames_with, rewrite_stack_line, RewrittenFrame,
 };
 
+/// Wrap a Tcl body with shim-side origin markers so any traceless
+/// warning/error emitted during the eval is tagged with `origin`
+/// via the marker stack — not with whatever the REPL / CLI happens
+/// to have as `pending_eval_index` when the message eventually
+/// arrives.
+///
+/// The race this fixes: Vivado's C++ writes warning bytes to the
+/// PTY, then Tcl sends the eval response over the protocol socket.
+/// The pump thread's latency can put the response ahead of the
+/// warning at the receiver, so the warning lands during the *next*
+/// eval and inherits its origin — often a synthetic prelude
+/// command with `line=0`. Wrapping the body means the origin frame
+/// sits on the shim's marker stack from `emit_pty_ctx_begin` (just
+/// before the body runs) until `emit_pty_ctx_end` (just after),
+/// and every straggler in that window tags off the top of the
+/// stack.
+///
+/// The wrapped body preserves rc/result/errorcode/-errorinfo via
+/// `return -options`, so callers see identical behavior to the
+/// unwrapped `tcl`.
+pub fn wrap_tcl_with_origin_marker(tcl: &str, origin: &Origin) -> String {
+    // Build a single frame string in the same "<file>:<line>"
+    // shape `capture_stack` emits, so the downstream renderer's
+    // stack-frame regex handles both uniformly. No proc part —
+    // this frame is the *statement's* file/line, not a Tcl
+    // proc-body line.
+    let file_repr = origin
+        .file
+        .as_deref()
+        .map(display_path)
+        .unwrap_or_else(|| "<input>".to_string());
+    let frame = format!("{file_repr}:{}", origin.line);
+    // Tcl list-quote via braces. The frame content is a file path
+    // + integer, so braces alone are sufficient — no metachars to
+    // escape.
+    format!(
+        "::vw::emit_pty_ctx_begin [list {{{frame}}}]\n\
+         set _vw_wrap_rc [catch {{\n{tcl}\n}} _vw_wrap_r _vw_wrap_o]\n\
+         ::vw::emit_pty_ctx_end\n\
+         return -options $_vw_wrap_o $_vw_wrap_r"
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum ReplError {
     #[error("terminal I/O: {0}")]

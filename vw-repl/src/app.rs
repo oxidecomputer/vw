@@ -69,13 +69,26 @@ pub enum ScrollbackKind {
 /// entries sharing the whole-batch wall time.
 #[derive(Clone, Debug)]
 struct InputBoundary {
-    scrollback_idx: usize,
+    /// Position in `scrollback` where this boundary's echo lives,
+    /// or `None` when the echo is still queued. Non-first entries
+    /// start `None` and get pushed by `advance_input_timers` when
+    /// the prior boundary closes — so a `:load` batch prints
+    /// linearly: command, its output, then the *next* command.
+    scrollback_idx: Option<usize>,
+    /// Snippet captured up front so the deferred push has the
+    /// exact text `dispatch_eval_with_echo` would have used
+    /// eagerly.
+    snippet: String,
     /// Eval-index in `pending_origins` of the last lowered
     /// command that originated from this top-level statement.
     /// When `pending_eval_index` reaches this value (i.e. the
     /// command at this index has just finished), the entry's
-    /// timer should freeze.
-    last_command_idx: usize,
+    /// timer should freeze. `None` when no lowered command was
+    /// attributed to this boundary — e.g. a `src` whose target
+    /// file lowered to zero Tcl commands. Such boundaries are
+    /// skipped when the prior boundary closes: nothing to wait
+    /// for and nothing to echo.
+    last_command_idx: Option<usize>,
     /// Set to true once we've stamped this entry's `completed_at`,
     /// so we don't re-stamp on subsequent EvalDones.
     completed: bool,
@@ -1785,21 +1798,25 @@ impl App {
             return;
         }
 
-        // Build per-Input-entry timer boundaries before echo so
-        // we can map each echoed Input to its last lowered
-        // command. Empty when not in echo mode (the non-echo
-        // single-Input case uses the existing
-        // `mark_inputs_completed` end-of-batch path).
+        // Build per-Input-entry timer boundaries. Empty when not
+        // in echo mode (the non-echo single-Input case uses the
+        // existing `mark_inputs_completed` end-of-batch path).
+        //
+        // Echo model: strictly linear. The batch's FIRST
+        // statement is echoed to scrollback now; every subsequent
+        // statement is registered as a boundary with
+        // `scrollback_idx: None` and echoed lazily by
+        // `advance_input_timers` when the prior boundary closes.
+        // That way a `:load prime.htcl` run reads like an
+        // interactive session — each command appears, its output
+        // and messages follow, then the next command appears.
         let mut input_boundaries: Vec<InputBoundary> = Vec::new();
         if echo {
-            // Push Input entries first, recording their
-            // scrollback indices for later timer freezing.
             for origin in &lowered.entry_top_level {
-                let idx = self.scrollback.len();
-                self.push(ScrollbackKind::Input, origin.snippet.clone());
                 input_boundaries.push(InputBoundary {
-                    scrollback_idx: idx,
-                    last_command_idx: 0, // filled below
+                    scrollback_idx: None,
+                    snippet: origin.snippet.clone(),
+                    last_command_idx: None, // filled below
                     completed: false,
                 });
             }
@@ -1822,37 +1839,23 @@ impl App {
                 for (j, top) in lowered.entry_top_level.iter().enumerate() {
                     if top.line == entry_line {
                         if let Some(b) = input_boundaries.get_mut(j) {
-                            b.last_command_idx = cmd_idx;
+                            b.last_command_idx = Some(cmd_idx);
                         }
                         break;
                     }
                 }
             }
-            // Reset the first entry's `started_at` to NOW —
-            // ensures the timer is anchored to dispatch time
-            // (mostly redundant with `push`-time stamping, but
-            // explicit). Subsequent entries' `started_at` is
-            // updated as the previous entry completes (see
-            // EvalDone handler).
-            if let Some(b) = input_boundaries.first() {
-                if let Some(entry) = self.scrollback.get_mut(b.scrollback_idx) {
-                    entry.started_at = Some(std::time::Instant::now());
-                }
-            }
-            // Subsequent boundaries are queued, not yet running —
-            // null out the `push`-time `started_at` they inherited so
-            // they don't tick alongside whichever statement is
-            // actually executing. `advance_input_timers` will anchor
-            // them to NOW when the prior boundary completes. Without
-            // this, a slow `set cips` would visually run "in parallel"
-            // with every queued statement after it.
-            for b in input_boundaries.iter().skip(1) {
-                if let Some(entry) = self.scrollback.get_mut(b.scrollback_idx) {
-                    entry.started_at = None;
-                }
-            }
         }
         self.pending_input_boundaries = input_boundaries;
+        if echo {
+            // Push the first non-empty boundary's echo NOW so the
+            // user sees `› <first statement>` before the batch
+            // starts producing output. `activate_next_boundary`
+            // also handles the edge case of a leading empty
+            // boundary (a `src` whose target file lowered to zero
+            // commands): it echoes, freezes, and cascades.
+            self.activate_next_boundary(0);
+        }
 
         // Snapshot per-command origins + types for the stream-
         // tagging + result-display paths. EvalBatch consumes
@@ -2199,30 +2202,74 @@ impl App {
             if b.completed {
                 continue;
             }
-            if b.last_command_idx == just_finished_idx {
+            if b.last_command_idx == Some(just_finished_idx) {
                 hit_position = Some(i);
             }
             break;
         }
         let Some(hit) = hit_position else { return };
         // Mark this boundary complete + stamp its entry.
-        let scrollback_idx = self.pending_input_boundaries[hit].scrollback_idx;
         self.pending_input_boundaries[hit].completed = true;
-        if let Some(entry) = self.scrollback.get_mut(scrollback_idx) {
-            if entry.completed_at.is_none() {
-                entry.completed_at = Some(now);
+        if let Some(idx) = self.pending_input_boundaries[hit].scrollback_idx {
+            if let Some(entry) = self.scrollback.get_mut(idx) {
+                if entry.completed_at.is_none() {
+                    entry.completed_at = Some(now);
+                }
             }
         }
-        // Start the next uncompleted boundary's timer at NOW.
-        for next in &self.pending_input_boundaries[hit + 1..] {
-            if next.completed {
+        // Activate the next uncompleted boundary — pushes its
+        // echo and stamps `started_at`. Empty boundaries (no
+        // lowered commands attributed) get echoed + frozen
+        // instantly and we cascade to the next one; otherwise
+        // no EvalDone would ever close them and the batch would
+        // stall at that point in the visual trace.
+        self.activate_next_boundary(hit + 1);
+    }
+
+    /// Push the echo for the first uncompleted boundary starting
+    /// at `start`, stamp its `started_at`, and freeze-and-cascade
+    /// past any empty boundaries encountered along the way. Used
+    /// both at batch dispatch (starting from index 0) and by
+    /// `advance_input_timers` when the prior boundary closes.
+    fn activate_next_boundary(&mut self, start: usize) {
+        let now = std::time::Instant::now();
+        let mut i = start;
+        while i < self.pending_input_boundaries.len() {
+            if self.pending_input_boundaries[i].completed {
+                i += 1;
                 continue;
             }
-            let next_idx = next.scrollback_idx;
-            if let Some(entry) = self.scrollback.get_mut(next_idx) {
+            let has_commands =
+                self.pending_input_boundaries[i].last_command_idx.is_some();
+            // Push echo lazily if we haven't already (the first
+            // boundary at batch dispatch may already have a
+            // scrollback_idx assigned).
+            let idx = match self.pending_input_boundaries[i].scrollback_idx {
+                Some(idx) => idx,
+                None => {
+                    let snippet =
+                        self.pending_input_boundaries[i].snippet.clone();
+                    let idx = self.scrollback.len();
+                    self.push(ScrollbackKind::Input, snippet);
+                    self.pending_input_boundaries[i].scrollback_idx = Some(idx);
+                    idx
+                }
+            };
+            if let Some(entry) = self.scrollback.get_mut(idx) {
                 entry.started_at = Some(now);
             }
-            break;
+            if has_commands {
+                // Real boundary — wait for its EvalDone to close it.
+                return;
+            }
+            // Empty boundary: no lowered commands, so no EvalDone
+            // will match. Freeze it now with a zero-second timer
+            // and cascade to the next.
+            self.pending_input_boundaries[i].completed = true;
+            if let Some(entry) = self.scrollback.get_mut(idx) {
+                entry.completed_at = Some(now);
+            }
+            i += 1;
         }
     }
 
@@ -2349,7 +2396,21 @@ async fn worker_task(
             WorkerCmd::EvalBatch(items) => {
                 let total = items.len();
                 for (i, item) in items.into_iter().enumerate() {
-                    let result = backend.eval(&item.tcl).await;
+                    // Wrap each command's Tcl body with a
+                    // shim-level origin marker so any traceless
+                    // warning it emits stays tagged with THIS
+                    // command's origin even when its PTY bytes lag
+                    // the protocol response into the next eval's
+                    // window. Without this the origin fallback in
+                    // `tag_streamed_message` uses whatever
+                    // `pending_eval_index` points at — which for a
+                    // batch's synthetic prelude commands means
+                    // `line=0` / `line=1` no-op tags.
+                    let wrapped = crate::wrap_tcl_with_origin_marker(
+                        &item.tcl,
+                        &item.origin,
+                    );
+                    let result = backend.eval(&wrapped).await;
                     let failed = result.is_err();
                     let last_in_batch = i + 1 == total || failed;
                     let _ = tx.send(WorkerEvent::EvalDone {

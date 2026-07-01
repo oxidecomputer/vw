@@ -1338,7 +1338,7 @@ async fn run_htcl(
         // Vivado emits during the eval with the right "what was
         // running" anchor. Mirrors the REPL's pending_origins +
         // pending_eval_index mechanism.
-        {
+        let stmt_origin = {
             let (file_path, line, snippet) = match program.locate_span(cmd.span)
             {
                 Some((idx, local)) => {
@@ -1374,15 +1374,17 @@ async fn run_htcl(
                     (None, lc.line + 1, snippet)
                 }
             };
+            let origin = vw_repl::Origin {
+                file: file_path,
+                line,
+                snippet,
+                via: Vec::new(),
+            };
             if let Ok(mut g) = current_origin.lock() {
-                *g = Some(vw_repl::Origin {
-                    file: file_path,
-                    line,
-                    snippet,
-                    via: Vec::new(),
-                });
+                *g = Some(origin.clone());
             }
-        }
+            origin
+        };
         // Overload specializations lower under their mangled
         // names so the dispatcher's switch arms can find them.
         let lowered = match overload_specialization_mangle(cmd, &overload_table)
@@ -1407,6 +1409,11 @@ async fn run_htcl(
         // body that forwards via `extern::` errors out at runtime
         // with `invalid command name "extern::create_project"`.
         let tcl = vw_htcl::rewrite_externs(&lowered).text;
+        // Wrap with a shim-side origin marker so any traceless
+        // warning emitted during THIS eval stays anchored to
+        // `stmt_origin` — see [`vw_repl::wrap_tcl_with_origin_marker`]
+        // for the race this fixes.
+        let tcl = vw_repl::wrap_tcl_with_origin_marker(&tcl, &stmt_origin);
         match backend.eval(&tcl).await {
             Ok(out) => {
                 // Puts output already streamed to stdout via the
