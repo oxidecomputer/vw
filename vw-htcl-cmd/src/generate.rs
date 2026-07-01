@@ -568,8 +568,34 @@ fn build_body(orig: &str, effective: &[EffectiveArg]) -> String {
 
 /// Emit the typed-arg branch tree. At each level we split on
 /// "this typed arg present?" and recurse; at the leaves we emit
-/// the actual `return [extern::<cmd> {*}$flags ...]` with whatever
-/// subset of typed args was present.
+/// `return [extern::_vw_global_call extern::<cmd> {*}$flags …]`
+/// with whatever subset of typed args was present. The `extern::`
+/// prefix on the helper is what the htcl analyzer sees — the
+/// lowerer's `rewrite_externs` pass strips it, so the actual
+/// runtime call is `::_vw_global_call ::<cmd> …`.
+///
+/// The `::_vw_global_call` helper (defined in the shim at
+/// `::` namespace) is what keeps Vivado's internal Tcl (XDC
+/// parsing, OOC synth flows) from resolving unqualified commands
+/// to *our* wrappers just because we're currently inside
+/// `::vivado_cmd::<wrapper>`. Without a global-namespace call, a
+/// wrapper that forwards to `synth_ip` — which itself sources XDC
+/// files whose scripts call `create_clock`, `get_ports`, …
+/// positionally — would put those XDC scripts in the
+/// `::vivado_cmd::` namespace context. The XDC's unqualified
+/// `create_clock` would then land on our typed wrapper (which
+/// expects `-flag` args) and its kwargs prologue would crash on
+/// the positional port name.
+///
+/// We use the helper rather than `namespace eval ::` /
+/// `namespace inscope ::` / `uplevel #0`, all of which internally
+/// serialize their args to a script string via `concat` and
+/// re-parse them. That round-trip loses Tcl_Obj internal reps —
+/// bd_cell handles become plain paths like `/cpm5`, which
+/// Vivado's `set_property -objects` then rejects as "Invalid
+/// option value". The helper's `{*}$cmd {*}$args` expansion is a
+/// direct arg-passing, not a script re-parse, so object identity
+/// is preserved end-to-end.
 fn emit_typed_invocation(
     body: &mut String,
     orig: &str,
@@ -578,7 +604,11 @@ fn emit_typed_invocation(
 ) {
     let indent = "  ".repeat(depth);
     if typed.is_empty() {
-        writeln!(body, "{indent}return [{orig} {{*}}$flags]").unwrap();
+        writeln!(
+            body,
+            "{indent}return [extern::_vw_global_call {orig} {{*}}$flags]"
+        )
+        .unwrap();
         return;
     }
     if let Some((first, rest)) = typed.split_first() {
@@ -624,7 +654,12 @@ fn emit_typed_invocation_with(
 ) {
     let indent = "  ".repeat(depth);
     if rest.is_empty() {
-        let mut line = format!("{indent}return [{orig} {{*}}$flags");
+        // Same `extern::_vw_global_call` helper as the no-typed
+        // leaf — see [`emit_typed_invocation`] for the rationale
+        // (including why the `extern::` prefix is on the helper).
+        let mut line = format!(
+            "{indent}return [extern::_vw_global_call {orig} {{*}}$flags"
+        );
         for (arg, flag) in included {
             match arg.kind {
                 ArgKind::Positional => {

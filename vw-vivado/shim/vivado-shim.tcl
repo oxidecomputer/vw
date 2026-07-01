@@ -185,6 +185,34 @@ proc ::vw::log {msg} {
     flush stderr
 }
 
+# Global-namespace call helper for wrappers.
+#
+# Each generated `vivado_cmd::<cmd>` wrapper forwards to the
+# underlying Vivado builtin via this proc so the forwarded call
+# runs with the interp's current namespace set to `::`. That
+# matters for builtins like `synth_ip` which source XDC files
+# whose scripts use *unqualified* names (`create_clock`,
+# `get_ports`, …). Without a global-namespace call, Tcl resolves
+# those unqualified names against whatever the wrapper's own
+# namespace happens to be (`::vivado_cmd::`), and picks the
+# wrapper again — which then throws on the XDC's positional
+# args because kwargs expects `-flag` form.
+#
+# We define the proc at `::` (via `namespace eval ::`) so its
+# execution context is `::`. The body invokes its args via
+# `{*}$cmd {*}$args` — a direct arg-expansion, NOT a string
+# re-parse. That's the critical difference from
+# `namespace eval :: [list …]` / `namespace inscope :: …` /
+# `uplevel #0 [list …]`, all of which serialize their args to a
+# script string and lose Tcl_Obj internal reps. bd_cell handles
+# would round-trip to plain paths like `/cpm5`, which Vivado's
+# `set_property -objects` then rejects as "Invalid option value".
+namespace eval :: {
+    proc _vw_global_call {cmd args} {
+        {*}$cmd {*}$args
+    }
+}
+
 # ---------- kwargs runtime ----------
 #
 # Wrapper procs lowered from htcl declare themselves as

@@ -62,12 +62,16 @@ pub enum StreamKind {
     /// Vivado `INFO:` line — usually low-importance chatter from
     /// the message system.
     Info,
-    /// Vivado `WARNING:` / `CRITICAL WARNING:` line.
+    /// Vivado `WARNING:` line.
     Warning,
-    /// Vivado `ERROR:` line. Distinct from the final
-    /// [`BackendError::Tcl`] returned by `eval` — these are
-    /// emitted *during* an eval and the final error often refers
-    /// back to them ("failed due to earlier errors").
+    /// Vivado `ERROR:` or `CRITICAL WARNING:` line. Both render
+    /// with the same red ✗ treatment — critical warnings are
+    /// semantically hard failures ("this may fail the run") even
+    /// though Vivado's severity hierarchy nests them below ERROR.
+    /// Distinct from the final [`BackendError::Tcl`] returned by
+    /// `eval` — these are emitted *during* an eval and the final
+    /// error often refers back to them ("failed due to earlier
+    /// errors").
     Error,
 }
 
@@ -865,10 +869,15 @@ pub(crate) fn classify_vivado_message_line(line: &str) -> Option<StreamKind> {
     let l = line.trim_start();
     // `CRITICAL WARNING:` must be checked BEFORE `WARNING:` because
     // the latter is a prefix of the former when leading whitespace
-    // is trimmed.
-    if l.starts_with("ERROR:") {
+    // is trimmed. `CRITICAL WARNING:` routes to Error rather than
+    // Warning — in Vivado's severity hierarchy it's between WARNING
+    // and ERROR but semantically means "your run may fail because
+    // of this" (bad connection, missing property, etc.), which
+    // reads like a hard failure to the user. Rendering it with the
+    // same red ✗ style as ERROR matches how a reader treats it.
+    if l.starts_with("ERROR:") || l.starts_with("CRITICAL WARNING:") {
         Some(StreamKind::Error)
-    } else if l.starts_with("CRITICAL WARNING:") || l.starts_with("WARNING:") {
+    } else if l.starts_with("WARNING:") {
         Some(StreamKind::Warning)
     } else if l.starts_with("INFO:") {
         Some(StreamKind::Info)
@@ -993,7 +1002,23 @@ impl PtyClassifier {
         if let Some(p) = self.pending.as_mut() {
             let merges =
                 matches!(p.kind, StreamKind::Warning | StreamKind::Error);
-            if merges && now.duration_since(p.arrived_at) < self.window {
+            // Only a leading-whitespace non-empty line is a
+            // real continuation. Vivado indents every body line
+            // of a multi-line message (e.g. the `.xci` path
+            // that follows `[Vivado_Tcl 4-393]`), so an
+            // unindented line — or a blank line acting as a
+            // separator — signals a new, unrelated message
+            // (Vivado's `Attempting to get a license…` status
+            // echoes are the motivating case). Reject them
+            // even inside the merge window; otherwise those
+            // status lines glom onto the previous warning and
+            // inherit its orange/red styling.
+            let looks_like_continuation =
+                line.chars().next().is_some_and(char::is_whitespace);
+            if merges
+                && looks_like_continuation
+                && now.duration_since(p.arrived_at) < self.window
+            {
                 p.text.push('\n');
                 p.text.push_str(line);
                 // Refresh the arrival time so a chain of
@@ -1003,7 +1028,8 @@ impl PtyClassifier {
                 out.absorbed = true;
                 return out;
             }
-            // Either kind doesn't merge, or the window expired —
+            // Either kind doesn't merge, the shape doesn't
+            // qualify as a continuation, or the window expired —
             // flush the pending. The current line itself is not
             // absorbed; caller may stderr-mirror it.
             let p = self.pending.take().unwrap();
@@ -1084,25 +1110,72 @@ mod tests {
     }
 
     #[test]
-    fn classifier_absorbs_unclassified_continuation_within_window() {
+    fn classifier_absorbs_indented_continuation_within_window() {
         let mut c = classifier(20);
         let t0 = Instant::now();
         let out = c.handle("WARNING: [X 1-1] header", t0);
         assert!(out.absorbed);
-        let out = c.handle("second body line", t0 + Duration::from_millis(5));
+        // Real Vivado multi-line messages indent every body line.
+        let out = c.handle("  second body line", t0 + Duration::from_millis(5));
         assert!(out.chunks.is_empty(), "{:?}", out.chunks);
         assert!(out.absorbed);
         // A third continuation works too (window refreshes on
         // each absorb).
-        let out = c.handle("third line", t0 + Duration::from_millis(15));
+        let out = c.handle("    third line", t0 + Duration::from_millis(15));
         assert!(out.chunks.is_empty(), "{:?}", out.chunks);
         assert!(out.absorbed);
         let (kind, text) = c.flush().unwrap();
         assert_eq!(kind, StreamKind::Warning);
         assert_eq!(
             text,
-            "WARNING: [X 1-1] header\nsecond body line\nthird line\n"
+            "WARNING: [X 1-1] header\n  second body line\n    third line\n"
         );
+    }
+
+    /// Regression: an unindented follow-up line (e.g. Vivado's
+    /// `Attempting to get a license for feature 'Synthesis'…`
+    /// status echo) must NOT be absorbed as a continuation of the
+    /// preceding WARNING. Real Vivado multi-line messages indent
+    /// every body line — an unindented line is a separate message,
+    /// even when it lands inside the merge window.
+    #[test]
+    fn classifier_does_not_absorb_unindented_line_as_continuation() {
+        let mut c = classifier(20);
+        let t0 = Instant::now();
+        assert!(c.handle("WARNING: [X 1-1] header", t0).absorbed);
+        // Indented body line: legitimate continuation.
+        let out =
+            c.handle("  /path/to/file.xci", t0 + Duration::from_millis(2));
+        assert!(out.chunks.is_empty(), "{:?}", out.chunks);
+        assert!(out.absorbed);
+        // Unindented follow-up: NOT a continuation. Pending
+        // flushes, current line is reported as not-absorbed.
+        let out = c.handle(
+            "Attempting to get a license for feature 'Synthesis'",
+            t0 + Duration::from_millis(4),
+        );
+        assert_eq!(out.chunks.len(), 1, "{:?}", out.chunks);
+        assert_eq!(out.chunks[0].0, StreamKind::Warning);
+        assert_eq!(
+            out.chunks[0].1,
+            "WARNING: [X 1-1] header\n  /path/to/file.xci\n"
+        );
+        assert!(!out.absorbed, "unindented follow-up must not be absorbed");
+    }
+
+    /// Regression: a blank line between the warning body and the
+    /// next status message must terminate the pending, not extend
+    /// it. Blank lines are visual separators, not warning bodies.
+    #[test]
+    fn classifier_treats_blank_line_as_message_separator() {
+        let mut c = classifier(20);
+        let t0 = Instant::now();
+        assert!(c.handle("WARNING: [X 1-1] header", t0).absorbed);
+        assert!(c.handle("  body", t0 + Duration::from_millis(1)).absorbed);
+        let out = c.handle("", t0 + Duration::from_millis(2));
+        assert_eq!(out.chunks.len(), 1, "{:?}", out.chunks);
+        assert_eq!(out.chunks[0].1, "WARNING: [X 1-1] header\n  body\n");
+        assert!(!out.absorbed);
     }
 
     #[test]
@@ -1207,11 +1280,12 @@ mod tests {
             ),
             (
                 "CRITICAL WARNING: [Vivado 12-180] ...",
-                // Critical warnings are still warnings as far as
-                // the UI is concerned — orange, not red. The
-                // `CRITICAL` prefix is preserved in the line
-                // content for the user to see.
-                StreamKind::Warning,
+                // Critical warnings render as Errors — same red ✗
+                // treatment. Vivado's severity ranking puts them
+                // between WARNING and ERROR, but semantically
+                // they mean "this may fail the run," which reads
+                // as a hard failure to a user scanning scrollback.
+                StreamKind::Error,
             ),
             (
                 "INFO: [Vivado 12-3661] auto-pinning enabled",
