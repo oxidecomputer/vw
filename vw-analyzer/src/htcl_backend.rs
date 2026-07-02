@@ -15,12 +15,13 @@ use tower_lsp::lsp_types::{
     DocumentSymbol, Documentation, Hover, HoverContents, InsertTextFormat,
     Location, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel,
     Position, Range, SignatureHelp, SignatureInformation, SymbolInformation,
-    SymbolKind, TextEdit, Url,
+    SymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use vw_htcl::{
-    complete_at, definition_at, hover_at, parse, signature_help_at, validate,
-    Attribute, AttributeValue, CommandKind, Completion, CompletionKind,
-    HoverTarget, LineCol, LineIndex, ProcArg, ProcSignature, Severity, Stmt,
+    complete_at, definition_at, hover_at, parse, rename_at, signature_help_at,
+    validate, Attribute, AttributeValue, CommandKind, Completion,
+    CompletionKind, HoverTarget, LineCol, LineIndex, ProcArg, ProcSignature,
+    RenameEdit, Severity, Stmt,
 };
 
 use crate::backend::LanguageBackend;
@@ -454,6 +455,55 @@ impl LanguageBackend for HtclBackend {
         let help =
             signature_help_at(&parsed.document, &view.view_source, offset)?;
         Some(signature_help_response(&help))
+    }
+
+    async fn rename(
+        &self,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
+    ) -> Option<WorkspaceEdit> {
+        let docs = self.docs.read().await;
+        let doc = docs.get(uri)?;
+        let line_index = LineIndex::new(&doc.text);
+        let offset = line_index.offset_of(LineCol {
+            line: position.line,
+            character: position.character,
+        });
+        // Rename operates on the local file only — vw-htcl's
+        // `rename_at` refuses cross-file targets by returning None.
+        // No workspace view: we don't want a rename to try to touch
+        // imported files whose contents we're only synthesizing.
+        let parsed = parse(&doc.text);
+        let edits = rename_at(&parsed.document, &doc.text, offset, new_name)?;
+        if edits.is_empty() {
+            return None;
+        }
+        let text_edits = edits
+            .into_iter()
+            .map(|e| rename_edit_to_lsp(e, &line_index))
+            .collect();
+        let mut changes = HashMap::new();
+        changes.insert(uri.clone(), text_edits);
+        Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        })
+    }
+}
+
+/// Translate a vw-htcl `RenameEdit` into an LSP `TextEdit`. Both
+/// carry the same shape (a source range plus replacement text); only
+/// the coordinate system differs.
+fn rename_edit_to_lsp(edit: RenameEdit, line_index: &LineIndex) -> TextEdit {
+    let (start, end) = line_index.range(edit.span);
+    TextEdit {
+        range: Range {
+            start: lc_to_pos(start),
+            end: lc_to_pos(end),
+        },
+        new_text: edit.new_text,
     }
 }
 
@@ -1072,6 +1122,96 @@ mod tests {
             "{:?}",
             diags
         );
+    }
+
+    /// Rename produces a WorkspaceEdit whose TextEdits, when
+    /// applied in reverse order, transform the source correctly.
+    /// Covers the end-to-end LSP path: cursor → offset → rename_at →
+    /// edits → LSP `WorkspaceEdit`.
+    #[tokio::test]
+    async fn rename_local_via_lsp() {
+        let backend = HtclBackend::new();
+        // `mode` is a local; renaming it should update the decl and
+        // the two `$mode` refs.
+        let src = "\
+proc f {} {
+  set mode fast
+  puts $mode
+  return $mode
+}
+";
+        backend.set_text(uri(), src.into()).await;
+        // Cursor on the `m` of `set mode` (line 1, column 6). 0-indexed.
+        let workspace_edit = backend
+            .rename(
+                &uri(),
+                Position {
+                    line: 1,
+                    character: 6,
+                },
+                "kind",
+            )
+            .await
+            .expect("rename should succeed");
+        let changes = workspace_edit.changes.expect("expected changes");
+        let text_edits = changes.get(&uri()).expect("edits for this file");
+        assert_eq!(text_edits.len(), 3, "{text_edits:?}");
+        // Apply edits from tail to head to preserve earlier offsets.
+        let mut renamed = src.to_string();
+        let mut edits = text_edits.clone();
+        edits.sort_by_key(|e| (e.range.start.line, e.range.start.character));
+        for edit in edits.iter().rev() {
+            let start = position_to_offset(&renamed, edit.range.start);
+            let end = position_to_offset(&renamed, edit.range.end);
+            renamed.replace_range(start..end, &edit.new_text);
+        }
+        assert!(renamed.contains("set kind fast"), "{renamed}");
+        assert!(renamed.contains("puts $kind"), "{renamed}");
+        assert!(renamed.contains("return $kind"), "{renamed}");
+        assert!(!renamed.contains("mode"), "{renamed}");
+    }
+
+    /// Renaming refuses cross-file targets (proc names) by returning
+    /// `None`. Editors surface this to the user without applying any
+    /// half-edit.
+    #[tokio::test]
+    async fn rename_refuses_proc_name_via_lsp() {
+        let backend = HtclBackend::new();
+        backend
+            .set_text(uri(), "proc greet {} { puts hi }\ngreet\n".into())
+            .await;
+        // Cursor on the `g` of the proc's own name.
+        let result = backend
+            .rename(
+                &uri(),
+                Position {
+                    line: 0,
+                    character: 5,
+                },
+                "hello",
+            )
+            .await;
+        assert!(result.is_none(), "{result:?}");
+    }
+
+    /// Utility: convert an LSP `Position` (line + UTF-16 char offset,
+    /// but at ASCII we treat as byte offset) into a byte index in the
+    /// given source. Used to apply text edits in tests.
+    fn position_to_offset(source: &str, pos: Position) -> usize {
+        let mut cur_line = 0u32;
+        let mut cur_col = 0u32;
+        for (idx, byte) in source.bytes().enumerate() {
+            if cur_line == pos.line && cur_col == pos.character {
+                return idx;
+            }
+            if byte == b'\n' {
+                cur_line += 1;
+                cur_col = 0;
+            } else {
+                cur_col += 1;
+            }
+        }
+        source.len()
     }
 
     #[tokio::test]

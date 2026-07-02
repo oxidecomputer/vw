@@ -183,8 +183,30 @@ fn parse_inline_payload(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
         }
         Ok(out)
     } else {
-        // Scalar payload: take everything up to the next `)`.
-        let scalar = take_while(0.., |c: char| c != ')').parse_next(input)?;
+        // Scalar payload: take everything up to the matching close
+        // paren of the surrounding call. Track paren depth so
+        // scalar values containing their own `(…)` (e.g. Vivado's
+        // `RS(544) CL119` FEC-config string) don't get cut short at
+        // the FIRST `)` — that used to abort the parse, drop the
+        // trailing text onto the caller's leftover input, and
+        // fall the whole line back to gray.
+        let start = *input;
+        let mut depth: usize = 0;
+        let mut end = 0;
+        for (i, c) in start.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 0 => {
+                    end = i;
+                    break;
+                }
+                ')' => depth -= 1,
+                _ => {}
+            }
+            end = i + c.len_utf8();
+        }
+        let scalar = &start[..end];
+        *input = &start[end..];
         Ok(vec![Span::styled(scalar.to_string(), scalar_style())])
     }
 }
@@ -326,6 +348,31 @@ mod tests {
         assert!(highlight_line("INFO: vivado started").is_none());
         assert!(highlight_line("just some random text").is_none());
         assert!(highlight_line("").is_none());
+    }
+
+    /// Regression: `Scalar(RS(544) CL119)` — Vivado's FEC-config
+    /// property value contains its own `(…)` pair. The scalar
+    /// payload parser must balance parens and stop only at the
+    /// matching outer `)`, otherwise the whole line falls back to
+    /// the gray no-repr styling.
+    #[test]
+    fn scalar_payload_with_inner_parens_still_highlights() {
+        let spans = highlight_line("FEC_SLICE0_CFG_C0 Scalar(RS(544) CL119)")
+            .expect("parses");
+        let contents: Vec<&str> =
+            spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            contents.contains(&"FEC_SLICE0_CFG_C0"),
+            "missing key: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"Scalar"),
+            "missing variant: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"RS(544) CL119"),
+            "missing scalar payload: {contents:?}"
+        );
     }
 
     #[test]

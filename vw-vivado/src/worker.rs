@@ -26,7 +26,7 @@ use portable_pty::{
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpListener;
 use tracing::{debug, warn};
 use vw_eda::{
@@ -182,7 +182,26 @@ pub struct VivadoBackend {
     /// Master end of the PTY. Kept alive so the slave (Vivado) doesn't
     /// receive EOF on its stdin.
     _master: Box<dyn MasterPty + Send>,
-    proto_read: BufReader<OwnedReadHalf>,
+    /// Protocol-socket line reader. Backed by a background task
+    /// (spawned in [`Self::new`]) that owns the `BufReader` and
+    /// forwards each newline-terminated frame here.
+    ///
+    /// Why the task exists: `BufReader::read_line` is
+    /// **cancellation-unsafe** per tokio's docs — if it's the
+    /// event in a `tokio::select!` and another branch fires
+    /// first, the future is dropped, any bytes already accumulated
+    /// into the internal buffer are lost, and the BufReader is left
+    /// in an unspecified state where subsequent reads return
+    /// incorrect data. Our eval loop races protocol reads against
+    /// `pty_rx.recv()` in a biased `select!`, so a big-enough
+    /// response (`props::get` returns ~25 KB Properties reprs)
+    /// crossing a PTY-line arrival used to corrupt the buffer and
+    /// produce "malformed message from shim" parse errors
+    /// truncated mid-JSON. Reading through a channel makes the
+    /// select's read side cancellation-safe.
+    proto_read:
+        tokio::sync::mpsc::UnboundedReceiver<Result<String, std::io::Error>>,
+    _proto_read_task: Option<tokio::task::JoinHandle<()>>,
     proto_write: OwnedWriteHalf,
     next_id: AtomicU64,
     stdout_pump: Option<std::thread::JoinHandle<()>>,
@@ -340,6 +359,30 @@ impl VivadoBackend {
         debug!("shim connected");
 
         let (read_half, write_half) = stream.into_split();
+        // Move BufReader::read_line onto a dedicated task so its
+        // cancellation-unsafe nature can't corrupt state when the
+        // eval loop's `select!` fires a different branch mid-read.
+        // See the field-doc on `proto_read` for the failure mode.
+        let (proto_tx, proto_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut proto_buf = BufReader::new(read_half);
+        let _proto_read_task = tokio::spawn(async move {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match proto_buf.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if proto_tx.send(Ok(line.clone())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = proto_tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
         let trace_message_sources = std::env::var("VW_TRACE_MESSAGE_SOURCES")
             .map(|v| {
                 let v = v.trim();
@@ -357,7 +400,8 @@ impl VivadoBackend {
         Ok(Self {
             child: Some(child),
             _master: pair.master,
-            proto_read: BufReader::new(read_half),
+            proto_read: proto_rx,
+            _proto_read_task: Some(_proto_read_task),
             proto_write: write_half,
             next_id: AtomicU64::new(1),
             stdout_pump: Some(stdout_pump),
@@ -449,13 +493,21 @@ impl VivadoBackend {
                     );
                     continue;
                 }
-                read = self.proto_read.read_line(&mut line) => {
-                    let n = read.map_err(BackendError::Io)?;
-                    if n == 0 {
+                read = self.proto_read.recv() => {
+                    // `recv()` on `UnboundedReceiver` is
+                    // cancellation-safe (per tokio's docs on
+                    // mpsc::Receiver::recv), so a losing branch
+                    // in this `select!` just drops a poll — no
+                    // in-flight bytes to corrupt.
+                    let Some(res) = read else {
                         return Err(BackendError::Worker(
                             "vivado shim closed protocol socket".into(),
                         ));
-                    }
+                    };
+                    let Ok(l) = res else {
+                        return Err(BackendError::Io(res.unwrap_err()));
+                    };
+                    line = l;
                 }
             }
             let trimmed = line.trim();

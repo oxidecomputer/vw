@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use tower_lsp::lsp_types::{
     CompletionItem, Diagnostic, DocumentSymbol, Hover, Location, Position,
-    SignatureHelp, SymbolInformation, Url,
+    SignatureHelp, SymbolInformation, Url, WorkspaceEdit,
 };
 
 #[async_trait]
@@ -95,6 +95,25 @@ pub trait LanguageBackend: Send + Sync {
         uri: &Url,
         position: Position,
     ) -> Option<SignatureHelp>;
+
+    /// Compute the workspace edit that renames the identifier at
+    /// `position` to `new_name`. `None` when the cursor isn't on a
+    /// renamable symbol, when `new_name` is invalid for the target
+    /// language, or when the rename would need to touch symbols the
+    /// backend can't safely reach (e.g. cross-file references).
+    ///
+    /// Default `None` so language backends without rename support
+    /// (or where rename hasn't landed yet) don't have to stub the
+    /// method out; the server treats the response as "not
+    /// supported here" and the editor shows an unobtrusive error.
+    async fn rename(
+        &self,
+        _uri: &Url,
+        _position: Position,
+        _new_name: &str,
+    ) -> Option<WorkspaceEdit> {
+        None
+    }
 }
 
 /// A symbol surfaced from a backend, language-neutral. Backends that

@@ -91,6 +91,7 @@ impl LanguageServer for Analyzer {
                     retrigger_characters: Some(vec!["-".to_string()]),
                     work_done_progress_options: Default::default(),
                 }),
+                rename_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -253,6 +254,19 @@ impl LanguageServer for Analyzer {
             return Ok(None);
         };
         Ok(backend.signature_help(&uri, position).await)
+    }
+
+    async fn rename(
+        &self,
+        params: RenameParams,
+    ) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri.clone();
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+        let Some(backend) = self.backend_for(&uri) else {
+            return Ok(None);
+        };
+        Ok(backend.rename(&uri, position, &new_name).await)
     }
 }
 
