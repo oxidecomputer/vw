@@ -442,6 +442,20 @@ fn parse_command(
             break;
         }
         let c = current_char(input, source);
+        // Line-continuation on a leading-dash next line: the
+        // configurator shape `cmd\n  -flag val\n  -flag val\n`
+        // parses as one command without needing `\` at every EOL.
+        // Only triggers mid-command (`!words.is_empty()`) — a `-`
+        // at the start of a fresh statement stays a new statement,
+        // even if it doesn't lex as a command name.
+        if mode == Mode::Toplevel
+            && c == '\n'
+            && !words.is_empty()
+            && next_line_is_flag_continuation(input, source)
+        {
+            advance_char(input);
+            continue;
+        }
         let terminate = match mode {
             Mode::Toplevel => c == '\n' || c == ';',
             // In bracket-body, only `;` terminates a command — `\n`
@@ -898,6 +912,37 @@ fn parse_escape(
         value,
         span: Span::new(start as u32, input.location() as u32),
     })
+}
+
+/// Peek past a `\n` and any inline whitespace on the immediately-
+/// following line: does that line's first non-whitespace byte
+/// begin a flag-shaped token (`-` followed by a letter, digit,
+/// or another `-`)? Called by [`parse_command`] to decide whether
+/// a newline should be treated as command continuation.
+///
+/// Deliberately does NOT peek across a second `\n` — a blank line
+/// terminates the continuation. Callers rely on this to model
+/// "paragraph breaks" naturally, matching a reader's intuition.
+///
+/// Doesn't consume input; only inspects `source` bytes.
+fn next_line_is_flag_continuation(input: &Input<'_>, source: &str) -> bool {
+    let bytes = source.as_bytes();
+    // Cursor sits on `\n`; look ahead starting at the byte after.
+    let mut i = input.location() + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' => i += 1,
+            _ => break,
+        }
+    }
+    if i >= bytes.len() || bytes[i] != b'-' {
+        return false;
+    }
+    // Look at what follows the `-`. Flag-shaped: letter, digit,
+    // or a second `-` (for `--end-of-options` idiom). Anything
+    // else (whitespace, EOF, punctuation) declines to continue.
+    let next = bytes.get(i + 1).copied().unwrap_or(b'\0');
+    next.is_ascii_alphanumeric() || next == b'-'
 }
 
 fn skip_inline_ws(input: &mut Input<'_>, source: &str, mode: Mode) {
@@ -1509,6 +1554,89 @@ set cell [
             })
             .collect();
         assert_eq!(cmds.len(), 2);
+    }
+
+    /// Line continuation via a leading `-` on the next line: the
+    /// common flag-per-line configurator shape (`create_foo`,
+    /// newline, indented `-bar val`, newline, `-baz val`, …)
+    /// parses as one command without needing a trailing `\`.
+    #[test]
+    fn dash_leading_next_line_continues_command() {
+        let src = "create_foo\n  -bar 1\n  -baz 2\n";
+        let out = parse(src);
+        let cmds: Vec<&Command> = out
+            .document
+            .stmts
+            .iter()
+            .filter_map(|s| {
+                if let Stmt::Command(c) = s {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(cmds.len(), 1, "{cmds:#?}");
+        let words: Vec<&str> =
+            cmds[0].words.iter().filter_map(Word::as_text).collect();
+        assert_eq!(words, ["create_foo", "-bar", "1", "-baz", "2"]);
+    }
+
+    /// A `--` (end-of-options) continuation also chains — same
+    /// leading-dash shape.
+    #[test]
+    fn double_dash_next_line_continues_command() {
+        let src = "cmd -a 1\n  -- rest\n";
+        let out = parse(src);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!("{:#?}", out.document.stmts);
+        };
+        assert_eq!(cmd.words.len(), 5);
+    }
+
+    /// Non-dash next line still terminates. A regression here
+    /// would break every existing top-level script.
+    #[test]
+    fn non_dash_next_line_terminates_as_before() {
+        let src = "puts a\nputs b\n";
+        let out = parse(src);
+        let cmds: Vec<&Command> = out
+            .document
+            .stmts
+            .iter()
+            .filter_map(|s| {
+                if let Stmt::Command(c) = s {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(cmds.len(), 2);
+    }
+
+    /// A blank line between the header and a dash-led line breaks
+    /// the continuation — the header stands alone and the dash-
+    /// led line becomes a new (probably weird) command. This
+    /// matches how a reader intuits paragraph breaks: an empty
+    /// line is a stronger separator than a newline.
+    #[test]
+    fn blank_line_before_dash_breaks_continuation() {
+        let src = "cmd\n\n  -a 1\n";
+        let out = parse(src);
+        let cmds: Vec<&Command> = out
+            .document
+            .stmts
+            .iter()
+            .filter_map(|s| {
+                if let Stmt::Command(c) = s {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(cmds.len(), 2, "{cmds:#?}");
     }
 
     #[test]

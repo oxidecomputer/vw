@@ -89,7 +89,9 @@ pub fn analyze(source: &str, offset: u32) -> CmdLine<'_> {
             b'\n' | b';'
                 if depth == 0
                     && nearest_top_sep.is_none()
-                    && !escaped_by_backslash(bytes, i) =>
+                    && !escaped_by_backslash(bytes, i)
+                    && !(bytes[i] == b'\n'
+                        && next_line_is_flag_continuation(bytes, i)) =>
             {
                 // The `!escaped_by_backslash` guard above is Tcl's
                 // line-continuation rule: `\<newline>` and `\;` are
@@ -102,6 +104,14 @@ pub fn analyze(source: &str, offset: u32) -> CmdLine<'_> {
                 //
                 // would have its completion fall off the cliff because
                 // the analyzer thought line 3 was a fresh command.
+                //
+                // The `next_line_is_flag_continuation` guard mirrors
+                // the parser's dash-line-continuation rule so the same
+                // shape without backslashes also completes correctly:
+                //
+                //   create_clk_wizard_clkout
+                //     -cell $clk
+                //     -req<cursor>
                 nearest_top_sep = Some(i + 1);
             }
             _ => {}
@@ -127,6 +137,27 @@ pub fn analyze(source: &str, offset: u32) -> CmdLine<'_> {
         partial,
         partial_span: Span::new((start + split) as u32, off as u32),
     }
+}
+
+/// Peek past `bytes[i]` (a `\n`) and any inline whitespace on the
+/// next line: does the first non-whitespace byte look like a flag
+/// (`-` followed by letter/digit/`-`)? Mirrors the parser's dash-
+/// line-continuation rule so the analyzer's cursor-at-end
+/// completion path agrees with the parser about whether an
+/// unescaped newline ends a command or extends it.
+fn next_line_is_flag_continuation(bytes: &[u8], i: usize) -> bool {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b' ' | b'\t' | b'\r' => j += 1,
+            _ => break,
+        }
+    }
+    if j >= bytes.len() || bytes[j] != b'-' {
+        return false;
+    }
+    let next = bytes.get(j + 1).copied().unwrap_or(b'\0');
+    next.is_ascii_alphanumeric() || next == b'-'
 }
 
 /// True when the byte at `i` is preceded by an odd-length run of
@@ -228,6 +259,23 @@ set x [
         let line = analyze(src, src.len() as u32);
         assert_eq!(line.command_name(), Some("create_cpm5_cpm_pcie0"));
         assert_eq!(line.partial, "-max_link_");
+    }
+
+    /// Dash-line continuation without `\`: the completion path
+    /// must agree with the parser that a newline followed by a
+    /// `-flag` line extends the current command, so cursor-at-end
+    /// resolves to the command's flag position.
+    #[test]
+    fn dash_led_next_line_continuation_no_backslash() {
+        let src = "\
+create_clk_wizard_clkout
+  -cell $clk
+  -req";
+        let line = analyze(src, src.len() as u32);
+        assert_eq!(line.command_name(), Some("create_clk_wizard_clkout"));
+        assert_eq!(line.partial, "-req");
+        let used: Vec<&str> = line.used_flags().collect();
+        assert_eq!(used, vec!["-cell"]);
     }
 
     #[test]
