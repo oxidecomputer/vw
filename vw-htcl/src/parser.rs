@@ -1620,6 +1620,30 @@ set cell [
     /// led line becomes a new (probably weird) command. This
     /// matches how a reader intuits paragraph breaks: an empty
     /// line is a stronger separator than a newline.
+    /// Trailing whitespace on the previous line must not defeat the
+    /// dash-continuation rule — real-world files often carry a stray
+    /// space at end of line, and we want the multi-line command to
+    /// still parse as one command.
+    #[test]
+    fn dash_continuation_survives_trailing_ws_on_previous_line() {
+        let src = "cmd\n  -foo 1 \n  -bar 2\n";
+        let out = parse(src);
+        let cmds: Vec<&Command> = out
+            .document
+            .stmts
+            .iter()
+            .filter_map(|s| {
+                if let Stmt::Command(c) = s {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(cmds.len(), 1, "{cmds:#?}");
+        assert_eq!(cmds[0].words.len(), 5);
+    }
+
     #[test]
     fn blank_line_before_dash_breaks_continuation() {
         let src = "cmd\n\n  -a 1\n";
