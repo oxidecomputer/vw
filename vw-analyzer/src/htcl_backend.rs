@@ -1023,7 +1023,7 @@ mod tests {
         backend
             .set_text(
                 uri(),
-                "proc axis {\n  @enum(1, 2, 4) width\n} { }\n\
+                "proc axis {\n  @enum(1, 2, 4) width\n} { puts $width }\n\
                  axis -width 3\n"
                     .into(),
             )
@@ -1031,6 +1031,44 @@ mod tests {
         let diags = backend.diagnostics(&uri()).await;
         assert!(
             diags.iter().any(|d| d.message.contains("@enum")),
+            "{:?}",
+            diags
+        );
+    }
+
+    /// Unused-variable warnings from the `vw-htcl::unused` pass
+    /// reach LSP clients with `DiagnosticSeverity::WARNING` and
+    /// point at the offending decl. Underscore-prefixed names are
+    /// exempt.
+    #[tokio::test]
+    async fn unused_var_warning_surfaces_in_lsp() {
+        let backend = HtclBackend::new();
+        backend
+            .set_text(uri(), "proc f {unused_arg} { return 1 }\n".into())
+            .await;
+        let diags = backend.diagnostics(&uri()).await;
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::WARNING))
+            .filter(|d| d.message.contains("unused proc arg"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{:?}", diags);
+        assert!(
+            warnings[0].message.contains("unused_arg"),
+            "{:?}",
+            warnings[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn unused_var_underscore_prefix_suppresses_lsp_warning() {
+        let backend = HtclBackend::new();
+        backend
+            .set_text(uri(), "proc f {_ignored} { return 1 }\n".into())
+            .await;
+        let diags = backend.diagnostics(&uri()).await;
+        assert!(
+            !diags.iter().any(|d| d.message.contains("unused")),
             "{:?}",
             diags
         );

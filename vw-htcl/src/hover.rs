@@ -334,8 +334,10 @@ fn hover_call_via_table<'a>(
 }
 
 /// Command names whose brace-args hold Tcl scripts rather than
-/// data. Same list as [`crate::goto`]'s counterpart.
-fn is_body_host(head: &str) -> bool {
+/// data. Same list as [`crate::goto`]'s counterpart. Exposed to
+/// the crate so the unused-var pass (`crate::unused`) can reuse
+/// it without a third copy.
+pub(crate) fn is_body_host(head: &str) -> bool {
     matches!(
         head,
         "if" | "elseif"
