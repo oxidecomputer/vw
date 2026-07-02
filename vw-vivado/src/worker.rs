@@ -43,6 +43,57 @@ const SHIM_TCL: &str = include_str!("../shim/vivado-shim.tcl");
 /// a warm cache it's a few seconds.
 const SHIM_CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
 
+// --- TEMPORARY DIAGNOSTIC ---------------------------------------------
+//
+// Timing log to disentangle three arrival questions:
+//
+//   1. When did Vivado *write* the bytes to the PTY? (pump_read /
+//      pump_send events — captured on the pump thread.)
+//   2. When did our select loop *pull* them from the pty_rx
+//      channel? (pty_rx_recv events.)
+//   3. When did the protocol Response arrive relative to those?
+//      (response_arrival events.)
+//
+// Answering "is a late error message A) already-written-but-not-
+// pumped, or B) not-yet-written-by-Vivado?" needs the delta between
+// (1) and (3). Writing to `/tmp/vw-timing.log` so it survives the
+// TUI's alternate-screen mode. Remove this block (and its callers)
+// once we've settled the timing question.
+fn vw_timing_log(event: &str, len: usize, preview: &str) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    let elapsed_us = start.elapsed().as_micros();
+    // Only write if the env var opts in — no forced disk I/O in
+    // normal runs.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled =
+        *ENABLED.get_or_init(|| std::env::var("VW_TIMING_LOG").is_ok());
+    if !enabled {
+        return;
+    }
+    static FILE: OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
+        OnceLock::new();
+    let file_slot = FILE.get_or_init(|| {
+        std::sync::Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/vw-timing.log")
+                .ok(),
+        )
+    });
+    if let Ok(mut guard) = file_slot.lock() {
+        if let Some(f) = guard.as_mut() {
+            let clean: String =
+                preview.chars().filter(|c| *c != '\n').take(140).collect();
+            let _ = writeln!(f, "{elapsed_us:>10} {event} len={len} {clean}");
+            let _ = f.flush();
+        }
+    }
+}
+
 /// Tag attached to each chunk a [`StdoutSink`] receives, so the
 /// caller can route it to the right UI lane. The shim's
 /// `puts`-interception path always produces [`StreamKind::Stdout`]
@@ -387,6 +438,11 @@ impl VivadoBackend {
                         // shutdown ack before the PTY EOFs.
                         continue;
                     };
+                    vw_timing_log(
+                        "pty_rx_recv",
+                        pty_line.len(),
+                        &pty_line,
+                    );
                     self.handle_pty_line_during_eval(
                         &pty_line,
                         &mut accumulated,
@@ -455,6 +511,18 @@ impl VivadoBackend {
                     );
                 }
                 WireMessage::Response(r) if r.id == expected_id => {
+                    vw_timing_log(
+                        "response_arrival",
+                        trimmed.len(),
+                        &format!(
+                            "id={} kind={}",
+                            r.id,
+                            match &r.result {
+                                ResponseResult::Ok { .. } => "Ok",
+                                ResponseResult::Err { .. } => "Err",
+                            }
+                        ),
+                    );
                     // Force-flush any buffered PTY message — a
                     // classified line that arrived right before
                     // the Vivado response would otherwise linger
@@ -561,6 +629,39 @@ impl VivadoBackend {
     /// Unclassified lines (banner, source-echo, the Vivado prompt)
     /// still drop on the floor — or stderr-mirror if `verbose`.
     /// Forwarding those would flood scrollback.
+    /// Post-Err PTY drain — see the call site in [`Self::eval`] for
+    /// the timing rationale. Polls `pty_rx` with a 10 ms per-wait
+    /// timeout so a quiescent channel exits fast; caps total wait
+    /// at 50 ms so a truly stuck Vivado can't hold the REPL longer
+    /// than that. Each retrieved line is fed through
+    /// [`Self::handle_pty_line_during_eval`] — same code path as an
+    /// in-flight eval — so marker BEGIN/END events pop the stack
+    /// coherently and error messages carry the failed eval's
+    /// frames when they reach the REPL sink.
+    async fn settle_late_pty_after_err(&mut self) {
+        use std::time::{Duration, Instant};
+        let mut sink_void = String::new();
+        let hard_deadline = Instant::now() + Duration::from_millis(50);
+        loop {
+            let now = Instant::now();
+            if now >= hard_deadline {
+                break;
+            }
+            let per_wait = Duration::from_millis(10);
+            match tokio::time::timeout(per_wait, self.pty_rx.recv()).await {
+                Ok(Some(line)) => {
+                    self.handle_pty_line_during_eval(&line, &mut sink_void);
+                }
+                _ => break, // idle window elapsed or channel closed
+            }
+        }
+        // Flush any classifier-pending message so it emits with
+        // THIS eval's context, not the next one's.
+        if let Some((kind, text)) = self.pty_classifier.flush() {
+            self.emit_pty_chunk(kind, &text, &mut sink_void);
+        }
+    }
+
     fn drain_pty_between_evals(&mut self) {
         // Force-flush any pending PTY message from the previous
         // eval first — if the eval ended right after a classified
@@ -700,6 +801,26 @@ impl EdaBackend for VivadoBackend {
         };
         self.write_request(&req).await?;
         let (resp, stdout) = self.read_response_for(id).await?;
+        // Vivado writes the Err response to the protocol socket
+        // *before* the underlying error text and marker cleanup
+        // reach the PTY — empirical: 65 μs between an Err response
+        // arrival and the [BD 41-71] error line landing on our
+        // pump thread's `read(2)`; another ~180 μs before the
+        // pump forwards it into `pty_rx`. Returning here without
+        // draining those bytes leaves them queued in `pty_rx`
+        // until the NEXT eval's `drain_pty_between_evals`, which
+        // runs after `pending_eval_index` has advanced — so the
+        // origin fallback in the REPL tags them with a completely
+        // unrelated command. Poll briefly for the tail so the
+        // late messages get emitted with THIS eval's marker
+        // context still on the stack. Err-only: successful evals
+        // don't have this misattribution risk (any tail markers
+        // just adjust the stack idempotently), and running it on
+        // every eval would add ~1 ms to each of the ~1800
+        // auto-load evals.
+        if matches!(resp.result, ResponseResult::Err { .. }) {
+            self.settle_late_pty_after_err().await;
+        }
         match resp.result {
             ResponseResult::Ok { result, .. } => {
                 let value = match result {
@@ -810,9 +931,23 @@ fn spawn_stdout_pump(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    // DIAGNOSTIC (temporary): log every `read(2)`
+                    // completion so we can see when Vivado actually
+                    // wrote bytes to the PTY. Paired with the
+                    // response-arrival and pty_rx.recv() logs in
+                    // `read_response_for`, this tells us whether a
+                    // late message is a pump-forwarding lag or a
+                    // Vivado-flush lag.
+                    let preview: String = std::str::from_utf8(&buf[..n])
+                        .unwrap_or("<non-utf8>")
+                        .chars()
+                        .take(140)
+                        .collect();
+                    vw_timing_log("pump_read", n, &preview);
                     for &b in &buf[..n] {
                         if b == b'\n' {
                             let send = std::mem::take(&mut line);
+                            vw_timing_log("pump_send", send.len(), &send);
                             if tx.send(send).is_err() {
                                 return;
                             }
