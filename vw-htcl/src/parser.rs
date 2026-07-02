@@ -939,10 +939,15 @@ fn next_line_is_flag_continuation(input: &Input<'_>, source: &str) -> bool {
         return false;
     }
     // Look at what follows the `-`. Flag-shaped: letter, digit,
-    // or a second `-` (for `--end-of-options` idiom). Anything
-    // else (whitespace, EOF, punctuation) declines to continue.
+    // underscore, or a second `-` (for `--end-of-options` idiom).
+    // Anything else (whitespace, EOF, punctuation) declines to
+    // continue. Underscore is included because real Vivado flag
+    // names like `-_64bit` (create_bd_cell's 64-bit BAR flag) are
+    // valid — without `_` in the set, the continuation rule
+    // breaks on them and Tcl tries to execute `-_64bit` as a
+    // command.
     let next = bytes.get(i + 1).copied().unwrap_or(b'\0');
-    next.is_ascii_alphanumeric() || next == b'-'
+    next.is_ascii_alphanumeric() || next == b'-' || next == b'_'
 }
 
 fn skip_inline_ws(input: &mut Input<'_>, source: &str, mode: Mode) {
@@ -1620,6 +1625,32 @@ set cell [
     /// led line becomes a new (probably weird) command. This
     /// matches how a reader intuits paragraph breaks: an empty
     /// line is a stronger separator than a newline.
+    /// Vivado flags like `-_64bit` start with `-_` — the underscore
+    /// must be recognized as flag-shaped so the continuation rule
+    /// keeps the line inside the enclosing command instead of
+    /// starting a new (invalid) command.
+    #[test]
+    fn dash_underscore_line_continues_command() {
+        let src = "create_bar\n  -cell foo\n  -_64bit 1\n";
+        let out = parse(src);
+        let cmds: Vec<&Command> = out
+            .document
+            .stmts
+            .iter()
+            .filter_map(|s| {
+                if let Stmt::Command(c) = s {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(cmds.len(), 1, "{cmds:#?}");
+        let words: Vec<&str> =
+            cmds[0].words.iter().filter_map(Word::as_text).collect();
+        assert_eq!(words, ["create_bar", "-cell", "foo", "-_64bit", "1"]);
+    }
+
     /// Trailing whitespace on the previous line must not defeat the
     /// dash-continuation rule — real-world files often carry a stray
     /// space at end of line, and we want the multi-line command to

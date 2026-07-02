@@ -157,7 +157,10 @@ fn next_line_is_flag_continuation(bytes: &[u8], i: usize) -> bool {
         return false;
     }
     let next = bytes.get(j + 1).copied().unwrap_or(b'\0');
-    next.is_ascii_alphanumeric() || next == b'-'
+    // Flag-shaped: letter/digit/underscore/`-`. See the parser's
+    // `next_line_is_flag_continuation` for the rationale on the
+    // underscore case (real Vivado flags like `-_64bit`).
+    next.is_ascii_alphanumeric() || next == b'-' || next == b'_'
 }
 
 /// True when the byte at `i` is preceded by an odd-length run of
