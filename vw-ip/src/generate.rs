@@ -572,12 +572,17 @@ fn generate_split(
         "if {{$bd}} {{ return $cell }} else {{ return $name }}"
     )
     .unwrap();
-    // Family newtype boilerplate lands at the FILE TOP LEVEL
-    // (outside the `namespace eval` block) — the language
-    // currently rejects qualified type names as return types, so
-    // `type <NsPrefix>Props = Properties` uses a flat name and the
-    // helper procs stay top-level too. Skip entirely when no
-    // families were detected.
+    // Family newtype preludes ship at the FILE TOP LEVEL — inside
+    // `namespace eval <ip>` blocks, the analyzer double-prefixes
+    // qualified proc names (a proc `<ip>::T::from` inside `namespace
+    // eval <ip>` becomes `<ip>::<ip>::T::from`, so external
+    // references never find it). Keeping them at top level with
+    // fully-qualified names — `type dcmac::GtChProps = Properties`,
+    // `proc dcmac::GtChProps::from { … } dcmac::GtChProps { … }` —
+    // avoids that and remains legal now that the validator accepts
+    // qualified newtype names (see this slice's changes to
+    // `validate::reject_nested_qualified`). An empty
+    // `namespace eval <ip>::<StemProps> {}` prelude keeps Tcl happy.
     if !families.is_empty() {
         for f in &families {
             writeln!(out).unwrap();
@@ -585,12 +590,12 @@ fn generate_split(
         }
         writeln!(out).unwrap();
     }
-    // All PROCS (family constructors, top proc, sub-procs) land
-    // inside `namespace eval <ip> { … }` with bare names. That
-    // lets Tcl register them as `<ip>::name` at load time — the
-    // namespace must exist before `proc <ip>::…` is legal, and
-    // wrapping via `namespace eval` is the canonical way to
-    // establish it (same pattern vivado-cmd's `log.htcl` uses).
+    // Family constructors + top proc + sub-procs ship INSIDE
+    // `namespace eval <ip> { … }` with bare names. The bare names
+    // become qualified via the enclosing namespace at load time
+    // (`create` → `<ip>::create`, `mac_port` → `<ip>::mac_port`),
+    // and this is the shape vivado-cmd's `log.htcl` / `ip.htcl`
+    // use idiomatically.
     let mut procs = String::new();
 
     // Family constructors.
@@ -932,16 +937,16 @@ fn emit_arg_decl_family(
 }
 
 /// Emit the newtype declaration and its `from`/`to`/`repr`/`empty`
-/// helper procs for one family. The whole block sits inside a
-/// `namespace eval <ip> { … }` because the htcl validator only
-/// accepts qualified type names (like `dcmac::GtChProps`) as the
-/// first-argument annotation of an overloaded handler proc — it
-/// refuses them as return types or generic arguments. Declaring
-/// the type and its helpers with BARE names inside `namespace eval
-/// dcmac { … }` lets the rest of the file reference them via the
-/// `dcmac::` prefix without hitting that rule. The whole block sits inside a
-/// `namespace eval <ip>::<StemProps> { … }` because the `type` decl
-/// plus per-op procs share the newtype's namespace.
+/// helper procs for one family. Called from inside a
+/// `namespace eval <ip> { … }` block, so identifiers use their
+/// TOP-LEVEL forms — this fn is called at file top level, NOT
+/// inside `namespace eval <ip> { … }`. Reason: the analyzer
+/// double-prefixes qualified proc names declared inside a matching
+/// namespace-eval block (`proc <ip>::T::from` inside
+/// `namespace eval <ip> { … }` becomes `<ip>::<ip>::T::from`), so
+/// external references never resolve. Keeping the newtype block at
+/// top level with fully-qualified names avoids that. Legal thanks
+/// to this slice's `validate::reject_nested_qualified` update.
 fn emit_family_prelude(out: &mut String, ip_name: &str, f: &IndexedFamily<'_>) {
     let stem_props = stem_props_name(ip_name, &f.stem);
     let stem_lower = lowercase_ident(&f.stem);
@@ -951,11 +956,12 @@ fn emit_family_prelude(out: &mut String, ip_name: &str, f: &IndexedFamily<'_>) {
          [{ip_name}::create].",
     )
     .unwrap();
-    // Tcl requires the target namespace to exist before a
-    // qualified proc name (`X::y`) can be declared. Same rule as
-    // vivado-cmd's `namespace eval bd_cell {}` prelude at
-    // types.htcl:28 — establish the namespace with an empty
-    // eval, then declare the type and its helper procs.
+    // Tcl requires the target namespace to exist before qualified
+    // proc names like `<ip>::<StemProps>::from` are legal. Nested
+    // `namespace eval` calls establish the whole chain. The outer
+    // `namespace eval <ip> {}` shape is idempotent — the proc-block
+    // emitted below re-enters the same namespace.
+    writeln!(out, "namespace eval {ip_name} {{}}").unwrap();
     writeln!(out, "namespace eval {stem_props} {{}}").unwrap();
     writeln!(out, "type {stem_props} = Properties").unwrap();
     writeln!(
@@ -1079,19 +1085,23 @@ fn stem_index_label(stem: &str, idx: u32) -> String {
     format!("{stem}{idx}")
 }
 
-/// PascalCase newtype name from IP-name + uppercase-with-underscores
-/// stem. `("dcmac", "MAC_PORT")` → `"DcmacMacPortProps"`.
+/// Fully-qualified newtype name from IP-name + uppercase-with-
+/// underscores stem. `("dcmac", "MAC_PORT")` → `"dcmac::MacPortProps"`.
 ///
-/// The IP-name prefix is a workaround for the current htcl language
-/// limitation that qualified type names (`dcmac::MacPortProps`)
-/// can't appear as return types on newtype-helper procs — the
-/// language accepts them only in overload-handler first-arg
-/// positions. Flat IP-prefixed names give us per-IP uniqueness
-/// without hitting that restriction. When the analyzer grows
-/// support for fully-qualified newtypes we can drop the prefix
-/// and namespace these under `<ip>::`.
+/// Namespaced under the IP so `dcmac::` completion surfaces the
+/// type alongside the constructor and top proc. Requires
+/// vw-htcl's validator to accept qualified newtype names (landed
+/// as part of this slice — see `validate::reject_nested_qualified`).
 fn stem_props_name(ip_name: &str, stem: &str) -> String {
-    let mut out = pascal_case(ip_name);
+    format!("{ip_name}::{}", stem_props_local(stem))
+}
+
+/// Local (unqualified) newtype segment — the PascalCase stem +
+/// `Props`. Used inside `namespace eval <ip> { … }` where bare
+/// names are preferred; the outer emission builds the qualified
+/// form via [`stem_props_name`].
+fn stem_props_local(stem: &str) -> String {
+    let mut out = String::new();
     for seg in stem.split('_').filter(|s| !s.is_empty()) {
         out.push_str(&pascal_case(seg));
     }

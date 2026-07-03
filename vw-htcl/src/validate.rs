@@ -133,7 +133,13 @@ pub fn validate_with_all_extras<'doc>(
     }
     validate_type_decl_triplets(&type_table, &table, &mut diags);
     validate_enum_decls(&enum_table, &type_table, &mut diags);
-    validate_qualified_positions(document, &mut diags);
+    // Set of every declared newtype's qualified name — passed to
+    // the qualified-position validator so `Qualified` references
+    // that resolve to a real newtype pass through instead of
+    // hitting the enum-variant-focused reject.
+    let newtype_names: std::collections::HashSet<String> =
+        type_table.keys().cloned().collect();
+    validate_qualified_positions(document, &newtype_names, &mut diags);
     validate_stmts(&document.stmts, source, &table, &mut diags);
     // Warning-level pass: unused-variable check. Runs last so the
     // hard-error diagnostics keep priority visually and any short-
@@ -740,13 +746,23 @@ fn validate_enum_decls(
 /// Walk the document and reject [`TypeExpr::Qualified`] anywhere
 /// other than as a proc's first-arg type annotation. Qualified
 /// types (`E::V`) are only meaningful as overload-dispatch
-/// indicators; they're nonsense as return types, generic args,
-/// nested type positions, or any non-first-arg slot.
+/// indicators unless they resolve to a declared newtype — those
+/// pass through as regular namespaced type references.
+///
+/// `newtype_names` carries the qualified names of every declared
+/// newtype in the document (built via
+/// [`build_type_decl_table`]); it's the disambiguator between
+/// enum-variant refs and namespaced newtype refs.
 fn validate_qualified_positions(
     document: &Document,
+    newtype_names: &std::collections::HashSet<String>,
     diags: &mut Vec<Diagnostic>,
 ) {
-    fn walk_stmts(stmts: &[Stmt], diags: &mut Vec<Diagnostic>) {
+    fn walk_stmts(
+        stmts: &[Stmt],
+        newtype_names: &std::collections::HashSet<String>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
         for stmt in stmts {
             let Stmt::Command(cmd) = stmt else { continue };
             match &cmd.kind {
@@ -755,33 +771,51 @@ fn validate_qualified_positions(
                         for (i, arg) in sig.args.iter().enumerate() {
                             if let Some(ty) = arg.type_annotation.as_ref() {
                                 // The first arg may be Qualified;
-                                // tail args may NOT.
+                                // tail args may NOT (unless a
+                                // known-newtype ref, handled by the
+                                // reject fn itself).
                                 let allow_qualified = i == 0;
                                 reject_nested_qualified(
                                     ty,
                                     allow_qualified,
+                                    newtype_names,
                                     diags,
                                 );
                             }
                         }
                         if let Some(ret) = sig.return_type.as_ref() {
-                            reject_nested_qualified(ret, false, diags);
+                            reject_nested_qualified(
+                                ret,
+                                false,
+                                newtype_names,
+                                diags,
+                            );
                         }
                     }
-                    walk_stmts(&proc.body, diags);
+                    walk_stmts(&proc.body, newtype_names, diags);
                 }
                 CommandKind::NamespaceEval(ns) => {
-                    walk_stmts(&ns.body, diags);
+                    walk_stmts(&ns.body, newtype_names, diags);
                 }
                 CommandKind::TypeDecl(td) => {
                     if let Some(ty) = td.underlying.as_ref() {
-                        reject_nested_qualified(ty, false, diags);
+                        reject_nested_qualified(
+                            ty,
+                            false,
+                            newtype_names,
+                            diags,
+                        );
                     }
                 }
                 CommandKind::EnumDecl(ed) => {
                     for v in &ed.variants {
                         if let Some(ty) = v.payload.as_ref() {
-                            reject_nested_qualified(ty, false, diags);
+                            reject_nested_qualified(
+                                ty,
+                                false,
+                                newtype_names,
+                                diags,
+                            );
                         }
                     }
                 }
@@ -789,20 +823,23 @@ fn validate_qualified_positions(
             }
         }
     }
-    walk_stmts(&document.stmts, diags);
+    walk_stmts(&document.stmts, newtype_names, diags);
 }
 
 fn reject_nested_qualified(
     ty: &TypeExpr,
     allow_top_qualified: bool,
+    newtype_names: &std::collections::HashSet<String>,
     diags: &mut Vec<Diagnostic>,
 ) {
     match ty {
         TypeExpr::Named { .. } => {}
         TypeExpr::Generic { args, .. } => {
-            // Inside a generic, nested Qualified is never allowed.
+            // Inside a generic, nested Qualified is never allowed —
+            // except for known-newtype references, which are just
+            // namespaced type names.
             for a in args {
-                reject_nested_qualified(a, false, diags);
+                reject_nested_qualified(a, false, newtype_names, diags);
             }
         }
         TypeExpr::Qualified {
@@ -811,6 +848,14 @@ fn reject_nested_qualified(
             span,
             ..
         } => {
+            // A qualified name that resolves to a declared newtype
+            // is a regular namespaced type reference — legal
+            // wherever a Named type is legal, including return
+            // types and generic args.
+            let qualified = format!("{namespace}::{variant}");
+            if newtype_names.contains(&qualified) {
+                return;
+            }
             if !allow_top_qualified {
                 diags.push(Diagnostic {
                     severity: Severity::Error,
@@ -933,16 +978,20 @@ fn validate_type_decl_triplets(
             if let (Some(actual), Some(want_name)) =
                 (sig.return_type.as_ref(), expected_ret)
             {
+                // Compare on the identifier's name. For Qualified
+                // (namespaced newtype refs like `dcmac::GtChProps`)
+                // we join the parts so the compare matches the
+                // qualified-name key `want_name` carries.
+                let actual_name_owned: String;
                 let actual_name = match actual {
                     TypeExpr::Named { name, .. } => name.as_str(),
                     TypeExpr::Generic { name, .. } => name.as_str(),
-                    // A qualified type like `E::V` shouldn't appear
-                    // as a newtype's return type — that's caught by
-                    // the dedicated Qualified-position validator
-                    // step. If it slips through, render the
-                    // namespace name so the user sees something
-                    // meaningful in the diagnostic.
-                    TypeExpr::Qualified { namespace, .. } => namespace.as_str(),
+                    TypeExpr::Qualified {
+                        namespace, variant, ..
+                    } => {
+                        actual_name_owned = format!("{namespace}::{variant}");
+                        actual_name_owned.as_str()
+                    }
                 };
                 if actual_name != *want_name {
                     diags.push(Diagnostic {
@@ -971,6 +1020,13 @@ fn named_lit(name: &str) -> crate::ast::TypeExpr {
 }
 
 /// Structural equality on type expressions, ignoring spans.
+///
+/// `Qualified { ns, var }` is treated as equivalent to
+/// `Named { name: "ns::var" }` — the two forms describe the same
+/// identifier and callers that need to compare an ast-parsed
+/// annotation against a synthetic Named expected type (e.g.
+/// `named_lit(qualified_name)` inside newtype-triplet validation)
+/// shouldn't see a spurious mismatch.
 fn types_match(a: &crate::ast::TypeExpr, b: &crate::ast::TypeExpr) -> bool {
     use crate::ast::TypeExpr;
     match (a, b) {
@@ -990,6 +1046,33 @@ fn types_match(a: &crate::ast::TypeExpr, b: &crate::ast::TypeExpr) -> bool {
                 && aa.len() == ba.len()
                 && aa.iter().zip(ba.iter()).all(|(x, y)| types_match(x, y))
         }
+        // Cross-form equivalence for qualified newtype references
+        // (`dcmac::GtChProps` on one side, `Named("dcmac::GtChProps")`
+        // on the other). Commutative.
+        (
+            TypeExpr::Qualified {
+                namespace, variant, ..
+            },
+            TypeExpr::Named { name, .. },
+        )
+        | (
+            TypeExpr::Named { name, .. },
+            TypeExpr::Qualified {
+                namespace, variant, ..
+            },
+        ) => *name == format!("{namespace}::{variant}"),
+        (
+            TypeExpr::Qualified {
+                namespace: ans,
+                variant: av,
+                ..
+            },
+            TypeExpr::Qualified {
+                namespace: bns,
+                variant: bv,
+                ..
+            },
+        ) => ans == bns && av == bv,
         _ => false,
     }
 }
@@ -2459,6 +2542,60 @@ proc bad {x: list<E::A>} { }\n";
         assert!(
             d.iter().any(|d| d.severity == Severity::Error
                 && d.message.contains("qualified")),
+            "got: {:?}",
+            d
+        );
+    }
+
+    /// A qualified name that resolves to a declared newtype
+    /// (`dcmac::GtChProps`) is legal wherever a Named type is
+    /// legal — including return-type slots on the newtype's own
+    /// `from`/`empty` helpers.
+    #[test]
+    fn namespaced_newtype_return_type_allowed() {
+        let src = "\
+namespace eval dcmac {}\n\
+namespace eval dcmac::T {}\n\
+type dcmac::T = string\n\
+proc dcmac::T::repr {v: dcmac::T} string { return $v }\n\
+proc dcmac::T::from {v: string} dcmac::T { return $v }\n\
+proc dcmac::T::to {v: dcmac::T} string { return $v }\n";
+        let d = diags(src);
+        let errs: Vec<_> =
+            d.iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    /// A namespaced newtype used as a tail-arg type annotation
+    /// (non-first-arg position, previously ruled out for
+    /// Qualified) passes when the name resolves to a real newtype.
+    #[test]
+    fn namespaced_newtype_tail_arg_allowed() {
+        let src = "\
+namespace eval dcmac {}\n\
+namespace eval dcmac::T {}\n\
+type dcmac::T = string\n\
+proc dcmac::T::repr {v: dcmac::T} string { return $v }\n\
+proc dcmac::T::from {v: string} dcmac::T { return $v }\n\
+proc dcmac::T::to {v: dcmac::T} string { return $v }\n\
+proc use {name slot: dcmac::T} string { return $slot }\n";
+        let d = diags(src);
+        let errs: Vec<_> =
+            d.iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    /// Unknown qualified names (no matching `type` decl) still
+    /// get rejected — the disambiguator only clears names that
+    /// resolve to a real newtype.
+    #[test]
+    fn unknown_qualified_still_rejected() {
+        let src = "proc bad {name} Unknown::Thing { return $name }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("qualified")
+                && d.message.contains("only legal")),
             "got: {:?}",
             d
         );

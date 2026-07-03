@@ -67,16 +67,15 @@ pub fn mangle(ty: &TypeExpr) -> String {
         TypeExpr::Qualified {
             namespace, variant, ..
         } => {
-            // Qualified types (`Enum::Variant`) are only legal as
-            // the dispatch-arg annotation on an overloaded handler
-            // — the validator rejects them anywhere else, so
-            // codegen should never see one at a value position. If
-            // we hit this it's a validator bug.
-            panic!(
-                "internal error: TypeExpr::Qualified `{namespace}::{variant}` \
-                 reached codegen at a value position — validator should have \
-                 rejected this"
-            );
+            // Qualified names that reached codegen at a value
+            // position resolve to a namespaced newtype — the
+            // validator has already verified the name refers to a
+            // declared `type ns::T = …`. Enum-variant Qualifieds
+            // never flow here (they're only legal as the dispatch
+            // first-arg annotation, which mangling doesn't touch).
+            // Mangle by joining with `::` so the resulting Tcl
+            // proc name matches the newtype's declared namespace.
+            format!("{namespace}::{variant}")
         }
     }
 }
@@ -465,12 +464,18 @@ fn emit_recursive(
         TypeExpr::Qualified {
             namespace, variant, ..
         } => {
-            // Mirror of `mangle`'s guard — Qualified types must
-            // not reach codegen at a value position.
-            panic!(
-                "internal error: TypeExpr::Qualified `{namespace}::{variant}` \
-                 reached emit_recursive — validator should have rejected this"
-            );
+            // Namespaced newtype reference (`dcmac::GtChProps` and
+            // friends). Look up by the joined qualified name — the
+            // types table is keyed exactly that way (see
+            // `validate::build_type_decl_table`). If found and its
+            // underlying is a generic, recurse so the generic's
+            // monomorphized repr ships alongside.
+            let qualified = format!("{namespace}::{variant}");
+            if let Some(decl) = types.get(qualified.as_str()) {
+                if let Some(underlying) = decl.underlying.as_ref() {
+                    emit_recursive(underlying, out, seen, types);
+                }
+            }
         }
     }
 }

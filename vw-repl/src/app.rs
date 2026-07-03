@@ -3040,6 +3040,15 @@ fn hover_target_to_popup(
             let body = format!("{{ {} }}", variants.join("; "));
             (title, body)
         }
+        HoverTarget::TypeDef { decl, .. } => {
+            let name = decl.name.clone()?;
+            let title = format!("type {name}");
+            let body = match decl.underlying.as_ref() {
+                Some(ty) => format!("= {}", render_type(ty)),
+                None => String::new(),
+            };
+            (title, body)
+        }
     };
     Some(crate::popup::HoverPopup {
         title,

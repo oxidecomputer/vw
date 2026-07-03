@@ -15,7 +15,10 @@ use crate::ast::{
     WordForm, WordPart,
 };
 use crate::lower::{signature_table, SignatureTable};
-use crate::scope::{innermost_scope, resolve_var_def, scan_var_ref, VarDef};
+use crate::scope::{
+    find_type_decl, innermost_scope, resolve_var_def, scan_var_ref,
+    type_expr_at, type_expr_lookup_name, VarDef,
+};
 use crate::span::Span;
 
 /// A construct the cursor is on, plus the data needed to render
@@ -56,6 +59,14 @@ pub enum HoverTarget<'a> {
         decl: &'a crate::ast::EnumDecl,
         span: Span,
     },
+    /// Cursor is on a type name in a proc signature or type-decl
+    /// underlying — e.g. `MyNewtype` in `proc f {} MyNewtype { … }`
+    /// or `dcmac::MacPortProps` in `-port0: dcmac::MacPortProps`.
+    /// Resolves to a declared `type` in the document.
+    TypeDef {
+        decl: &'a crate::ast::TypeDecl,
+        span: Span,
+    },
 }
 
 impl HoverTarget<'_> {
@@ -66,7 +77,8 @@ impl HoverTarget<'_> {
             | HoverTarget::CallSite { span, .. }
             | HoverTarget::CallArg { span, .. }
             | HoverTarget::LocalVar { span, .. }
-            | HoverTarget::EnumDef { span, .. } => *span,
+            | HoverTarget::EnumDef { span, .. }
+            | HoverTarget::TypeDef { span, .. } => *span,
         }
     }
 }
@@ -88,6 +100,21 @@ pub fn hover_at<'a>(
         // Fallback: a `$var` reference — including one buried in opaque
         // text (a command substitution or `if`/`while` condition).
         .or_else(|| hover_scanned_var(document, source, offset))
+        // Fallback: cursor on a type-name annotation (arg type,
+        // return type, `type … = TYPE` underlying, generic arg).
+        .or_else(|| hover_of_type(document, offset))
+}
+
+/// Cursor on a type name → return a `TypeDef` hover target for the
+/// matching declaration. Mirror of [`crate::goto::definition_of_type`].
+fn hover_of_type(document: &Document, offset: u32) -> Option<HoverTarget<'_>> {
+    let ty = type_expr_at(document, offset)?;
+    let name = type_expr_lookup_name(ty);
+    let decl = find_type_decl(document, &name)?;
+    Some(HoverTarget::TypeDef {
+        decl,
+        span: ty.span(),
+    })
 }
 
 /// Hover for a `[NAME]` reference inside a `##` doc-comment block.

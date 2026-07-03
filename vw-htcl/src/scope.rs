@@ -18,7 +18,9 @@
 //!   substitution body, or an `if`/`while` condition), by reading the
 //!   raw source at the cursor and locating the enclosing proc by span.
 
-use crate::ast::{Command, CommandKind, Document, Proc, ProcArg, Stmt};
+use crate::ast::{
+    Command, CommandKind, Document, Proc, ProcArg, Stmt, TypeDecl, TypeExpr,
+};
 use crate::span::Span;
 
 /// What a `$name` reference resolves to.
@@ -167,6 +169,124 @@ pub fn scan_var_ref(source: &str, offset: u32) -> Option<(String, Span)> {
         return Some((name, Span::new((start - 2) as u32, (end + 1) as u32)));
     }
     None
+}
+
+/// Walk `document` and return the innermost [`TypeExpr`] whose
+/// span contains `offset`. Considers proc-signature arg
+/// annotations, proc return-type annotations, `type … = TYPE`
+/// underlying, and generic type arguments (recursively). Returns
+/// `None` when the cursor isn't on a type-expression position.
+pub fn type_expr_at(document: &Document, offset: u32) -> Option<&TypeExpr> {
+    fn inner(ty: &TypeExpr, offset: u32) -> Option<&TypeExpr> {
+        if !ty.span().contains(offset) {
+            return None;
+        }
+        // Recurse into generic args first so the innermost match wins.
+        if let TypeExpr::Generic { args, .. } = ty {
+            for a in args {
+                if let Some(hit) = inner(a, offset) {
+                    return Some(hit);
+                }
+            }
+        }
+        Some(ty)
+    }
+    fn walk(stmts: &[Stmt], offset: u32) -> Option<&TypeExpr> {
+        for stmt in stmts {
+            let Stmt::Command(cmd) = stmt else { continue };
+            if !cmd.span.contains(offset) {
+                continue;
+            }
+            match &cmd.kind {
+                CommandKind::Proc(proc) => {
+                    if let Some(sig) = &proc.signature {
+                        for arg in &sig.args {
+                            if let Some(ty) = arg.type_annotation.as_ref() {
+                                if let Some(hit) = inner(ty, offset) {
+                                    return Some(hit);
+                                }
+                            }
+                        }
+                        if let Some(ret) = sig.return_type.as_ref() {
+                            if let Some(hit) = inner(ret, offset) {
+                                return Some(hit);
+                            }
+                        }
+                    }
+                    if let Some(hit) = walk(&proc.body, offset) {
+                        return Some(hit);
+                    }
+                }
+                CommandKind::TypeDecl(td) => {
+                    if let Some(ty) = td.underlying.as_ref() {
+                        if let Some(hit) = inner(ty, offset) {
+                            return Some(hit);
+                        }
+                    }
+                }
+                CommandKind::NamespaceEval(ns) => {
+                    if let Some(hit) = walk(&ns.body, offset) {
+                        return Some(hit);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    walk(&document.stmts, offset)
+}
+
+/// Find a top-level `type NAME = …` declaration whose name matches
+/// `name`. Handles bare and qualified forms — a caller looking up
+/// `dcmac::MacPortProps` and one looking up `Properties` both hit
+/// the right decl since parser stores the raw textual name.
+pub fn find_type_decl<'a>(
+    document: &'a Document,
+    name: &str,
+) -> Option<&'a TypeDecl> {
+    fn walk<'a>(stmts: &'a [Stmt], name: &str) -> Option<&'a TypeDecl> {
+        for stmt in stmts {
+            let Stmt::Command(cmd) = stmt else { continue };
+            match &cmd.kind {
+                CommandKind::TypeDecl(td)
+                    if td.name.as_deref() == Some(name) =>
+                {
+                    return Some(td);
+                }
+                CommandKind::NamespaceEval(ns) => {
+                    if let Some(hit) = walk(&ns.body, name) {
+                        return Some(hit);
+                    }
+                }
+                CommandKind::Proc(proc) => {
+                    // Types can also be declared inside a proc body
+                    // in principle (though rare). Search anyway.
+                    if let Some(hit) = walk(&proc.body, name) {
+                        return Some(hit);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    walk(&document.stmts, name)
+}
+
+/// Extract the qualified/bare identifier a [`TypeExpr`] references,
+/// suitable for [`find_type_decl`] lookup. Returns the joined
+/// `"namespace::variant"` for [`TypeExpr::Qualified`], and the raw
+/// `name` field for the other two shapes.
+pub fn type_expr_lookup_name(ty: &TypeExpr) -> String {
+    match ty {
+        TypeExpr::Named { name, .. } | TypeExpr::Generic { name, .. } => {
+            name.clone()
+        }
+        TypeExpr::Qualified {
+            namespace, variant, ..
+        } => format!("{namespace}::{variant}"),
+    }
 }
 
 #[cfg(test)]

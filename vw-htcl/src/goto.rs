@@ -22,7 +22,10 @@ use crate::ast::{
     ProcSignature, Stmt, WordForm, WordPart,
 };
 use crate::lower::{signature_table, SignatureTable};
-use crate::scope::{innermost_scope, resolve_var_def, scan_var_ref};
+use crate::scope::{
+    find_type_decl, innermost_scope, resolve_var_def, scan_var_ref,
+    type_expr_at, type_expr_lookup_name,
+};
 use crate::span::Span;
 
 pub fn definition_at(
@@ -45,6 +48,20 @@ pub fn definition_at(
         // scanning the source and resolving against the enclosing
         // proc's scope.
         .or_else(|| definition_of_scanned_var(document, source, offset))
+        // Fallback: cursor on a type-name annotation (arg type,
+        // return type, `type … = TYPE` underlying, generic arg).
+        .or_else(|| definition_of_type(document, offset))
+}
+
+/// Cursor on a type name in a proc signature or a `type` decl's
+/// underlying → return the matching type declaration's name span.
+/// Handles qualified names (`dcmac::MacPortProps`) via the parser's
+/// `Qualified` variant plus the type-table lookup helper.
+fn definition_of_type(document: &Document, offset: u32) -> Option<Span> {
+    let ty = type_expr_at(document, offset)?;
+    let name = type_expr_lookup_name(ty);
+    let decl = find_type_decl(document, &name)?;
+    Some(decl.name_span)
 }
 
 /// Resolve a `[NAME]` reference embedded in a `##` doc-comment
@@ -850,5 +867,71 @@ proc target {} { puts hi }
         // inside a `[…]`.
         let pos = first(src, "prose");
         assert!(definition_at(&parsed.document, src, pos).is_none());
+    }
+
+    /// Goto on a return-type annotation resolves to the `type` decl.
+    #[test]
+    fn goto_on_return_type_finds_type_decl() {
+        let src = "\
+type MyProps = string
+proc use {name} MyProps { return $name }
+";
+        let parsed = parse(src);
+        // Cursor on `MyProps` in the return-type slot (2nd occurrence).
+        let pos = nth(src, "MyProps", 1);
+        let target = definition_at(&parsed.document, src, pos).unwrap();
+        let expected = parsed
+            .document
+            .stmts
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Command(c) => match &c.kind {
+                    CommandKind::TypeDecl(td)
+                        if td.name.as_deref() == Some("MyProps") =>
+                    {
+                        Some(td.name_span)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(target, expected);
+    }
+
+    /// Goto on a qualified type name (`dcmac::MacPortProps`) resolves
+    /// to the declaration when the type_table key matches.
+    #[test]
+    fn goto_on_qualified_type_finds_decl() {
+        let src = "\
+namespace eval dcmac {}
+namespace eval dcmac::T {}
+type dcmac::T = string
+proc dcmac::T::from {v: string} dcmac::T { return $v }
+proc dcmac::T::to {v: dcmac::T} string { return $v }
+proc dcmac::T::repr {v: dcmac::T} string { return $v }
+proc use {port0: dcmac::T} string { return $port0 }
+";
+        let parsed = parse(src);
+        // Cursor on `T` inside `port0: dcmac::T` (the last occurrence).
+        let pos = src.rfind("dcmac::T").unwrap() as u32 + 7; // land on `T`
+        let target = definition_at(&parsed.document, src, pos).unwrap();
+        let expected = parsed
+            .document
+            .stmts
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Command(c) => match &c.kind {
+                    CommandKind::TypeDecl(td)
+                        if td.name.as_deref() == Some("dcmac::T") =>
+                    {
+                        Some(td.name_span)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(target, expected);
     }
 }

@@ -735,7 +735,20 @@ fn format_hover(target: &HoverTarget, proc_doc_comments: &[String]) -> String {
         | HoverTarget::CallArg { arg, .. } => format_arg(arg),
         HoverTarget::LocalVar { name, .. } => format_local_var(name),
         HoverTarget::EnumDef { decl, .. } => format_enum(decl),
+        HoverTarget::TypeDef { decl, .. } => format_type_def(decl),
     }
+}
+
+fn format_type_def(decl: &vw_htcl::TypeDecl) -> String {
+    let name = decl.name.as_deref().unwrap_or("<type>");
+    let mut out = String::new();
+    writeln!(out, "```htcl").unwrap();
+    match decl.underlying.as_ref() {
+        Some(ty) => writeln!(out, "type {name} = {}", render_type(ty)).unwrap(),
+        None => writeln!(out, "type {name} = <unresolved>").unwrap(),
+    }
+    writeln!(out, "```").unwrap();
+    out
 }
 
 fn format_enum(decl: &vw_htcl::EnumDecl) -> String {
@@ -1857,6 +1870,51 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
             hover.is_some(),
             "hover against real htcl tree returned None \
              for cpm5/module.htcl:{line}:{character}"
+        );
+    }
+
+    /// Hover + goto on a namespaced newtype (`dcmac::MacPortProps`)
+    /// used as a return-type annotation resolve to the type
+    /// declaration. Guards the analyzer's type-annotation path
+    /// against regressions and validates end-to-end with a real
+    /// generated wrapper.
+    #[tokio::test]
+    async fn hover_goto_on_namespaced_newtype_return_type() {
+        let dcmac_module =
+            std::path::PathBuf::from("/home/ry/src/htcl/amd/dcmac/module.htcl");
+        if !dcmac_module.exists() {
+            return;
+        }
+        let backend = HtclBackend::new();
+        let dcmac_uri = Url::from_file_path(&dcmac_module).unwrap();
+        let text = std::fs::read_to_string(&dcmac_module).unwrap();
+        backend.set_text(dcmac_uri.clone(), text.clone()).await;
+        // Find a real type-annotation site (arg-type slot on
+        // `MacPortProps::from` etc.) — not the `namespace eval
+        // dcmac::MacPortProps {}` word, which passes the string as
+        // a namespace name rather than a type annotation.
+        let target = text.lines().enumerate().find_map(|(i, line)| {
+            line.find(": dcmac::MacPortProps")
+                .map(|col| (i as u32, (col + 9) as u32))
+        });
+        let Some((line, character)) = target else {
+            panic!("no `: dcmac::MacPortProps` in dcmac/module.htcl");
+        };
+        let hover = backend
+            .hover(&dcmac_uri, Position { line, character })
+            .await;
+        assert!(
+            hover.is_some(),
+            "hover on `dcmac::MacPortProps` at line {line}:{character} \
+             returned None — type-annotation path not wired"
+        );
+        let locs = backend
+            .goto_definition(&dcmac_uri, Position { line, character })
+            .await;
+        assert!(
+            !locs.is_empty(),
+            "goto on `dcmac::MacPortProps` at line {line}:{character} \
+             returned no locations"
         );
     }
 
