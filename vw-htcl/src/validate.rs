@@ -141,6 +141,10 @@ pub fn validate_with_all_extras<'doc>(
         type_table.keys().cloned().collect();
     validate_qualified_positions(document, &newtype_names, &mut diags);
     validate_stmts(&document.stmts, source, &table, &mut diags);
+    // Undefined-variable check. Errors (fail `vw check` / red LSP
+    // squiggle), mirror shape to unused-var pass but with the
+    // set-operation flipped.
+    crate::undefined::validate_undefined_vars(document, source, &mut diags);
     // Warning-level pass: unused-variable check. Runs last so the
     // hard-error diagnostics keep priority visually and any short-
     // circuit in earlier passes is unaffected by the walk here.
@@ -1685,18 +1689,21 @@ mod tests {
             "unexpected parse errors: {:?}",
             parsed.errors
         );
-        // Filter out unused-variable warnings. This module tests
-        // the arg / type / enum / qualified-position validators;
-        // fixtures typically declare test-only procs with unused
-        // args, and the unused-var pass would otherwise flood every
-        // test result with warnings unrelated to what it asserts.
-        // The unused-var pass has its own tests in `unused::tests`.
+        // Filter out unused-variable warnings AND undefined-variable
+        // errors. This module tests the arg / type / enum /
+        // qualified-position validators; fixtures typically declare
+        // test-only procs with unused args and reference free vars
+        // to keep the snippets short. The unused / undefined passes
+        // have their own tests in `unused::tests` / `undefined::tests`.
         validate(&parsed.document, src)
             .into_iter()
             .filter(|d| {
-                !(d.severity == Severity::Warning
+                let unused = d.severity == Severity::Warning
                     && (d.message.starts_with("unused proc arg ")
-                        || d.message.starts_with("unused local ")))
+                        || d.message.starts_with("unused local "));
+                let undefined = d.severity == Severity::Error
+                    && d.message.starts_with("undefined variable ");
+                !(unused || undefined)
             })
             .collect()
     }

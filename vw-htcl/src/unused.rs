@@ -27,7 +27,7 @@ use crate::validate::{Diagnostic, Severity};
 
 /// Kind of local binding — drives the diagnostic message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeclKind {
+pub(crate) enum DeclKind {
     ProcArg,
     Set,
     ForeachVar,
@@ -36,9 +36,9 @@ enum DeclKind {
 
 /// Where a name was declared and by what construct.
 #[derive(Clone, Copy, Debug)]
-struct DeclSite {
-    span: Span,
-    kind: DeclKind,
+pub(crate) struct DeclSite {
+    pub(crate) span: Span,
+    pub(crate) kind: DeclKind,
 }
 
 /// Top-level entry. Walks the document as one scope (for top-level
@@ -66,7 +66,7 @@ fn walk_scope(stmts: &[Stmt], source: &str, diags: &mut Vec<Diagnostic>) {
     let mut uses: HashSet<String> = HashSet::new();
     for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
-        collect_decls(cmd, &mut decls);
+        collect_decls(cmd, source, &mut decls);
         collect_uses_in_command(cmd, source, &mut uses);
     }
     if !scope_is_leaked(stmts, source) {
@@ -93,7 +93,7 @@ fn walk_scope(stmts: &[Stmt], source: &str, diags: &mut Vec<Diagnostic>) {
 /// Scans this scope's statements plus any brace-body interiors
 /// that Slice 2's reparse would walk — same-frame constructs
 /// (`if`/`while`/etc.) can leak from inside their bodies too.
-fn scope_is_leaked(stmts: &[Stmt], source: &str) -> bool {
+pub(crate) fn scope_is_leaked(stmts: &[Stmt], source: &str) -> bool {
     for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
         if command_leaks(cmd) {
@@ -152,7 +152,7 @@ fn command_leaks(cmd: &Command) -> bool {
 
 /// True when `word` isn't a pure literal (contains a `$var` or
 /// `[…]` substitution).
-fn word_is_dynamic(word: &Word) -> bool {
+pub(crate) fn word_is_dynamic(word: &Word) -> bool {
     word.parts.iter().any(|p| {
         matches!(p, WordPart::VarRef { .. } | WordPart::CmdSubst { .. })
     })
@@ -180,7 +180,7 @@ fn descend_scopes(cmd: &Command, source: &str, diags: &mut Vec<Diagnostic>) {
             }
             for stmt in &proc.body {
                 let Stmt::Command(inner) = stmt else { continue };
-                collect_decls(inner, &mut decls);
+                collect_decls(inner, source, &mut decls);
                 collect_uses_in_command(inner, source, &mut uses);
             }
             if !scope_is_leaked(&proc.body, source) {
@@ -208,7 +208,18 @@ fn descend_scopes(cmd: &Command, source: &str, diags: &mut Vec<Diagnostic>) {
 ///   *enclosing* scope's frame per Tcl semantics — a `foreach x $list
 ///   {}` binding is visible after the loop returns. That means adding
 ///   the iterator to the same scope's decl map is correct.
-fn collect_decls(cmd: &Command, decls: &mut HashMap<String, DeclSite>) {
+///
+/// **Recursion into body-hosts.** Tcl's `if`/`while`/`for`/`foreach`/
+/// `catch`/`try` bodies run in the enclosing frame — a `set foo …`
+/// inside `if { … } { … }` binds `foo` in the outer scope. So we
+/// reparse each braced-body argument of a body-host and recurse.
+/// Only `proc` and `namespace eval` bodies open fresh frames; those
+/// are handled by [`descend_scopes`], not here.
+pub(crate) fn collect_decls(
+    cmd: &Command,
+    source: &str,
+    decls: &mut HashMap<String, DeclSite>,
+) {
     match &cmd.kind {
         CommandKind::Set => {
             // 2-word `set` is a read (`set foo` returns $foo). Only
@@ -230,16 +241,56 @@ fn collect_decls(cmd: &Command, decls: &mut HashMap<String, DeclSite>) {
             });
         }
         CommandKind::Generic => {
-            let Some(head) = cmd.words.first().and_then(Word::as_text) else {
-                return;
-            };
-            match head {
-                "foreach" => collect_foreach_decls(cmd, decls),
-                "upvar" => collect_upvar_decls(cmd, decls),
-                _ => {}
+            // Head-based recognition. A command whose first word
+            // isn't a plain identifier (e.g. `[cmd-subst]`) has
+            // no head we can dispatch on — skip this stage, but
+            // fall through to the body-host and cmd-subst recursion
+            // below (which walk the WORDS regardless).
+            if let Some(head) = cmd.words.first().and_then(Word::as_text) {
+                match head {
+                    "foreach" => collect_foreach_decls(cmd, decls),
+                    "upvar" => collect_upvar_decls(cmd, decls),
+                    "catch" => collect_catch_decls(cmd, decls),
+                    "regexp" | "regsub" => collect_regexp_decls(cmd, decls),
+                    _ => {}
+                }
             }
         }
         _ => {}
+    }
+    // Body-host recursion: `if`/`while`/`foreach`/`for`/`catch`/`try`/…
+    // bodies run in the enclosing frame. Reparse each braced-body arg
+    // and recurse — a `set foo …` inside binds `foo` in this scope.
+    // Skip `proc` and `namespace eval` (they open fresh scopes).
+    if let Some(head) = cmd.words.first().and_then(Word::as_text) {
+        if is_body_host(head)
+            && !matches!(
+                &cmd.kind,
+                CommandKind::Proc(_) | CommandKind::NamespaceEval(_)
+            )
+        {
+            for word in cmd.words.iter().skip(1) {
+                if let Some(stmts) = reparse_braced_body(word, source) {
+                    for stmt in &stmts {
+                        let Stmt::Command(inner) = stmt else { continue };
+                        collect_decls(inner, source, decls);
+                    }
+                }
+            }
+        }
+    }
+    // Command-substitution recursion: `[set x 1]`, `if {[catch {…} n]} …`,
+    // and any other `[…]` embedded in a word runs in the enclosing
+    // frame. Its `set`/`catch`/`regexp`/… count as decls here.
+    for word in &cmd.words {
+        for part in &word.parts {
+            if let WordPart::CmdSubst { body, .. } = part {
+                for stmt in body {
+                    let Stmt::Command(inner) = stmt else { continue };
+                    collect_decls(inner, source, decls);
+                }
+            }
+        }
     }
 }
 
@@ -254,7 +305,10 @@ fn collect_decls(cmd: &Command, decls: &mut HashMap<String, DeclSite>) {
 /// they refer to an outer frame we can't see. Dynamic-remote form
 /// (`upvar $var local`) is fine: we can still see the *local* half
 /// literally as a decl.
-fn collect_upvar_decls(cmd: &Command, decls: &mut HashMap<String, DeclSite>) {
+pub(crate) fn collect_upvar_decls(
+    cmd: &Command,
+    decls: &mut HashMap<String, DeclSite>,
+) {
     let mut idx = 1;
     // Skip the optional LEVEL: bare numeric or `#`-prefixed.
     if let Some(w) = cmd.words.get(idx) {
@@ -279,6 +333,76 @@ fn collect_upvar_decls(cmd: &Command, decls: &mut HashMap<String, DeclSite>) {
     }
 }
 
+/// Extract the result-var and options-var names from a `catch`.
+///
+/// Syntax: `catch script ?resultVarName? ?optionsVarName?`. Both
+/// trailing args (when literal identifiers) are decls in the
+/// enclosing scope — catch runs the script in the current frame
+/// and stores the return value into `resultVarName`. Dynamic
+/// forms (`catch script $var`) are opaque; we skip them.
+pub(crate) fn collect_catch_decls(
+    cmd: &Command,
+    decls: &mut HashMap<String, DeclSite>,
+) {
+    // `catch script` (2 words) — no result var.
+    // `catch script name` (3 words) — name is result decl.
+    // `catch script name opts` (4 words) — both are decls.
+    for i in [2, 3] {
+        let Some(w) = cmd.words.get(i) else { break };
+        let Some(name) = w.as_text() else { continue };
+        decls.entry(name.to_string()).or_insert(DeclSite {
+            span: w.span,
+            kind: DeclKind::Set,
+        });
+    }
+}
+
+/// Extract capture-var names from a `regexp`/`regsub` command.
+///
+/// `regexp ?switches? pattern string ?matchVar? ?subVar ...?`
+/// Everything after the pattern + string that's a bare identifier
+/// becomes a capture-var decl in the enclosing scope. Switches
+/// (leading `-`) are skipped up to `--` or the first non-switch
+/// word; the switch/pattern boundary heuristic here is: the first
+/// non-`-` word is the pattern, the next is the string, and
+/// everything else is a capture-var. That's the standard Tcl
+/// shape; we skip precise switch-list parsing.
+///
+/// `regsub` shares the same trailing-vars shape (the last arg is
+/// the result-var).
+pub(crate) fn collect_regexp_decls(
+    cmd: &Command,
+    decls: &mut HashMap<String, DeclSite>,
+) {
+    // Skip the command word (index 0). Skip leading switches (any
+    // word beginning with `-` that isn't `--`). After the pattern
+    // + string, the rest are capture vars.
+    let mut i = 1;
+    while let Some(w) = cmd.words.get(i) {
+        let Some(t) = w.as_text() else { break };
+        if t == "--" {
+            i += 1;
+            break;
+        }
+        if !t.starts_with('-') {
+            break;
+        }
+        i += 1;
+    }
+    // i is now the pattern arg. Skip it + the string arg.
+    i += 2;
+    // Remaining words are capture-var names (bare identifiers).
+    while let Some(w) = cmd.words.get(i) {
+        if let Some(name) = w.as_text() {
+            decls.entry(name.to_string()).or_insert(DeclSite {
+                span: w.span,
+                kind: DeclKind::Set,
+            });
+        }
+        i += 1;
+    }
+}
+
 /// Extract the iterator variable(s) from a `foreach` command.
 /// `foreach var $list {…}` — single var at `words[1]`.
 /// `foreach {a b c} $list {…}` — multi-var brace list at `words[1]`
@@ -287,7 +411,10 @@ fn collect_upvar_decls(cmd: &Command, decls: &mut HashMap<String, DeclSite>) {
 /// starting at 1 as an iterator target: words[1], words[3], … up to
 /// `words.len() - 2` (last two words are the final list-value and
 /// the body).
-fn collect_foreach_decls(cmd: &Command, decls: &mut HashMap<String, DeclSite>) {
+pub(crate) fn collect_foreach_decls(
+    cmd: &Command,
+    decls: &mut HashMap<String, DeclSite>,
+) {
     if cmd.words.len() < 4 {
         // `foreach var list body` minimum. Malformed: give up
         // gracefully rather than emit a spurious decl.
@@ -342,7 +469,7 @@ fn add_foreach_target(target: &Word, decls: &mut HashMap<String, DeclSite>) {
 /// walked recursively — that reparse is what recovers false-
 /// negatives from Slice 1 (variables used inside `if { $x > 0 }
 /// { … }` etc.).
-fn collect_uses_in_command(
+pub(crate) fn collect_uses_in_command(
     cmd: &Command,
     source: &str,
     uses: &mut HashSet<String>,
@@ -384,16 +511,27 @@ fn collect_uses_in_command(
 /// fragment (same recipe as `hover_in_braced_bodies`). Returns
 /// `None` for non-braced words (`Bare`, `Quoted`) or when the
 /// interior isn't a single text part.
-fn reparse_braced_body(word: &Word, source: &str) -> Option<Vec<Stmt>> {
+pub(crate) fn reparse_braced_body(
+    word: &Word,
+    source: &str,
+) -> Option<Vec<Stmt>> {
     if word.form != WordForm::Braced {
         return None;
     }
     let WordPart::Text { value, span } = word.parts.first()? else {
         return None;
     };
+    // Body-host bodies (`if`/`while`/`foreach`/`for`/`catch`/`try`
+    // {…}) are Tcl SCRIPTS — newline is a statement separator, not
+    // whitespace. Reparse in `Mode::Toplevel` so each `set foo` /
+    // `puts $bar` / etc. lands as its own Command. Using BracketBody
+    // here would merge every statement into a single mega-command
+    // whose head is the first statement's head, causing both decl
+    // collection AND use collection to miss everything past the
+    // first statement (repros against port.htcl's `foreach` body).
     let (mut stmts, mut errs) = crate::parser::parse_fragment(
         value.as_str(),
-        crate::parser::Mode::BracketBody,
+        crate::parser::Mode::Toplevel,
     );
     let delta = span.start;
     for s in &mut stmts {

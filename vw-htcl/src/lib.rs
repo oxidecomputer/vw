@@ -46,6 +46,7 @@ pub mod signature_help;
 pub mod span;
 pub mod src_path;
 pub mod type_parse;
+pub mod undefined;
 pub mod unused;
 pub mod validate;
 
