@@ -612,6 +612,99 @@ proc ::vw::_wrap_nested {plain} {
     return $out
 }
 
+# `::vw::config_from_dotted_pairs {pairs}` — lift a flat paired-
+# list of `dotted.key raw-value` entries into a nested tagged
+# `Properties` value. Same transform `::vw::props_nested`
+# performs on `list_property` output — split each key on `.`,
+# insert at the resulting path in a plain nested dict, `_wrap_nested`
+# to tag intermediate levels, `_lift_value` to tag each leaf.
+#
+# The generated `<ip>::configure` procs call this in their bodies
+# to convert the assembled `_vw_d` (built by `lappend _vw_d
+# CONFIG.<PARAM> <value>` loops) into the proper `<ip>::Config`
+# shape: a Properties value where CONFIG at the top wraps a
+# `Property::Nested` containing every `<PARAM>` sub-key. Consumers
+# then use `dict get [<ip>::Config::to -v $cfg] CONFIG` +
+# `Property::as_nested -v ...` to extract the sub-tree, matching
+# the pattern `props::get` documents.
+proc ::vw::config_from_dotted_pairs {pairs} {
+    set plain [dict create]
+    foreach {name raw} $pairs {
+        set leaf [::vw::_lift_value $raw]
+        dict set plain {*}[split $name "."] $leaf
+    }
+    return [::vw::_wrap_nested $plain]
+}
+
+# `::vw::config_to_dotted_flat {nested}` — inverse of the lift.
+# Walks a nested tagged Properties tree and emits a flat paired
+# list `TOP.LEAF value TOP.LEAF value ...` matching the shape
+# Vivado's `set_property -dict` expects for an IP cell.
+#
+# **Depth invariant.** The generated `<ip>::configure` procs
+# always assemble `_vw_d` with keys of the form `CONFIG.<PARAM>`
+# (one dot at the top, two path segments). `Properties::from_
+# dotted_pairs` splits on `.` and inserts, producing a two-level
+# tagged structure: root → Nested-wrapped CONFIG → tagged entries
+# (one per Vivado property).
+#
+# So the flatten pairs off exactly two levels: iterate the root
+# dict for TOP keys (`CONFIG`), unwrap that Nested to get the
+# entries, then emit `TOP.LEAF = untag(value)` per entry. A Scalar
+# entry unwraps to its bare string. A Nested entry — e.g.
+# `CONFIG.CPM_CONFIG` where the caller passed a Properties value —
+# unwraps to its raw paired-list dict (recursively stripping any
+# further tags inside), which is what Vivado stores as the value
+# of a nested-dict property.
+#
+# Naively recursing past the two-level structure would emit
+# `CONFIG.CPM_CONFIG.CPM_PCIE0_MODES` which Vivado then rejects
+# with `[BD 41-1276] Cannot set the parameter … Parameter does
+# not exist`, since CPM_CONFIG is a single property (accepting a
+# nested dict value), not a namespace.
+proc ::vw::config_to_dotted_flat {nested} {
+    set out [list]
+    dict for {top_key top_val} $nested {
+        set top_tag [lindex $top_val 0]
+        set top_payload [lindex $top_val 1]
+        if {$top_tag ne "Nested"} {
+            # Unexpected shape at the root — configure-built Configs
+            # always wrap the top namespace as Nested via
+            # _wrap_nested. Emit under the raw key rather than
+            # silently drop.
+            lappend out $top_key [::vw::_untag_recursive $top_val]
+            continue
+        }
+        dict for {leaf_key leaf_val} $top_payload {
+            lappend out "$top_key.$leaf_key" \
+                [::vw::_untag_recursive $leaf_val]
+        }
+    }
+    return $out
+}
+
+# Recursively strip `Property::Scalar` / `Property::Nested` tags
+# from a tagged Properties value. Scalar returns its bare string.
+# Nested returns its inner dict with each value recursively
+# untagged. Used inside `config_to_dotted_flat` to convert a
+# Nested-typed property's tagged payload into the raw paired
+# dict Vivado expects as that property's value.
+proc ::vw::_untag_recursive {tagged} {
+    if {[llength $tagged] != 2} { return $tagged }
+    set tag [lindex $tagged 0]
+    set payload [lindex $tagged 1]
+    if {$tag eq "Scalar"} {
+        return $payload
+    } elseif {$tag eq "Nested"} {
+        set out [list]
+        dict for {k v} $payload {
+            lappend out $k [::vw::_untag_recursive $v]
+        }
+        return $out
+    }
+    return $tagged
+}
+
 # ---------- send_msg_id override ----------
 #
 # Why we override: when Vivado emits a WARNING/ERROR/INFO/CRITICAL

@@ -296,9 +296,12 @@ pub fn prepare_with_observer(
     for (name, td) in batch_type_decls {
         type_decl_table.insert(name, td);
     }
+    let newtype_names: std::collections::HashSet<String> =
+        type_decl_table.keys().cloned().collect();
     let (_full_sig_table, overload_table) =
         vw_htcl::build_signature_table_with_overloads(
             &parsed.document,
+            &newtype_names,
             &mut _ignored_diags,
         );
     for ed in enum_decl_table.values() {

@@ -1268,9 +1268,12 @@ async fn run_htcl(
         vw_htcl::build_enum_decl_table(&parsed.document, &mut _ignored);
     let type_decl_table =
         vw_htcl::build_type_decl_table(&parsed.document, &mut _ignored);
+    let type_decl_names: std::collections::HashSet<String> =
+        type_decl_table.keys().cloned().collect();
     let (full_sigs, overload_table) =
         vw_htcl::build_signature_table_with_overloads(
             &parsed.document,
+            &type_decl_names,
             &mut _ignored,
         );
     // Always ship the primitive prelude so user-written newtype

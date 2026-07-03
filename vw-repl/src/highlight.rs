@@ -92,7 +92,7 @@ fn parse_line(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
         return Ok(spans);
     }
     // Dict-entry line: KEY SP VALUE
-    let key = parse_ident(input)?;
+    let key = parse_dict_key(input)?;
     spans.push(Span::styled(key.to_string(), key_style()));
     let sp = take_while(1.., |c: char| c == ' ').parse_next(input)?;
     spans.push(Span::raw(sp.to_string()));
@@ -281,6 +281,38 @@ fn parse_ident<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
     }
 }
 
+/// Same as [`parse_ident`] but also accepts `.` in the middle —
+/// used for dict KEYS, not variant names. Vivado's property keys
+/// are `CONFIG.<PARAM>` style (a dot-composed namespace), so a
+/// `<ip>::Config`-style repr line like `CONFIG.CPM_PCIE0_MODES
+/// Scalar(None)` needs to accept the `.` as part of the key or
+/// the whole line fails to parse and falls back to plain rendering
+/// — which is what "the highlighter isn't working" looked like in
+/// practice. Variant names (`Scalar`, `Nested`, `Empty`, …) still
+/// use [`parse_ident`] so this stays confined to KEYS only.
+fn parse_dict_key<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
+    let ident = take_while(1.., |c: char| {
+        c.is_ascii_alphanumeric() || c == '_' || c == '.'
+    })
+    .parse_next(input)?;
+    match ident.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            // Reject leading dot / trailing dot / consecutive dots
+            // shape — those are structurally malformed keys, and
+            // accepting them would silently paint bogus prose.
+            if ident.starts_with('.')
+                || ident.ends_with('.')
+                || ident.contains("..")
+            {
+                Err(winnow::error::ErrMode::Backtrack(ContextError::new()))
+            } else {
+                Ok(ident)
+            }
+        }
+        _ => Err(winnow::error::ErrMode::Backtrack(ContextError::new())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +359,34 @@ mod tests {
         assert!(contents.contains(&"CONFIG"));
         assert!(contents.contains(&"Nested"));
         assert_eq!(spans.last().unwrap().content.as_ref(), "(");
+    }
+
+    /// The `<ip>::Config::repr` shape emits `CONFIG.<PARAM>
+    /// Scalar(value)` — a dot-composed Vivado property key. The
+    /// key parser has to accept dots or the whole line falls
+    /// through to unstyled plain text.
+    #[test]
+    fn dotted_config_key_parses() {
+        let spans = highlight_line("CONFIG.CPM_PCIE0_MODES Scalar(None)")
+            .expect("parses");
+        let contents: Vec<&str> =
+            spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            contents.contains(&"CONFIG.CPM_PCIE0_MODES"),
+            "dotted key not captured whole: {contents:?}"
+        );
+        assert!(contents.contains(&"Scalar"), "{contents:?}");
+        assert!(contents.contains(&"None"), "{contents:?}");
+    }
+
+    /// Consecutive-dot / leading-dot / trailing-dot keys are
+    /// rejected so genuine prose (`. Alignment ...`) doesn't
+    /// silently get repainted as a repr.
+    #[test]
+    fn malformed_dotted_key_rejected() {
+        assert!(highlight_line(".leading Scalar(x)").is_none());
+        assert!(highlight_line("trailing. Scalar(x)").is_none());
+        assert!(highlight_line("dou..ble Scalar(x)").is_none());
     }
 
     #[test]

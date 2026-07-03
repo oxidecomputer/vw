@@ -290,23 +290,13 @@ fn generate_single(
     )
     .unwrap();
 
-    let mut proc_doc = Doc::new();
-    proc_doc.push(Item::DocComment(
-        "Project-level IP module name, or (when `-bd 1`) the \
-         instance name in the block design."
-            .into(),
-    ));
-    proc_doc.push(Item::Command(Command::call(
-        "name",
-        std::iter::empty::<Word>(),
-    )));
-    push_bd_switch_arg(&mut proc_doc);
-    if !parameters.is_empty() {
-        proc_doc.push(Item::Blank);
-    }
+    // `configure`'s arg-doc — the whole documented kwarg pile.
+    // Same shape as the old inline-`create` version, minus the
+    // `-name` / `-bd` slots which are now `create`-only.
+    let mut configure_doc = Doc::new();
     for p in parameters {
         emit_arg_decl(
-            &mut proc_doc,
+            &mut configure_doc,
             component,
             presets,
             p,
@@ -317,18 +307,69 @@ fn generate_single(
         );
     }
 
+    // `create`'s arg-doc — the narrow surface. Just the
+    // instantiation-mode args + a single typed `-config`.
+    let mut create_doc = Doc::new();
+    create_doc.push(Item::DocComment(
+        "Project-level IP module name, or (when `-bd 1`) the \
+         instance name in the block design."
+            .into(),
+    ));
+    create_doc.push(Item::Command(Command::call(
+        "name",
+        std::iter::empty::<Word>(),
+    )));
+    push_bd_switch_arg(&mut create_doc);
+    create_doc.push(Item::DocComment(format!(
+        "Typed configuration value. Construct with [{ip_name}::configure]. \
+         Defaults to an empty config (all parameters take their IP defaults)."
+    )));
+    create_doc.push(Item::Command(Command {
+        doc_comments: Vec::new(),
+        words: vec![
+            Word::Raw("@default(\"\")".into()),
+            Word::Bare(format!("config: {ip_name}::Config")),
+        ],
+        body: None,
+    }));
+
+    // Config prelude ships at file TOP LEVEL — namespace-eval
+    // double-prefix bug means qualified proc names like
+    // `<ip>::Config::from` inside `namespace eval <ip> {…}` end
+    // up as `<ip>::<ip>::Config::from`. See emit_family_prelude
+    // for the same trick.
+    writeln!(out).unwrap();
+    emit_config_prelude(&mut out, &ip_name);
+    writeln!(out).unwrap();
+
     let dict_schema_newtypes =
         build_dict_schema_newtypes(&ip_name, dict_schemas);
-    let body = build_single_body(&vlnv, parameters, &dict_schema_newtypes);
-    // Emit into a per-namespace buffer, then wrap. Same shape as
-    // vivado-cmd's `namespace eval log { ... }` in log.htcl —
-    // Tcl requires the namespace to exist before qualified proc
-    // names like `<ip>::create` can be created, and wrapping the
-    // whole proc block in `namespace eval <ip> { … }` is the
-    // idiomatic way to establish it while letting the procs
-    // themselves use bare `proc create { … }` shape.
+    let configure_body = build_single_configure_body(
+        parameters,
+        &ip_name,
+        &dict_schema_newtypes,
+    );
+    let create_body = build_single_create_body(&vlnv, &ip_name);
+
+    // Emit both procs inside `namespace eval <ip> { … }` so
+    // `configure` and `create` register as `<ip>::configure` and
+    // `<ip>::create`. Same wrap idiom as vivado-cmd's log.htcl.
     let mut procs = String::new();
-    emit_proc(&mut procs, "create", &proc_doc, Some("bd_cell"), &body);
+    emit_proc(
+        &mut procs,
+        "configure",
+        &configure_doc,
+        Some(&config_name(&ip_name)),
+        &configure_body,
+    );
+    writeln!(procs).unwrap();
+    emit_proc(
+        &mut procs,
+        "create",
+        &create_doc,
+        Some("bd_cell"),
+        &create_body,
+    );
     write_namespace_block(&mut out, &ip_name, &procs);
     out
 }
@@ -382,19 +423,28 @@ fn push_bd_switch_arg(doc: &mut Doc) {
     }));
 }
 
-fn build_single_body(
-    vlnv: &str,
-    parameters: &[&Parameter],
-    dict_schema_newtypes: &std::collections::HashMap<String, String>,
-) -> String {
+/// Build `<ip>::create`'s body (single shape). Just cell-creation,
+/// config unwrap, `set_property` finalize, and return. All the
+/// dict-assembly happens in `<ip>::configure` — see
+/// [`build_single_configure_body`].
+///
+/// The `-bd` switch chooses between `create_bd_cell` (default
+/// bd=1) for block-design usage and `create_ip` (bd=0) for
+/// project-IP usage. Returns `$cell` or `$name` accordingly per
+/// the two-mode contract [`emit_config_finalize`] and its callers
+/// depend on.
+fn build_single_create_body(vlnv: &str, ip_name: &str) -> String {
     let mut out = String::new();
-    // `-bd` switches between the two Vivado instantiation paths.
-    // Default (`-bd 1`) is `create_bd_cell` — the block-design
-    // shape most wrappers use. `-bd 0` calls `create_ip` and adds
-    // the IP as a project-level source object; the returned handle
-    // is still a set_property-compatible object, so downstream
-    // sub-procs work unchanged. This mirrors the split-shape body
-    // in `generate_split`.
+    // Guard: `-config` defaults to `""` because the analyzer's
+    // `@default(...)` grammar rejects bracket-expressions like
+    // `[<T>::empty]`. Coerce to a real empty Config value at the
+    // top of the body so downstream `<T>::to` unwrap works.
+    // Family / split-node kwargs on the old shape used the same
+    // placeholder pattern (see the old generate_split arg-decl
+    // block for the family precedent).
+    writeln!(out, "if {{$config eq \"\"}} {{").unwrap();
+    writeln!(out, "  set config [{ip_name}::Config::empty]").unwrap();
+    writeln!(out, "}}").unwrap();
     writeln!(out, "if {{$bd}} {{").unwrap();
     writeln!(
         out,
@@ -408,24 +458,37 @@ fn build_single_body(
     )
     .unwrap();
     writeln!(out, "}}").unwrap();
-    if !parameters.is_empty() {
-        write_set_property_dict(
-            &mut out,
-            parameters,
-            "",
-            &[],
-            dict_schema_newtypes,
-        );
-    }
-    // Every `create_<ip>` proc must return an identifier the
-    // sub-procs can pass to their own `set_property` calls. In bd
-    // mode that's `$cell` (a bd_cell path). In ip mode we return
-    // `$name` instead — `$cell` is the XCI file path returned by
-    // `create_ip`, and downstream sub-procs need the IP's module
-    // name so they can look up the object with `[get_ips $cell]`.
-    // Same contract, one variable per branch.
+    emit_config_finalize(&mut out, ip_name);
+    // Return the identifier sub-procs / downstream code needs. In
+    // bd mode that's `$cell` (a bd_cell path); in ip mode `$name`
+    // (module name) since `$cell` is an XCI path.
     writeln!(out, "if {{$bd}} {{ return $cell }} else {{ return $name }}")
         .unwrap();
+    out
+}
+
+/// Build `<ip>::configure`'s body (single shape). Pure dict
+/// assembly + wrap in `<ip>::Config`. Zero side effects.
+fn build_single_configure_body(
+    parameters: &[&Parameter],
+    ip_name: &str,
+    dict_schema_newtypes: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut out = String::new();
+    write_dict_assembly(&mut out, parameters, "", &[], dict_schema_newtypes);
+    let config_ty = config_name(ip_name);
+    // Lift the assembled `_vw_d` (flat `CONFIG.<PARAM> value` pairs
+    // with bare-string values) into a NESTED, tagged Properties
+    // tree — CONFIG at the top wraps `Property::Nested` containing
+    // every `<PARAM>` sub-key as `Property::Scalar`. Matches the
+    // shape `props::get` returns from a live BD cell, so consumers
+    // can use `dict get [<ip>::Config::to -v $cfg] CONFIG` +
+    // `Property::as_nested -v ...` to extract sub-trees.
+    writeln!(
+        out,
+        "return [{config_ty}::from -v [Properties::from_dotted_pairs -v $_vw_d]]"
+    )
+    .unwrap();
     out
 }
 
@@ -515,40 +578,29 @@ fn generate_split(
     )
     .unwrap();
 
-    // Top proc: creates the cell and returns it. Any tree-root direct
-    // params live here too — though for IPs whose params all share a
-    // common first segment (CPM5, CIPS), the root has none.
-    let mut top_doc = Doc::new();
-    top_doc.push(Item::DocComment(
-        "Project-level IP module name, or (when `-bd 1`) the \
-         instance name in the block design."
-            .into(),
-    ));
-    top_doc.push(Item::Command(Command::call(
-        "name",
-        std::iter::empty::<Word>(),
-    )));
-    push_bd_switch_arg(&mut top_doc);
-    if !tree.direct.is_empty() {
-        top_doc.push(Item::Blank);
-        for p in &tree.direct {
-            emit_arg_decl(
-                &mut top_doc,
-                component,
-                presets,
-                p,
-                opts,
-                "",
-                &ip_name,
-                dict_schemas,
-            );
-        }
+    // `configure`'s arg-doc — the whole documented kwarg pile
+    // (direct + family + split-node). Zero cell handles, zero
+    // `-name`/`-bd`. The old inline-`create` doc had all of these
+    // mixed with `-name`/`-bd`; the split lifts them out into
+    // `configure` so `<ip>::create`'s surface stays tiny.
+    let mut configure_doc = Doc::new();
+    for p in &tree.direct {
+        emit_arg_decl(
+            &mut configure_doc,
+            component,
+            presets,
+            p,
+            opts,
+            "",
+            &ip_name,
+            dict_schemas,
+        );
     }
-    // Family kwargs on the top proc: one `-<stem_lower><i>` per
-    // family member, typed as the newtype, with a doc comment
-    // referencing the constructor via `[…]` for semantic-goto.
+    // Family kwargs: one `-<stem_lower><i>` per family member,
+    // typed as the newtype, with a doc comment referencing the
+    // constructor via `[…]` for semantic-goto.
     //
-    // The `@default("")` is a placeholder — the analyzer's
+    // `@default("")` is a placeholder — the analyzer's
     // `@default(...)` grammar rejects bracket-expressions like
     // `[<T>::empty]`, so we can't declare the semantically-correct
     // default in the annotation. The body's `__vw_kw_<arg>_set`
@@ -556,17 +608,19 @@ fn generate_split(
     // slot, so `$<arg>` is never dereferenced with the placeholder
     // value — the empty string never reaches the newtype machinery.
     if !families.is_empty() {
-        top_doc.push(Item::Blank);
+        if !tree.direct.is_empty() {
+            configure_doc.push(Item::Blank);
+        }
         for f in &families {
             let ctor = format!("{ip_name}::{}", lowercase_ident(&f.stem));
             let ty = stem_props_name(&ip_name, &f.stem);
             for i in &f.indices {
                 let arg = format!("{}{i}", lowercase_ident(&f.stem));
-                top_doc.push(Item::DocComment(format!(
+                configure_doc.push(Item::DocComment(format!(
                     "Configuration for {} slot {i}. Construct with [{ctor}].",
                     f.stem
                 )));
-                top_doc.push(Item::Command(Command {
+                configure_doc.push(Item::Command(Command {
                     doc_comments: Vec::new(),
                     words: vec![
                         Word::Raw("@default(\"\")".into()),
@@ -618,22 +672,25 @@ fn generate_split(
         writeln!(out).unwrap();
     }
 
-    // Top-proc kwargs: one per split-shape constructor. Each is
-    // typed as the node's newtype so the top proc composes ALL
-    // configuration atomically. Semantic-ref doc comment points
-    // at the constructor for goto/hover.
+    // Split-node kwargs on configure: one per split-shape
+    // constructor, typed as the node's newtype so configure
+    // composes ALL configuration into one Config value.
+    // Semantic-ref doc comment points at the constructor for
+    // goto/hover.
     if !split_nodes.is_empty() {
-        top_doc.push(Item::Blank);
+        if !tree.direct.is_empty() || !families.is_empty() {
+            configure_doc.push(Item::Blank);
+        }
         for n in &split_nodes {
             let ctor_suffix = sanitize_ident(&n.label.to_ascii_lowercase());
             let ctor = format!("{ip_name}::{ctor_suffix}");
             let ty = split_props_name(&ip_name, &n.label);
-            top_doc.push(Item::DocComment(format!(
+            configure_doc.push(Item::DocComment(format!(
                 "Configuration for the {} sub-tree. Construct with \
                  [{ctor}].",
                 n.label
             )));
-            top_doc.push(Item::Command(Command {
+            configure_doc.push(Item::Command(Command {
                 doc_comments: Vec::new(),
                 words: vec![
                     Word::Raw("@default(\"\")".into()),
@@ -642,53 +699,65 @@ fn generate_split(
                 body: None,
             }));
         }
-        // Re-emit the top proc with the updated top_doc (we
-        // rebuild top_body below to inject the merge loops).
     }
 
-    // Top-proc body: rebuild to fold in the split-shape merge
-    // loops before the finalization. Structure:
-    //   (create_bd_cell / create_ip)
-    //   set _vw_d [list]
-    //   … top-level knob loads …
-    //   … family merge loops …
-    //   … split-shape merge loops (NEW) …
-    //   if {llength > 0} { set_property -dict $_vw_d -objects … }
-    //   return $cell / $name
-    let mut top_body = String::new();
-    writeln!(top_body, "if {{$bd}} {{").unwrap();
+    // Config prelude at file top level (namespace-eval double-
+    // prefix workaround). Emit BEFORE the namespace-eval block
+    // opens so `<ip>::Config` is available when the enclosed
+    // `<ip>::configure` returns it and `<ip>::create` accepts it.
+    writeln!(out).unwrap();
+    emit_config_prelude(&mut out, &ip_name);
+    writeln!(out).unwrap();
+
+    // `configure` body: pure dict assembly + wrap. No cell handle,
+    // no `set_property`, no `-bd` branch.
+    let mut configure_body = String::new();
+    write_dict_assembly_with_splits(
+        &mut configure_body,
+        &tree.direct,
+        &family_merges,
+        &dict_schema_newtypes,
+        &split_nodes,
+        &ip_name,
+    );
+    let config_ty = config_name(&ip_name);
+    // Lift flat `CONFIG.<PARAM>` keys into a nested tagged Properties
+    // tree (see `build_single_configure_body` for the rationale).
     writeln!(
-        top_body,
-        "  set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
+        configure_body,
+        "return [{config_ty}::from -v [Properties::from_dotted_pairs -v $_vw_d]]"
     )
     .unwrap();
-    writeln!(top_body, "}} else {{").unwrap();
-    writeln!(
-        top_body,
-        "  set cell [vivado_cmd::create_ip -vlnv {vlnv} -module_name $name]"
-    )
-    .unwrap();
-    writeln!(top_body, "}}").unwrap();
-    if !tree.direct.is_empty()
-        || !families.is_empty()
-        || !split_nodes.is_empty()
-    {
-        write_set_property_dict_with_splits(
-            &mut top_body,
-            &tree.direct,
-            &family_merges,
-            &dict_schema_newtypes,
-            &split_nodes,
-            &ip_name,
-        );
-    }
-    writeln!(
-        top_body,
-        "if {{$bd}} {{ return $cell }} else {{ return $name }}"
-    )
-    .unwrap();
+
+    // `create`'s arg-doc — narrow surface: -name, -bd, -config.
+    let mut create_doc = Doc::new();
+    create_doc.push(Item::DocComment(
+        "Project-level IP module name, or (when `-bd 1`) the \
+         instance name in the block design."
+            .into(),
+    ));
+    create_doc.push(Item::Command(Command::call(
+        "name",
+        std::iter::empty::<Word>(),
+    )));
+    push_bd_switch_arg(&mut create_doc);
+    create_doc.push(Item::DocComment(format!(
+        "Typed configuration value. Construct with [{ip_name}::configure]. \
+         Defaults to an empty config (all parameters take their IP defaults)."
+    )));
+    create_doc.push(Item::Command(Command {
+        doc_comments: Vec::new(),
+        words: vec![
+            Word::Raw("@default(\"\")".into()),
+            Word::Bare(format!("config: {config_ty}")),
+        ],
+        body: None,
+    }));
+
+    let create_body = build_single_create_body(&vlnv, &ip_name);
+
     // Assemble the `namespace eval <ip> { … }` body in
-    // families → splits → create order.
+    // families → splits → configure → create order.
     let mut procs = String::new();
     for (i, f) in families.iter().enumerate() {
         if i > 0 {
@@ -712,7 +781,21 @@ fn generate_split(
     if !families.is_empty() || !split_nodes.is_empty() {
         writeln!(procs).unwrap();
     }
-    emit_proc(&mut procs, "create", &top_doc, Some("bd_cell"), &top_body);
+    emit_proc(
+        &mut procs,
+        "configure",
+        &configure_doc,
+        Some(&config_ty),
+        &configure_body,
+    );
+    writeln!(procs).unwrap();
+    emit_proc(
+        &mut procs,
+        "create",
+        &create_doc,
+        Some("bd_cell"),
+        &create_body,
+    );
 
     write_namespace_block(&mut out, &ip_name, &procs);
     out
@@ -724,6 +807,66 @@ fn generate_split(
 /// helper procs. Consumed by [`emit_split_node_constructor`] and
 /// the top-proc merge loop in
 /// [`write_set_property_dict_with_splits`].
+/// Emit the top-level `<ip>::Config = Properties` newtype at file
+/// top level (outside `namespace eval <ip> {…}` to sidestep the
+/// analyzer's double-prefix bug on qualified proc names inside
+/// namespace-eval blocks). Structural mirror of
+/// [`emit_split_props_prelude`] / [`emit_family_prelude`] /
+/// [`emit_dict_props_prelude`] — same four helpers (`empty`,
+/// `from`, `to`, `repr`) with identity implementations. The name
+/// is always `<ip>::Config` — one per generated wrapper — so the
+/// callsite pattern `set cfg [<ip>::configure -foo x]` returns a
+/// value the analyzer knows about and `<ip>::create` can accept
+/// via its typed `-config <ip>::Config` param.
+fn emit_config_prelude(out: &mut String, ip_name: &str) {
+    let qualified = config_name(ip_name);
+    writeln!(
+        out,
+        "## Typed configuration value for [{ip_name}::create]. \
+         Construct with [{ip_name}::configure].",
+    )
+    .unwrap();
+    writeln!(out, "namespace eval {ip_name} {{}}").unwrap();
+    writeln!(out, "namespace eval {qualified} {{}}").unwrap();
+    writeln!(out, "type {qualified} = Properties").unwrap();
+    // Values are a properly nested tagged Properties tree by the
+    // time they reach Config (see `build_single_configure_body` —
+    // configure's return path lifts through
+    // `Properties::from_dotted_pairs`). Delegate to
+    // `Properties::repr` for uniform tagged-Property rendering —
+    // same `KEY Scalar(VALUE)` / `KEY Nested(…)` shape the REPL's
+    // syntax highlighter colours specially.
+    writeln!(
+        out,
+        "proc {qualified}::repr {{ v: {qualified} }} string \
+         {{ return [Properties::repr -v $v] }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::from {{ v: Properties }} {qualified} \
+         {{ return $v }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::to {{ v: {qualified} }} Properties \
+         {{ return $v }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::empty {{}} {qualified} \
+         {{ return [{qualified}::from -v [Properties::empty]] }}"
+    )
+    .unwrap();
+}
+
+/// Qualified name of the top-level Config newtype for `ip_name`.
+fn config_name(ip_name: &str) -> String {
+    format!("{ip_name}::Config")
+}
+
 fn emit_split_props_prelude(out: &mut String, ip_name: &str, label: &str) {
     let qualified = split_props_name(ip_name, label);
     let ctor_lower = label.to_ascii_lowercase();
@@ -808,11 +951,12 @@ fn emit_split_node_constructor(
     for p in &n.direct {
         let arg = lowercase_ident(strip_prefix(&p.name, &n.label));
         let field_key = strip_prefix(&p.name, &n.label);
-        let value_expr = if is_properties_shaped(p.value.default_value()) {
-            format!("[Properties::to_raw -v ${arg}]")
-        } else {
-            format!("${arg}")
-        };
+        // Properties-typed sub-slots arrive as raw paired-list
+        // dicts (that's what our configure procs produce). Store
+        // `$arg` directly; NOT `[Properties::to_raw -v $arg]`
+        // which would try to unwrap Property::Scalar/Nested tags
+        // that our stored values don't carry.
+        let value_expr = format!("${arg}");
         writeln!(
             body,
             "if {{${{__vw_kw_{arg}_set}}}} \
@@ -849,7 +993,7 @@ fn split_props_local(label: &str) -> String {
 /// split-node merges in between the top-level knobs, family
 /// merges, and the finalization.
 #[allow(clippy::too_many_arguments)]
-fn write_set_property_dict_with_splits(
+fn write_dict_assembly_with_splits(
     out: &mut String,
     parameters: &[&Parameter],
     families: &[FamilyMerge<'_>],
@@ -876,6 +1020,16 @@ fn write_set_property_dict_with_splits(
             if let Some(newtype) = dict_schema_newtypes.get(&p.name) {
                 format!("[{newtype}::to -v ${arg}]")
             } else if is_properties_shaped(p.value.default_value()) {
+                // Properties-typed args now arrive as tagged trees
+                // (from other IPs' `configure` procs, or extracted
+                // via `dict get $props CONFIG` + `Property::as_nested`
+                // by the caller). Unwrap tags to a raw paired list
+                // via `Properties::to_raw` so
+                // `Properties::from_dotted_pairs` (which lifts the
+                // whole `_vw_d` at the end of the configure body)
+                // sees consistent bare-string values across all
+                // sub-slots. Without this the tagged-tree elements
+                // would confuse the shim's structural lifter.
                 format!("[Properties::to_raw -v ${arg}]")
             } else {
                 format!("${arg}")
@@ -924,22 +1078,10 @@ fn write_set_property_dict_with_splits(
         writeln!(out, "  }}").unwrap();
         writeln!(out, "}}").unwrap();
     }
-    // Finalization — one atomic `set_property -dict` call.
-    writeln!(out, "if {{[llength $_vw_d] > 0}} {{").unwrap();
-    writeln!(out, "  if {{$bd}} {{").unwrap();
-    writeln!(
-        out,
-        "    vivado_cmd::set_property -dict $_vw_d -objects $cell"
-    )
-    .unwrap();
-    writeln!(out, "  }} else {{").unwrap();
-    writeln!(
-        out,
-        "    vivado_cmd::set_property -dict $_vw_d -objects [get_ips $name]"
-    )
-    .unwrap();
-    writeln!(out, "  }}").unwrap();
-    writeln!(out, "}}").unwrap();
+    // No finalization here — callers wrap the assembled `_vw_d`
+    // in a typed `<ip>::Config` value. The `set_property` finalize
+    // has moved to `emit_config_finalize` on the `<ip>::create`
+    // side, which unwraps the caller's `-config` param and applies.
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,13 +1171,19 @@ fn emit_proc(
     writeln!(out, "}}").unwrap();
 }
 
-/// Emit `set_property -dict [list \ … ]` for `parameters`. Arg names
-/// are built by stripping `prefix_to_strip` from each parameter's full
-/// IP-XACT name; the `CONFIG.<NAME>` key keeps the full name Vivado
-/// expects. Only the top-level `<ip>::create` proc calls this today —
-/// sub-procs became pure value-constructors under Slice 6 and no
-/// longer emit `set_property` themselves.
-fn write_set_property_dict(
+/// Emit the paired-list assembly loops that build `_vw_d` from
+/// direct parameters + composed families + dict-schema newtypes.
+/// Arg names are built by stripping `prefix_to_strip` from each
+/// parameter's full IP-XACT name; the `CONFIG.<NAME>` key keeps
+/// the full name Vivado expects.
+///
+/// Callers: `<ip>::configure`'s body (both single and split shapes).
+/// The output is a plain `_vw_d` paired list — no finalize, no
+/// `set_property` call. `configure` wraps the assembled dict in
+/// `[<ip>::Config::from -v [Properties::from -v $_vw_d]]` and
+/// returns it; `<ip>::create` unwraps and applies. See
+/// [`emit_config_finalize`] for the corresponding apply side.
+fn write_dict_assembly(
     out: &mut String,
     parameters: &[&Parameter],
     prefix_to_strip: &str,
@@ -1091,6 +1239,16 @@ fn write_set_property_dict(
             if let Some(newtype) = dict_schema_newtypes.get(&p.name) {
                 format!("[{newtype}::to -v ${arg}]")
             } else if is_properties_shaped(p.value.default_value()) {
+                // Properties-typed args now arrive as tagged trees
+                // (from other IPs' `configure` procs, or extracted
+                // via `dict get $props CONFIG` + `Property::as_nested`
+                // by the caller). Unwrap tags to a raw paired list
+                // via `Properties::to_raw` so
+                // `Properties::from_dotted_pairs` (which lifts the
+                // whole `_vw_d` at the end of the configure body)
+                // sees consistent bare-string values across all
+                // sub-slots. Without this the tagged-tree elements
+                // would confuse the shim's structural lifter.
                 format!("[Properties::to_raw -v ${arg}]")
             } else {
                 format!("${arg}")
@@ -1133,24 +1291,34 @@ fn write_set_property_dict(
             writeln!(out, "}}").unwrap();
         }
     }
-    // `-bd 1` → cell handle is a bd_cell path, set_property targets
-    // it directly. `-bd 0` → cell handle came from `create_ip`,
-    // which returns an XCI file path (not a usable IP object). We
-    // resolve the IP through `get_ips` keyed on the top proc's
-    // `$name` arg. (Sub-procs no longer emit `set_property`, so
-    // the historical `-cell`-keyed variant is gone.)
-    let ip_ref = "[get_ips $name]";
-    writeln!(out, "if {{[llength $_vw_d] > 0}} {{").unwrap();
+}
+
+/// Emit the create-side finalize: unwrap `$config` through
+/// `<ip>::Config::to`, flatten the nested tagged Properties tree
+/// back into the flat `CONFIG.<PARAM> value` paired list
+/// `set_property -dict` expects (via [`Properties::to_dotted_flat`]),
+/// then apply against the cell handle. Two-mode `-bd` branch:
+/// `bd=1` → target `$cell` directly (a bd_cell path); `bd=0` →
+/// resolve via `[get_ips $name]` because `create_ip` returns an
+/// XCI file path, not an IP handle.
+fn emit_config_finalize(out: &mut String, ip_name: &str) {
+    let config_ty = config_name(ip_name);
+    writeln!(
+        out,
+        "set _dict [Properties::to_dotted_flat -v [{config_ty}::to -v $config]]"
+    )
+    .unwrap();
+    writeln!(out, "if {{[llength $_dict] > 0}} {{").unwrap();
     writeln!(out, "  if {{$bd}} {{").unwrap();
     writeln!(
         out,
-        "    vivado_cmd::set_property -dict $_vw_d -objects $cell"
+        "    vivado_cmd::set_property -dict $_dict -objects $cell"
     )
     .unwrap();
     writeln!(out, "  }} else {{").unwrap();
     writeln!(
         out,
-        "    vivado_cmd::set_property -dict $_vw_d -objects {ip_ref}"
+        "    vivado_cmd::set_property -dict $_dict -objects [get_ips $name]"
     )
     .unwrap();
     writeln!(out, "  }}").unwrap();
@@ -1345,15 +1513,12 @@ fn emit_family_constructor(
         // Post-strip key becomes the CONFIG.<STEM><i>_ suffix at
         // top-proc merge time. Store un-prefixed field name here.
         let field_key = strip_prefix(&p.name, &f.shape_member_label);
-        // Properties-typed sub-slots (rare in a family shape;
-        // included for completeness) get unwrapped through
-        // Properties::to_raw before landing in the dict. Otherwise
-        // the value is a plain string.
-        let value_expr = if is_properties_shaped(p.value.default_value()) {
-            format!("[Properties::to_raw -v ${arg}]")
-        } else {
-            format!("${arg}")
-        };
+        // Properties-typed sub-slots arrive as raw paired-list
+        // dicts; scalar sub-slots are plain strings. Both cases
+        // reduce to `$arg`. The old `Properties::to_raw` step
+        // required Property::Scalar/Nested tags that our new
+        // configure-based value flow no longer produces.
+        let value_expr = format!("${arg}");
         writeln!(
             body,
             "if {{${{__vw_kw_{arg}_set}}}} \
@@ -1801,11 +1966,17 @@ mod tests {
             &GenerateOptions::default(),
         );
         // Procs live inside `namespace eval <ip> { … }` and get
-        // the 2-space indent from `write_namespace_block`.
+        // the 2-space indent from `write_namespace_block`. Two
+        // procs: `configure` (typed value constructor) and
+        // `create` (cell instantiator + config applier).
         let n_procs = out.matches("\n  proc ").count();
-        assert_eq!(n_procs, 1, "{out}");
+        assert_eq!(n_procs, 2, "{out}");
+        assert!(out.contains("proc configure"));
         assert!(out.contains("proc create"));
         assert!(out.contains("namespace eval demo {"));
+        // Top-level Config newtype ships outside the namespace
+        // block (see emit_config_prelude for why).
+        assert!(out.contains("type demo::Config = Properties"));
     }
 
     #[test]
@@ -1873,21 +2044,25 @@ mod tests {
         for name in ["proc tiny_a ", "proc tiny_b ", "proc stray "] {
             assert!(!out.contains(name), "unexpected {name} in:\n{out}");
         }
-        // ...and the params instead appear as args on the top proc
-        // (`create`). Slice the create-proc range so we can search
-        // its args without accidentally matching arg names embedded
-        // in one of the value-constructor sub-procs' bodies.
-        let create_start = out.find("proc create {").expect("no proc create");
-        let create_body = &out[create_start..];
-        let create_end = create_body
+        // ...and the params instead appear as args on the top
+        // proc's configure counterpart. Post-refactor `create` has
+        // just `-name`/`-bd`/`-config`; the full documented kwarg
+        // pile lives on `configure`. Slice the configure range so
+        // we can search its args without accidentally matching arg
+        // names embedded in one of the value-constructor sub-procs'
+        // bodies.
+        let cfg_start =
+            out.find("proc configure {").expect("no proc configure");
+        let cfg_body = &out[cfg_start..];
+        let cfg_end = cfg_body
             .find("\n  }\n")
             .map(|e| e + 5)
-            .unwrap_or(create_body.len());
-        let create_range = &create_body[..create_end];
+            .unwrap_or(cfg_body.len());
+        let cfg_range = &cfg_body[..cfg_end];
         for arg in ["tiny_a_one", "tiny_b_one", "tiny_c_one", "stray_thing"] {
             assert!(
-                create_range.contains(arg),
-                "{arg} missing from create proc: {create_range}"
+                cfg_range.contains(arg),
+                "{arg} missing from configure proc: {cfg_range}"
             );
         }
     }
@@ -2038,7 +2213,102 @@ mod tests {
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
+        // Post-refactor these lappend lines live inside `configure`,
+        // not `create`. `create`'s body just unwraps `-config` and
+        // splats the resulting dict via `set_property -dict`.
         assert!(out.contains("CONFIG.BUS_WIDTH $bus_width"), "{out}");
         assert!(out.contains("CONFIG.MODE $mode"), "{out}");
+    }
+
+    /// `configure`'s body is pure dict assembly + a Config wrap.
+    /// Any of the side-effecting Vivado calls appearing inside its
+    /// body would mean the seam wasn't cleanly cut.
+    #[test]
+    fn configure_returns_typed_config_no_side_effects() {
+        let out = generate(
+            &mk_component(),
+            &Default::default(),
+            &::std::collections::HashMap::new(),
+            &GenerateOptions::default(),
+        );
+        let cfg_start = out.find("proc configure {").expect("no configure");
+        let cfg_body = &out[cfg_start..];
+        let cfg_end = cfg_body
+            .find("\n  }\n")
+            .map(|e| e + 5)
+            .unwrap_or(cfg_body.len());
+        let cfg_range = &cfg_body[..cfg_end];
+        for forbidden in ["create_bd_cell", "create_ip", "set_property"] {
+            assert!(
+                !cfg_range.contains(forbidden),
+                "configure body should not contain `{forbidden}`:\n{cfg_range}"
+            );
+        }
+        // But it SHOULD wrap the assembled dict as a Config value.
+        assert!(cfg_range.contains("demo::Config::from"), "{cfg_range}");
+    }
+
+    /// `create`'s arg surface is exactly `-name`, `-bd`, `-config`
+    /// under the post-refactor design. No documented-kwarg pile.
+    #[test]
+    fn create_takes_only_name_bd_config() {
+        let out = generate(
+            &mk_component(),
+            &Default::default(),
+            &::std::collections::HashMap::new(),
+            &GenerateOptions::default(),
+        );
+        let create_start = out.find("proc create {").expect("no create");
+        // Argspec ends at `} bd_cell {`.
+        let create_body = &out[create_start..];
+        let argspec_end = create_body
+            .find("} bd_cell {")
+            .expect("create should return bd_cell");
+        let argspec = &create_body[..argspec_end];
+        for expected in ["name", "bd", "config: demo::Config"] {
+            assert!(
+                argspec.contains(expected),
+                "expected `{expected}` in create argspec:\n{argspec}"
+            );
+        }
+        // No leftover typed IP-param kwargs on create.
+        for forbidden in ["bus_width: int", "@enum(FAST, SLOW)"] {
+            assert!(
+                !argspec.contains(forbidden),
+                "IP-param kwarg `{forbidden}` leaked onto create:\n{argspec}"
+            );
+        }
+    }
+
+    /// `create`'s body unwraps `$config` through the Config newtype
+    /// and applies via `set_property -dict` in both `-bd 1` and
+    /// `-bd 0` branches.
+    #[test]
+    fn create_body_unwraps_config_and_applies() {
+        let out = generate(
+            &mk_component(),
+            &Default::default(),
+            &::std::collections::HashMap::new(),
+            &GenerateOptions::default(),
+        );
+        let create_start = out.find("proc create {").expect("no create");
+        let create_range = &out[create_start..];
+        // Unwrap step.
+        assert!(
+            create_range.contains("demo::Config::to -v $config"),
+            "create should unwrap $config via Config::to:\n{create_range}"
+        );
+        // Guard for the empty-Config default (bracket-expr @default
+        // fallback pattern documented in build_single_create_body).
+        assert!(
+            create_range.contains("demo::Config::empty"),
+            "create should coerce empty-string default to Config::empty:\n{create_range}"
+        );
+        // Both bd branches.
+        assert!(
+            create_range.contains("set_property -dict $_dict -objects $cell")
+        );
+        assert!(create_range
+            .contains("set_property -dict $_dict -objects [get_ips $name]"));
     }
 }

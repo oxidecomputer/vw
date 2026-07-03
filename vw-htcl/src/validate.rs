@@ -141,17 +141,33 @@ pub fn validate_with_all_extras_and_vars<'doc>(
     extra_top_level_vars: &std::collections::HashSet<String>,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    let (mut table, _overloads) =
-        build_signature_table_with_overloads(document, &mut diags);
+    // Type-table FIRST — its keys feed the overloaded-proc-arm
+    // detection in `build_signature_table_with_overloads` so a proc
+    // whose first arg is a newtype-Qualified name (e.g.
+    // `-config: versal_cips::PsPmcConfig` inside `namespace eval
+    // versal_cips`) isn't misclassified as an enum-overload arm.
+    // Duplicate-decl diagnostics from this pass are held aside and
+    // re-emitted after signature collection so ordering matches the
+    // pre-refactor rendering.
+    let mut type_prescan_diags = Vec::new();
+    let mut type_table =
+        build_type_decl_table(document, &mut type_prescan_diags);
+    for (name, td) in extra_types {
+        type_table.entry(name.clone()).or_insert(*td);
+    }
+    let newtype_qualified_names: std::collections::HashSet<String> =
+        type_table.keys().cloned().collect();
+    let (mut table, _overloads) = build_signature_table_with_overloads(
+        document,
+        &newtype_qualified_names,
+        &mut diags,
+    );
     // Prior-batch signatures fill in the gaps. The doc's own entries
     // win because `entry().or_insert(...)` is a no-op on present keys.
     for (name, sig) in extra_sigs {
         table.entry(name.clone()).or_insert(*sig);
     }
-    let mut type_table = build_type_decl_table(document, &mut diags);
-    for (name, td) in extra_types {
-        type_table.entry(name.clone()).or_insert(*td);
-    }
+    diags.extend(type_prescan_diags);
     let mut enum_table = build_enum_decl_table(document, &mut diags);
     for (name, ed) in extra_enums {
         enum_table.entry(name.clone()).or_insert(*ed);
@@ -235,8 +251,11 @@ pub fn build_signature_table<'doc>(
     document: &'doc Document,
     diags: &mut Vec<Diagnostic>,
 ) -> HashMap<String, &'doc ProcSignature> {
-    let (table, _overloads) =
-        build_signature_table_with_overloads(document, diags);
+    let (table, _overloads) = build_signature_table_with_overloads(
+        document,
+        &std::collections::HashSet::new(),
+        diags,
+    );
     table
 }
 
@@ -246,6 +265,7 @@ pub fn build_signature_table<'doc>(
 /// hover, signature help) consult this.
 pub fn build_signature_table_with_overloads<'doc>(
     document: &'doc Document,
+    newtype_qualified_names: &std::collections::HashSet<String>,
     diags: &mut Vec<Diagnostic>,
 ) -> (HashMap<String, &'doc ProcSignature>, OverloadTable) {
     // First pass: collect every proc decl per qualified name,
@@ -255,7 +275,13 @@ pub fn build_signature_table_with_overloads<'doc>(
     // procs.
     let mut multi: HashMap<String, Vec<(&'doc Proc, &'doc ProcSignature)>> =
         HashMap::new();
-    collect_signatures_multi(&document.stmts, "", &mut multi, diags);
+    collect_signatures_multi(
+        &document.stmts,
+        "",
+        newtype_qualified_names,
+        &mut multi,
+        diags,
+    );
 
     let mut table: HashMap<String, &'doc ProcSignature> = HashMap::new();
     let mut overloads: OverloadTable = HashMap::new();
@@ -367,6 +393,7 @@ fn check_reserved_proc_name(
 fn collect_signatures_multi<'doc>(
     stmts: &'doc [Stmt],
     prefix: &str,
+    newtype_qualified_names: &std::collections::HashSet<String>,
     multi: &mut HashMap<String, Vec<(&'doc Proc, &'doc ProcSignature)>>,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -386,15 +413,28 @@ fn collect_signatures_multi<'doc>(
                 // doesn't re-route to the mangled-name + dispatcher
                 // pipeline, so an overload arm inside a namespace
                 // would silently lose its dispatch semantics.
-                // Detect this here so the user gets a clear error
-                // instead of a confused runtime behavior.
-                let is_qualified_first = sig
+                //
+                // Only ENUM-Qualified first args (`Foo::Variant` where
+                // `Foo` is a declared enum) count as overload-arm
+                // shape. A `Qualified` type that resolves to a
+                // declared NEWTYPE (e.g. `-config: versal_cips::Config`
+                // in a `namespace eval versal_cips { proc create … }`
+                // block) is just a typed newtype ref — legal
+                // everywhere. The newtype-set peeked in by the caller
+                // disambiguates.
+                let overload_shape_first = sig
                     .args
                     .first()
                     .and_then(|a| a.type_annotation.as_ref())
-                    .map(|t| matches!(t, TypeExpr::Qualified { .. }))
-                    .unwrap_or(false);
-                if is_qualified_first && !prefix.is_empty() {
+                    .and_then(|t| match t {
+                        TypeExpr::Qualified {
+                            namespace, variant, ..
+                        } => Some(format!("{namespace}::{variant}")),
+                        _ => None,
+                    })
+                    .filter(|qname| !newtype_qualified_names.contains(qname))
+                    .is_some();
+                if overload_shape_first && !prefix.is_empty() {
                     diags.push(Diagnostic {
                         severity: Severity::Error,
                         message: format!(
@@ -432,7 +472,13 @@ fn collect_signatures_multi<'doc>(
                     continue;
                 }
                 let nested = qualify(prefix, name);
-                collect_signatures_multi(&ns.body, &nested, multi, diags);
+                collect_signatures_multi(
+                    &ns.body,
+                    &nested,
+                    newtype_qualified_names,
+                    multi,
+                    diags,
+                );
             }
             _ => {}
         }
@@ -2423,8 +2469,11 @@ proc handle {v: Property::Nested} { return $v }\n";
         let parsed = parse(src);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let mut diags = Vec::new();
-        let (sig_table, overloads) =
-            build_signature_table_with_overloads(&parsed.document, &mut diags);
+        let (sig_table, overloads) = build_signature_table_with_overloads(
+            &parsed.document,
+            &std::collections::HashSet::new(),
+            &mut diags,
+        );
         assert!(
             diags.iter().all(|d| d.severity != Severity::Error),
             "got: {:?}",
