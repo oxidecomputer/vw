@@ -93,9 +93,9 @@ pub fn generate(
         })
         .collect();
     let mut out = if parameters.len() > opts.split_threshold {
-        generate_split(component, presets, &parameters, opts)
+        generate_split(component, presets, &parameters, opts, dict_schemas)
     } else {
-        generate_single(component, presets, &parameters, opts)
+        generate_single(component, presets, &parameters, opts, dict_schemas)
     };
     if !dict_schemas.is_empty() {
         append_dict_sub_procs(&mut out, component, dict_schemas, opts);
@@ -103,10 +103,14 @@ pub fn generate(
     out
 }
 
-/// Append `create_<ip>_<param>` sub-procs — one for each IP-XACT
-/// `structured_tcldict` parameter we have a schema for. Each builds a
-/// Tcl dict-list of `KEY VALUE` pairs the user passes back into the
-/// top proc's `-<param>` argument.
+/// Emit one compositional-value constructor per IP-XACT
+/// `structured_tcldict` parameter. Each schema gets a newtype
+/// prelude (`namespace eval`, `type <T> = Properties`,
+/// `::repr`/`::from`/`::to`/`::empty`) plus a pure `<ip>::<param>`
+/// constructor that returns the typed value. The top proc's
+/// matching kwarg (e.g. `-ps_pmc_config`) then takes the newtype
+/// and unwraps it into the atomic `set_property -dict` — no
+/// separate mutator call.
 fn append_dict_sub_procs(
     out: &mut String,
     component: &Component,
@@ -122,10 +126,61 @@ fn append_dict_sub_procs(
             continue;
         }
         writeln!(out).unwrap();
+        emit_dict_props_prelude(out, &ip_name, param_name);
+        writeln!(out).unwrap();
         emit_dict_sub_proc(out, &ip_name, param_name, schema, opts);
     }
 }
 
+/// Emit the newtype declaration + `::from`/`::to`/`::repr`/`::empty`
+/// helper procs for one dict-schema param. Mirror of
+/// [`emit_family_prelude`] — same shape, different naming source.
+fn emit_dict_props_prelude(out: &mut String, ip_name: &str, param_name: &str) {
+    let qualified = dict_props_name(ip_name, param_name);
+    let ctor_lower = param_name.to_ascii_lowercase();
+    writeln!(
+        out,
+        "## Typed configuration value for [{ip_name}::create]'s \
+         `-{ctor_lower}` slot. Construct with [{ip_name}::{ctor_lower}].",
+    )
+    .unwrap();
+    writeln!(out, "namespace eval {ip_name} {{}}").unwrap();
+    writeln!(out, "namespace eval {qualified} {{}}").unwrap();
+    writeln!(out, "type {qualified} = Properties").unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::repr {{ v: {qualified} }} string \
+         {{ return [Properties::repr -v $v] }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::from {{ v: Properties }} {qualified} \
+         {{ return $v }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::to {{ v: {qualified} }} Properties \
+         {{ return $v }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::empty {{}} {qualified} \
+         {{ return [{qualified}::from -v [Properties::empty]] }}"
+    )
+    .unwrap();
+}
+
+/// Emit the value-constructor `<ip>::<param_lower>` for one
+/// dict-schema. Pure — no cell, no `-bd`, no `set_property`. Builds
+/// a `Properties`-shaped dict from the supplied field kwargs and
+/// wraps it in the newtype. The atomic materialization happens
+/// later in `<ip>::create`'s body, where the matching
+/// `-<param_lower>` kwarg gets unwrapped through `::to` +
+/// `Properties::to_raw` and merged into the single
+/// `set_property -dict` call.
 fn emit_dict_sub_proc(
     out: &mut String,
     ip_name: &str,
@@ -133,34 +188,17 @@ fn emit_dict_sub_proc(
     schema: &crate::DictSchema,
     opts: &GenerateOptions,
 ) {
-    let suffix = sanitize_ident(&param_name.to_ascii_lowercase());
-    let sub_name = format!("{ip_name}::{suffix}");
-    let top_proc = format!("{ip_name}::create");
+    let ctor_local = param_name.to_ascii_lowercase();
+    let ctor_name = format!("{ip_name}::{ctor_local}");
+    let ret_ty = dict_props_name(ip_name, param_name);
 
     let mut doc = Doc::new();
     doc.push(Item::DocComment(format!(
-        "Apply a `CONFIG.{param_name}` value to the IP.",
+        "Configuration value for [{ip_name}::create]'s \
+         `-{ctor_local}` slot (`CONFIG.{param_name}`). Composes into \
+         the top proc so every provided field lands in ONE atomic \
+         `set_property -dict` call.",
     )));
-    doc.push(Item::DocComment(format!(
-        "Pass the handle returned by `{top_proc}` — a bd_cell path \
-         when the top proc ran in `-bd 1` mode, or the IP module name \
-         when it ran in `-bd 0` mode.",
-    )));
-    doc.push(Item::Blank);
-    doc.push(Item::DocComment(
-        "Cell or IP module handle to set the property on.".into(),
-    ));
-    doc.push(Item::Command(Command {
-        doc_comments: Vec::new(),
-        // `cell: bd_cell` — typed arg. The parser tokenizes the
-        // ident `cell`, the `:` separator, and the type word
-        // `bd_cell` separately; emitting them as two adjacent
-        // bare words renders the source the way a human would
-        // write it (`cell: bd_cell`).
-        words: vec![Word::Bare("cell:".into()), Word::Bare("bd_cell".into())],
-        body: None,
-    }));
-    push_bd_switch_arg(&mut doc);
     if !schema.fields.is_empty() {
         doc.push(Item::Blank);
     }
@@ -168,51 +206,24 @@ fn emit_dict_sub_proc(
         emit_dict_field_arg(&mut doc, f, opts);
     }
 
-    // Build the inner CONFIG.<param> dict conditionally so unsupplied
-    // args never reach Vivado. Unconditionally emitting every field
-    // (even at its declared default) re-validates the whole cell and
-    // Vivado rejects values whose defaults happen to be out-of-range
-    // for the cell's current state — e.g. `STRADDLE_SIZE=0` when the
-    // valid enum is `{None, 2_TLP}`. The `__vw_kw_<arg>_set` flag is
-    // set by `::vw::kwargs` (shim helper) only when the user passed
-    // a value for that arg, so the test filters out the defaults.
     let mut body = String::new();
-    writeln!(body, "set _vw_inner [list]").unwrap();
+    writeln!(body, "set _vw_d [dict create]").unwrap();
     for f in &schema.fields {
         let arg = lowercase_ident(&f.name);
         writeln!(
             body,
             "if {{${{__vw_kw_{arg}_set}}}} \
-             {{ lappend _vw_inner {} ${arg} }}",
+             {{ dict set _vw_d {} ${arg} }}",
             f.name
         )
         .unwrap();
     }
-    // Branch on `-bd` the same way `write_set_property_dict` does.
-    // In bd mode `$cell` is a bd_cell path we hand straight to
-    // `set_property`; in ip mode `$cell` is the module name and we
-    // resolve the IP object via `get_ips`.
-    writeln!(body, "if {{[llength $_vw_inner] > 0}} {{").unwrap();
-    writeln!(body, "  if {{$bd}} {{").unwrap();
     writeln!(
         body,
-        "    vivado_cmd::set_property -dict \
-         [list CONFIG.{param_name} $_vw_inner] -objects $cell"
+        "return [{ret_ty}::from -v [Properties::from -v $_vw_d]]"
     )
     .unwrap();
-    writeln!(body, "  }} else {{").unwrap();
-    writeln!(
-        body,
-        "    vivado_cmd::set_property -dict \
-         [list CONFIG.{param_name} $_vw_inner] -objects [get_ips $cell]"
-    )
-    .unwrap();
-    writeln!(body, "  }}").unwrap();
-    writeln!(body, "}}").unwrap();
-    // Dict-sub procs configure an existing cell; they don't
-    // produce a new one. Return type is `unit` so the REPL
-    // suppresses the (meaningless) empty-string result.
-    emit_proc(out, &sub_name, &doc, Some("unit"), &body);
+    emit_proc(out, &ctor_name, &doc, Some(&ret_ty), &body);
 }
 
 fn emit_dict_field_arg(
@@ -264,6 +275,7 @@ fn generate_single(
     presets: &crate::presets::PresetMap,
     parameters: &[&Parameter],
     opts: &GenerateOptions,
+    dict_schemas: &std::collections::HashMap<String, crate::DictSchema>,
 ) -> String {
     let vlnv = component.vlnv();
     let ip_name = sanitize_ident(&component.name);
@@ -293,10 +305,21 @@ fn generate_single(
         proc_doc.push(Item::Blank);
     }
     for p in parameters {
-        emit_arg_decl(&mut proc_doc, component, presets, p, opts, "");
+        emit_arg_decl(
+            &mut proc_doc,
+            component,
+            presets,
+            p,
+            opts,
+            "",
+            &ip_name,
+            dict_schemas,
+        );
     }
 
-    let body = build_single_body(&vlnv, parameters);
+    let dict_schema_newtypes =
+        build_dict_schema_newtypes(&ip_name, dict_schemas);
+    let body = build_single_body(&vlnv, parameters, &dict_schema_newtypes);
     // Emit into a per-namespace buffer, then wrap. Same shape as
     // vivado-cmd's `namespace eval log { ... }` in log.htcl —
     // Tcl requires the namespace to exist before qualified proc
@@ -359,7 +382,11 @@ fn push_bd_switch_arg(doc: &mut Doc) {
     }));
 }
 
-fn build_single_body(vlnv: &str, parameters: &[&Parameter]) -> String {
+fn build_single_body(
+    vlnv: &str,
+    parameters: &[&Parameter],
+    dict_schema_newtypes: &std::collections::HashMap<String, String>,
+) -> String {
     let mut out = String::new();
     // `-bd` switches between the two Vivado instantiation paths.
     // Default (`-bd 1`) is `create_bd_cell` — the block-design
@@ -386,8 +413,8 @@ fn build_single_body(vlnv: &str, parameters: &[&Parameter]) -> String {
             &mut out,
             parameters,
             "",
-            PropDictSite::TopProc,
             &[],
+            dict_schema_newtypes,
         );
     }
     // Every `create_<ip>` proc must return an identifier the
@@ -411,6 +438,7 @@ fn generate_split(
     presets: &crate::presets::PresetMap,
     parameters: &[&Parameter],
     opts: &GenerateOptions,
+    dict_schemas: &std::collections::HashMap<String, crate::DictSchema>,
 ) -> String {
     let vlnv = component.vlnv();
     let ip_name = sanitize_ident(&component.name);
@@ -464,6 +492,9 @@ fn generate_split(
         })
         .collect();
 
+    let dict_schema_newtypes =
+        build_dict_schema_newtypes(&ip_name, dict_schemas);
+
     let mut out = String::new();
     emit_file_header(&mut out, component, &vlnv);
     writeln!(
@@ -501,27 +532,18 @@ fn generate_split(
     if !tree.direct.is_empty() {
         top_doc.push(Item::Blank);
         for p in &tree.direct {
-            emit_arg_decl(&mut top_doc, component, presets, p, opts, "");
+            emit_arg_decl(
+                &mut top_doc,
+                component,
+                presets,
+                p,
+                opts,
+                "",
+                &ip_name,
+                dict_schemas,
+            );
         }
     }
-    // Branch on `-bd` between block-design and project-IP shapes.
-    // See `build_single_body` for the rationale — same rule, just
-    // inline here because `generate_split` composes its top-body
-    // ad-hoc rather than through the shared helper.
-    let mut top_body = String::new();
-    writeln!(top_body, "if {{$bd}} {{").unwrap();
-    writeln!(
-        top_body,
-        "  set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
-    )
-    .unwrap();
-    writeln!(top_body, "}} else {{").unwrap();
-    writeln!(
-        top_body,
-        "  set cell [vivado_cmd::create_ip -vlnv {vlnv} -module_name $name]"
-    )
-    .unwrap();
-    writeln!(top_body, "}}").unwrap();
     // Family kwargs on the top proc: one `-<stem_lower><i>` per
     // family member, typed as the newtype, with a doc comment
     // referencing the constructor via `[…]` for semantic-goto.
@@ -555,33 +577,14 @@ fn generate_split(
             }
         }
     }
-    if !tree.direct.is_empty() || !families.is_empty() {
-        write_set_property_dict(
-            &mut top_body,
-            &tree.direct,
-            "",
-            PropDictSite::TopProc,
-            &family_merges,
-        );
-    }
-    // Return the identifier callers pass to sub-procs — `$cell`
-    // (bd_cell path) in bd mode, `$name` (module name) in ip mode.
-    // See `build_single_body` for the two-mode contract.
-    writeln!(
-        top_body,
-        "if {{$bd}} {{ return $cell }} else {{ return $name }}"
-    )
-    .unwrap();
     // Family newtype preludes ship at the FILE TOP LEVEL — inside
     // `namespace eval <ip>` blocks, the analyzer double-prefixes
     // qualified proc names (a proc `<ip>::T::from` inside `namespace
     // eval <ip>` becomes `<ip>::<ip>::T::from`, so external
     // references never find it). Keeping them at top level with
-    // fully-qualified names — `type dcmac::GtChProps = Properties`,
-    // `proc dcmac::GtChProps::from { … } dcmac::GtChProps { … }` —
-    // avoids that and remains legal now that the validator accepts
-    // qualified newtype names (see this slice's changes to
-    // `validate::reject_nested_qualified`). An empty
+    // fully-qualified names avoids that and remains legal now that
+    // the validator accepts qualified newtype names (see Slice 4's
+    // changes to `validate::reject_nested_qualified`). An empty
     // `namespace eval <ip>::<StemProps> {}` prelude keeps Tcl happy.
     if !families.is_empty() {
         for f in &families {
@@ -590,15 +593,103 @@ fn generate_split(
         }
         writeln!(out).unwrap();
     }
-    // Family constructors + top proc + sub-procs ship INSIDE
-    // `namespace eval <ip> { … }` with bare names. The bare names
-    // become qualified via the enclosing namespace at load time
-    // (`create` → `<ip>::create`, `mac_port` → `<ip>::mac_port`),
-    // and this is the shape vivado-cmd's `log.htcl` / `ip.htcl`
-    // use idiomatically.
-    let mut procs = String::new();
 
-    // Family constructors.
+    // One value-constructor per non-root node that has direct
+    // parameters. Each is a pure function: takes typed field
+    // kwargs, returns a `<ip>::<NodeProps>` newtype value that the
+    // top proc composes into its atomic `set_property -dict` call.
+    //
+    // `emit_nodes` already excludes labels collapsed into a
+    // family — those emit through `emit_family_constructor` above.
+    let split_nodes: Vec<&Node<'_>> = emit_nodes
+        .iter()
+        .filter(|n| !n.label.is_empty())
+        .copied()
+        .collect();
+
+    // Newtype preludes for each split-shape constructor land at
+    // file top level (same reason as families — `namespace eval
+    // <ip>` blocks double-prefix qualified proc names).
+    for n in &split_nodes {
+        writeln!(out).unwrap();
+        emit_split_props_prelude(&mut out, &ip_name, &n.label);
+    }
+    if !split_nodes.is_empty() {
+        writeln!(out).unwrap();
+    }
+
+    // Top-proc kwargs: one per split-shape constructor. Each is
+    // typed as the node's newtype so the top proc composes ALL
+    // configuration atomically. Semantic-ref doc comment points
+    // at the constructor for goto/hover.
+    if !split_nodes.is_empty() {
+        top_doc.push(Item::Blank);
+        for n in &split_nodes {
+            let ctor_suffix = sanitize_ident(&n.label.to_ascii_lowercase());
+            let ctor = format!("{ip_name}::{ctor_suffix}");
+            let ty = split_props_name(&ip_name, &n.label);
+            top_doc.push(Item::DocComment(format!(
+                "Configuration for the {} sub-tree. Construct with \
+                 [{ctor}].",
+                n.label
+            )));
+            top_doc.push(Item::Command(Command {
+                doc_comments: Vec::new(),
+                words: vec![
+                    Word::Raw("@default(\"\")".into()),
+                    Word::Bare(format!("{ctor_suffix}: {ty}")),
+                ],
+                body: None,
+            }));
+        }
+        // Re-emit the top proc with the updated top_doc (we
+        // rebuild top_body below to inject the merge loops).
+    }
+
+    // Top-proc body: rebuild to fold in the split-shape merge
+    // loops before the finalization. Structure:
+    //   (create_bd_cell / create_ip)
+    //   set _vw_d [list]
+    //   … top-level knob loads …
+    //   … family merge loops …
+    //   … split-shape merge loops (NEW) …
+    //   if {llength > 0} { set_property -dict $_vw_d -objects … }
+    //   return $cell / $name
+    let mut top_body = String::new();
+    writeln!(top_body, "if {{$bd}} {{").unwrap();
+    writeln!(
+        top_body,
+        "  set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
+    )
+    .unwrap();
+    writeln!(top_body, "}} else {{").unwrap();
+    writeln!(
+        top_body,
+        "  set cell [vivado_cmd::create_ip -vlnv {vlnv} -module_name $name]"
+    )
+    .unwrap();
+    writeln!(top_body, "}}").unwrap();
+    if !tree.direct.is_empty()
+        || !families.is_empty()
+        || !split_nodes.is_empty()
+    {
+        write_set_property_dict_with_splits(
+            &mut top_body,
+            &tree.direct,
+            &family_merges,
+            &dict_schema_newtypes,
+            &split_nodes,
+            &ip_name,
+        );
+    }
+    writeln!(
+        top_body,
+        "if {{$bd}} {{ return $cell }} else {{ return $name }}"
+    )
+    .unwrap();
+    // Assemble the `namespace eval <ip> { … }` body in
+    // families → splits → create order.
+    let mut procs = String::new();
     for (i, f) in families.iter().enumerate() {
         if i > 0 {
             writeln!(procs).unwrap();
@@ -610,55 +701,245 @@ fn generate_split(
     if !families.is_empty() {
         writeln!(procs).unwrap();
     }
-
-    // Top split-shape proc: creates the bd_cell. Bare `create`
-    // becomes `<ip>::create` via the enclosing namespace.
-    emit_proc(&mut procs, "create", &top_doc, Some("bd_cell"), &top_body);
-
-    // One proc per non-root node that has direct parameters.
-    // `emit_nodes` already excludes labels collapsed into a family.
-    for n in emit_nodes.iter().filter(|n| !n.label.is_empty()) {
-        writeln!(procs).unwrap();
-        let suffix = sanitize_ident(&n.label.to_ascii_lowercase());
-
-        let mut sub_doc = Doc::new();
-        sub_doc.push(Item::DocComment(format!(
-            "Handle returned by `{top_proc}` — a bd_cell path when \
-             the top proc ran in `-bd 1` mode, or the IP module name \
-             when it ran in `-bd 0` mode.",
-        )));
-        sub_doc.push(Item::Command(Command::call(
-            "cell:",
-            std::iter::once(Word::Bare("bd_cell".into())),
-        )));
-        push_bd_switch_arg(&mut sub_doc);
-        if !n.direct.is_empty() {
-            sub_doc.push(Item::Blank);
+    for (i, n) in split_nodes.iter().enumerate() {
+        if !families.is_empty() || i > 0 {
+            writeln!(procs).unwrap();
         }
-        for p in &n.direct {
-            emit_arg_decl(&mut sub_doc, component, presets, p, opts, &n.label);
-        }
-
-        let mut body = String::new();
-        write_set_property_dict(
-            &mut body,
-            &n.direct,
-            &n.label,
-            PropDictSite::SubProc,
-            &[],
+        emit_split_node_constructor(
+            &mut procs, &ip_name, component, presets, opts, n,
         );
-        // Return the handle the user passed in. Lets
-        // `set x [<ip>::<group> -cell $cell ...]` round-trip
-        // the handle for downstream calls and avoids `$x = ""` when
-        // the conditional-dict had zero supplied args.
-        writeln!(body, "return $cell").unwrap();
-        // Sub-procs propagate whatever the caller handed them —
-        // either a bd_cell path or a module name.
-        emit_proc(&mut procs, &suffix, &sub_doc, Some("bd_cell"), &body);
     }
+    if !families.is_empty() || !split_nodes.is_empty() {
+        writeln!(procs).unwrap();
+    }
+    emit_proc(&mut procs, "create", &top_doc, Some("bd_cell"), &top_body);
 
     write_namespace_block(&mut out, &ip_name, &procs);
     out
+}
+
+/// Emit the newtype prelude for a split-shape node. Same shape as
+/// [`emit_family_prelude`] / [`emit_dict_props_prelude`] — one
+/// `namespace eval <T> {}` + `type <T> = Properties` + the four
+/// helper procs. Consumed by [`emit_split_node_constructor`] and
+/// the top-proc merge loop in
+/// [`write_set_property_dict_with_splits`].
+fn emit_split_props_prelude(out: &mut String, ip_name: &str, label: &str) {
+    let qualified = split_props_name(ip_name, label);
+    let ctor_lower = label.to_ascii_lowercase();
+    writeln!(
+        out,
+        "## Typed configuration value for [{ip_name}::create]'s \
+         `-{ctor_lower}` slot. Construct with [{ip_name}::{ctor_lower}].",
+    )
+    .unwrap();
+    writeln!(out, "namespace eval {ip_name} {{}}").unwrap();
+    writeln!(out, "namespace eval {qualified} {{}}").unwrap();
+    writeln!(out, "type {qualified} = Properties").unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::repr {{ v: {qualified} }} string \
+         {{ return [Properties::repr -v $v] }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::from {{ v: Properties }} {qualified} \
+         {{ return $v }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::to {{ v: {qualified} }} Properties \
+         {{ return $v }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {qualified}::empty {{}} {qualified} \
+         {{ return [{qualified}::from -v [Properties::empty]] }}"
+    )
+    .unwrap();
+}
+
+/// Emit the value-constructor for a split-shape node. Bare proc
+/// name (`<label_lower>`) — becomes `<ip>::<label_lower>` via the
+/// enclosing `namespace eval <ip> { … }`. Pure — no cell handle,
+/// no `-bd`, no `set_property`. Body builds a `Properties`-shaped
+/// dict from the supplied field kwargs (index-stripped keys) and
+/// wraps in the newtype.
+fn emit_split_node_constructor(
+    out: &mut String,
+    ip_name: &str,
+    component: &Component,
+    presets: &crate::presets::PresetMap,
+    opts: &GenerateOptions,
+    n: &Node<'_>,
+) {
+    let ctor_local = sanitize_ident(&n.label.to_ascii_lowercase());
+    let ret_ty = split_props_name(ip_name, &n.label);
+
+    let mut doc = Doc::new();
+    doc.push(Item::DocComment(format!(
+        "Configuration value for [{ip_name}::create]'s \
+         `-{ctor_local}` slot ({} sub-tree). Composes into the top \
+         proc so every provided field lands in ONE atomic \
+         `set_property -dict` call.",
+        n.label
+    )));
+    if !n.direct.is_empty() {
+        doc.push(Item::Blank);
+    }
+    for p in &n.direct {
+        emit_arg_decl(
+            &mut doc,
+            component,
+            presets,
+            p,
+            opts,
+            &n.label,
+            ip_name,
+            &std::collections::HashMap::new(),
+        );
+    }
+
+    let mut body = String::new();
+    writeln!(body, "set _vw_d [dict create]").unwrap();
+    for p in &n.direct {
+        let arg = lowercase_ident(strip_prefix(&p.name, &n.label));
+        let field_key = strip_prefix(&p.name, &n.label);
+        let value_expr = if is_properties_shaped(p.value.default_value()) {
+            format!("[Properties::to_raw -v ${arg}]")
+        } else {
+            format!("${arg}")
+        };
+        writeln!(
+            body,
+            "if {{${{__vw_kw_{arg}_set}}}} \
+             {{ dict set _vw_d {field_key} {value_expr} }}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        body,
+        "return [{ret_ty}::from -v [Properties::from -v $_vw_d]]"
+    )
+    .unwrap();
+    emit_proc(out, &ctor_local, &doc, Some(&ret_ty), &body);
+}
+
+/// Fully-qualified newtype name for a split-shape node.
+/// `("dcmac", "MAC_PORT0_RX")` → `"dcmac::MacPort0RxProps"`.
+fn split_props_name(ip_name: &str, label: &str) -> String {
+    format!("{ip_name}::{}", split_props_local(label))
+}
+
+fn split_props_local(label: &str) -> String {
+    let mut out = String::new();
+    for seg in label.split('_').filter(|s| !s.is_empty()) {
+        out.push_str(&pascal_case(seg));
+    }
+    out.push_str("Props");
+    out
+}
+
+/// Extended top-proc dict writer that also merges split-shape
+/// value-constructor outputs into the atomic dict. Mirrors
+/// [`write_set_property_dict`]'s structure but weaves the
+/// split-node merges in between the top-level knobs, family
+/// merges, and the finalization.
+#[allow(clippy::too_many_arguments)]
+fn write_set_property_dict_with_splits(
+    out: &mut String,
+    parameters: &[&Parameter],
+    families: &[FamilyMerge<'_>],
+    dict_schema_newtypes: &std::collections::HashMap<String, String>,
+    split_nodes: &[&Node<'_>],
+    ip_name: &str,
+) {
+    writeln!(out, "set _vw_d [list]").unwrap();
+    for p in parameters {
+        let arg = lowercase_ident(&p.name);
+        // Type-driven value unwrap:
+        // - Dict-schema newtype: the constructor stores bare-string
+        //   values in a paired-list dict (see
+        //   [`emit_dict_sub_proc`]), which is EXACTLY what Vivado
+        //   expects at `CONFIG.<PARAM>`. So just unwrap the newtype
+        //   via `<T>::to` — do NOT pipe through `Properties::to_raw`,
+        //   which would try to dispatch on `Property::Scalar`/
+        //   `Nested` tags our stored values don't carry.
+        // - Plain Properties (paired-dict-shaped default without a
+        //   schema): assume the caller passed a properly-tagged
+        //   Properties value; unwrap through `Properties::to_raw`.
+        // - Scalar: `$arg` as-is.
+        let value_expr =
+            if let Some(newtype) = dict_schema_newtypes.get(&p.name) {
+                format!("[{newtype}::to -v ${arg}]")
+            } else if is_properties_shaped(p.value.default_value()) {
+                format!("[Properties::to_raw -v ${arg}]")
+            } else {
+                format!("${arg}")
+            };
+        writeln!(
+            out,
+            "if {{${{__vw_kw_{arg}_set}}}} \
+             {{ lappend _vw_d CONFIG.{} {value_expr} }}",
+            p.name
+        )
+        .unwrap();
+    }
+    // Composed-family merges.
+    for fam in families {
+        for idx in &fam.indices {
+            let arg = format!("{}{}", fam.stem_lower, idx);
+            let prefix = format!("CONFIG.{}{}_", fam.stem, idx);
+            writeln!(out, "if {{${{__vw_kw_{arg}_set}}}} {{").unwrap();
+            writeln!(
+                out,
+                "  foreach {{_vw_f _vw_v}} [{}::to -v ${arg}] {{",
+                fam.newtype_qualified
+            )
+            .unwrap();
+            writeln!(out, "    lappend _vw_d \"{prefix}$_vw_f\" $_vw_v")
+                .unwrap();
+            writeln!(out, "  }}").unwrap();
+            writeln!(out, "}}").unwrap();
+        }
+    }
+    // Split-shape merges — each provided value-constructor result
+    // gets its dict entries flattened into the atomic dict with
+    // the `CONFIG.<node.label>_` prefix so property names round-
+    // trip to Vivado exactly as they were in IP-XACT.
+    for n in split_nodes {
+        let arg = sanitize_ident(&n.label.to_ascii_lowercase());
+        let prefix = format!("CONFIG.{}_", n.label);
+        let newtype = split_props_name(ip_name, &n.label);
+        writeln!(out, "if {{${{__vw_kw_{arg}_set}}}} {{").unwrap();
+        writeln!(
+            out,
+            "  foreach {{_vw_f _vw_v}} [{newtype}::to -v ${arg}] {{"
+        )
+        .unwrap();
+        writeln!(out, "    lappend _vw_d \"{prefix}$_vw_f\" $_vw_v").unwrap();
+        writeln!(out, "  }}").unwrap();
+        writeln!(out, "}}").unwrap();
+    }
+    // Finalization — one atomic `set_property -dict` call.
+    writeln!(out, "if {{[llength $_vw_d] > 0}} {{").unwrap();
+    writeln!(out, "  if {{$bd}} {{").unwrap();
+    writeln!(
+        out,
+        "    vivado_cmd::set_property -dict $_vw_d -objects $cell"
+    )
+    .unwrap();
+    writeln!(out, "  }} else {{").unwrap();
+    writeln!(
+        out,
+        "    vivado_cmd::set_property -dict $_vw_d -objects [get_ips $name]"
+    )
+    .unwrap();
+    writeln!(out, "  }}").unwrap();
+    writeln!(out, "}}").unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -750,27 +1031,14 @@ fn emit_proc(
 
 /// Emit `set_property -dict [list \ … ]` for `parameters`. Arg names
 /// are built by stripping `prefix_to_strip` from each parameter's full
-/// IP-XACT name (so a `CPM_PCIE1_PF0_BAR0_ENABLED` parameter inside a
-/// proc scoped at `CPM_PCIE1_PF0_BAR0` reads back as `$enabled`),
-/// while the `CONFIG.<NAME>` key keeps the full name Vivado expects.
-/// Where the write is coming from — the top-level `create_<ip>`
-/// proc or one of its sub-procs. The distinction matters for the
-/// `-bd 0` (project-IP) branch: the top proc has `$name` (its
-/// declared arg) and uses `[get_ips $name]`; sub-procs don't get
-/// `$name`, and by contract their `-cell` arg carries the module
-/// name in `-bd 0` mode, so they use `[get_ips $cell]`. See
-/// [`push_bd_switch_arg`] for the two-mode contract.
-#[derive(Clone, Copy)]
-enum PropDictSite {
-    TopProc,
-    SubProc,
-}
-
+/// IP-XACT name; the `CONFIG.<NAME>` key keeps the full name Vivado
+/// expects. Only the top-level `<ip>::create` proc calls this today —
+/// sub-procs became pure value-constructors under Slice 6 and no
+/// longer emit `set_property` themselves.
 fn write_set_property_dict(
     out: &mut String,
     parameters: &[&Parameter],
     prefix_to_strip: &str,
-    site: PropDictSite,
     // Composed families to merge atomically into the same dict.
     // Empty for sub-procs; populated on the top proc when the
     // generator has collapsed indexed sibling groups into
@@ -779,6 +1047,14 @@ fn write_set_property_dict(
     // its newtype's `::to` + `Properties::to_raw` and merged into
     // `_vw_d` with `CONFIG.<STEM><i>_<FIELD>` keys.
     families: &[FamilyMerge<'_>],
+    // Dict-schema newtype names, keyed by IP-XACT param name
+    // (e.g. `PS_PMC_CONFIG` → `versal_cips::PsPmcConfig`). When a
+    // parameter here matches a top-level top-proc param, its
+    // value_expr gets the `[<T>::to -v $arg]` unwrap injected
+    // BEFORE the `Properties::to_raw` step so the type-check
+    // passes at compile time. Empty for sub-procs / single-shape
+    // IPs without any schemas.
+    dict_schema_newtypes: &std::collections::HashMap<String, String>,
 ) {
     // Build the dict conditionally so only user-supplied args reach
     // Vivado. See `emit_dict_proc` for the rationale — unconditionally
@@ -790,17 +1066,35 @@ fn write_set_property_dict(
     writeln!(out, "set _vw_d [list]").unwrap();
     for p in parameters {
         let arg = lowercase_ident(strip_prefix(&p.name, prefix_to_strip));
-        // Properties-typed args (paired-dict-shaped defaults; see
-        // [`emit_arg_decl`]) get unwrapped through `Properties::to_raw`
-        // before flowing into `set_property -dict`. Vivado expects
-        // a bare paired-list of keys + values for CONFIG.* dict
-        // slots — without the unwrap, the tagged tuple
-        // (`Nested {... Scalar X ...}`) would be passed verbatim.
-        let value_expr = if is_properties_shaped(p.value.default_value()) {
-            format!("[Properties::to_raw -v ${arg}]")
-        } else {
-            format!("${arg}")
-        };
+        // Type-driven value unwrap:
+        // - Dict-schema newtype (`versal_cips::PsPmcConfig` etc.):
+        //   `[Properties::to_raw -v [<T>::to -v $arg]]`. The extra
+        //   `<T>::to` step satisfies the type-checker at compile
+        //   time; at runtime it's identity on the underlying
+        //   Properties value.
+        // - Plain Properties (paired-dict-shaped default without
+        //   a registered schema): `[Properties::to_raw -v $arg]`.
+        // - Scalar: `$arg`.
+        // Type-driven value unwrap:
+        // - Dict-schema newtype: the constructor stores bare-string
+        //   values in a paired-list dict (see
+        //   [`emit_dict_sub_proc`]), which is EXACTLY what Vivado
+        //   expects at `CONFIG.<PARAM>`. So just unwrap the newtype
+        //   via `<T>::to` — do NOT pipe through `Properties::to_raw`,
+        //   which would try to dispatch on `Property::Scalar`/
+        //   `Nested` tags our stored values don't carry.
+        // - Plain Properties (paired-dict-shaped default without a
+        //   schema): assume the caller passed a properly-tagged
+        //   Properties value; unwrap through `Properties::to_raw`.
+        // - Scalar: `$arg` as-is.
+        let value_expr =
+            if let Some(newtype) = dict_schema_newtypes.get(&p.name) {
+                format!("[{newtype}::to -v ${arg}]")
+            } else if is_properties_shaped(p.value.default_value()) {
+                format!("[Properties::to_raw -v ${arg}]")
+            } else {
+                format!("${arg}")
+            };
         writeln!(
             out,
             "if {{${{__vw_kw_{arg}_set}}}} \
@@ -842,13 +1136,10 @@ fn write_set_property_dict(
     // `-bd 1` → cell handle is a bd_cell path, set_property targets
     // it directly. `-bd 0` → cell handle came from `create_ip`,
     // which returns an XCI file path (not a usable IP object). We
-    // resolve the IP through `get_ips`, keyed on either the top
-    // proc's `$name` (which was passed to `-module_name`) or the
-    // sub-proc's `$cell` (by the top-returns-$name contract).
-    let ip_ref = match site {
-        PropDictSite::TopProc => "[get_ips $name]",
-        PropDictSite::SubProc => "[get_ips $cell]",
-    };
+    // resolve the IP through `get_ips` keyed on the top proc's
+    // `$name` arg. (Sub-procs no longer emit `set_property`, so
+    // the historical `-cell`-keyed variant is gone.)
+    let ip_ref = "[get_ips $name]";
     writeln!(out, "if {{[llength $_vw_d] > 0}} {{").unwrap();
     writeln!(out, "  if {{$bd}} {{").unwrap();
     writeln!(
@@ -1109,6 +1400,39 @@ fn stem_props_local(stem: &str) -> String {
     out
 }
 
+/// Fully-qualified newtype name for a dict-schema parameter's
+/// composed value. `("versal_cips", "PS_PMC_CONFIG")` →
+/// `"versal_cips::PsPmcConfig"`. Same compositional-value pattern
+/// as the family-based [`stem_props_name`], applied to Xilinx's
+/// `structured_tcldict` parameter surface so top-proc kwargs like
+/// `-ps_pmc_config` get a typed newtype instead of raw Properties.
+fn dict_props_name(ip_name: &str, param_name: &str) -> String {
+    format!("{ip_name}::{}", dict_props_local(param_name))
+}
+
+/// Local (unqualified) form of the dict-schema newtype name —
+/// PascalCase of the param name.
+fn dict_props_local(param_name: &str) -> String {
+    let mut out = String::new();
+    for seg in param_name.split('_').filter(|s| !s.is_empty()) {
+        out.push_str(&pascal_case(seg));
+    }
+    out
+}
+
+/// Build the `param_name → qualified_newtype_name` map that
+/// [`write_set_property_dict`] consults to inject the `<T>::to`
+/// unwrap step. Empty when the IP has no dict schemas.
+fn build_dict_schema_newtypes(
+    ip_name: &str,
+    dict_schemas: &std::collections::HashMap<String, crate::DictSchema>,
+) -> std::collections::HashMap<String, String> {
+    dict_schemas
+        .keys()
+        .map(|k| (k.clone(), dict_props_name(ip_name, k)))
+        .collect()
+}
+
 /// Convert an identifier segment to PascalCase — first char upper,
 /// rest lower. Non-ASCII passes through unchanged.
 fn pascal_case(s: &str) -> String {
@@ -1140,6 +1464,7 @@ struct FamilyMerge<'a> {
     marker: std::marker::PhantomData<&'a ()>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_arg_decl(
     doc: &mut Doc,
     component: &Component,
@@ -1147,6 +1472,8 @@ fn emit_arg_decl(
     p: &Parameter,
     opts: &GenerateOptions,
     prefix_to_strip: &str,
+    ip_name: &str,
+    dict_schemas: &std::collections::HashMap<String, crate::DictSchema>,
 ) {
     if opts.include_descriptions {
         if let Some(desc) = p.description.as_deref().filter(|s| !s.is_empty()) {
@@ -1155,33 +1482,57 @@ fn emit_arg_decl(
             }
         }
     }
-    let mut words = Vec::new();
-    let enum_values = enum_values_for(component, presets, p);
-    if !enum_values.is_empty() {
-        let formatted: Vec<String> = enum_values
-            .iter()
-            .map(|v| format_attribute_value(v))
-            .collect();
-        words.push(Word::Raw(format!("@enum({})", formatted.join(", "))));
+    // Dict-schema-backed params get their composed newtype form
+    // instead of raw Properties. The IP-XACT default (a paired-list
+    // string) is unrepresentable as a newtype value, so we omit the
+    // `@default(...)` — the top-proc body's `__vw_kw_<arg>_set`
+    // guard skips unset args, and callers explicitly compose the
+    // slot via the constructor when they want to override.
+    let dict_schema = dict_schemas.get(&p.name);
+    if let Some(_schema) = dict_schema {
+        let ctor = format!("{ip_name}::{}", p.name.to_ascii_lowercase());
+        doc.push(Item::DocComment(format!("Composed via [{ctor}].")));
     }
-    let default = p.value.default_value();
-    if !default.is_empty() {
-        words.push(Word::Raw(format!(
-            "@default({})",
-            format_attribute_value(default)
-        )));
+    let mut words = Vec::new();
+    if dict_schema.is_none() {
+        let enum_values = enum_values_for(component, presets, p);
+        if !enum_values.is_empty() {
+            let formatted: Vec<String> = enum_values
+                .iter()
+                .map(|v| format_attribute_value(v))
+                .collect();
+            words.push(Word::Raw(format!("@enum({})", formatted.join(", "))));
+        }
+        let default = p.value.default_value();
+        if !default.is_empty() {
+            words.push(Word::Raw(format!(
+                "@default({})",
+                format_attribute_value(default)
+            )));
+        }
+    } else {
+        // Empty-string placeholder default. The runtime guard
+        // (`__vw_kw_<arg>_set`) prevents the placeholder from ever
+        // being dereferenced through the newtype machinery.
+        words.push(Word::Raw("@default(\"\")".into()));
     }
     let lowered = lowercase_ident(strip_prefix(&p.name, prefix_to_strip));
-    // Type the arg as `Properties` when the default value parses as
-    // a paired-dict (even-length list with identifier keys) —
-    // Vivado's IP-customization slots like `cpm_config` / `ps_pmc_config`
-    // consume a CONFIG.* dict, and typing them as `Properties`
-    // lets callers pass typed values from `util::props` /
-    // dict-traversal. The wrapper body wraps the arg with
-    // `Properties::to_raw` at the `set_property -dict` call
-    // (see [`write_set_property_dict`]) so the boundary
-    // strips the tags before Vivado sees them.
-    let typed_name = if is_properties_shaped(default) {
+    // Typing rules for the param:
+    // - Dict-schema-backed: use its typed newtype
+    //   (`versal_cips::PsPmcConfig`) so `dcmac::` / `versal_cips::`
+    //   completion surfaces the type alongside the constructor,
+    //   and misuse (passing e.g. `CpmConfig` to `-ps_pmc_config`)
+    //   is a compile-time error.
+    // - Otherwise Properties-shaped (paired-dict default without a
+    //   registered schema): keep raw `Properties` — callers still
+    //   compose these by hand, and the top-proc body unwraps via
+    //   `Properties::to_raw` at the `set_property -dict` boundary
+    //   (see [`write_set_property_dict`]).
+    // - Plain scalar: no type annotation.
+    let default = p.value.default_value();
+    let typed_name = if dict_schema.is_some() {
+        format!("{lowered}: {}", dict_props_name(ip_name, &p.name))
+    } else if is_properties_shaped(default) {
         format!("{lowered}: Properties")
     } else {
         lowered
@@ -1497,9 +1848,16 @@ mod tests {
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
-        // Sub-proc args block starts with the `cell` arg.
-        assert!(out.contains("proc big_one {\n    ## Handle returned by"));
-        assert!(out.contains("cell\n"));
+        // Sub-procs are pure value-constructors — no `cell:`
+        // first arg, no bd switch — and return the node's typed
+        // newtype instead of `bd_cell`. Assert the shape.
+        assert!(
+            out.contains("proc big_one {\n    ## Configuration value"),
+            "{out}"
+        );
+        assert!(out.contains("} wide::BigOneProps {"), "{out}");
+        // The old `cell: bd_cell` mutator arg must NOT appear.
+        assert!(!out.contains("cell: bd_cell"), "{out}");
     }
 
     #[test]
@@ -1515,15 +1873,21 @@ mod tests {
         for name in ["proc tiny_a ", "proc tiny_b ", "proc stray "] {
             assert!(!out.contains(name), "unexpected {name} in:\n{out}");
         }
-        // ...and the params instead appear as args on the top proc.
-        let top_block = out
-            .split_once("proc big_one")
-            .map(|(top, _)| top.to_string())
-            .unwrap_or_else(|| out.clone());
+        // ...and the params instead appear as args on the top proc
+        // (`create`). Slice the create-proc range so we can search
+        // its args without accidentally matching arg names embedded
+        // in one of the value-constructor sub-procs' bodies.
+        let create_start = out.find("proc create {").expect("no proc create");
+        let create_body = &out[create_start..];
+        let create_end = create_body
+            .find("\n  }\n")
+            .map(|e| e + 5)
+            .unwrap_or(create_body.len());
+        let create_range = &create_body[..create_end];
         for arg in ["tiny_a_one", "tiny_b_one", "tiny_c_one", "stray_thing"] {
             assert!(
-                top_block.contains(arg),
-                "{arg} missing from top: {top_block}"
+                create_range.contains(arg),
+                "{arg} missing from create proc: {create_range}"
             );
         }
     }
@@ -1578,8 +1942,14 @@ mod tests {
         // not `group_a_field0`.
         assert!(out.contains("@default(0) field0\n"), "{out}");
         assert!(!out.contains("group_a_field0"), "{out}");
-        // The CONFIG.<NAME> mapping keeps the full IP-XACT name.
-        assert!(out.contains("CONFIG.GROUP_A_FIELD0 $field0"), "{out}");
+        // The constructor stores the index-stripped key in its
+        // Properties dict…
+        assert!(out.contains("dict set _vw_d FIELD0 $field0"), "{out}");
+        // …and the top proc's merge loop prefixes with
+        // `CONFIG.GROUP_A_` when composing atomically. The literal
+        // format uses `$_vw_f` at runtime, so we assert on the
+        // prefix pattern.
+        assert!(out.contains("CONFIG.GROUP_A_$_vw_f"), "{out}");
     }
 
     #[test]

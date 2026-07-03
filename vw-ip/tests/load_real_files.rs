@@ -158,12 +158,17 @@ fn generates_cpm5_wrapper_in_split_mode() {
         eprintln!("  {n:>40} = {s} args");
     }
 
-    // Hierarchical split should leave every proc small enough to
-    // navigate in an LSP — no more 4200-arg procs.
+    // Under the flat compositional model the top-level `create`
+    // proc IS the single composition point — one kwarg per split
+    // sub-tree constructor. For a giant IP like CPM5 that's a lot
+    // of kwargs but each is typed, LSP-navigable, and users
+    // typically only pass a handful. Cap at 1000 to guard against
+    // runaway growth without pretending we're back to the
+    // 200-arg hierarchical shape.
     assert!(
-        max_size <= 250,
-        "biggest proc {max_name} still has {max_size} args; \
-         hierarchy isn't splitting deep enough"
+        max_size <= 1000,
+        "biggest proc {max_name} has {max_size} args; \
+         even the compositional top proc shouldn't exceed 1000"
     );
     // And the overall proc count should reflect that we *are* splitting.
     assert!(
@@ -171,15 +176,20 @@ fn generates_cpm5_wrapper_in_split_mode() {
         "only {total_procs} procs — hierarchy isn't being built"
     );
 
-    // Under the namespace-eval wrapping, proc names are BARE
-    // inside the block and rendered with the block's indent
-    // (2 spaces) prefix. The wrapping `namespace eval cpm5 { … }`
-    // sits outside.
+    // Under the compositional model + namespace-eval wrapping:
+    // - Newtype preludes emit at file top level (outside the block).
+    // - Inside `namespace eval cpm5 { … }`: value constructors,
+    //   the top-level `create` proc, all with bare names and
+    //   2-space indent.
+    // The exact ordering of constructors depends on tree traversal;
+    // just assert the wrapping block exists and expected procs
+    // appear inside.
     assert!(
-        out.contains("namespace eval cpm5 {\n  proc create {"),
+        out.contains("namespace eval cpm5 {"),
         "{}",
         &out[..out.len().min(1200)]
     );
+    assert!(out.contains("  proc create {"));
     assert!(out.contains("  proc cpm_pcie0 "));
     assert!(out.contains("  proc cpm_pcie1 "));
 
