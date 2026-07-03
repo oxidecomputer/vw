@@ -130,10 +130,60 @@ pub fn reflow_doc_comments(lines: &[String]) -> String {
             if !paragraph.is_empty() {
                 paragraph.push(' ');
             }
-            paragraph.push_str(trimmed);
+            paragraph.push_str(&render_refs(trimmed));
         }
     }
     flush(&mut paragraph, &mut out);
+    out
+}
+
+/// Rewrite `[NAME]` tokens as `` `NAME` `` so hover-popup markdown
+/// renders them as inline code — visually distinct from prose, and
+/// (in editors that honor code-span click handlers) discoverable as
+/// something a reader can act on. The analyzer's goto/hover paths
+/// already resolve the cursor to the same reference; this is the
+/// display side of the same feature.
+///
+/// Interior chars accepted: letters, digits, `_`, and `:` (for
+/// namespace qualification). Anything else is left as-is — a
+/// prose sentence like "see [1]" or "[TODO: refactor]" isn't a
+/// reference.
+fn render_refs(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let content_start = i + 1;
+            // First char of a Tcl-style ident must be a letter or
+            // underscore; digits and `:`-prefixed forms don't count
+            // (they're prose or footnote-style refs, not identifiers).
+            if content_start < bytes.len()
+                && (bytes[content_start].is_ascii_alphabetic()
+                    || bytes[content_start] == b'_')
+            {
+                let mut j = content_start;
+                while j < bytes.len() && bytes[j] != b']' {
+                    let b = bytes[j];
+                    let ok =
+                        b.is_ascii_alphanumeric() || b == b'_' || b == b':';
+                    if !ok {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b']' && j > content_start {
+                    out.push('`');
+                    out.push_str(&s[content_start..j]);
+                    out.push('`');
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
     out
 }
 
@@ -281,5 +331,28 @@ mod tests {
         // double-space inside the joined paragraph.
         let out = reflow_doc_comments(&lines([" word one", " word two"]));
         assert_eq!(out, "word one word two");
+    }
+
+    /// `[NAME]` refs in doc-comment text render as inline code
+    /// spans so hover popups distinguish them from prose.
+    #[test]
+    fn ref_tokens_render_as_inline_code() {
+        let out = reflow_doc_comments(&lines([
+            "Construct with [dcmac::mac_port] before calling [dcmac::create].",
+        ]));
+        assert_eq!(
+            out,
+            "Construct with `dcmac::mac_port` before calling `dcmac::create`."
+        );
+    }
+
+    /// Not every `[…]` in prose is a reference. Only accept alnum +
+    /// `_` + `:` interiors; anything else stays as-is.
+    #[test]
+    fn non_ref_brackets_left_alone() {
+        let out = reflow_doc_comments(&lines([
+            "See [1] and [TODO: refactor] for details.",
+        ]));
+        assert_eq!(out, "See [1] and [TODO: refactor] for details.");
     }
 }

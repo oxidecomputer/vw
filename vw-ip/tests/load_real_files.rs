@@ -108,28 +108,36 @@ fn generates_cpm5_wrapper_in_split_mode() {
     let mut proc_sizes: Vec<(String, usize)> = Vec::new();
     let mut current: Option<(String, usize)> = None;
     let mut in_args = false;
+    // Track the indent of the current proc — procs live inside
+    // `namespace eval <ip> { … }` and get a 2-space prefix.
+    let mut proc_indent = 0usize;
     for line in out.lines() {
-        if let Some(name) = line
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if let Some(name) = trimmed
             .strip_prefix("proc ")
             .and_then(|s| s.split_once(' ').map(|(n, _)| n))
         {
             current = Some((name.to_string(), 0));
             in_args = true;
-        } else if line == "} {"
-            || (line.starts_with("} ") && line.ends_with(" {"))
+            proc_indent = indent;
+        } else if trimmed == "} {"
+            || (trimmed.starts_with("} ") && trimmed.ends_with(" {"))
         {
             // `} {` is the old (untyped) body opener; `} TYPE {`
             // (e.g. `} bd_cell {`, `} unit {`) is the new
-            // type-annotated form added in step 6 of the
-            // return-type rollout. Either ends the args block.
-            if let Some(c) = current.take() {
-                proc_sizes.push(c);
+            // type-annotated form. Match on the exact indent so
+            // an inner `} {` in the body doesn't close the outer.
+            if indent == proc_indent {
+                if let Some(c) = current.take() {
+                    proc_sizes.push(c);
+                }
+                in_args = false;
             }
-            in_args = false;
         } else if in_args
-            && line.starts_with("  ")
-            && !line.trim_start().starts_with("##")
-            && !line.trim().is_empty()
+            && indent > proc_indent
+            && !trimmed.starts_with("##")
+            && !trimmed.is_empty()
         {
             if let Some(c) = current.as_mut() {
                 c.1 += 1;
@@ -163,13 +171,17 @@ fn generates_cpm5_wrapper_in_split_mode() {
         "only {total_procs} procs — hierarchy isn't being built"
     );
 
+    // Under the namespace-eval wrapping, proc names are BARE
+    // inside the block and rendered with the block's indent
+    // (2 spaces) prefix. The wrapping `namespace eval cpm5 { … }`
+    // sits outside.
     assert!(
-        out.contains("proc create_cpm5 {\n  ## Project-level IP module name"),
+        out.contains("namespace eval cpm5 {\n  proc create {"),
         "{}",
-        &out[..out.find("\n}\n").unwrap_or(out.len().min(600)).min(600)]
+        &out[..out.len().min(1200)]
     );
-    assert!(out.contains("proc create_cpm5_cpm_pcie0 "));
-    assert!(out.contains("proc create_cpm5_cpm_pcie1 "));
+    assert!(out.contains("  proc cpm_pcie0 "));
+    assert!(out.contains("  proc cpm_pcie1 "));
 
     let parsed = vw_htcl::parse(&out);
     assert!(

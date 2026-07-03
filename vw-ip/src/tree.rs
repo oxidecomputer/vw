@@ -69,6 +69,16 @@ impl<'a> Node<'a> {
         }
     }
 
+    /// True when this node has no sub-children — its whole
+    /// configuration surface lives in `direct`. Used by the
+    /// indexed-family collapse pass to gate whether a set of
+    /// sibling nodes can flatten into one constructor: nodes with
+    /// their own sub-trees carry more shape than a flat
+    /// `<StemProps>` value can capture.
+    pub fn is_leaf_only(&self) -> bool {
+        self.children.is_empty()
+    }
+
     /// Collect references to every node in this subtree in pre-order.
     /// Used by code-gen, which needs to iterate the tree twice (once
     /// for the header summary, once to emit procs) without re-walking

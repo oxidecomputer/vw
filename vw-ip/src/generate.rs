@@ -4,27 +4,30 @@
 
 //! Emit an htcl wrapper proc for an IP-XACT component.
 //!
-//! Two shapes, picked by `split_threshold`:
+//! Two shapes, picked by `split_threshold`. Every emitted proc lives
+//! in the IP's own namespace (`<ip>::…`) so name collisions across
+//! IPs are structural and callers reach helpers by tab-completing
+//! `<ip>::`.
 //!
 //! - **Single-proc** (small IPs like CIPS with 19 params): one
-//!   `create_<name>` proc whose structured args mirror the IP's
+//!   `<ip>::create` proc whose structured args mirror the IP's
 //!   parameters. Each arg gets `@default(<value>)` from the IP-XACT
 //!   default; `@enum(...)` when the parameter has a `choiceRef`. The
 //!   body emits `set_property -dict [list ...]` mapping each arg back
 //!   to its `CONFIG.<NAME>` key.
 //!
 //! - **Split** (large IPs like CPM5 with ~8700 params): a top
-//!   `create_<name>` proc that just creates the bd_cell and returns
-//!   its handle, plus one `create_<name>_<group>` sub-proc per
-//!   parameter prefix group. Each sub-proc takes the cell handle as
-//!   its first arg, then its own group's parameters. Small groups
+//!   `<ip>::create` proc that just creates the bd_cell and returns
+//!   its handle, plus one `<ip>::<group>` sub-proc per parameter
+//!   prefix group. Each sub-proc takes the cell handle as its first
+//!   arg, then its own group's parameters. Small groups
 //!   (< `min_group_size`) collapse into a `_misc` sub-proc so we end
 //!   up with a manageable handful rather than dozens of singletons.
 //!
 //!   Call-site composition:
 //!   ```tcl
-//!   set cps [create_cpm5 cps]
-//!   create_cpm5_pcie1 $cps -max_link_speed "32.0_GT/s" -modes PCIE
+//!   set cps [cpm5::create cps]
+//!   cpm5::pcie1 $cps -max_link_speed "32.0_GT/s" -modes PCIE
 //!   ```
 
 use std::fmt::Write;
@@ -32,6 +35,7 @@ use std::fmt::Write;
 use ipxact::{Component, Parameter};
 use vw_htcl::emit::{Command, Doc, Item, Word};
 
+use crate::family::{detect_families, DetectOptions, IndexedFamily};
 use crate::tree::{build_tree, strip_prefix, Node, TreeOptions};
 
 #[derive(Clone, Debug)]
@@ -50,6 +54,12 @@ pub struct GenerateOptions {
     /// args of the parent so we don't get a long tail of singleton
     /// procs.
     pub min_split_size: usize,
+    /// Indexed-family stems to leave per-N (skip the composed-
+    /// constructor collapse). Passed through to
+    /// [`crate::family::DetectOptions::excluded_stems`]. Empty by
+    /// default; populated from the CLI's `--no-collapse=STEM,STEM,…`
+    /// flag when a specific stem needs to opt out.
+    pub no_collapse: Vec<String>,
 }
 
 impl Default for GenerateOptions {
@@ -59,6 +69,7 @@ impl Default for GenerateOptions {
             user_configurable_only: true,
             split_threshold: 100,
             min_split_size: 8,
+            no_collapse: Vec::new(),
         }
     }
 }
@@ -103,7 +114,6 @@ fn append_dict_sub_procs(
     opts: &GenerateOptions,
 ) {
     let ip_name = sanitize_ident(&component.name);
-    let top_proc = format!("create_{ip_name}");
     let mut keys: Vec<&String> = dict_schemas.keys().collect();
     keys.sort();
     for param_name in keys {
@@ -112,19 +122,20 @@ fn append_dict_sub_procs(
             continue;
         }
         writeln!(out).unwrap();
-        emit_dict_sub_proc(out, &top_proc, param_name, schema, opts);
+        emit_dict_sub_proc(out, &ip_name, param_name, schema, opts);
     }
 }
 
 fn emit_dict_sub_proc(
     out: &mut String,
-    top_proc: &str,
+    ip_name: &str,
     param_name: &str,
     schema: &crate::DictSchema,
     opts: &GenerateOptions,
 ) {
     let suffix = sanitize_ident(&param_name.to_ascii_lowercase());
-    let sub_name = format!("{top_proc}_{suffix}");
+    let sub_name = format!("{ip_name}::{suffix}");
+    let top_proc = format!("{ip_name}::create");
 
     let mut doc = Doc::new();
     doc.push(Item::DocComment(format!(
@@ -255,7 +266,7 @@ fn generate_single(
     opts: &GenerateOptions,
 ) -> String {
     let vlnv = component.vlnv();
-    let proc_name = format!("create_{}", sanitize_ident(&component.name));
+    let ip_name = sanitize_ident(&component.name);
 
     let mut out = String::new();
     emit_file_header(&mut out, component, &vlnv);
@@ -286,9 +297,34 @@ fn generate_single(
     }
 
     let body = build_single_body(&vlnv, parameters);
-    // The single-shape proc creates a bd_cell and `return $cell`s.
-    emit_proc(&mut out, &proc_name, &proc_doc, Some("bd_cell"), &body);
+    // Emit into a per-namespace buffer, then wrap. Same shape as
+    // vivado-cmd's `namespace eval log { ... }` in log.htcl —
+    // Tcl requires the namespace to exist before qualified proc
+    // names like `<ip>::create` can be created, and wrapping the
+    // whole proc block in `namespace eval <ip> { … }` is the
+    // idiomatic way to establish it while letting the procs
+    // themselves use bare `proc create { … }` shape.
+    let mut procs = String::new();
+    emit_proc(&mut procs, "create", &proc_doc, Some("bd_cell"), &body);
+    write_namespace_block(&mut out, &ip_name, &procs);
     out
+}
+
+/// Wrap `body` in `namespace eval <ip> { … }`, indenting each
+/// non-empty line by two spaces. The wrapper lets the enclosed
+/// procs use bare names (`create`, `mac_port`, …) while remaining
+/// externally addressable as `<ip>::<name>` — exactly the shape
+/// vivado-cmd's hand-written `log.htcl` / `ip.htcl` use.
+fn write_namespace_block(out: &mut String, ip_name: &str, body: &str) {
+    writeln!(out, "namespace eval {ip_name} {{").unwrap();
+    for line in body.lines() {
+        if line.is_empty() {
+            writeln!(out).unwrap();
+        } else {
+            writeln!(out, "  {line}").unwrap();
+        }
+    }
+    writeln!(out, "}}").unwrap();
 }
 
 /// Emit the `-bd` switch as a proc-arg declaration.
@@ -351,6 +387,7 @@ fn build_single_body(vlnv: &str, parameters: &[&Parameter]) -> String {
             parameters,
             "",
             PropDictSite::TopProc,
+            &[],
         );
     }
     // Every `create_<ip>` proc must return an identifier the
@@ -377,7 +414,7 @@ fn generate_split(
 ) -> String {
     let vlnv = component.vlnv();
     let ip_name = sanitize_ident(&component.name);
-    let top_proc = format!("create_{ip_name}");
+    let top_proc = format!("{ip_name}::create");
 
     let tree = build_tree(
         parameters.iter().copied(),
@@ -386,14 +423,45 @@ fn generate_split(
         },
     );
 
+    let families = detect_families(
+        &tree,
+        &DetectOptions {
+            excluded_stems: opts.no_collapse.clone(),
+        },
+    );
+    // Set of node labels whose per-N sub-proc we should NOT emit —
+    // they collapsed into a family constructor. Their sub-nodes
+    // (`MAC_PORT0_RX`, etc.) still emit; only the direct-param
+    // per-N node vanishes.
+    let collapsed_labels: std::collections::HashSet<String> = families
+        .iter()
+        .flat_map(|f| {
+            f.indices.iter().map(move |i| stem_index_label(&f.stem, *i))
+        })
+        .collect();
+
     // Collect every node that will emit a proc — the root for the
-    // top-level `create_<ip>` and every non-root node that has at least
-    // one direct parameter to configure.
+    // top-level `<ip>::create` and every non-root node that has at
+    // least one direct parameter to configure AND hasn't been
+    // collapsed into a family.
     let all_nodes = tree.collect();
     let emit_nodes: Vec<&Node> = all_nodes
         .iter()
         .copied()
         .filter(|n| n.label.is_empty() || !n.direct.is_empty())
+        .filter(|n| !collapsed_labels.contains(&n.label))
+        .collect();
+
+    // Family-side lookups the top-proc emitter uses.
+    let family_merges: Vec<FamilyMerge<'_>> = families
+        .iter()
+        .map(|f| FamilyMerge {
+            stem: f.stem.clone(),
+            stem_lower: lowercase_ident(&f.stem),
+            indices: f.indices.clone(),
+            newtype_qualified: stem_props_name(&ip_name, &f.stem),
+            marker: std::marker::PhantomData,
+        })
         .collect();
 
     let mut out = String::new();
@@ -454,12 +522,46 @@ fn generate_split(
     )
     .unwrap();
     writeln!(top_body, "}}").unwrap();
-    if !tree.direct.is_empty() {
+    // Family kwargs on the top proc: one `-<stem_lower><i>` per
+    // family member, typed as the newtype, with a doc comment
+    // referencing the constructor via `[…]` for semantic-goto.
+    //
+    // The `@default("")` is a placeholder — the analyzer's
+    // `@default(...)` grammar rejects bracket-expressions like
+    // `[<T>::empty]`, so we can't declare the semantically-correct
+    // default in the annotation. The body's `__vw_kw_<arg>_set`
+    // guard skips the merge loop when the caller didn't pass the
+    // slot, so `$<arg>` is never dereferenced with the placeholder
+    // value — the empty string never reaches the newtype machinery.
+    if !families.is_empty() {
+        top_doc.push(Item::Blank);
+        for f in &families {
+            let ctor = format!("{ip_name}::{}", lowercase_ident(&f.stem));
+            let ty = stem_props_name(&ip_name, &f.stem);
+            for i in &f.indices {
+                let arg = format!("{}{i}", lowercase_ident(&f.stem));
+                top_doc.push(Item::DocComment(format!(
+                    "Configuration for {} slot {i}. Construct with [{ctor}].",
+                    f.stem
+                )));
+                top_doc.push(Item::Command(Command {
+                    doc_comments: Vec::new(),
+                    words: vec![
+                        Word::Raw("@default(\"\")".into()),
+                        Word::Bare(format!("{arg}: {ty}")),
+                    ],
+                    body: None,
+                }));
+            }
+        }
+    }
+    if !tree.direct.is_empty() || !families.is_empty() {
         write_set_property_dict(
             &mut top_body,
             &tree.direct,
             "",
             PropDictSite::TopProc,
+            &family_merges,
         );
     }
     // Return the identifier callers pass to sub-procs — `$cell`
@@ -470,14 +572,49 @@ fn generate_split(
         "if {{$bd}} {{ return $cell }} else {{ return $name }}"
     )
     .unwrap();
-    // Top split-shape proc: creates the bd_cell.
-    emit_proc(&mut out, &top_proc, &top_doc, Some("bd_cell"), &top_body);
+    // Family newtype boilerplate lands at the FILE TOP LEVEL
+    // (outside the `namespace eval` block) — the language
+    // currently rejects qualified type names as return types, so
+    // `type <NsPrefix>Props = Properties` uses a flat name and the
+    // helper procs stay top-level too. Skip entirely when no
+    // families were detected.
+    if !families.is_empty() {
+        for f in &families {
+            writeln!(out).unwrap();
+            emit_family_prelude(&mut out, &ip_name, f);
+        }
+        writeln!(out).unwrap();
+    }
+    // All PROCS (family constructors, top proc, sub-procs) land
+    // inside `namespace eval <ip> { … }` with bare names. That
+    // lets Tcl register them as `<ip>::name` at load time — the
+    // namespace must exist before `proc <ip>::…` is legal, and
+    // wrapping via `namespace eval` is the canonical way to
+    // establish it (same pattern vivado-cmd's `log.htcl` uses).
+    let mut procs = String::new();
+
+    // Family constructors.
+    for (i, f) in families.iter().enumerate() {
+        if i > 0 {
+            writeln!(procs).unwrap();
+        }
+        emit_family_constructor(
+            &mut procs, &ip_name, component, presets, opts, f,
+        );
+    }
+    if !families.is_empty() {
+        writeln!(procs).unwrap();
+    }
+
+    // Top split-shape proc: creates the bd_cell. Bare `create`
+    // becomes `<ip>::create` via the enclosing namespace.
+    emit_proc(&mut procs, "create", &top_doc, Some("bd_cell"), &top_body);
 
     // One proc per non-root node that has direct parameters.
+    // `emit_nodes` already excludes labels collapsed into a family.
     for n in emit_nodes.iter().filter(|n| !n.label.is_empty()) {
-        writeln!(out).unwrap();
+        writeln!(procs).unwrap();
         let suffix = sanitize_ident(&n.label.to_ascii_lowercase());
-        let sub_name = format!("{top_proc}_{suffix}");
 
         let mut sub_doc = Doc::new();
         sub_doc.push(Item::DocComment(format!(
@@ -503,17 +640,19 @@ fn generate_split(
             &n.direct,
             &n.label,
             PropDictSite::SubProc,
+            &[],
         );
         // Return the handle the user passed in. Lets
-        // `set x [create_<ip>_<group> -cell $cell ...]` round-trip
+        // `set x [<ip>::<group> -cell $cell ...]` round-trip
         // the handle for downstream calls and avoids `$x = ""` when
         // the conditional-dict had zero supplied args.
         writeln!(body, "return $cell").unwrap();
         // Sub-procs propagate whatever the caller handed them —
         // either a bd_cell path or a module name.
-        emit_proc(&mut out, &sub_name, &sub_doc, Some("bd_cell"), &body);
+        emit_proc(&mut procs, &suffix, &sub_doc, Some("bd_cell"), &body);
     }
 
+    write_namespace_block(&mut out, &ip_name, &procs);
     out
 }
 
@@ -627,6 +766,14 @@ fn write_set_property_dict(
     parameters: &[&Parameter],
     prefix_to_strip: &str,
     site: PropDictSite,
+    // Composed families to merge atomically into the same dict.
+    // Empty for sub-procs; populated on the top proc when the
+    // generator has collapsed indexed sibling groups into
+    // `<ip>::<stem_lower>` constructors + `-<stem_lower><i>`
+    // kwargs. Each family's per-index kwarg is unwrapped through
+    // its newtype's `::to` + `Properties::to_raw` and merged into
+    // `_vw_d` with `CONFIG.<STEM><i>_<FIELD>` keys.
+    families: &[FamilyMerge<'_>],
 ) {
     // Build the dict conditionally so only user-supplied args reach
     // Vivado. See `emit_dict_proc` for the rationale — unconditionally
@@ -657,6 +804,36 @@ fn write_set_property_dict(
         )
         .unwrap();
     }
+    // Composed-family merges — each provided `-<stem_lower><i>`
+    // value gets unwrapped and its `FIELD → value` pairs merged
+    // into `_vw_d` with the `CONFIG.<STEM><i>_` prefix. Runs
+    // BEFORE the `if {llength} { set_property … }` finalization
+    // so the whole thing lands as ONE atomic call.
+    for fam in families {
+        for idx in &fam.indices {
+            let arg = format!("{}{}", fam.stem_lower, idx);
+            let prefix = format!("CONFIG.{}{}_", fam.stem, idx);
+            // Family constructors store bare-string values in
+            // their dict (see `emit_family_constructor`), so
+            // iterate the raw dict directly rather than going
+            // through `Properties::to_raw`. The latter would
+            // dispatch on `Property::Scalar`/`Nested` tags that
+            // our stored values don't carry — the constructor
+            // treats every field as a scalar and this loop has
+            // to match that convention.
+            writeln!(out, "if {{${{__vw_kw_{arg}_set}}}} {{").unwrap();
+            writeln!(
+                out,
+                "  foreach {{_vw_f _vw_v}} [{}::to -v ${arg}] {{",
+                fam.newtype_qualified
+            )
+            .unwrap();
+            writeln!(out, "    lappend _vw_d \"{prefix}$_vw_f\" $_vw_v")
+                .unwrap();
+            writeln!(out, "  }}").unwrap();
+            writeln!(out, "}}").unwrap();
+        }
+    }
     // `-bd 1` → cell handle is a bd_cell path, set_property targets
     // it directly. `-bd 0` → cell handle came from `create_ip`,
     // which returns an XCI file path (not a usable IP object). We
@@ -682,6 +859,275 @@ fn write_set_property_dict(
     .unwrap();
     writeln!(out, "  }}").unwrap();
     writeln!(out, "}}").unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Indexed-family emission.
+// ---------------------------------------------------------------------------
+
+/// Emit one arg-decl for a family constructor. Mirror of
+/// [`emit_arg_decl`] with one addition: the `@enum(...)` list is
+/// the **union** of enum choices across every provided member
+/// (`per_member`), so the collapsed constructor accepts any value
+/// any port takes. Defaults are shape-equal by construction (the
+/// shape-match check requires it), so we use `shape_param`'s
+/// default verbatim.
+fn emit_arg_decl_family(
+    doc: &mut Doc,
+    component: &Component,
+    presets: &crate::presets::PresetMap,
+    shape_param: &Parameter,
+    per_member: &[&Parameter],
+    shape_member_label: &str,
+    opts: &GenerateOptions,
+) {
+    if opts.include_descriptions {
+        if let Some(desc) =
+            shape_param.description.as_deref().filter(|s| !s.is_empty())
+        {
+            for line in desc.lines() {
+                doc.push(Item::DocComment(line.trim_end().into()));
+            }
+        }
+    }
+    let mut words = Vec::new();
+    // Union enum choices across every per-member Parameter that
+    // maps to this field. Preserve insertion order (IP-XACT first
+    // across members, presets after) so hover/completion shows a
+    // stable list.
+    let mut seen = std::collections::HashSet::new();
+    let mut unioned: Vec<String> = Vec::new();
+    for p in per_member {
+        for v in enum_values_for(component, presets, p) {
+            if seen.insert(v.clone()) {
+                unioned.push(v);
+            }
+        }
+    }
+    if !unioned.is_empty() {
+        let formatted: Vec<String> =
+            unioned.iter().map(|v| format_attribute_value(v)).collect();
+        words.push(Word::Raw(format!("@enum({})", formatted.join(", "))));
+    }
+    let default = shape_param.value.default_value();
+    if !default.is_empty() {
+        words.push(Word::Raw(format!(
+            "@default({})",
+            format_attribute_value(default)
+        )));
+    }
+    let lowered =
+        lowercase_ident(strip_prefix(&shape_param.name, shape_member_label));
+    let typed_name = if is_properties_shaped(default) {
+        format!("{lowered}: Properties")
+    } else {
+        lowered
+    };
+    words.push(Word::Bare(typed_name));
+    doc.push(Item::Command(Command {
+        doc_comments: Vec::new(),
+        words,
+        body: None,
+    }));
+}
+
+/// Emit the newtype declaration and its `from`/`to`/`repr`/`empty`
+/// helper procs for one family. The whole block sits inside a
+/// `namespace eval <ip> { … }` because the htcl validator only
+/// accepts qualified type names (like `dcmac::GtChProps`) as the
+/// first-argument annotation of an overloaded handler proc — it
+/// refuses them as return types or generic arguments. Declaring
+/// the type and its helpers with BARE names inside `namespace eval
+/// dcmac { … }` lets the rest of the file reference them via the
+/// `dcmac::` prefix without hitting that rule. The whole block sits inside a
+/// `namespace eval <ip>::<StemProps> { … }` because the `type` decl
+/// plus per-op procs share the newtype's namespace.
+fn emit_family_prelude(out: &mut String, ip_name: &str, f: &IndexedFamily<'_>) {
+    let stem_props = stem_props_name(ip_name, &f.stem);
+    let stem_lower = lowercase_ident(&f.stem);
+    writeln!(
+        out,
+        "## Typed configuration slot for one [{ip_name}::{stem_lower}] on \
+         [{ip_name}::create].",
+    )
+    .unwrap();
+    // Tcl requires the target namespace to exist before a
+    // qualified proc name (`X::y`) can be declared. Same rule as
+    // vivado-cmd's `namespace eval bd_cell {}` prelude at
+    // types.htcl:28 — establish the namespace with an empty
+    // eval, then declare the type and its helper procs.
+    writeln!(out, "namespace eval {stem_props} {{}}").unwrap();
+    writeln!(out, "type {stem_props} = Properties").unwrap();
+    writeln!(
+        out,
+        "proc {stem_props}::repr {{ v: {stem_props} }} string \
+         {{ return [Properties::repr -v $v] }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {stem_props}::from {{ v: Properties }} {stem_props} \
+         {{ return $v }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {stem_props}::to {{ v: {stem_props} }} Properties \
+         {{ return $v }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "proc {stem_props}::empty {{}} {stem_props} \
+         {{ return [{stem_props}::from -v [Properties::empty]] }}"
+    )
+    .unwrap();
+}
+
+/// Emit the family constructor `<ip>::<stem_lower>` — a pure
+/// value-builder that takes the same typed args the collapsed
+/// per-N procs took, packs the supplied ones into a `Properties`
+/// dict, and returns it wrapped in the newtype. NO Vivado side
+/// effects; the atomic materialization happens later in
+/// `<ip>::create`.
+fn emit_family_constructor(
+    out: &mut String,
+    ip_name: &str,
+    component: &Component,
+    presets: &crate::presets::PresetMap,
+    opts: &GenerateOptions,
+    f: &IndexedFamily<'_>,
+) {
+    // Emitted inside `namespace eval <ip> { … }` — use a bare
+    // proc name; Tcl resolves it to `<ip>::<stem_lower>` at load
+    // time via the enclosing namespace.
+    let stem_lower = lowercase_ident(&f.stem);
+    let ret_ty = stem_props_name(ip_name, &f.stem);
+
+    let mut doc = Doc::new();
+    doc.push(Item::DocComment(format!(
+        "Configuration value for one of [{ip_name}::create]'s \
+         `-{stem_lower}<i>` slots. Composes into the top proc so \
+         every provided slot's fields land in ONE atomic \
+         `set_property -dict` call.",
+    )));
+    doc.push(Item::Blank);
+    // Each field's `@enum(...)` values are the UNION of that
+    // field's per-member enum choices — the constructor has to
+    // accept any value any port can take. See ShapeSlot's docs
+    // for why choice_ref differences don't block the family.
+    for p in &f.shape {
+        let field_short = strip_prefix(&p.name, &f.shape_member_label);
+        let per_member: Vec<&Parameter> = f
+            .members_direct
+            .iter()
+            .zip(&f.member_labels)
+            .filter_map(|(direct, label)| {
+                direct
+                    .iter()
+                    .copied()
+                    .find(|q| strip_prefix(&q.name, label) == field_short)
+            })
+            .collect();
+        emit_arg_decl_family(
+            &mut doc,
+            component,
+            presets,
+            p,
+            &per_member,
+            &f.shape_member_label,
+            opts,
+        );
+    }
+
+    // Body: build a dict from the supplied kwargs and wrap it.
+    let mut body = String::new();
+    writeln!(body, "set _vw_d [dict create]").unwrap();
+    for p in &f.shape {
+        let arg = lowercase_ident(strip_prefix(&p.name, &f.shape_member_label));
+        // Post-strip key becomes the CONFIG.<STEM><i>_ suffix at
+        // top-proc merge time. Store un-prefixed field name here.
+        let field_key = strip_prefix(&p.name, &f.shape_member_label);
+        // Properties-typed sub-slots (rare in a family shape;
+        // included for completeness) get unwrapped through
+        // Properties::to_raw before landing in the dict. Otherwise
+        // the value is a plain string.
+        let value_expr = if is_properties_shaped(p.value.default_value()) {
+            format!("[Properties::to_raw -v ${arg}]")
+        } else {
+            format!("${arg}")
+        };
+        writeln!(
+            body,
+            "if {{${{__vw_kw_{arg}_set}}}} \
+             {{ dict set _vw_d {field_key} {value_expr} }}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        body,
+        "return [{ret_ty}::from -v [Properties::from -v $_vw_d]]"
+    )
+    .unwrap();
+    emit_proc(out, &stem_lower, &doc, Some(&ret_ty), &body);
+}
+
+/// Reconstruct a family member's tree-node label from stem + index.
+/// The `<STEM><INDEX>` naming (no separator) matches how
+/// `tree::build_tree` produces `MAC_PORT0`, `MAC_PORT1`, ….
+fn stem_index_label(stem: &str, idx: u32) -> String {
+    format!("{stem}{idx}")
+}
+
+/// PascalCase newtype name from IP-name + uppercase-with-underscores
+/// stem. `("dcmac", "MAC_PORT")` → `"DcmacMacPortProps"`.
+///
+/// The IP-name prefix is a workaround for the current htcl language
+/// limitation that qualified type names (`dcmac::MacPortProps`)
+/// can't appear as return types on newtype-helper procs — the
+/// language accepts them only in overload-handler first-arg
+/// positions. Flat IP-prefixed names give us per-IP uniqueness
+/// without hitting that restriction. When the analyzer grows
+/// support for fully-qualified newtypes we can drop the prefix
+/// and namespace these under `<ip>::`.
+fn stem_props_name(ip_name: &str, stem: &str) -> String {
+    let mut out = pascal_case(ip_name);
+    for seg in stem.split('_').filter(|s| !s.is_empty()) {
+        out.push_str(&pascal_case(seg));
+    }
+    out.push_str("Props");
+    out
+}
+
+/// Convert an identifier segment to PascalCase — first char upper,
+/// rest lower. Non-ASCII passes through unchanged.
+fn pascal_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    if let Some(c) = chars.next() {
+        out.push(c.to_ascii_uppercase());
+        for c in chars {
+            out.push(c.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// Bundle of names needed to emit one family's per-index merge
+/// block inside [`write_set_property_dict`]. Built at the top-proc
+/// call site from an [`IndexedFamily`] + the IP's namespace.
+struct FamilyMerge<'a> {
+    /// Uppercase stem (`"MAC_PORT"`).
+    stem: String,
+    /// Lowercase-ident stem for arg names (`"mac_port"`).
+    stem_lower: String,
+    /// Present indices (`[0, 1, 2, 3, 4, 5]`).
+    indices: Vec<u32>,
+    /// Fully-qualified newtype path for the `::to` unwrap
+    /// (`"dcmac::MacPortProps"`).
+    newtype_qualified: String,
+    #[allow(dead_code)]
+    marker: std::marker::PhantomData<&'a ()>,
 }
 
 fn emit_arg_decl(
@@ -993,10 +1439,12 @@ mod tests {
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
         );
-        let n_procs =
-            out.matches("\nproc ").count() + out.starts_with("proc ") as usize;
+        // Procs live inside `namespace eval <ip> { … }` and get
+        // the 2-space indent from `write_namespace_block`.
+        let n_procs = out.matches("\n  proc ").count();
         assert_eq!(n_procs, 1, "{out}");
-        assert!(out.contains("proc create_demo"));
+        assert!(out.contains("proc create"));
+        assert!(out.contains("namespace eval demo {"));
     }
 
     #[test]
@@ -1009,9 +1457,9 @@ mod tests {
             &GenerateOptions::default(),
         );
         eprintln!("--- generated ---\n{out}\n--- end ---");
-        assert!(out.contains("proc create_wide "));
-        assert!(out.contains("proc create_wide_big_one "));
-        assert!(out.contains("proc create_wide_big_two "));
+        assert!(out.contains("proc create"));
+        assert!(out.contains("proc big_one"));
+        assert!(out.contains("proc big_two"));
         let parsed = vw_htcl::parse(&out);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let diags = vw_htcl::validate(&parsed.document, &out);
@@ -1040,9 +1488,7 @@ mod tests {
             &GenerateOptions::default(),
         );
         // Sub-proc args block starts with the `cell` arg.
-        assert!(
-            out.contains("proc create_wide_big_one {\n  ## Handle returned by")
-        );
+        assert!(out.contains("proc big_one {\n    ## Handle returned by"));
         assert!(out.contains("cell\n"));
     }
 
@@ -1056,16 +1502,12 @@ mod tests {
             &GenerateOptions::default(),
         );
         // None of the tiny prefix groups becomes its own proc...
-        for name in [
-            "create_wide_tiny_a ",
-            "create_wide_tiny_b ",
-            "create_wide_stray ",
-        ] {
+        for name in ["proc tiny_a ", "proc tiny_b ", "proc stray "] {
             assert!(!out.contains(name), "unexpected {name} in:\n{out}");
         }
         // ...and the params instead appear as args on the top proc.
         let top_block = out
-            .split_once("proc create_wide_big_one")
+            .split_once("proc big_one")
             .map(|(top, _)| top.to_string())
             .unwrap_or_else(|| out.clone());
         for arg in ["tiny_a_one", "tiny_b_one", "tiny_c_one", "stray_thing"] {

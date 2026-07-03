@@ -314,6 +314,12 @@ fn parse_document(
     let start = input.location();
     let mut stmts = Vec::new();
     let mut pending_docs: Vec<String> = Vec::new();
+    // Span covering all currently-pending `##` lines from the first
+    // `#` byte to the last line's end. Grows with each new `##`
+    // encountered; cleared alongside `pending_docs`. Used to seed
+    // the attached command's `doc_comments_span` so the analyzer
+    // can answer "is the cursor inside this doc block?"
+    let mut pending_docs_span: Option<Span> = None;
 
     loop {
         skip_inline_ws(input, source, mode);
@@ -348,8 +354,16 @@ fn parse_document(
                 let comment = parse_comment(input, source);
                 if comment.is_doc {
                     pending_docs.push(comment.text.clone());
+                    // Extend the block-span to cover this line. The
+                    // comment's own span starts at its `#` and ends
+                    // at the line's end.
+                    pending_docs_span = Some(match pending_docs_span {
+                        Some(prev) => Span::new(prev.start, comment.span.end),
+                        None => comment.span,
+                    });
                 } else {
                     pending_docs.clear();
+                    pending_docs_span = None;
                 }
                 stmts.push(Stmt::Comment(comment));
             }
@@ -358,10 +372,12 @@ fn parse_document(
                 match parse_command(input, source, mode) {
                     Ok(mut cmd) => {
                         cmd.doc_comments = std::mem::take(&mut pending_docs);
+                        cmd.doc_comments_span = pending_docs_span.take();
                         stmts.push(Stmt::Command(cmd));
                     }
                     Err(err) => {
                         pending_docs.clear();
+                        pending_docs_span = None;
                         // Resync to the next statement boundary. In
                         // `BracketBody` only `;` breaks; the surrounding
                         // `]` is EOF for the interior parser.
@@ -480,6 +496,7 @@ fn parse_command(
         span,
         kind,
         doc_comments: Vec::new(),
+        doc_comments_span: None,
     })
 }
 

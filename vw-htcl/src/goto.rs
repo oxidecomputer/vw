@@ -31,12 +31,133 @@ pub fn definition_at(
     offset: u32,
 ) -> Option<Span> {
     let table = signature_table(document);
+    // Try a doc-comment `[NAME]` reference first — it's cheap and
+    // rules out any structural resolution when the cursor is inside
+    // a `##` block. Otherwise fall through to the structural paths.
+    if let Some(span) =
+        definition_in_doc_comment(document, source, offset, &table)
+    {
+        return Some(span);
+    }
     definition_in_stmts(&document.stmts, None, document, &table, source, offset)
         // Fallback: a `$var` the structured tree keeps opaque — inside
         // a command substitution or an `if`/`while` condition. Found by
         // scanning the source and resolving against the enclosing
         // proc's scope.
         .or_else(|| definition_of_scanned_var(document, source, offset))
+}
+
+/// Resolve a `[NAME]` reference embedded in a `##` doc-comment
+/// block. Returns `None` when the cursor isn't inside any command's
+/// or arg's doc-comment span, or when the `[…]` at the cursor
+/// doesn't name a proc declared in this document.
+///
+/// Cross-file references (e.g. `[Properties::from]` where
+/// `Properties::from` lives in `types.htcl`) resolve when the
+/// document has already sourced that file; unresolved names simply
+/// return `None`, which the LSP client renders as "no definition
+/// available" without disrupting the fallback paths.
+fn definition_in_doc_comment(
+    document: &Document,
+    source: &str,
+    offset: u32,
+    _table: &SignatureTable<'_>,
+) -> Option<Span> {
+    let block = enclosing_doc_block(&document.stmts, offset)?;
+    let name = extract_ref_at(source, block, offset)?;
+    let proc = find_proc_decl(document, &name)?;
+    Some(proc.name_span)
+}
+
+/// Return the doc-comment span that contains `offset`, if any. Walks
+/// commands, proc signatures, nested proc bodies, and namespace-eval
+/// bodies.
+fn enclosing_doc_block(stmts: &[Stmt], offset: u32) -> Option<Span> {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        if let Some(span) = cmd.doc_comments_span {
+            if span.contains(offset) {
+                return Some(span);
+            }
+        }
+        // ProcArg doc-comment blocks sit inside the proc's args span.
+        if let CommandKind::Proc(proc) = &cmd.kind {
+            if let Some(sig) = &proc.signature {
+                for arg in &sig.args {
+                    if let Some(span) = arg.doc_comments_span {
+                        if span.contains(offset) {
+                            return Some(span);
+                        }
+                    }
+                }
+            }
+            if let Some(span) = enclosing_doc_block(&proc.body, offset) {
+                return Some(span);
+            }
+        }
+        if let CommandKind::NamespaceEval(ns) = &cmd.kind {
+            if let Some(span) = enclosing_doc_block(&ns.body, offset) {
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
+/// Given a doc-comment block-span and a cursor offset inside it,
+/// find a `[NAME]` reference whose interior span contains `offset`
+/// and return `NAME`. Interior must be a valid ident (letters,
+/// digits, `_`, `:` for namespace qualification). `[` and `]` are
+/// the disambiguators from surrounding prose.
+fn extract_ref_at(source: &str, block: Span, offset: u32) -> Option<String> {
+    let bytes = source.as_bytes();
+    let start = block.start as usize;
+    let end = (block.end as usize).min(bytes.len());
+    let off = offset as usize;
+    if off < start || off > end {
+        return None;
+    }
+    // Scan for `[…]` pairs. `[` and `]` are cheap to find; the
+    // interior is validated once we have both delimiters.
+    let mut i = start;
+    while i < end {
+        if bytes[i] == b'[' {
+            let content_start = i + 1;
+            // Ident-start rule: first char must be a letter or `_`.
+            // Same as `render_refs` in doc.rs — keeps the analyzer
+            // and the renderer in agreement on what counts as a ref.
+            if content_start < end
+                && (bytes[content_start].is_ascii_alphabetic()
+                    || bytes[content_start] == b'_')
+            {
+                let mut j = content_start;
+                while j < end && bytes[j] != b']' {
+                    let b = bytes[j];
+                    let ok =
+                        b.is_ascii_alphanumeric() || b == b'_' || b == b':';
+                    if !ok {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j < end && bytes[j] == b']' && j > content_start {
+                    // Reference spans `[NAME]` inclusive. The cursor
+                    // hits a ref if it's on any of `[`, `NAME`, or `]`.
+                    if off >= i && off <= j {
+                        let name =
+                            std::str::from_utf8(&bytes[content_start..j])
+                                .ok()?
+                                .to_string();
+                        return Some(name);
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn definition_of_scanned_var(
@@ -92,6 +213,18 @@ fn definition_in_stmts<'a>(
                 source,
                 offset,
             );
+        }
+
+        // `namespace eval <name> { … }` — descend into the populated
+        // body directly. Without this arm we'd fall through to the
+        // brace-body reparse path, which works but discards the
+        // pre-populated proc bodies and re-triggers a full parse.
+        if let CommandKind::NamespaceEval(ns) = &cmd.kind {
+            if let Some(span) = definition_in_stmts(
+                &ns.body, enclosing, document, table, source, offset,
+            ) {
+                return Some(span);
+            }
         }
 
         // Cursor on a `$var` reference → its definition in scope.
@@ -622,6 +755,100 @@ proc show {\n  width\n} { }\n\
 show -widthz 16\n";
         let parsed = parse(src);
         let pos = first(src, "-widthz");
+        assert!(definition_at(&parsed.document, src, pos).is_none());
+    }
+
+    /// `[NAME]` in a proc's leading `##` doc block resolves to that
+    /// proc's declaration when NAME is defined in the same document.
+    #[test]
+    fn doc_ref_in_proc_block_resolves_to_proc() {
+        let src = "\
+proc target {} { puts hi }
+## See [target] for related config.
+proc other {} { return 1 }
+";
+        let parsed = parse(src);
+        // Cursor on the `t` inside `[target]`.
+        let pos = first(src, "[target]") + 1;
+        let target = definition_at(&parsed.document, src, pos).unwrap();
+        let expected = parsed
+            .document
+            .stmts
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Command(c) => match &c.kind {
+                    CommandKind::Proc(p)
+                        if p.name.as_deref() == Some("target") =>
+                    {
+                        Some(p.name_span)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(target, expected);
+    }
+
+    /// `[NAME]` in a proc arg's `##` block resolves too — this is
+    /// exactly the shape the generator emits for `-port0`-style args.
+    #[test]
+    fn doc_ref_in_proc_arg_block_resolves() {
+        let src = "\
+proc mac_port {} { puts ok }
+proc create {
+  ## Configuration for MAC port 0. Construct with [mac_port].
+  port0
+} { return 1 }
+";
+        let parsed = parse(src);
+        let pos = first(src, "[mac_port]") + 1;
+        let target = definition_at(&parsed.document, src, pos).unwrap();
+        let expected = parsed
+            .document
+            .stmts
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Command(c) => match &c.kind {
+                    CommandKind::Proc(p)
+                        if p.name.as_deref() == Some("mac_port") =>
+                    {
+                        Some(p.name_span)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(target, expected);
+    }
+
+    /// Unresolved `[NAME]` — target doesn't exist — falls through to
+    /// None without touching the structural paths.
+    #[test]
+    fn doc_ref_to_unknown_returns_none() {
+        let src = "\
+## See [nonexistent] for details.
+proc foo {} { puts hi }
+";
+        let parsed = parse(src);
+        let pos = first(src, "[nonexistent]") + 1;
+        assert!(definition_at(&parsed.document, src, pos).is_none());
+    }
+
+    /// Cursor on prose inside a doc comment (not on a `[…]` token)
+    /// falls through to structural resolution. Sanity check that the
+    /// doc-ref path doesn't intercept every cursor position in a `##`.
+    #[test]
+    fn doc_prose_falls_through() {
+        let src = "\
+## Just prose, no refs here at all.
+proc target {} { puts hi }
+";
+        let parsed = parse(src);
+        // Cursor on the `p` of "prose" — inside the block but not
+        // inside a `[…]`.
+        let pos = first(src, "prose");
         assert!(definition_at(&parsed.document, src, pos).is_none());
     }
 }

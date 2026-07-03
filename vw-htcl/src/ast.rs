@@ -56,6 +56,13 @@ pub struct Command {
     /// Doc comments (`##`) immediately preceding the command, in
     /// source order with the `##` prefix stripped.
     pub doc_comments: Vec<String>,
+    /// Source span covering the whole `##` block — from the first
+    /// `#` of the first line to the newline after the last line.
+    /// `None` when the command has no doc comments. Used by the
+    /// analyzer to answer "is the cursor inside this command's doc
+    /// block?" so `[NAME]` references inside `##` text can resolve
+    /// via goto/hover.
+    pub doc_comments_span: Option<Span>,
 }
 
 /// Recognized command shapes. Generic covers any unrecognized command;
@@ -352,6 +359,10 @@ pub struct ProcArg {
     pub name: String,
     pub name_span: Span,
     pub doc_comments: Vec<String>,
+    /// Source span covering the whole `##` block that attaches to
+    /// this arg — `None` when the arg has no doc comments. See
+    /// [`Command::doc_comments_span`] for the analyzer-side rationale.
+    pub doc_comments_span: Option<Span>,
     pub attributes: Vec<Attribute>,
     /// Optional `: TYPE` annotation on the arg. `Some` when the
     /// source carries `name: bd_cell` style; `None` when the arg

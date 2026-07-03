@@ -77,10 +77,138 @@ pub fn hover_at<'a>(
     offset: u32,
 ) -> Option<HoverTarget<'a>> {
     let table = signature_table(document);
+    // Doc-comment `[NAME]` reference — cheap to detect and rules
+    // out any structural resolution when the cursor is inside a
+    // `##` block. Renders the target proc's signature as the hover
+    // content, same as if the cursor were on a call site.
+    if let Some(t) = hover_in_doc_comment(document, source, offset, &table) {
+        return Some(t);
+    }
     hover_in_stmts(&document.stmts, &table, source, offset)
         // Fallback: a `$var` reference — including one buried in opaque
         // text (a command substitution or `if`/`while` condition).
         .or_else(|| hover_scanned_var(document, source, offset))
+}
+
+/// Hover for a `[NAME]` reference inside a `##` doc-comment block.
+/// The result mirrors `HoverTarget::CallSite` for the referenced
+/// proc, so the LSP formatter renders the target's signature with
+/// its own docs — exactly what a reader following the reference
+/// wants to see.
+fn hover_in_doc_comment<'a>(
+    document: &'a Document,
+    source: &str,
+    offset: u32,
+    table: &SignatureTable<'a>,
+) -> Option<HoverTarget<'a>> {
+    let block = enclosing_doc_block(&document.stmts, offset)?;
+    let name = extract_ref_at(source, block, offset)?;
+    // Anchor the hover span on the `[NAME]` reference itself so the
+    // editor highlights just that token.
+    let ref_span = ref_span_at(source, block, offset)?;
+    let sig = *table.get(&name)?;
+    Some(HoverTarget::CallSite {
+        proc_name: name,
+        signature: sig,
+        span: ref_span,
+    })
+}
+
+/// Return the doc-comment span containing `offset`. Mirror of
+/// [`crate::goto::enclosing_doc_block`] — kept crate-local because
+/// both consumers want the same rule.
+fn enclosing_doc_block(stmts: &[Stmt], offset: u32) -> Option<Span> {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        if let Some(span) = cmd.doc_comments_span {
+            if span.contains(offset) {
+                return Some(span);
+            }
+        }
+        if let CommandKind::Proc(proc) = &cmd.kind {
+            if let Some(sig) = &proc.signature {
+                for arg in &sig.args {
+                    if let Some(span) = arg.doc_comments_span {
+                        if span.contains(offset) {
+                            return Some(span);
+                        }
+                    }
+                }
+            }
+            if let Some(span) = enclosing_doc_block(&proc.body, offset) {
+                return Some(span);
+            }
+        }
+        if let CommandKind::NamespaceEval(ns) = &cmd.kind {
+            if let Some(span) = enclosing_doc_block(&ns.body, offset) {
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
+/// Extract the identifier inside a `[NAME]` reference at `offset`.
+/// See goto.rs's `extract_ref_at` for the disambiguation rules.
+fn extract_ref_at(source: &str, block: Span, offset: u32) -> Option<String> {
+    let (_, name) = find_ref(source, block, offset)?;
+    Some(name)
+}
+
+/// Return the inclusive span of the `[NAME]` token at `offset` in
+/// the block, so the hover popup anchors on the reference (not the
+/// entire doc block).
+fn ref_span_at(source: &str, block: Span, offset: u32) -> Option<Span> {
+    let (span, _) = find_ref(source, block, offset)?;
+    Some(span)
+}
+
+fn find_ref(source: &str, block: Span, offset: u32) -> Option<(Span, String)> {
+    let bytes = source.as_bytes();
+    let start = block.start as usize;
+    let end = (block.end as usize).min(bytes.len());
+    let off = offset as usize;
+    if off < start || off > end {
+        return None;
+    }
+    let mut i = start;
+    while i < end {
+        if bytes[i] == b'[' {
+            let content_start = i + 1;
+            // Ident-start rule mirrors doc.rs / goto.rs.
+            if content_start < end
+                && (bytes[content_start].is_ascii_alphabetic()
+                    || bytes[content_start] == b'_')
+            {
+                let mut j = content_start;
+                while j < end && bytes[j] != b']' {
+                    let b = bytes[j];
+                    let ok =
+                        b.is_ascii_alphanumeric() || b == b'_' || b == b':';
+                    if !ok {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j < end && bytes[j] == b']' && j > content_start {
+                    if off >= i && off <= j {
+                        let name =
+                            std::str::from_utf8(&bytes[content_start..j])
+                                .ok()?
+                                .to_string();
+                        return Some((
+                            Span::new(i as u32, (j + 1) as u32),
+                            name,
+                        ));
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Hover for a `$var` reference found by scanning the source. Resolves
@@ -137,6 +265,14 @@ fn hover_in_command<'a>(
             // Cursor isn't on the proc's name or an arg — look inside
             // the body.
             .or_else(|| hover_in_stmts(&proc.body, table, source, offset)),
+        CommandKind::NamespaceEval(ns) => {
+            // `namespace eval <name> { … }` — descend into the
+            // populated body. The parser's post-pass already
+            // reparsed the block into `ns.body`, so we walk the
+            // structured AST rather than re-triggering the on-demand
+            // brace-body reparse.
+            hover_in_stmts(&ns.body, table, source, offset)
+        }
         CommandKind::EnumDecl(decl) => {
             // Cursor on the enum's name → show the variants.
             if decl.name_span.contains(offset) {
@@ -614,6 +750,29 @@ proc p {} {\n  set count 0\n  use $count\n}\n";
         match target {
             HoverTarget::LocalVar { name, .. } => assert_eq!(name, "count"),
             other => panic!("expected LocalVar, got {other:?}"),
+        }
+    }
+
+    /// `[NAME]` inside a `##` block renders as a CallSite hover on
+    /// the referenced proc — same as if the cursor were on a live
+    /// call. Lets the reader hover the reference and see the
+    /// target's signature.
+    #[test]
+    fn doc_ref_hovers_as_target_call_site() {
+        let src = "\
+## Documented target proc.
+proc target {} { puts hi }
+## See [target] for more.
+proc caller {} { return 1 }
+";
+        let parsed = crate::parser::parse(src);
+        let pos = src.find("[target]").unwrap() as u32 + 1;
+        let target = hover_at(&parsed.document, src, pos).unwrap();
+        match target {
+            HoverTarget::CallSite { proc_name, .. } => {
+                assert_eq!(proc_name, "target");
+            }
+            other => panic!("expected CallSite, got {other:?}"),
         }
     }
 }

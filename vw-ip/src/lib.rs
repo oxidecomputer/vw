@@ -19,6 +19,7 @@
 //! prefix clusters. See [`group_parameters`].
 
 pub mod cips_dict;
+pub mod family;
 pub mod generate;
 pub mod group;
 pub mod presets;
@@ -28,6 +29,7 @@ pub mod tree;
 pub use cips_dict::{
     load_schemas as load_cips_dict_schemas, DictField, DictSchema,
 };
+pub use family::{detect_families, DetectOptions, IndexedFamily};
 pub use generate::{generate, GenerateOptions};
 pub use group::{group_parameters, ParameterGroup};
 pub use presets::{

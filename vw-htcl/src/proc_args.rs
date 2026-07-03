@@ -107,9 +107,13 @@ impl<'a> State<'a> {
 
     /// Consume blank lines, comments, and whitespace; doc comments
     /// (`##`) are collected and returned so they can attach to the
-    /// next arg item.
-    fn skip_separators(&mut self) -> Vec<String> {
+    /// next arg item. The returned span (when non-empty) covers the
+    /// whole `##` block from its first `#` byte to the newline after
+    /// its last line, matching [`Command::doc_comments_span`]'s
+    /// convention.
+    fn skip_separators(&mut self) -> (Vec<String>, Option<Span>) {
         let mut docs = Vec::new();
+        let mut docs_span: Option<Span> = None;
         loop {
             // Whitespace including newlines
             while !self.at_eof() {
@@ -124,6 +128,7 @@ impl<'a> State<'a> {
                 break;
             }
             if self.current() == '#' {
+                let line_start = self.abs();
                 let is_doc = self.peek_at(1) == '#';
                 self.bump();
                 if is_doc {
@@ -138,18 +143,23 @@ impl<'a> State<'a> {
                 }
                 let text = self.inner[text_start..self.pos].to_string();
                 if is_doc {
+                    let line_end = self.abs();
                     docs.push(text);
+                    docs_span = Some(match docs_span {
+                        Some(prev) => Span::new(prev.start, line_end),
+                        None => Span::new(line_start, line_end),
+                    });
                 }
                 continue;
             }
             break;
         }
-        docs
+        (docs, docs_span)
     }
 
     fn parse_args(&mut self, out: &mut Vec<ProcArg>) {
         loop {
-            let docs = self.skip_separators();
+            let (docs, docs_span) = self.skip_separators();
             if self.at_eof() {
                 if !docs.is_empty() {
                     // Doc comments with nothing to attach to. Warn so
@@ -247,6 +257,7 @@ impl<'a> State<'a> {
                 name,
                 name_span,
                 doc_comments: docs,
+                doc_comments_span: docs_span,
                 attributes,
                 type_annotation,
                 span,
