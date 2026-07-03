@@ -772,20 +772,39 @@ fn infer_return_type(returns: Option<&[String]>) -> Option<String> {
         // "nothing" / "Tcl_OK on success" — side-effecting commands.
         ("returns nothing", "unit"),
         ("nothing", "unit"),
-        // Lists of typed handles.
+        // Lists of typed handles. Order matters within each type
+        // family: more-specific "intf" phrasings first so a plain
+        // "list of pins" doesn't shadow "list of intf_pins" for a
+        // page whose prose mentions both.
+        //
+        // The `list of <type> objects` variants catch phrasing
+        // Vivado uses on the `get_bd_*` pages ("Gets a list of pin
+        // objects", "Gets a list of net objects", …). Without them,
+        // those procs land untyped and the REPL renders their
+        // return value as one wrapped wall of text instead of
+        // one-per-line via `list<T>::repr`.
+        ("a list of intf_pins", "list<bd_intf_pin>"),
+        ("a list of interface pins", "list<bd_intf_pin>"),
+        ("list of intf_pin objects", "list<bd_intf_pin>"),
+        ("list of interface pin objects", "list<bd_intf_pin>"),
+        ("a list of intf_ports", "list<bd_intf_port>"),
+        ("a list of interface ports", "list<bd_intf_port>"),
+        ("list of intf_port objects", "list<bd_intf_port>"),
+        ("list of interface port objects", "list<bd_intf_port>"),
+        ("a list of intf_nets", "list<bd_intf_net>"),
+        ("a list of interface nets", "list<bd_intf_net>"),
+        ("list of intf_net objects", "list<bd_intf_net>"),
+        ("list of interface net objects", "list<bd_intf_net>"),
         ("a list of cells", "list<bd_cell>"),
         ("a list of bd_cells", "list<bd_cell>"),
         ("list of cell objects", "list<bd_cell>"),
         ("a list of pins", "list<bd_pin>"),
         ("a list of bd_pins", "list<bd_pin>"),
-        ("a list of intf_pins", "list<bd_intf_pin>"),
-        ("a list of interface pins", "list<bd_intf_pin>"),
-        ("a list of intf_ports", "list<bd_intf_port>"),
-        ("a list of interface ports", "list<bd_intf_port>"),
+        ("list of pin objects", "list<bd_pin>"),
         ("a list of ports", "list<bd_port>"),
+        ("list of port objects", "list<bd_port>"),
         ("a list of nets", "list<bd_net>"),
-        ("a list of intf_nets", "list<bd_intf_net>"),
-        ("a list of interface nets", "list<bd_intf_net>"),
+        ("list of net objects", "list<bd_net>"),
         // Singular handles.
         ("the cell created", "bd_cell"),
         ("the new cell", "bd_cell"),
