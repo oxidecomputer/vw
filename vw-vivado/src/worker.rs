@@ -620,13 +620,32 @@ impl VivadoBackend {
         if self.consume_ctx_marker(line) {
             return;
         }
+        if is_vivado_known_noise(line) {
+            // Verbose still logs it so the transcript is intact
+            // when someone's debugging what Vivado emitted.
+            if self.verbose {
+                self.write_verbose_line(line);
+            }
+            return;
+        }
         let outcome =
             self.pty_classifier.handle(line, std::time::Instant::now());
         for (kind, text) in outcome.chunks {
             self.emit_pty_chunk(kind, &text, accumulated);
         }
-        if !outcome.absorbed && self.verbose {
-            self.write_verbose_line(line);
+        if !outcome.absorbed {
+            // Unclassified PTY output DURING an eval — the tail
+            // of a multi-line Vivado error (`[BD 41-758] … valid
+            // clock source:` followed by unindented `/pin` list),
+            // or arbitrary chatter the user's command triggered.
+            // Route as Stdout so the user can SEE it in the
+            // scrollback without it inheriting the previous
+            // warning/error's styling. Verbose-log too, for
+            // parity with the previous behavior.
+            self.emit_pty_chunk(StreamKind::Stdout, line, accumulated);
+            if self.verbose {
+                self.write_verbose_line(line);
+            }
         }
     }
 
@@ -844,6 +863,30 @@ impl VivadoBackend {
 pub(crate) fn is_vw_log_chunk(text: &str) -> bool {
     let trimmed = text.trim_start();
     VW_LOG_PREFIXES.iter().any(|p| trimmed.starts_with(p))
+}
+
+/// True for lines Vivado is known to emit but which carry no signal
+/// the user needs at REPL / `vw run` level. Filtered out during
+/// eval (verbose mode still records them in the log). Keep this
+/// list tight — filter only stuff Vivado has no knob for and no
+/// downstream tool cares about.
+///
+/// Current entries:
+///
+/// - `Wrote  : <path>` — status echo emitted by `save_bd_design`,
+///   `write_bd_tcl`, `write_xci`, etc. No Vivado parameter
+///   suppresses it (searched `list_param` for wrote / write /
+///   save / persist / log / quiet / silent / banner / bd. /
+///   verbose / echo / message / command — zero matches).
+///
+/// If a genuine Vivado parameter shows up in a later release, drop
+/// the corresponding pattern here.
+pub(crate) fn is_vivado_known_noise(line: &str) -> bool {
+    // Vivado uses two spaces between "Wrote" and ":" — match on
+    // the whole `Wrote  : <` prefix rather than just "Wrote" so
+    // a genuine user `puts "Wrote foo"` doesn't get filtered.
+    let trimmed = line.trim_start();
+    trimmed.starts_with("Wrote  : <")
 }
 
 #[async_trait]
@@ -1207,7 +1250,12 @@ impl PtyClassifier {
             // echoes are the motivating case). Reject them
             // even inside the merge window; otherwise those
             // status lines glom onto the previous warning and
-            // inherit its orange/red styling.
+            // inherit its orange/red styling. Non-continuation
+            // unclassified lines return `absorbed=false` — the
+            // during-eval caller routes them to Stdout so they
+            // still surface (e.g. the `/pin` list following
+            // `[BD 41-758] … clock source:`), just without the
+            // pending's severity style.
             let looks_like_continuation =
                 line.chars().next().is_some_and(char::is_whitespace);
             if merges

@@ -1176,6 +1176,16 @@ catch {::vw::install_all_context_wrappers}
 catch {::vw::install_set_property_recorder}
 catch {::vw::install_proc_body_wrap}
 
+# Silence Vivado's per-command performance report — the
+# `<cmd>: Time (s): cpu = … Memory (MB): peak = …` chatter that
+# appears after any command whose elapsed time exceeds
+# `tcl.statsThreshold` seconds (default: quite low, so most
+# `create_bd_cell` calls trip it). Users who WANT the stats can
+# re-lower the threshold in their own script; setting it high
+# by default keeps the REPL / `vw run` output focused on the
+# user's actual results.
+catch {set_param tcl.statsThreshold 9999999}
+
 while {1} {
     if {[gets $sock line] < 0} {
         if {[eof $sock]} {
