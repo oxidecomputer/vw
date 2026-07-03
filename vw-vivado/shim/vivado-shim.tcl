@@ -43,6 +43,18 @@ namespace eval ::vw {
     # cap is per-message, not per-session, so a future deeper trace
     # still gets its first N frames.
     variable stack_frame_cap 20
+    # Set at startup from `VW_TRACE_STACK_CAPTURE`. When true,
+    # `capture_stack` emits a per-frame `[vw-stack]` log line with
+    # the info-frame dict, level-args probe, and keep/drop reason
+    # for every frame it examines. Useful when a warning tag
+    # renders with fewer frames than expected: the log shows
+    # exactly which frames existed and why each was kept or
+    # filtered. Zero cost when unset.
+    variable trace_stack_capture 0
+    catch {
+        set trace_stack_capture \
+            [expr {$::env(VW_TRACE_STACK_CAPTURE) eq "1"}]
+    }
 }
 
 # ---------- puts capture ----------
@@ -712,11 +724,16 @@ proc ::vw::attach_stack_if_message {str skip_caller_frames} {
 # Tcl gave us nothing to render."
 proc ::vw::capture_stack {skip_caller_frames} {
     variable stack_frame_cap
+    variable trace_stack_capture
     set out [list]
     set depth [info frame]
     set level_depth [info level]
     # Skip our own frame plus whatever the caller asked us to skip.
     set start [expr {1 + $skip_caller_frames}]
+    if {$trace_stack_capture} {
+        ::vw::log "\[vw-stack\] BEGIN capture skip=$skip_caller_frames\
+                   depth=$depth level_depth=$level_depth start=$start"
+    }
     for {set i $start} {$i <= $depth} {incr i} {
         if {[llength $out] >= $stack_frame_cap} { break }
         set frame ""
@@ -732,7 +749,17 @@ proc ::vw::capture_stack {skip_caller_frames} {
             catch {set level_args [info level -$k]}
         }
         set entry [::vw::format_frame $frame $level_args]
+        if {$trace_stack_capture} {
+            set kept "kept"
+            if {$entry eq ""} { set kept "dropped" }
+            ::vw::log "\[vw-stack\] i=$i k=$k $kept frame=\{$frame\}\
+                       level_args=\{$level_args\}\
+                       entry=\"$entry\""
+        }
         if {$entry ne ""} { lappend out $entry }
+    }
+    if {$trace_stack_capture} {
+        ::vw::log "\[vw-stack\] END capture out=\{[join $out { | }]\}"
     }
     if {[llength $out] == 0} {
         lappend out "(stack: info-frame-depth=$depth\

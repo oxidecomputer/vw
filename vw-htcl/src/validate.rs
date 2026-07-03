@@ -115,6 +115,31 @@ pub fn validate_with_all_extras<'doc>(
     extra_types: &HashMap<String, &'doc TypeDecl>,
     extra_enums: &HashMap<String, &'doc EnumDecl>,
 ) -> Vec<Diagnostic> {
+    validate_with_all_extras_and_vars(
+        document,
+        source,
+        extra_sigs,
+        extra_types,
+        extra_enums,
+        &std::collections::HashSet::new(),
+    )
+}
+
+/// Same as [`validate_with_all_extras`], plus a pool of top-level
+/// variable names known to be defined in prior batches. The
+/// undef-variable pass merges these into its top-level decl set,
+/// so a `set p …` in REPL batch N-1 makes `$p` in batch N legal.
+/// Proc-body scopes ignore the pool (Tcl locals don't inherit
+/// top-level scope), so this only affects the document's own
+/// top-level statements.
+pub fn validate_with_all_extras_and_vars<'doc>(
+    document: &'doc Document,
+    source: &str,
+    extra_sigs: &HashMap<String, &'doc ProcSignature>,
+    extra_types: &HashMap<String, &'doc TypeDecl>,
+    extra_enums: &HashMap<String, &'doc EnumDecl>,
+    extra_top_level_vars: &std::collections::HashSet<String>,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let (mut table, _overloads) =
         build_signature_table_with_overloads(document, &mut diags);
@@ -143,8 +168,14 @@ pub fn validate_with_all_extras<'doc>(
     validate_stmts(&document.stmts, source, &table, &mut diags);
     // Undefined-variable check. Errors (fail `vw check` / red LSP
     // squiggle), mirror shape to unused-var pass but with the
-    // set-operation flipped.
-    crate::undefined::validate_undefined_vars(document, source, &mut diags);
+    // set-operation flipped. `extra_top_level_vars` seeds the
+    // top-level decl set so REPL batches see prior-batch vars.
+    crate::undefined::validate_undefined_vars_with_extras(
+        document,
+        source,
+        extra_top_level_vars,
+        &mut diags,
+    );
     // Warning-level pass: unused-variable check. Runs last so the
     // hard-error diagnostics keep priority visually and any short-
     // circuit in earlier passes is unaffected by the walk here.

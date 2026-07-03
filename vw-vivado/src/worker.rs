@@ -324,6 +324,14 @@ impl VivadoBackend {
             "VW_INFO_WITH_STACK",
             if config.info_with_stack { "1" } else { "0" },
         );
+        // Diagnostic knobs — propagate whatever the shell set so
+        // `VW_TRACE_STACK_CAPTURE=1 vw run …` (or the REPL
+        // equivalent) reaches the shim. portable-pty inherits by
+        // default on unix, but pass-through explicitly keeps the
+        // contract obvious.
+        if let Ok(v) = std::env::var("VW_TRACE_STACK_CAPTURE") {
+            cmd.env("VW_TRACE_STACK_CAPTURE", v);
+        }
         cmd.cwd(&cwd);
 
         let child = pair.slave.spawn_command(cmd).map_err(|e| {

@@ -55,6 +55,26 @@ const IMPLICITS: &[&str] = &[
     "_",
 ];
 
+/// Collect the names of every variable defined at the document's
+/// top level. Same collection rules as the undef pass — `set`
+/// LHS, `foreach` iterator vars, `upvar` locals, `catch` result
+/// vars, `regexp`/`regsub` capture vars, and any of the above
+/// inside body-host `if`/`while`/… bodies that run in the top-
+/// level frame. Used by the REPL to accumulate a name set across
+/// batches so `set p …` in batch N-1 doesn't cause a false-
+/// positive `undefined variable $p` in batch N.
+pub fn top_level_var_names(
+    document: &Document,
+    source: &str,
+) -> HashSet<String> {
+    let mut decls: HashMap<String, DeclSite> = HashMap::new();
+    for stmt in &document.stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        crate::unused::collect_decls(cmd, source, &mut decls);
+    }
+    decls.into_keys().collect()
+}
+
 /// Top-level entry. Walks the document as one scope (for top-level
 /// `set`/`$var` references), then recurses into every proc body /
 /// namespace-eval body as an independent scope.
@@ -63,13 +83,52 @@ pub fn validate_undefined_vars(
     source: &str,
     diags: &mut Vec<Diagnostic>,
 ) {
-    walk_scope(&document.stmts, source, diags);
+    validate_undefined_vars_with_extras(
+        document,
+        source,
+        &HashSet::new(),
+        diags,
+    );
+}
+
+/// Same as [`validate_undefined_vars`], with an extra pool of
+/// top-level variable names the caller injects as "already
+/// defined" — used by the REPL so a `set p …` in batch N-1 makes
+/// `$p` in batch N legal. Only applies at the DOCUMENT top level;
+/// proc bodies start with just their own args + `set`s (Tcl
+/// semantics — top-level vars aren't visible inside a proc
+/// without `global`/`upvar`, so leaking session state in would
+/// mask real bugs).
+pub fn validate_undefined_vars_with_extras(
+    document: &Document,
+    source: &str,
+    extra_top_level: &HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    walk_scope(&document.stmts, source, extra_top_level, diags);
 }
 
 /// One scope pass — collect decls, walk uses (with spans), emit
 /// errors for each use that has no matching decl and isn't implicit.
-fn walk_scope(stmts: &[Stmt], source: &str, diags: &mut Vec<Diagnostic>) {
+/// The `extra_decls` param is only non-empty for the document top
+/// level (see [`validate_undefined_vars_with_extras`]); recursive
+/// scope walks pass an empty set.
+fn walk_scope(
+    stmts: &[Stmt],
+    source: &str,
+    extra_decls: &HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
     let mut decls: HashMap<String, DeclSite> = HashMap::new();
+    for name in extra_decls {
+        decls.insert(
+            name.clone(),
+            DeclSite {
+                span: Span::new(0, 0),
+                kind: crate::unused::DeclKind::Set,
+            },
+        );
+    }
     let mut use_sites: Vec<(String, Span)> = Vec::new();
     for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
@@ -81,6 +140,9 @@ fn walk_scope(stmts: &[Stmt], source: &str, diags: &mut Vec<Diagnostic>) {
     }
     // Descend into fresh-frame children (proc bodies, namespace eval
     // bodies) regardless — the outer scope's leak doesn't taint them.
+    // Extras only apply to the document top level; recursive walks
+    // pass an empty set (see [`validate_undefined_vars_with_extras`]
+    // docstring for the rationale).
     for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
         descend_scopes(cmd, source, diags);
@@ -128,7 +190,7 @@ fn descend_scopes(cmd: &Command, source: &str, diags: &mut Vec<Diagnostic>) {
             }
         }
         CommandKind::NamespaceEval(ns) => {
-            walk_scope(&ns.body, source, diags);
+            walk_scope(&ns.body, source, &HashSet::new(), diags);
         }
         _ => {}
     }

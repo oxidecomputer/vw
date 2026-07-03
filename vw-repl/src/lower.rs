@@ -194,16 +194,22 @@ pub fn prepare_with_observer(
     }
 
     // Validator runs first so unknown-keyword-call errors land
-    // before we ship anything. Prior-batch signatures are merged
-    // in so calls to wrappers from earlier inputs resolve. These
-    // are hard errors (not pre-flight warnings); routing them back
-    // as `LowerError` keeps the App's existing error-rendering
-    // path unchanged.
+    // before we ship anything. Prior-batch signatures + types +
+    // enums + top-level var names are merged in so calls, type
+    // refs, and `$var` references to prior-batch state all
+    // resolve. These are hard errors (not pre-flight warnings);
+    // routing them back as `LowerError` keeps the App's existing
+    // error-rendering path unchanged.
     let prior_sigs = session.signature_table();
-    let validator_diags = vw_htcl::validate_with_signatures(
+    let prior_types = session.type_decl_table();
+    let prior_vars = session.top_level_var_names();
+    let validator_diags = vw_htcl::validate_with_all_extras_and_vars(
         &parsed.document,
         &program.source,
         &prior_sigs,
+        &prior_types,
+        &std::collections::HashMap::new(),
+        &prior_vars,
     );
     if let Some(first_err) = validator_diags
         .iter()

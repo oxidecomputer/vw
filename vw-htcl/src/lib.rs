@@ -47,6 +47,7 @@ pub mod span;
 pub mod src_path;
 pub mod type_parse;
 pub mod undefined;
+pub use undefined::top_level_var_names;
 pub mod unused;
 pub mod validate;
 
@@ -75,7 +76,8 @@ pub use src_path::{
 pub use validate::{
     build_enum_decl_table, build_signature_table_with_overloads,
     build_type_decl_table, mangle_specialization, validate,
-    validate_with_all_extras, validate_with_extras, validate_with_signatures,
+    validate_with_all_extras, validate_with_all_extras_and_vars,
+    validate_with_extras, validate_with_signatures,
     Diagnostic as ValidatorDiagnostic, OverloadTable, Severity,
 };
 

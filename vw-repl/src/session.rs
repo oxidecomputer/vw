@@ -109,6 +109,22 @@ impl Session {
         table
     }
 
+    /// Union of every top-level variable name defined across every
+    /// batch. Passed to the validator so the undef-var pass doesn't
+    /// false-positive `set p …` in an earlier REPL input followed
+    /// by `$p` in a later one. Only top-level names — proc-body
+    /// locals don't leak across evals (Tcl semantics).
+    pub fn top_level_var_names(&self) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        for batch in &self.batches {
+            names.extend(vw_htcl::top_level_var_names(
+                &batch.document,
+                &batch.program.source,
+            ));
+        }
+        names
+    }
+
     /// Look up the most-recent proc location across every batch.
     /// Returns `None` when no batch has declared that proc — the
     /// error renderer's drill-down path silently skips such frames
