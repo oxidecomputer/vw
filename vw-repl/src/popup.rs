@@ -375,8 +375,8 @@ const HELP_ROWS: &[HelpRow] = &[
         description: "submit input (newline if parse incomplete)",
     },
     HelpRow {
-        keys: "Shift+Enter, Alt+Enter",
-        description: "insert literal newline",
+        keys: "Shift+Enter, Ctrl+Enter, Alt+Enter",
+        description: "insert literal newline (Shift+Enter reaches the app as Ctrl+J on legacy-encoding terminals; we bind both)",
     },
     HelpRow {
         keys: "Ctrl-P / Ctrl-N",
@@ -396,11 +396,11 @@ const HELP_ROWS: &[HelpRow] = &[
     },
     // --- scrollback ---
     HelpRow {
-        keys: "Ctrl-K, PageUp",
+        keys: "Alt-K, PageUp",
         description: "scroll scrollback up",
     },
     HelpRow {
-        keys: "Ctrl-J, PageDown",
+        keys: "Alt-J, PageDown",
         description: "scroll scrollback down",
     },
     HelpRow {

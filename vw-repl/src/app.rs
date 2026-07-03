@@ -18,8 +18,10 @@
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+    EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
@@ -315,6 +317,23 @@ pub async fn run(opts: ReplOptions) -> Result<(), ReplError> {
     // release). F2 toggles capture off if a user would rather use
     // their terminal's native selection.
     stdout.execute(EnableMouseCapture)?;
+    // Bracketed paste — the terminal wraps pasted content in
+    // sentinel byte sequences so we can distinguish it from
+    // manually-typed input. Without this, a pasted multi-line
+    // block delivers embedded `\n`s as raw Enter events, each of
+    // which the app treats as "submit" — the exact bug this
+    // enables us to fix.
+    stdout.execute(EnableBracketedPaste)?;
+    // Kitty keyboard protocol (minimal set) — asks the terminal
+    // to disambiguate keys that would otherwise collide (Ctrl+I
+    // vs. Tab, etc.). Doesn't help with Shift+Enter — this
+    // terminal (and many others) sends Shift+Enter as Ctrl+J
+    // instead of a distinct CSI-u sequence, so the outer key
+    // handler binds Ctrl+J to `insert_newline`. Unsupported
+    // flags are ignored, so this is safe everywhere.
+    let _ = stdout.execute(PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+    ));
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -324,6 +343,8 @@ pub async fn run(opts: ReplOptions) -> Result<(), ReplError> {
     let mut stdout = std::io::stdout();
     // No-op if capture was already disabled via F2.
     let _ = stdout.execute(DisableMouseCapture);
+    let _ = stdout.execute(DisableBracketedPaste);
+    let _ = stdout.execute(PopKeyboardEnhancementFlags);
     stdout.execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
@@ -556,7 +577,7 @@ impl App {
     /// to ship. Drives the input-area title and Enter behavior.
     pub fn input_is_complete(&self) -> bool {
         let buf = self.current_input_text();
-        is_buffer_complete(&buf)
+        is_buffer_complete(&buf, &self.session.signature_table())
     }
 
     fn current_input_text(&self) -> String {
@@ -768,6 +789,30 @@ impl App {
                     KeyCode::Esc => {
                         self.popup = None;
                         true
+                    }
+                    KeyCode::Enter if !key.modifiers.is_empty() => {
+                        // Any modifier on Enter (Shift, Alt, Ctrl,
+                        // combos) is the "keep typing" escape
+                        // hatch. Don't let the popup consume it —
+                        // dismiss the popup so the outer handler
+                        // can insert a newline. Terminals differ
+                        // on which modifier they attach; accept
+                        // any of them.
+                        self.popup = None;
+                        false
+                    }
+                    KeyCode::Char('j')
+                        if key.modifiers.contains(
+                            crossterm::event::KeyModifiers::CONTROL,
+                        ) =>
+                    {
+                        // Shift+Enter on legacy terminals arrives
+                        // as Ctrl+J — see the outer handler's
+                        // matching branch for the rationale. Let
+                        // it through so the outer handler can
+                        // insert a newline.
+                        self.popup = None;
+                        false
                     }
                     KeyCode::Enter => {
                         if let Some(item) = comp.current().cloned() {
@@ -1437,6 +1482,10 @@ impl App {
             self.handle_mouse_event(mouse);
             return;
         }
+        if let Event::Paste(data) = ev {
+            self.handle_paste(data);
+            return;
+        }
         let Event::Key(key) = ev else { return };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return;
@@ -1530,12 +1579,16 @@ impl App {
             // Direction: see `handle_mouse_event` — `k`/PageUp
             // moves the viewport UP toward older content, which
             // means decreasing the y-scroll offset.
-            (KeyCode::PageUp, _)
-            | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+            // Vim-style scroll: Alt+K up, Alt+J down. Alt (not
+            // Ctrl) because Ctrl+J is claimed by Shift+Enter on
+            // legacy-encoding terminals (see the Ctrl+J-as-
+            // newline arm below), and single-modifier consistency
+            // beats splitting the pair across two modifiers.
+            (KeyCode::PageUp, _) | (KeyCode::Char('k'), KeyModifiers::ALT) => {
                 self.scroll_by(-5);
             }
             (KeyCode::PageDown, _)
-            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+            | (KeyCode::Char('j'), KeyModifiers::ALT) => {
                 self.scroll_by(5);
             }
             // Snap to bottom + re-engage tail-follow. Use End
@@ -1552,14 +1605,23 @@ impl App {
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 self.on_submit().await;
             }
-            (KeyCode::Enter, m)
-                if m.contains(KeyModifiers::ALT)
-                    || m.contains(KeyModifiers::SHIFT) =>
-            {
-                // Explicit newline regardless of parser
-                // completeness — escape hatch for "I really want to
-                // keep typing."
-                self.input.insert_newline();
+            (KeyCode::Enter, m) if !m.is_empty() => {
+                // Enter with ANY modifier is a "keep typing"
+                // escape hatch — Ctrl+Enter and Alt+Enter both
+                // arrive here as `Enter + CTRL/ALT` under the
+                // kitty protocol.
+                self.insert_newline_preserving_indent();
+            }
+            // Shift+Enter on legacy-encoding terminals (macOS
+            // Terminal.app, GNOME Terminal without kitty
+            // protocol, and many tmux configurations) arrives
+            // as Ctrl+J — because ASCII 0x0A (linefeed) IS what
+            // the shifted-Enter physically produces, and raw
+            // mode disables the `\n` → Enter auto-translation.
+            // Bind it to newline directly so the user gets the
+            // expected behavior everywhere.
+            (KeyCode::Char('j'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.insert_newline_preserving_indent();
             }
             _ => {
                 // Forward everything else to the text editor.
@@ -1647,13 +1709,64 @@ impl App {
         self.input = ta;
     }
 
+    /// Insert bracketed-paste content into the input area, one
+    /// line at a time. Embedded newlines become real newlines in
+    /// the buffer, NOT Enter events — that's the whole reason
+    /// bracketed paste exists: without it, a pasted multi-line
+    /// block delivers each `\n` as a submit trigger and every
+    /// intermediate line runs as its own command.
+    ///
+    /// Also drops the history walk (any typed edit — paste
+    /// included — starts a fresh history search on the next
+    /// Ctrl-P) and turns off scrollback follow so the user can
+    /// still scroll up during the paste render.
+    /// Insert a newline and re-emit the CURRENT line's leading
+    /// whitespace on the new line. Matches how editors (and
+    /// Claude Code's TUI) behave on Shift+Enter — hitting it
+    /// inside a `-flag`-continued command keeps you at the same
+    /// column so `-foo\n  -bar` becomes `-foo\n  -bar\n  |cursor`
+    /// instead of `-foo\n  -bar\n|cursor`. Only whitespace is
+    /// copied (spaces + tabs) — never the actual line content.
+    ///
+    /// Applies at the CURRENT cursor row, not the top row: if the
+    /// user is mid-line and hits Ctrl+J, they see indent-copied
+    /// behavior on the CURRENT line's indent, matching every
+    /// other editor's rule.
+    fn insert_newline_preserving_indent(&mut self) {
+        let (row, _) = self.input.cursor();
+        let indent: String = self.input.lines()[row]
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        self.input.insert_newline();
+        for ch in indent.chars() {
+            self.input.insert_char(ch);
+        }
+    }
+
+    fn handle_paste(&mut self, data: String) {
+        self.history_cursor = None;
+        let mut first = true;
+        for line in data.split('\n') {
+            if !first {
+                self.input.insert_newline();
+            }
+            first = false;
+            // Strip carriage returns some terminals prepend (CRLF
+            // sources on Windows / some remote sessions).
+            for ch in line.chars().filter(|&c| c != '\r') {
+                self.input.insert_char(ch);
+            }
+        }
+    }
+
     async fn on_submit(&mut self) {
         let text = self.current_input_text();
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return;
         }
-        if !is_buffer_complete(&text) {
+        if !is_buffer_complete(&text, &self.session.signature_table()) {
             self.input.insert_newline();
             return;
         }
@@ -3139,37 +3252,104 @@ fn render_type(ty: &vw_htcl::TypeExpr) -> String {
     }
 }
 
-fn is_buffer_complete(text: &str) -> bool {
+/// Decide whether the current input buffer is ready to submit.
+///
+/// Two hard "no": unterminated brace/bracket errors from the parser,
+/// or a "missing required argument" diagnostic from the validator.
+/// The latter is the key ergonomic hook: when the user types
+/// `vivado_cmd::assign_bd_address` alone and hits Enter, the
+/// validator sees a call to a proc with required args that haven't
+/// been supplied. Treat as incomplete → the REPL appends a newline
+/// so the user can continue with `-offset …` on the next line.
+/// Once every required arg is supplied, the diagnostic clears and
+/// Enter submits.
+///
+/// The signature table comes from the app's session so procs
+/// defined earlier in the same REPL run are visible; passing an
+/// empty map degrades gracefully to "unterminated-only" behavior
+/// (Slice 5's compositional constructors have required args but
+/// aren't in the session table for unit tests).
+fn is_buffer_complete(
+    text: &str,
+    sig_table: &std::collections::HashMap<String, &vw_htcl::ProcSignature>,
+) -> bool {
     let parsed = vw_htcl::parse(text);
-    !parsed
+    if parsed
         .errors
         .iter()
         .any(|e| e.message.contains("unterminated"))
+    {
+        return false;
+    }
+    // Ask the validator whether required-arg gaps remain. Any
+    // other kind of diagnostic (unknown proc, type error, etc.) is
+    // a real error the user should see; incomplete is reserved
+    // for the specific "waiting for more flags" state.
+    let diags =
+        vw_htcl::validate_with_signatures(&parsed.document, text, sig_table);
+    let waiting = diags.iter().any(|d| {
+        matches!(d.severity, vw_htcl::Severity::Error)
+            && d.message.starts_with("missing required argument")
+    });
+    !waiting
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn empty_sigs(
+    ) -> std::collections::HashMap<String, &'static vw_htcl::ProcSignature>
+    {
+        std::collections::HashMap::new()
+    }
+
     #[test]
     fn buffer_complete_for_simple_statement() {
-        assert!(is_buffer_complete("set x 1"));
-        assert!(is_buffer_complete("puts \"hi\""));
+        assert!(is_buffer_complete("set x 1", &empty_sigs()));
+        assert!(is_buffer_complete("puts \"hi\"", &empty_sigs()));
     }
 
     #[test]
     fn buffer_incomplete_with_unterminated_brace() {
         assert!(!is_buffer_complete(
-            "set x [\n  create_cpm5\n    -name cpm5"
+            "set x [\n  create_cpm5\n    -name cpm5",
+            &empty_sigs()
         ));
-        assert!(!is_buffer_complete("proc foo {"));
+        assert!(!is_buffer_complete("proc foo {", &empty_sigs()));
     }
 
     #[test]
     fn buffer_complete_for_multiline_well_formed_proc() {
         assert!(is_buffer_complete(
-            "proc foo {\n  @default(1) x\n} {\n  puts $x\n}"
+            "proc foo {\n  @default(1) x\n} {\n  puts $x\n}",
+            &empty_sigs()
         ));
+    }
+
+    /// The core UX fix: when a proc call is missing required args,
+    /// the buffer is considered incomplete so Enter appends a
+    /// newline instead of submitting — the user can continue with
+    /// `-flag value` continuations.
+    #[test]
+    fn buffer_incomplete_when_required_args_missing() {
+        use vw_htcl::{parse, signature_table};
+        let src = "\
+proc greet {
+  name
+  msg
+} unit {
+  puts \"$msg $name\"
+}
+";
+        let parsed = parse(src);
+        let sigs = signature_table(&parsed.document);
+        // Bare call — both required args missing.
+        assert!(!is_buffer_complete("greet", &sigs));
+        // One required arg missing — still incomplete.
+        assert!(!is_buffer_complete("greet -name there", &sigs));
+        // Both provided — complete.
+        assert!(is_buffer_complete("greet -name there -msg hi", &sigs));
     }
 
     // --- stack-frame resolution ---------------------------------
