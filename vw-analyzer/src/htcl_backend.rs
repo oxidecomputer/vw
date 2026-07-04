@@ -19,9 +19,9 @@ use tower_lsp::lsp_types::{
 };
 use vw_htcl::{
     complete_at, definition_at, hover_at, parse, rename_at, signature_help_at,
-    validate, Attribute, AttributeValue, CommandKind, Completion,
-    CompletionKind, HoverTarget, LineCol, LineIndex, ProcArg, ProcSignature,
-    RenameEdit, Severity, Stmt,
+    validate_with_all_extras_and_vars, Attribute, AttributeValue, CommandKind,
+    Completion, CompletionKind, HoverTarget, LineCol, LineIndex, ProcArg,
+    ProcSignature, RenameEdit, Severity, Stmt,
 };
 
 use crate::backend::LanguageBackend;
@@ -135,7 +135,15 @@ impl LanguageBackend for HtclBackend {
         // *in* this file still does.
         let view = self.build_view(uri, &doc.text).await;
         let parsed_view = parse(&view.view_source);
-        for d in validate(&parsed_view.document, &view.view_source) {
+        for d in validate_with_all_extras_and_vars(
+            &parsed_view.document,
+            &view.view_source,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &view.dep_names,
+        ) {
             if d.span.start >= view.local_len {
                 continue;
             }

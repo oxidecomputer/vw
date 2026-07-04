@@ -41,6 +41,13 @@ pub struct WorkspaceView {
     /// that lives in some imported file.
     pub local_len: u32,
     pub imports: Vec<ImportRegion>,
+    /// Names of every dep the file's resolver knows about
+    /// (workspace `vw.toml` + editor extra_roots + sibling
+    /// scan). Passed to the validator's undefined-src-module
+    /// check so `src @<name>` where `<name>` isn't in the set
+    /// gets a spanned Error diagnostic. Empty when no workspace
+    /// context resolved.
+    pub dep_names: std::collections::HashSet<String>,
 }
 
 pub struct ImportRegion {
@@ -86,6 +93,7 @@ pub fn build_view(
         view_source: local_text.to_string(),
         local_len: local_text.len() as u32,
         imports: Vec::new(),
+        dep_names: std::collections::HashSet::new(),
     };
 
     let Ok(file_path) = file_uri.to_file_path() else {
@@ -96,6 +104,11 @@ pub fn build_view(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let resolver = build_resolver_with(&file_path, extra_roots);
+    // Snapshot dep names now — the resolver may get moved into
+    // collect_imports below; the diagnostics pass needs the
+    // set as a plain HashSet<String>.
+    view.dep_names =
+        resolver.deps().map(|(name, _)| name.to_string()).collect();
 
     let mut loaded: HashSet<PathBuf> = HashSet::new();
     if let Ok(canonical) = file_path.canonicalize() {

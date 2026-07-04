@@ -203,6 +203,11 @@ pub fn prepare_with_observer(
     let prior_sigs = session.signature_table();
     let prior_types = session.type_decl_table();
     let prior_vars = session.top_level_var_names();
+    // Names of every dep the workspace resolver knows about.
+    // Passed to the validator so `src @<name>` where `<name>`
+    // isn't in vw.toml fires a spanned Error diagnostic.
+    let dep_names: std::collections::HashSet<String> =
+        resolver.deps().map(|(name, _)| name.to_string()).collect();
     let validator_diags = vw_htcl::validate_with_all_extras_and_vars(
         &parsed.document,
         &program.source,
@@ -210,6 +215,7 @@ pub fn prepare_with_observer(
         &prior_types,
         &std::collections::HashMap::new(),
         &prior_vars,
+        &dep_names,
     );
     if let Some(first_err) = validator_diags
         .iter()

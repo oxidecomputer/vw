@@ -902,6 +902,23 @@ fn friendly_import(raw: &str) -> String {
         .to_string()
 }
 
+/// Names of every dep the workspace (via `vw.toml`) resolves for
+/// `entry`. Used by `check_htcl` to pre-flight `src @<name>`
+/// imports and produce spanned diagnostics before the loader's
+/// hard-abort path fires. Returns an empty set when `entry` isn't
+/// inside a workspace or the dep cache can't be read — the caller
+/// treats empty as "skip the check", matching the validator's own
+/// short-circuit.
+fn collect_dep_names(entry: &Utf8Path) -> std::collections::HashSet<String> {
+    let Some(ws) = find_workspace_dir(entry) else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(paths) = vw_lib::transitive_dep_cache_paths(&ws) else {
+        return std::collections::HashSet::new();
+    };
+    paths.into_keys().collect()
+}
+
 /// Walk up from `start`'s parent directory looking for a `vw.toml`.
 fn find_workspace_dir(start: &Utf8Path) -> Option<Utf8PathBuf> {
     let mut cur = start.parent()?.to_path_buf();
@@ -930,6 +947,55 @@ fn init_analyzer_logging() {
 async fn check_htcl(
     file: &camino::Utf8Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    // Pre-flight: run the validator's src-import check on the entry
+    // file BEFORE handing to `load_htcl_program`, which would
+    // hard-abort on the first unresolved `src @<name>` with a bare
+    // non-span error. The pre-flight produces the same spanned
+    // diagnostics the LSP shows, so `vw check` and the editor agree
+    // on where the missing dep is and how to fix it. Only kicks in
+    // when the workspace has a `vw.toml` (otherwise dep-names is
+    // empty and the check is a no-op).
+    let dep_names = collect_dep_names(file);
+    if !dep_names.is_empty() {
+        let entry_text = std::fs::read_to_string(file.as_str())?;
+        let entry_parsed = vw_htcl::parse(&entry_text);
+        let pre_diags = vw_htcl::validate_with_all_extras_and_vars(
+            &entry_parsed.document,
+            &entry_text,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &dep_names,
+        );
+        let src_errs: Vec<_> = pre_diags
+            .iter()
+            .filter(|d| {
+                d.severity == vw_htcl::Severity::Error
+                    && d.message.starts_with("unknown src module")
+            })
+            .collect();
+        if !src_errs.is_empty() {
+            let idx = vw_htcl::LineIndex::new(&entry_text);
+            let cwd_owned = std::env::current_dir().ok();
+            let cwd = cwd_owned.as_deref();
+            let display_path =
+                render_path(std::path::Path::new(file.as_str()), cwd);
+            for d in &src_errs {
+                let (start, _) = idx.range(d.span);
+                eprintln!(
+                    "{} {display_path}:{}:{}: {}",
+                    "error:".bright_red(),
+                    start.line + 1,
+                    start.character + 1,
+                    d.message,
+                );
+            }
+            eprintln!("{file}: {} error(s), 0 warning(s)", src_errs.len());
+            return Ok(true);
+        }
+    }
+
     let program = load_htcl_program(file)?;
     let parsed = vw_htcl::parse(&program.source);
     let validator_diags = vw_htcl::validate(&parsed.document, &program.source);

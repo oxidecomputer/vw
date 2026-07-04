@@ -122,16 +122,24 @@ pub fn validate_with_all_extras<'doc>(
         extra_types,
         extra_enums,
         &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
     )
 }
 
-/// Same as [`validate_with_all_extras`], plus a pool of top-level
-/// variable names known to be defined in prior batches. The
-/// undef-variable pass merges these into its top-level decl set,
-/// so a `set p …` in REPL batch N-1 makes `$p` in batch N legal.
-/// Proc-body scopes ignore the pool (Tcl locals don't inherit
-/// top-level scope), so this only affects the document's own
-/// top-level statements.
+/// Same as [`validate_with_all_extras`], plus:
+///
+/// - `extra_top_level_vars` — top-level variable names known to
+///   be defined in prior batches. The undef-variable pass merges
+///   these into its top-level decl set, so a `set p …` in REPL
+///   batch N-1 makes `$p` in batch N legal. Proc-body scopes
+///   ignore the pool (Tcl locals don't inherit top-level scope),
+///   so this only affects the document's own top-level statements.
+/// - `extra_dep_names` — workspace-dependency names the caller
+///   registered with its `vw_htcl::Resolver`. Each `src @<name>`
+///   statement in the document is checked against this pool; a
+///   name that's not in the set fires an `Error` diagnostic
+///   spanned to the `@<name>` text. Empty set → the check
+///   no-ops (unit tests and non-workspace-aware callers).
 pub fn validate_with_all_extras_and_vars<'doc>(
     document: &'doc Document,
     source: &str,
@@ -139,6 +147,7 @@ pub fn validate_with_all_extras_and_vars<'doc>(
     extra_types: &HashMap<String, &'doc TypeDecl>,
     extra_enums: &HashMap<String, &'doc EnumDecl>,
     extra_top_level_vars: &std::collections::HashSet<String>,
+    extra_dep_names: &std::collections::HashSet<String>,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     // Type-table FIRST — its keys feed the overloaded-proc-arm
@@ -196,7 +205,71 @@ pub fn validate_with_all_extras_and_vars<'doc>(
     // hard-error diagnostics keep priority visually and any short-
     // circuit in earlier passes is unaffected by the walk here.
     crate::unused::validate_unused_vars(document, source, &mut diags);
+    // Undefined-src-module check. `src @<name>` where `<name>`
+    // isn't a registered dep name in the caller's `Resolver` fires
+    // a spanned Error diagnostic; without this the LSP silently
+    // drops the import (workspace.rs::collect_imports) and `vw
+    // check` only surfaces the failure via the loader's hard-abort
+    // path (no span). The check no-ops when `extra_dep_names` is
+    // empty — unit tests and non-workspace callers skip it.
+    validate_src_imports(document, extra_dep_names, &mut diags);
     diags
+}
+
+/// Walk every top-level `src @<name>` statement in `document` and
+/// emit an Error diagnostic for any `<name>` not present in
+/// `known_deps`. Relative and absolute path imports (non-`@`
+/// forms) are skipped — those get their existence checked
+/// downstream by the loader's filesystem probe.
+fn validate_src_imports(
+    document: &Document,
+    known_deps: &std::collections::HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // The empty-set case covers unit tests (no workspace) and
+    // downstream callers that don't hook up a Resolver. Short-
+    // circuit rather than walking every statement for nothing.
+    if known_deps.is_empty() {
+        return;
+    }
+    for stmt in &document.stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        let CommandKind::Src(src) = &cmd.kind else {
+            continue;
+        };
+        // Missing path (contains `$var` / `[cmd]` substitution) —
+        // handled by other passes; don't double-flag here.
+        let Some(path) = src.path.as_deref() else {
+            continue;
+        };
+        let classified = crate::src_path::classify(path);
+        let crate::src_path::PathKind::Named { name, subpath } =
+            classified.kind
+        else {
+            continue;
+        };
+        if known_deps.contains(&name) {
+            continue;
+        }
+        // Message mirrors `ResolveError::UnknownDependency`'s text
+        // in `src_path.rs` — same hint keeps the CLI hard-abort
+        // path (which still fires) and the analyzer diagnostic
+        // pointing at the same fix.
+        let subpath_hint = if subpath.is_empty() {
+            String::new()
+        } else {
+            format!("/{subpath}")
+        };
+        diags.push(Diagnostic {
+            severity: Severity::Error,
+            message: format!(
+                "unknown src module `{name}` in `src @{name}{subpath_hint}`; \
+                 add a `[dependencies.{name}]` entry to your workspace's \
+                 vw.toml or run `vw add` to fetch it"
+            ),
+            span: src.path_span,
+        });
+    }
 }
 
 /// Validate every command in `stmts`, descending into proc bodies so
@@ -2707,5 +2780,103 @@ proc Properties::to {v} { return $v }\n";
             "got: {:?}",
             d
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Undefined `src @<name>` module check.
+    // ------------------------------------------------------------------
+
+    fn src_diags(src: &str, known_deps: &[&str]) -> Vec<Diagnostic> {
+        let parsed = crate::parser::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "unexpected parse errors: {:?}",
+            parsed.errors
+        );
+        let deps: std::collections::HashSet<String> =
+            known_deps.iter().map(|s| s.to_string()).collect();
+        validate_with_all_extras_and_vars(
+            &parsed.document,
+            src,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            &deps,
+        )
+        .into_iter()
+        .filter(|d| d.message.starts_with("unknown src module"))
+        .collect()
+    }
+
+    #[test]
+    fn src_at_named_unresolved_flagged() {
+        let src = "src @gtwiz-versal\n";
+        let d = src_diags(src, &["vivado-cmd", "cpm5"]);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].severity, Severity::Error);
+        assert!(d[0].message.contains("gtwiz-versal"), "{}", d[0].message);
+        assert!(
+            d[0].message.contains("[dependencies.gtwiz-versal]"),
+            "{}",
+            d[0].message
+        );
+        // Span should cover the `@gtwiz-versal` text.
+        let bytes =
+            &src.as_bytes()[d[0].span.start as usize..d[0].span.end as usize];
+        assert_eq!(std::str::from_utf8(bytes).unwrap(), "@gtwiz-versal");
+    }
+
+    #[test]
+    fn src_at_named_resolved_clean() {
+        let src = "src @vivado-cmd\n";
+        let d = src_diags(src, &["vivado-cmd"]);
+        assert!(d.is_empty(), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn src_at_named_multi_flagged() {
+        let src = "src @foo\nsrc @bar\nsrc @cpm5\n";
+        let d = src_diags(src, &["cpm5"]);
+        assert_eq!(d.len(), 2);
+        // Distinct spans.
+        assert_ne!(d[0].span.start, d[1].span.start);
+    }
+
+    #[test]
+    fn src_bare_path_not_flagged() {
+        // Relative path form — never triggers the `@<name>` check
+        // even when known_deps is empty. Filesystem existence gets
+        // validated downstream by the loader; the analyzer's
+        // job here is only the dep-name lookup.
+        let src = "src ./ports.htcl\n";
+        let d = src_diags(src, &[]);
+        assert!(d.is_empty(), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn src_subpath_reported_with_hint() {
+        // `@foo/sub` — the subpath appears in the diagnostic
+        // message so the user sees the exact directive that
+        // failed. Also verifies subpath doesn't confuse the
+        // classifier.
+        let src = "src @gtwiz-versal/module\n";
+        let d = src_diags(src, &["cpm5"]);
+        assert_eq!(d.len(), 1);
+        assert!(
+            d[0].message.contains("@gtwiz-versal/module"),
+            "{}",
+            d[0].message
+        );
+    }
+
+    #[test]
+    fn empty_deps_no_check() {
+        // The check must no-op when the caller doesn't know about
+        // any deps — matches the behavior for unit tests / non-
+        // workspace-aware callers who invoke `validate` directly.
+        let src = "src @gtwiz-versal\nsrc @other\n";
+        let d = src_diags(src, &[]);
+        assert!(d.is_empty(), "unexpected diags: {d:?}");
     }
 }
