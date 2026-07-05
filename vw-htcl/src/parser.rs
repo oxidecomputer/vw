@@ -1800,7 +1800,12 @@ set cfg [
             .stmts
             .iter()
             .find_map(|s| match s {
-                crate::ast::Stmt::Command(c) if c.words.first().and_then(|w| w.as_text()) == Some("set") => Some(c),
+                crate::ast::Stmt::Command(c)
+                    if c.words.first().and_then(|w| w.as_text())
+                        == Some("set") =>
+                {
+                    Some(c)
+                }
                 _ => None,
             })
             .expect("set command");
@@ -1818,11 +1823,8 @@ set cfg [
                 _ => None,
             })
             .expect("configure command");
-        let word_texts: Vec<&str> = inner_cmd
-            .words
-            .iter()
-            .filter_map(|w| w.as_text())
-            .collect();
+        let word_texts: Vec<&str> =
+            inner_cmd.words.iter().filter_map(|w| w.as_text()).collect();
         assert_eq!(
             word_texts,
             vec!["configure", "-enable_reg_interface", "1"],

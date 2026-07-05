@@ -721,15 +721,43 @@ fn generate_split(
         if dict_schemas.contains_key(&p.name) {
             continue;
         }
-        if !is_properties_shaped_param(p) {
+        // Anchor lookup: some Vivado top-level params carry a scalar
+        // sentinel default (`0`) while a sibling `<modelParameter>`
+        // of the same name holds the actual paired-list schema. Use
+        // the model-param default as the anchor when the top-level
+        // default doesn't parse as paired. Enables typed-constructor
+        // emission for INTF_PARENT_PIN_LIST and similar — where the
+        // slot names live in the internal HDL-generic view rather
+        // than on the user-facing property.
+        let anchor_default = model_param_anchor_default(component, &p.name);
+        let use_anchor = !is_properties_shaped_param(p)
+            && anchor_default.as_deref().is_some_and(|d| {
+                !crate::paired_list::parse_paired_list(d).is_empty()
+            });
+        if !is_properties_shaped_param(p) && !use_anchor {
             continue;
         }
+        let default = if use_anchor {
+            anchor_default.as_deref().unwrap()
+        } else {
+            p.value.default_value()
+        };
         let shape_path = lowercase_ident(&p.name);
-        let schema = crate::DictSchema::from_paired_default(
-            p.value.default_value(),
+        let mut schema = crate::DictSchema::from_paired_default(
+            default,
             &shape_path,
             &opts.overrides,
         );
+        // Extrapolate `QUAD<n>_<X>` keys across every quad the IP
+        // ships (5 for gtwiz-versal) so the constructor exposes
+        // ALL slots, not just quad0's — the model-param default
+        // only enumerates one quad's worth as a template.
+        // Also attaches auto-derived pin-path enums when the key
+        // shape matches `QUAD<q>_<RX|TX><n>`. See
+        // `extrapolate_quad_schema` for the details.
+        if use_anchor {
+            extrapolate_quad_schema(&mut schema, component, &shape_path, opts);
+        }
         if schema.fields.is_empty() && schema.sub_schemas.is_empty() {
             continue;
         }
@@ -796,16 +824,27 @@ fn generate_split(
             continue;
         };
         // Skip CSV-driven schemas (`append_dict_sub_procs` emits
-        // those at the tail); recognizable because they're keyed
-        // by the same name the caller passed in the original
-        // `dict_schemas` reference, NOT one we synthesized above.
-        // Simplest way to check: whether the caller's original map
-        // has it. But we shadowed the binding; use a sentinel by
-        // testing `schema.fields.is_empty() && schema.sub_schemas.is_empty()`
-        // — CSV schemas always have fields, XML schemas we just
-        // merged also do. So instead, filter by whether the param
-        // is Properties-shaped (XML schemas come from those).
-        if !is_properties_shaped_param(p) {
+        // those at the tail). We differentiate two rails:
+        //   * XML-derived schemas — populated above from `tree.direct`
+        //     via `is_properties_shaped_param` OR via the
+        //     model-param anchor path. Both are keyed under
+        //     `p.name`; caller's original `dict_schemas` didn't
+        //     hold them yet. We check by whether the schema has
+        //     content — CSV and XML both do, so that's ambiguous.
+        //   * Anchor-derived: `p` isn't structurally Properties
+        //     but a sibling model param is. Emit iff we DID pick
+        //     up an anchor for it.
+        // Simplest gate: emit whenever `dict_schemas` has an
+        // entry that wasn't in the original caller-supplied map.
+        // We express that indirectly via the two-track OR:
+        // Properties-shaped (usual path) OR model-param anchor
+        // present (INTF_PARENT_PIN_LIST-shaped path).
+        let has_anchor = model_param_anchor_default(component, &p.name)
+            .as_deref()
+            .is_some_and(|d| {
+                !crate::paired_list::parse_paired_list(d).is_empty()
+            });
+        if !is_properties_shaped_param(p) && !has_anchor {
             continue;
         }
         writeln!(&mut out).unwrap();
@@ -2443,6 +2482,209 @@ fn enum_values_for(
 fn is_properties_shaped_param(p: &Parameter) -> bool {
     p.has_parameter_type("tcldict")
         || is_properties_shaped(p.value.default_value())
+}
+
+/// Look up the sibling `<modelParameter>` whose name matches
+/// `param_name` and return its default. Vivado sometimes hides the
+/// paired-list schema for a user-facing scalar param in an
+/// internally-flagged model parameter with the same name — the
+/// `INTF_PARENT_PIN_LIST` case (top-level default `0`, model-param
+/// default `QUAD0_RX0 undef QUAD0_RX1 undef …`). `None` when no
+/// matching model param exists or when the two names diverge.
+fn model_param_anchor_default(
+    component: &Component,
+    param_name: &str,
+) -> Option<String> {
+    component
+        .model_parameters()
+        .find(|mp| mp.name == param_name)
+        .map(|mp| mp.value.default_value().to_string())
+}
+
+/// Post-process an anchor-derived schema: if its keys follow the
+/// `QUAD<n>_(RX|TX)<m>` pattern (Vivado's per-quad-per-channel
+/// pin-map convention), replicate the slot set across every quad
+/// the IP declares and attach an `@enum(…)` value list of valid
+/// pin paths.
+///
+/// **Key extrapolation.** Model-param anchors typically only
+/// enumerate ONE quad's worth of slots as a template. Detect the
+/// `QUAD<n>_` prefix and, for each other quad `q` up to the IP's
+/// max, clone the `QUAD0_*` slots as `QUAD<q>_*`. The max is
+/// derived from the parameter tree — every top-level param whose
+/// name starts `QUAD<k>_` counts, so gtwiz-versal's 5-quad layout
+/// materializes 40 slots (5 × 8) from the 8-slot QUAD0 template.
+///
+/// **Value enum.** For each slot whose stripped name matches
+/// `RX<m>` or `TX<m>`, build the enum
+/// `[undef, /INTF0_<dir><n>_GT_IP_Interface_0, /INTF1_<dir><n>_…,
+/// … /INTF<N-1>_<dir><n>_…]`. `N` = number of interface split
+/// nodes on the IP (8 for gtwiz-versal, detected by scanning the
+/// parameter set for the `INTF<k>_` prefix). `n` ranges over the
+/// channel count implied by the source slot name — same convention
+/// Vivado's BD builder uses when materializing GT interface pins.
+fn extrapolate_quad_schema(
+    schema: &mut crate::DictSchema,
+    component: &Component,
+    shape_path: &str,
+    opts: &GenerateOptions,
+) {
+    // Detect the quad-prefix pattern on any existing field.
+    let has_quad_pattern = schema
+        .fields
+        .iter()
+        .any(|f| parse_quad_slot(&f.name).is_some());
+    if !has_quad_pattern {
+        return;
+    }
+    let max_quads = count_indexed_prefix(component, "QUAD");
+    let max_intfs = count_indexed_prefix(component, "INTF");
+    // Number of RX/TX channels per interface. Look at any INTF_RXn
+    // or INTF_TXn model params — same shape as the QUAD channels.
+    // Fall back to 4 (Xilinx's fixed per-interface channel count on
+    // Versal GT wizards) if we can't count.
+    let n_channels = detect_channel_count(schema).max(1);
+
+    // Build a fresh field list: one per (quad, orig_local_slot)
+    // pair, ordered quad-major then original-order.
+    let template: Vec<crate::DictField> = std::mem::take(&mut schema.fields);
+    let mut fields = Vec::with_capacity(template.len() * max_quads.max(1));
+    for q in 0..max_quads.max(1) {
+        for f in &template {
+            let Some((_orig_q, local)) = parse_quad_slot(&f.name) else {
+                // Non-QUAD-shaped keys stay as-is on the first quad
+                // iteration only, so we don't duplicate them.
+                if q == 0 {
+                    fields.push(f.clone());
+                }
+                continue;
+            };
+            let name = format!("QUAD{q}_{local}");
+            let field_lookup = lowercase_ident(&name);
+            let field_override =
+                opts.overrides.field(shape_path, &field_lookup);
+            let mut enum_values = f.enum_values.clone();
+            // Auto-derived pin-path enum. Only overwrite when the
+            // slot name has a recognizable direction — leaves
+            // non-RX/TX slots (uncommon on this pattern but
+            // possible) alone.
+            if let Some(dir_ch) = parse_dir_channel(&local) {
+                let derived =
+                    derive_pin_enum(dir_ch.0, dir_ch.1, max_intfs, n_channels);
+                if !derived.is_empty() {
+                    enum_values = derived;
+                }
+            }
+            let mut default = f.default.clone();
+            if let Some(fo) = field_override {
+                if let Some(d) = &fo.default {
+                    default = d.clone();
+                }
+                if let Some(ev) = &fo.enum_values {
+                    enum_values = ev.iter().cloned().collect();
+                }
+            }
+            fields.push(crate::DictField {
+                name,
+                default,
+                description: f.description.clone(),
+                enum_values,
+            });
+        }
+    }
+    schema.fields = fields;
+}
+
+/// Split a `QUAD<n>_<REST>` slot name into `(n, REST)`. Returns
+/// `None` when the prefix doesn't match.
+fn parse_quad_slot(name: &str) -> Option<(usize, String)> {
+    let rest = name.strip_prefix("QUAD")?;
+    let digit_end = rest.find(|c: char| !c.is_ascii_digit())?;
+    let n: usize = rest[..digit_end].parse().ok()?;
+    let after = rest[digit_end..].strip_prefix('_')?;
+    Some((n, after.to_string()))
+}
+
+/// Split an `RX<m>` / `TX<m>` slot local name into
+/// `(direction, m)`. Direction is `"RX"` or `"TX"`.
+fn parse_dir_channel(local: &str) -> Option<(&'static str, usize)> {
+    let (dir, rest) = if let Some(r) = local.strip_prefix("RX") {
+        ("RX", r)
+    } else if let Some(r) = local.strip_prefix("TX") {
+        ("TX", r)
+    } else {
+        return None;
+    };
+    // Channel index has to be a run of digits terminating the local
+    // name (`RX0`, `TX3`). Anything else disqualifies.
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let m: usize = rest.parse().ok()?;
+    Some((dir, m))
+}
+
+/// Count how many top-level params share the `<prefix><N>_` shape,
+/// which gives us the max index for that family. Used to figure
+/// out the IP's max quad count and interface count without
+/// hard-coding.
+fn count_indexed_prefix(component: &Component, prefix: &str) -> usize {
+    let mut indices = std::collections::BTreeSet::new();
+    for p in component.component_parameters() {
+        let Some(rest) = p.name.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(digit_end) = rest.find(|c: char| !c.is_ascii_digit()) else {
+            continue;
+        };
+        if rest[digit_end..].starts_with('_') {
+            if let Ok(n) = rest[..digit_end].parse::<usize>() {
+                indices.insert(n);
+            }
+        }
+    }
+    indices.iter().max().map(|n| n + 1).unwrap_or(0)
+}
+
+/// Peek at an anchor's fields to figure out how many RX/TX
+/// channels the shape carries. `QUAD0_RX0..RX3` → 4. Returns 0
+/// when no direction-shaped slots are present.
+fn detect_channel_count(schema: &crate::DictSchema) -> usize {
+    let mut max_ch: usize = 0;
+    for f in &schema.fields {
+        let Some((_q, local)) = parse_quad_slot(&f.name) else {
+            continue;
+        };
+        if let Some((_dir, ch)) = parse_dir_channel(&local) {
+            max_ch = max_ch.max(ch + 1);
+        }
+    }
+    max_ch
+}
+
+/// Build the `@enum(…)` value list for a `QUAD<q>_<dir><n>` slot.
+/// Enum contents: the `undef` sentinel + every valid interface
+/// pin path (`/INTF<i>_<dir><m>_GT_IP_Interface_0`) for `i` in
+/// `0..n_intfs` and `m` in `0..n_channels`. Empty when either
+/// axis is zero (defensive — caller falls back to whatever the
+/// XML default declares).
+fn derive_pin_enum(
+    dir: &'static str,
+    _slot_channel: usize,
+    n_intfs: usize,
+    n_channels: usize,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if n_intfs == 0 || n_channels == 0 {
+        return out;
+    }
+    out.insert("undef".to_string());
+    for i in 0..n_intfs {
+        for m in 0..n_channels {
+            out.insert(format!("/INTF{i}_{dir}{m}_GT_IP_Interface_0"));
+        }
+    }
+    out
 }
 
 fn is_properties_shaped(default: &str) -> bool {
