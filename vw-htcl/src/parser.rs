@@ -481,6 +481,30 @@ fn parse_command(
         if terminate {
             break;
         }
+        // Inline comment at word-start position (mid-command). The
+        // configurator idiom for commenting out an arg line —
+        //
+        //   set cfg [
+        //     versal_cips::configure
+        //       -enable_reg_interface 1
+        //       #-intf_parent_pin_list 0
+        //   ]
+        //
+        // — needs the parser to eat the `#-intf_parent_pin_list 0`
+        // as a comment, otherwise it lands as a word and the
+        // analyzer flags `expected keyword argument`. Only fires
+        // MID-command (`!words.is_empty()`) so `#` at
+        // command-start on the top-level (a real Tcl comment) still
+        // reaches the outer `parse_document` handler; inside
+        // brackets `words.is_empty()` at line-start is normal
+        // because bracket-body has no prior context, but the
+        // enclosing `[…]` was already parsed as a CmdSubst so any
+        // `#` INSIDE the subst body's first command *does* have
+        // words already (the command name).
+        if c == '#' && !words.is_empty() {
+            skip_to_end_of_line(input, source);
+            continue;
+        }
         words.push(parse_word(input, source)?);
     }
     if words.is_empty() {
@@ -965,6 +989,18 @@ fn next_line_is_flag_continuation(input: &Input<'_>, source: &str) -> bool {
     // command.
     let next = bytes.get(i + 1).copied().unwrap_or(b'\0');
     next.is_ascii_alphanumeric() || next == b'-' || next == b'_'
+}
+
+/// Consume input up to the next `\n` (not consuming the `\n`
+/// itself). Used to treat `#`-prefixed lines mid-command as
+/// inline comments — see the callsite in `parse_command`.
+fn skip_to_end_of_line(input: &mut Input<'_>, source: &str) {
+    while !at_eof(input, source) {
+        if current_char(input, source) == '\n' {
+            break;
+        }
+        advance_char(input);
+    }
 }
 
 fn skip_inline_ws(input: &mut Input<'_>, source: &str, mode: Mode) {
@@ -1743,5 +1779,65 @@ set cell [
             })
             .collect();
         assert_eq!(cmds.len(), 2);
+    }
+
+    #[test]
+    fn inline_comment_arg_line_is_stripped() {
+        // The configurator idiom for commenting out an arg line.
+        // Parser should eat `#-intf_parent_pin_list 0` and leave a
+        // clean word list `[configure, -enable_reg_interface, 1]`.
+        let src = "\
+set cfg [
+  configure
+    -enable_reg_interface 1
+    #-intf_parent_pin_list 0
+]\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "parse errors: {:?}", out.errors);
+        // The set command has three words: `set`, `cfg`, `[…]`.
+        let set = out
+            .document
+            .stmts
+            .iter()
+            .find_map(|s| match s {
+                crate::ast::Stmt::Command(c) if c.words.first().and_then(|w| w.as_text()) == Some("set") => Some(c),
+                _ => None,
+            })
+            .expect("set command");
+        // The CmdSubst body should contain one command with 3 words
+        // (the `#-intf_parent_pin_list 0` line is eaten).
+        let bracket = &set.words[2];
+        let crate::ast::WordPart::CmdSubst { body, .. } = &bracket.parts[0]
+        else {
+            panic!("expected CmdSubst");
+        };
+        let inner_cmd = body
+            .iter()
+            .find_map(|s| match s {
+                crate::ast::Stmt::Command(c) => Some(c),
+                _ => None,
+            })
+            .expect("configure command");
+        let word_texts: Vec<&str> = inner_cmd
+            .words
+            .iter()
+            .filter_map(|w| w.as_text())
+            .collect();
+        assert_eq!(
+            word_texts,
+            vec!["configure", "-enable_reg_interface", "1"],
+            "expected the commented arg line to be gone",
+        );
+    }
+
+    #[test]
+    fn hash_mid_command_line_is_still_comment() {
+        // `#` mid-command at word-start, even without a newline
+        // in-between, is treated as a comment. Matches the
+        // configurator ergonomics — inside `[cmd -a x #-b y]`
+        // the `#-b y` gets eaten.
+        let src = "[configure -a x #-b y]\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "parse errors: {:?}", out.errors);
     }
 }
