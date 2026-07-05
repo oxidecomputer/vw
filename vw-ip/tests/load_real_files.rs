@@ -59,7 +59,8 @@ fn generates_cips_wrapper_that_reparses() {
         &Default::default(),
         &Default::default(),
         &GenerateOptions::default(),
-    );
+    )
+    .into_single();
     eprintln!("--- generated CIPS wrapper (first 60 lines) ---");
     for line in out.lines().take(60) {
         eprintln!("{line}");
@@ -100,7 +101,8 @@ fn generates_cpm5_wrapper_in_split_mode() {
         &Default::default(),
         &Default::default(),
         &GenerateOptions::default(),
-    );
+    )
+    .into_single();
 
     // Walk the generated source and measure per-proc arg counts so we
     // can assert nothing is anywhere near the 4200-arg PCIE1 disaster
@@ -190,8 +192,12 @@ fn generates_cpm5_wrapper_in_split_mode() {
         &out[..out.len().min(1200)]
     );
     assert!(out.contains("  proc create {"));
-    assert!(out.contains("  proc cpm_pcie0 "));
-    assert!(out.contains("  proc cpm_pcie1 "));
+    // Split-node procs use fully-qualified names now — they live
+    // OUTSIDE the namespace-block (in sibling `.htcl` files after
+    // the split pass) so they can be individually loaded without
+    // Tcl doubling the namespace prefix.
+    assert!(out.contains("proc cpm5::cpm_pcie0 "));
+    assert!(out.contains("proc cpm5::cpm_pcie1 "));
 
     let parsed = vw_htcl::parse(&out);
     assert!(

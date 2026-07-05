@@ -1785,9 +1785,21 @@ where
     // tolerates a few keystroke errors. Floor at 1, ceiling at 3 —
     // anything past 3 starts producing surprising suggestions.
     let threshold = (target.chars().count() / 3).clamp(1, 3);
+    let target_len = target.chars().count();
     let mut best: Option<(usize, &str)> = None;
     for cand in candidates {
-        let d = levenshtein(target, cand);
+        // Length-difference lower-bound: levenshtein(a, b) ≥ ||a| - |b||.
+        // Skip candidates whose length already exceeds the threshold —
+        // no amount of substitution/insertion can bring the distance
+        // in range. This alone cuts the ~5000-candidate scan on
+        // gtwiz-versal (proc names 20-80 chars, target ~15 chars)
+        // down to a small handful of viable comparisons.
+        let cand_len = cand.chars().count();
+        let len_diff = target_len.abs_diff(cand_len);
+        if len_diff > threshold {
+            continue;
+        }
+        let d = levenshtein_capped(target, cand, threshold);
         if d == 0 || d > threshold {
             continue;
         }
@@ -1798,9 +1810,49 @@ where
     best.map(|(_, s)| s.to_string())
 }
 
+/// Length-capped Levenshtein — returns `max+1` (or larger) as soon
+/// as the running row minimum exceeds `max`, avoiding the full
+/// O(m*n) sweep when the caller only cares whether the distance
+/// is ≤ `max`. Every call from `suggest_name` cares about a
+/// threshold of at most 3, so this ends most comparisons after a
+/// handful of cells — critical when the candidate table has
+/// thousands of entries.
+fn levenshtein_capped(a: &str, b: &str, max: usize) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let m = a.len();
+    let n = b.len();
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut cur = vec![0usize; n + 1];
+    let sentinel = max + 1;
+    for i in 1..=m {
+        cur[0] = i;
+        let mut row_min = cur[0];
+        for j in 1..=n {
+            let sub = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + sub);
+            if cur[j] < row_min {
+                row_min = cur[j];
+            }
+        }
+        if row_min > max {
+            return sentinel;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[n]
+}
+
 /// Standard Levenshtein edit distance — number of single-character
 /// insertions, deletions, or substitutions to turn `a` into `b`.
 /// Two-row rolling table; O(n*m) time, O(n) space.
+#[allow(dead_code)]
 fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();

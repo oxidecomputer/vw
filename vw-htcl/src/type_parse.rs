@@ -148,6 +148,14 @@ impl<'a> Parser<'a> {
         // Optional `::Variant` qualified-path suffix. Mutually
         // exclusive with the `<…>` generic form — `E::V<int>` is
         // rejected below.
+        //
+        // Deeper chains (`A::B::C::D`) collapse into a `Named` type
+        // whose name is the whole colon-joined string. That's how
+        // generated wrappers can reference nested-namespace
+        // newtypes like `gtwiz_versal::intf0::gt_settings::Lr0Settings`
+        // without teaching the whole validator about
+        // multi-segment qualified paths (they never carry variant
+        // semantics — they're just deep newtype references).
         if self.pos + 1 < self.bytes.len()
             && self.bytes[self.pos] == b':'
             && self.bytes[self.pos + 1] == b':'
@@ -155,6 +163,40 @@ impl<'a> Parser<'a> {
             self.pos += 2; // ::
             let (variant, variant_span) = self.parse_ident()?;
             self.skip_ws();
+            // Third `::segment`? Keep going and produce a flat
+            // Named type with the whole joined path as its name.
+            if self.pos + 1 < self.bytes.len()
+                && self.bytes[self.pos] == b':'
+                && self.bytes[self.pos + 1] == b':'
+            {
+                let mut joined = format!("{name}::{variant}");
+                while self.pos + 1 < self.bytes.len()
+                    && self.bytes[self.pos] == b':'
+                    && self.bytes[self.pos + 1] == b':'
+                {
+                    self.pos += 2;
+                    let (seg, _) = self.parse_ident()?;
+                    joined.push_str("::");
+                    joined.push_str(&seg);
+                    self.skip_ws();
+                }
+                if !self.eof() && self.bytes[self.pos] == b'<' {
+                    return Err(TypeParseError {
+                        message: format!(
+                            "nested-namespace type `{joined}` cannot take \
+                             generic arguments"
+                        ),
+                        span: self.here_span(),
+                    });
+                }
+                let span = self.span_from(start);
+                return Ok(TypeExpr::Named { name: joined, span });
+            }
+            // Exactly two segments — the classic `Enum::Variant`
+            // shape used for overload dispatch. Preserve the
+            // Qualified form so the validator's variant-reference
+            // rules kick in.
+            //
             // Reject `E::V<…>` — qualified names don't take generic
             // args (their purpose is to name one variant of a
             // declared enum, which has no type parameters in v1).

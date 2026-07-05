@@ -252,6 +252,15 @@ enum IpCommand {
                     `--preset` ones."
         )]
         no_auto_presets: bool,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Per-IP TOML overrides file. Refines XML-derived \
+                    dict-schemas with `@enum(...)` restrictions and \
+                    per-field default overrides. Silently ignored when \
+                    the file doesn't exist."
+        )]
+        overrides: Option<Utf8PathBuf>,
     },
 }
 
@@ -634,6 +643,7 @@ async fn main() {
                 include_internal,
                 presets,
                 no_auto_presets,
+                overrides,
             } => {
                 if let Err(e) = run_ip_generate(
                     &input,
@@ -641,6 +651,7 @@ async fn main() {
                     include_internal,
                     &presets,
                     no_auto_presets,
+                    overrides.as_deref(),
                 ) {
                     eprintln!("{} {e}", "error:".bright_red());
                     process::exit(1);
@@ -700,6 +711,7 @@ fn run_ip_generate(
     include_internal: bool,
     explicit_presets: &[Utf8PathBuf],
     no_auto_presets: bool,
+    overrides_path: Option<&Utf8Path>,
 ) -> Result<(), String> {
     let component =
         vw_ip::load(input).map_err(|e| format!("loading {input}: {e}"))?;
@@ -742,27 +754,70 @@ fn run_ip_generate(
         );
     }
 
+    // Load per-IP TOML overrides. Missing file → empty overrides;
+    // the generator falls back to XML-only defaults everywhere.
+    let overrides = match overrides_path {
+        Some(p) => {
+            let ov =
+                vw_ip::overrides::OverridesFile::load_from(p.as_std_path())
+                    .map_err(|e| format!("{e}"))?;
+            if !ov.is_empty() {
+                eprintln!(
+                    "{:>12} {} shape refinement(s) from {p}",
+                    "Loaded".bright_green().bold(),
+                    ov.shapes.len()
+                );
+            }
+            ov
+        }
+        None => vw_ip::overrides::OverridesFile::default(),
+    };
+
     let opts = vw_ip::GenerateOptions {
         user_configurable_only: !include_internal,
+        overrides,
         ..Default::default()
     };
-    let text = vw_ip::generate(&component, &presets, &dict_schemas, &opts);
+    let out = vw_ip::generate(&component, &presets, &dict_schemas, &opts);
     match output {
         Some(path) => {
-            std::fs::write(path, &text)
+            let module_dir = match path.parent() {
+                Some(p) if !p.as_str().is_empty() => p.to_path_buf(),
+                _ => Utf8PathBuf::from("."),
+            };
+            std::fs::write(path, &out.main)
                 .map_err(|e| format!("writing {path}: {e}"))?;
+            // Sibling `.htcl` files that the main module sources.
+            // For the split gtwiz-versal IP this is 8+5 = 13 files
+            // (one per intfN, quadN). For small IPs (cips, dcmac)
+            // the subfiles vec is empty and only main.htcl gets
+            // written.
+            for (basename, content) in &out.subfiles {
+                let sub_path = module_dir.join(basename);
+                std::fs::write(&sub_path, content)
+                    .map_err(|e| format!("writing {sub_path}: {e}"))?;
+            }
+            if !out.subfiles.is_empty() {
+                eprintln!(
+                    "{:>12} main + {} subfile(s)",
+                    "Wrote".bright_green().bold(),
+                    out.subfiles.len()
+                );
+            }
             // Generated IP modules need a workspace toml so `vw test`,
             // `vw analyzer`, and the REPL can resolve `src @vivado-cmd`
             // (and any other helpers the wrapper calls into). Seed a
             // default one alongside `module.htcl` on first generation;
             // never clobber an existing user-edited toml.
-            let module_dir = match path.parent() {
-                Some(p) if !p.as_str().is_empty() => p.to_path_buf(),
-                _ => Utf8PathBuf::from("."),
-            };
             ensure_module_vw_toml(&module_dir)?;
         }
-        None => print!("{text}"),
+        None => {
+            // stdout mode has no way to represent multiple files;
+            // fall back to the concatenated single-file form so
+            // manual `vw ip generate ... > file.htcl` invocations
+            // still work.
+            print!("{}", out.into_single());
+        }
     }
     Ok(())
 }

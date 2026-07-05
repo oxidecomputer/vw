@@ -60,6 +60,12 @@ pub struct GenerateOptions {
     /// default; populated from the CLI's `--no-collapse=STEM,STEM,…`
     /// flag when a specific stem needs to opt out.
     pub no_collapse: Vec<String>,
+    /// Per-IP TOML overrides file. Attaches `@enum(…)` refinements
+    /// and per-field default overrides to XML-derived DictSchemas
+    /// (see [`crate::overrides::OverridesFile`]). Empty when no
+    /// override file is present — the generator falls back to
+    /// XML-only defaults.
+    pub overrides: crate::overrides::OverridesFile,
 }
 
 impl Default for GenerateOptions {
@@ -70,7 +76,43 @@ impl Default for GenerateOptions {
             split_threshold: 100,
             min_split_size: 8,
             no_collapse: Vec::new(),
+            overrides: crate::overrides::OverridesFile::default(),
         }
+    }
+}
+
+/// Multi-file generation output.
+///
+/// Big IPs (gtwiz-versal at 160k lines, cpm5 at 40k) blow past
+/// tree-sitter's default incremental-parse budget when squeezed
+/// into one file. Splitting per split-node keeps every file under
+/// ~20k lines — still large, but within reach of downstream tools.
+///
+/// `main` is the primary `module.htcl` content, which sources every
+/// entry in `subfiles` via `src ./<basename>` lines. Each subfile
+/// contains one split-node's dict-schema newtypes + its constructor
+/// proc, emitted with fully-qualified proc names so the file
+/// stands alone (no namespace-block wrapping needed).
+#[derive(Debug, Clone, Default)]
+pub struct MultiFileOutput {
+    pub main: String,
+    /// `(basename, content)` pairs — basename is the file name
+    /// (no leading `./`, no directory prefix); the CLI writes each
+    /// to `<output_dir>/<basename>`.
+    pub subfiles: Vec<(String, String)>,
+}
+
+impl MultiFileOutput {
+    /// Merge every subfile into `main` and return the concatenated
+    /// text. Preserves the pre-split single-file shape so unit tests
+    /// and callers that don't care about file layout can keep
+    /// treating the output as one string.
+    pub fn into_single(mut self) -> String {
+        for (_, sub) in &self.subfiles {
+            self.main.push('\n');
+            self.main.push_str(sub);
+        }
+        self.main
     }
 }
 
@@ -85,7 +127,7 @@ pub fn generate(
     presets: &crate::presets::PresetMap,
     dict_schemas: &std::collections::HashMap<String, crate::DictSchema>,
     opts: &GenerateOptions,
-) -> String {
+) -> MultiFileOutput {
     let parameters: Vec<&Parameter> = component
         .component_parameters()
         .filter(|p| {
@@ -97,10 +139,20 @@ pub fn generate(
     } else {
         generate_single(component, presets, &parameters, opts, dict_schemas)
     };
+    // Only the CSV-driven top-level schemas are surfaced here.
+    // XML-derived schemas for split-node params get emitted inline
+    // inside `emit_split_node_constructor`, and top-level XML
+    // schemas (unclaimed by split nodes) get emitted inside
+    // `generate_split` / `generate_single` themselves — see the
+    // dedicated merge steps there.
     if !dict_schemas.is_empty() {
         append_dict_sub_procs(&mut out, component, dict_schemas, opts);
     }
-    out
+    // Peel off large split-node blocks into sibling files so
+    // tree-sitter (and any other line-oriented consumer) doesn't
+    // choke on the aggregate. See [`split_into_files`] for the
+    // peel heuristic and file-shape contract.
+    split_into_files(out)
 }
 
 /// Emit one compositional-value constructor per IP-XACT
@@ -126,25 +178,56 @@ fn append_dict_sub_procs(
             continue;
         }
         writeln!(out).unwrap();
-        emit_dict_props_prelude(out, &ip_name, param_name);
+        // Top-level dict-schema procs (PS_PMC_CONFIG, etc.) live
+        // directly under `<ip>::` — pass an empty namespace prefix.
+        // Sub-schemas emitted while recursing pick up their own
+        // prefix chain from `emit_dict_sub_schemas`.
+        emit_dict_props_prelude(out, &ip_name, &[], param_name);
         writeln!(out).unwrap();
-        emit_dict_sub_proc(out, &ip_name, param_name, schema, opts);
+        emit_dict_sub_proc(out, &ip_name, &[], param_name, schema, opts);
     }
 }
 
 /// Emit the newtype declaration + `::from`/`::to`/`::repr`/`::empty`
 /// helper procs for one dict-schema param. Mirror of
 /// [`emit_family_prelude`] — same shape, different naming source.
-fn emit_dict_props_prelude(out: &mut String, ip_name: &str, param_name: &str) {
-    let qualified = dict_props_name(ip_name, param_name);
+///
+/// `namespace_prefix` composes intermediate namespace segments
+/// between the IP name and the param name — for a nested
+/// sub-constructor emitted under `<ip>::intf::gt_settings::`, pass
+/// `["intf", "gt_settings"]`. Empty slice reproduces the original
+/// flat `<ip>::<param>` shape used by PS_PMC_CONFIG.
+fn emit_dict_props_prelude(
+    out: &mut String,
+    ip_name: &str,
+    namespace_prefix: &[&str],
+    param_name: &str,
+) {
+    let qualified = dict_props_name(ip_name, namespace_prefix, param_name);
     let ctor_lower = param_name.to_ascii_lowercase();
+    let scope_display = if namespace_prefix.is_empty() {
+        format!("[{ip_name}::create]")
+    } else {
+        format!("[{ip_name}::{}]", namespace_prefix.join("::"))
+    };
     writeln!(
         out,
-        "## Typed configuration value for [{ip_name}::create]'s \
-         `-{ctor_lower}` slot. Construct with [{ip_name}::{ctor_lower}].",
+        "## Typed configuration value for {scope_display}'s \
+         `-{ctor_lower}` slot. Construct with [{}::{ctor_lower}].",
+        proc_scope(ip_name, namespace_prefix)
     )
     .unwrap();
+    // Every ancestor namespace segment needs `namespace eval` so
+    // downstream `proc <ip>::a::b::c` declarations resolve. Emit the
+    // whole chain from `<ip>` down to the newtype's own namespace.
     writeln!(out, "namespace eval {ip_name} {{}}").unwrap();
+    for i in 0..namespace_prefix.len() {
+        let chain = std::iter::once(ip_name)
+            .chain(namespace_prefix[..=i].iter().copied())
+            .collect::<Vec<_>>()
+            .join("::");
+        writeln!(out, "namespace eval {chain} {{}}").unwrap();
+    }
     writeln!(out, "namespace eval {qualified} {{}}").unwrap();
     writeln!(out, "type {qualified} = Properties").unwrap();
     writeln!(
@@ -173,6 +256,18 @@ fn emit_dict_props_prelude(out: &mut String, ip_name: &str, param_name: &str) {
     .unwrap();
 }
 
+/// Compose the parent-namespace form for a nested sub-proc, without
+/// the leaf. `("gtwiz_versal", ["intf", "gt_settings"])` →
+/// `"gtwiz_versal::intf::gt_settings"`. Used by doc comments to
+/// point at the containing scope.
+fn proc_scope(ip_name: &str, namespace_prefix: &[&str]) -> String {
+    if namespace_prefix.is_empty() {
+        ip_name.to_string()
+    } else {
+        format!("{ip_name}::{}", namespace_prefix.join("::"))
+    }
+}
+
 /// Emit the value-constructor `<ip>::<param_lower>` for one
 /// dict-schema. Pure — no cell, no `-bd`, no `set_property`. Builds
 /// a `Properties`-shaped dict from the supplied field kwargs and
@@ -184,26 +279,63 @@ fn emit_dict_props_prelude(out: &mut String, ip_name: &str, param_name: &str) {
 fn emit_dict_sub_proc(
     out: &mut String,
     ip_name: &str,
+    namespace_prefix: &[&str],
     param_name: &str,
     schema: &crate::DictSchema,
     opts: &GenerateOptions,
 ) {
+    // Recurse into sub-schemas FIRST so nested newtypes are declared
+    // before the outer proc references them. The outer proc's slot
+    // args carry types like `Intf0GtSettingsLr0Settings` — those
+    // types must exist in the analyzer's view by the time the outer
+    // proc's signature is checked, so the emission order (deepest
+    // first, then parent) matches lexical declaration order.
+    let sub_ctors = emit_dict_sub_schemas(
+        out,
+        ip_name,
+        namespace_prefix,
+        param_name,
+        schema,
+        opts,
+    );
+
     let ctor_local = param_name.to_ascii_lowercase();
-    let ctor_name = format!("{ip_name}::{ctor_local}");
-    let ret_ty = dict_props_name(ip_name, param_name);
+    let ctor_scope = proc_scope(ip_name, namespace_prefix);
+    let ctor_name = format!("{ctor_scope}::{ctor_local}");
+    let ret_ty = dict_props_name(ip_name, namespace_prefix, param_name);
 
     let mut doc = Doc::new();
+    let scope_display = if namespace_prefix.is_empty() {
+        format!("[{ip_name}::create]")
+    } else {
+        format!("[{}]", proc_scope(ip_name, namespace_prefix))
+    };
     doc.push(Item::DocComment(format!(
-        "Configuration value for [{ip_name}::create]'s \
+        "Configuration value for {scope_display}'s \
          `-{ctor_local}` slot (`CONFIG.{param_name}`). Composes into \
          the top proc so every provided field lands in ONE atomic \
          `set_property -dict` call.",
     )));
-    if !schema.fields.is_empty() {
+    if !schema.fields.is_empty() || !sub_ctors.is_empty() {
         doc.push(Item::Blank);
     }
     for f in &schema.fields {
         emit_dict_field_arg(&mut doc, f, opts);
+    }
+    // Typed slots for nested sub-schemas — the outer proc takes
+    // one arg per LRn slot (or equivalent), and the runtime merges
+    // each slot's `<T>::to` unwrap into the top-level Properties
+    // dict under the slot's XML key.
+    for (raw_name, sub_ret_ty) in &sub_ctors {
+        let arg = lowercase_ident(raw_name);
+        doc.push(Item::Command(Command {
+            doc_comments: Vec::new(),
+            words: vec![
+                Word::Raw("@default(\"\")".into()),
+                Word::Bare(format!("{arg}: {sub_ret_ty}")),
+            ],
+            body: None,
+        }));
     }
 
     let mut body = String::new();
@@ -218,12 +350,73 @@ fn emit_dict_sub_proc(
         )
         .unwrap();
     }
+    // Sub-slot merges: unwrap the typed newtype to its raw paired
+    // dict via `<T>::to` + `Properties::to_raw`, and stash it under
+    // the slot's original XML key so `set_property -dict` sees the
+    // nested-paired-dict shape Vivado expects.
+    for (raw_name, sub_ret_ty) in &sub_ctors {
+        let arg = lowercase_ident(raw_name);
+        writeln!(
+            body,
+            "if {{${{__vw_kw_{arg}_set}}}} \
+             {{ dict set _vw_d {raw_name} \
+                [Properties::to_raw -v [{sub_ret_ty}::to -v ${arg}]] }}",
+        )
+        .unwrap();
+    }
     writeln!(
         body,
         "return [{ret_ty}::from -v [Properties::from -v $_vw_d]]"
     )
     .unwrap();
     emit_proc(out, &ctor_name, &doc, Some(&ret_ty), &body);
+}
+
+/// Recursively emit the sub-constructor procs for `schema`'s nested
+/// slots. Each sub-schema gets its own prelude + proc, declared in
+/// a namespace one level deeper than the outer schema
+/// (`<ip>::<prefix…>::<param>::<slot>`). Returns
+/// `(raw_slot_name, sub_ret_ty)` pairs so the outer proc's emitter
+/// can declare typed slot args referencing these newtypes.
+fn emit_dict_sub_schemas(
+    out: &mut String,
+    ip_name: &str,
+    namespace_prefix: &[&str],
+    outer_param: &str,
+    schema: &crate::DictSchema,
+    opts: &GenerateOptions,
+) -> Vec<(String, String)> {
+    let mut acc = Vec::new();
+    if schema.sub_schemas.is_empty() {
+        return acc;
+    }
+    // Extend the namespace prefix with the outer param's lowercase
+    // form — every sub-slot lives one level under the outer proc's
+    // scope: `<prefix…>::<outer_param>::<slot>`.
+    let outer_lower = outer_param.to_ascii_lowercase();
+    let mut deeper: Vec<&str> = namespace_prefix.to_vec();
+    deeper.push(&outer_lower);
+    for (raw_name, sub_schema) in &schema.sub_schemas {
+        // Empty sub-schemas (no fields + no further sub-slots)
+        // arise when an anchor's inner slot is a placeholder — e.g.
+        // TXRX_OPTIONAL_PORTS's `INTF_LR_SETTINGS` has LR0_SETTINGS
+        // populated but LR1_SETTINGS..LR15_SETTINGS empty. Emitting
+        // a proc for those would produce a body-less arg list
+        // (`proc … { ## doc only }`) which the htcl parser rejects
+        // as "doc comment with no following argument". Skip them —
+        // the outer proc's typed slot becomes bare (no sub-slot
+        // arg) and the pair simply isn't set.
+        if sub_schema.fields.is_empty() && sub_schema.sub_schemas.is_empty() {
+            continue;
+        }
+        writeln!(out).unwrap();
+        emit_dict_props_prelude(out, ip_name, &deeper, raw_name);
+        writeln!(out).unwrap();
+        emit_dict_sub_proc(out, ip_name, &deeper, raw_name, sub_schema, opts);
+        let sub_ret_ty = dict_props_name(ip_name, &deeper, raw_name);
+        acc.push((raw_name.clone(), sub_ret_ty));
+    }
+    acc
 }
 
 fn emit_dict_field_arg(
@@ -304,6 +497,7 @@ fn generate_single(
             "",
             &ip_name,
             dict_schemas,
+            &[],
         );
     }
 
@@ -514,6 +708,36 @@ fn generate_split(
         },
     );
 
+    // Merge XML-derived DictSchemas for the top-level Properties-
+    // shaped params (`tree.direct` only, so we don't clobber
+    // schemas the split-node emitter builds for its own params).
+    // These end up in `dict_schemas` for both the top-proc
+    // arg-decl (`emit_arg_decl` picks up the typed newtype) and
+    // the tail `append_dict_sub_procs` call in `generate()` (which
+    // emits the newtype prelude + constructor proc for each).
+    let mut dict_schemas: std::collections::HashMap<String, crate::DictSchema> =
+        dict_schemas.clone();
+    for p in &tree.direct {
+        if dict_schemas.contains_key(&p.name) {
+            continue;
+        }
+        if !is_properties_shaped_param(p) {
+            continue;
+        }
+        let shape_path = lowercase_ident(&p.name);
+        let schema = crate::DictSchema::from_paired_default(
+            p.value.default_value(),
+            &shape_path,
+            &opts.overrides,
+        );
+        if schema.fields.is_empty() && schema.sub_schemas.is_empty() {
+            continue;
+        }
+        dict_schemas.insert(p.name.clone(), schema);
+    }
+    // Take a reference to what all downstream code expects.
+    let dict_schemas = &dict_schemas;
+
     let families = detect_families(
         &tree,
         &DetectOptions {
@@ -560,6 +784,35 @@ fn generate_split(
 
     let mut out = String::new();
     emit_file_header(&mut out, component, &vlnv);
+    // Emit newtype declarations + constructor procs for XML-derived
+    // top-level dict schemas. These live flat under `<ip>::` (like
+    // PS_PMC_CONFIG) — the CSV-driven ones the caller supplied get
+    // emitted by `append_dict_sub_procs` at the tail of `generate`.
+    // Emitting them here keeps the top-proc's typed arg references
+    // (`hnic_pipe_parameters: <ip>::HnicPipeParameters`) resolvable
+    // during validation.
+    for p in &tree.direct {
+        let Some(schema) = dict_schemas.get(&p.name) else {
+            continue;
+        };
+        // Skip CSV-driven schemas (`append_dict_sub_procs` emits
+        // those at the tail); recognizable because they're keyed
+        // by the same name the caller passed in the original
+        // `dict_schemas` reference, NOT one we synthesized above.
+        // Simplest way to check: whether the caller's original map
+        // has it. But we shadowed the binding; use a sentinel by
+        // testing `schema.fields.is_empty() && schema.sub_schemas.is_empty()`
+        // — CSV schemas always have fields, XML schemas we just
+        // merged also do. So instead, filter by whether the param
+        // is Properties-shaped (XML schemas come from those).
+        if !is_properties_shaped_param(p) {
+            continue;
+        }
+        writeln!(&mut out).unwrap();
+        emit_dict_props_prelude(&mut out, &ip_name, &[], &p.name);
+        writeln!(&mut out).unwrap();
+        emit_dict_sub_proc(&mut out, &ip_name, &[], &p.name, schema, opts);
+    }
     writeln!(
         out,
         "## {} configurable parameter{} across {} proc{}.",
@@ -594,6 +847,7 @@ fn generate_split(
             "",
             &ip_name,
             dict_schemas,
+            &[],
         );
     }
     // Family kwargs: one `-<stem_lower><i>` per family member,
@@ -661,16 +915,13 @@ fn generate_split(
         .copied()
         .collect();
 
-    // Newtype preludes for each split-shape constructor land at
-    // file top level (same reason as families — `namespace eval
-    // <ip>` blocks double-prefix qualified proc names).
-    for n in &split_nodes {
-        writeln!(out).unwrap();
-        emit_split_props_prelude(&mut out, &ip_name, &n.label);
-    }
-    if !split_nodes.is_empty() {
-        writeln!(out).unwrap();
-    }
+    // Split-shape newtype preludes are emitted INSIDE each
+    // split-node's own subfile (see `emit_split_node_constructor`)
+    // rather than up here at module.htcl top-level. That way
+    // opening `intf7.htcl` standalone in the LSP still finds the
+    // `gtwiz_versal::Intf7Props` declaration the file needs.
+    // module.htcl still sees them because it `src`s each subfile
+    // via the `## ==== split-file: ... ==== ##` peel-off pass.
 
     // Split-node kwargs on configure: one per split-shape
     // constructor, typed as the node's newtype so configure
@@ -774,8 +1025,17 @@ fn generate_split(
         if !families.is_empty() || i > 0 {
             writeln!(procs).unwrap();
         }
+        // The `out` buffer collects dict-schema newtypes and
+        // constructor procs for this node's Properties args. They
+        // live at fully-qualified names like
+        // `gtwiz_versal::intf0::ChannelMap::from`, which Tcl only
+        // resolves correctly when NOT inside a `namespace eval <ip>
+        // { … }` block. So `emit_split_node_constructor` writes them
+        // to the outer `out` buffer (which is emitted at the top
+        // level of the file, before `write_namespace_block` wraps
+        // `procs`).
         emit_split_node_constructor(
-            &mut procs, &ip_name, component, presets, opts, n,
+            &mut procs, &mut out, &ip_name, component, presets, opts, n,
         );
     }
     if !families.is_empty() || !split_nodes.is_empty() {
@@ -913,6 +1173,14 @@ fn emit_split_props_prelude(out: &mut String, ip_name: &str, label: &str) {
 /// wraps in the newtype.
 fn emit_split_node_constructor(
     out: &mut String,
+    // Buffer for output that must live OUTSIDE the ip-scoped
+    // `namespace eval <ip> { … }` block that wraps `out`. Dict-schema
+    // sub-procs (which use fully-qualified names like
+    // `gtwiz_versal::intf0::ChannelMap::from`) go here — placing them
+    // inside the `namespace eval` block causes Tcl to double the ip
+    // prefix (`gtwiz_versal::gtwiz_versal::intf0::…`) and the
+    // procs become undiscoverable.
+    outer_out: &mut String,
     ip_name: &str,
     component: &Component,
     presets: &crate::presets::PresetMap,
@@ -933,6 +1201,14 @@ fn emit_split_node_constructor(
     if !n.direct.is_empty() {
         doc.push(Item::Blank);
     }
+    // Build the XML-driven dict-schema map for this split-node's
+    // Properties-shaped params (channel_map, gt_settings, etc. on an
+    // `intf` node). Each schema gets emitted as a nested-namespace
+    // typed sub-proc under `<ip>::<node_local>::`, and the arg-decl
+    // references the typed newtype instead of raw `Properties`.
+    // See [`build_split_dict_schemas`] for the extraction logic.
+    let node_local = sanitize_ident(&n.label.to_ascii_lowercase());
+    let local_dict_schemas = build_split_dict_schemas(n, &node_local, opts);
     for p in &n.direct {
         emit_arg_decl(
             &mut doc,
@@ -942,21 +1218,72 @@ fn emit_split_node_constructor(
             opts,
             &n.label,
             ip_name,
-            &std::collections::HashMap::new(),
+            &local_dict_schemas,
+            &[node_local.as_str()],
         );
     }
+
+    // Split-file marker: everything between OPEN and CLOSE ends up
+    // in a sibling `.htcl` file (see `split_into_files`) with the
+    // main module.htcl gaining a `src ./<basename>` line at this
+    // spot. Basename derives from the split-node's local ident so
+    // gtwiz-versal's 8 intfN nodes land in `intf0.htcl`…`intf7.htcl`.
+    // For small IPs the marker still emits but every subfile stays
+    // tiny (a handful of lines) which the tree-sitter parser handles
+    // instantly.
+    writeln!(outer_out, "## ==== split-file: {node_local}.htcl ==== ##")
+        .unwrap();
+    // Every subfile needs its own `src @vivado-cmd` so it can be
+    // analyzed (and hovered / go-to-def'd) standalone in the LSP
+    // without the analyzer opening it via module.htcl. The dict-
+    // schema prelude references `Properties::repr`, `Properties::empty`,
+    // and similar procs that live in the vivado-cmd library; without
+    // the src line the analyzer flags every reference as undefined.
+    writeln!(outer_out, "src @vivado-cmd").unwrap();
+    writeln!(outer_out).unwrap();
+
+    // Split-shape newtype prelude for THIS node — moved from
+    // module.htcl into the subfile so opening the subfile
+    // standalone in the LSP finds the type declaration the file's
+    // own return-type annotations reference.
+    emit_split_props_prelude(outer_out, ip_name, &n.label);
+
+    // Emit the per-node typed sub-procs first so their newtypes
+    // are visible before this proc's signature references them.
+    // Each sub-proc lives at `<ip>::<node_local>::<param_lower>`;
+    // its newtype at `<ip>::<node_local>::<PascalOfParam>`.
+    // Placed on the outer buffer so the fully-qualified proc names
+    // (`gtwiz_versal::intf0::…`) don't get an accidental extra
+    // `gtwiz_versal::` prefix from Tcl's namespace resolution.
+    emit_split_dict_sub_procs(
+        outer_out,
+        ip_name,
+        &node_local,
+        &n.label,
+        &n.direct,
+        &local_dict_schemas,
+        opts,
+    );
 
     let mut body = String::new();
     writeln!(body, "set _vw_d [dict create]").unwrap();
     for p in &n.direct {
-        let arg = lowercase_ident(strip_prefix(&p.name, &n.label));
         let field_key = strip_prefix(&p.name, &n.label);
-        // Properties-typed sub-slots arrive as raw paired-list
-        // dicts (that's what our configure procs produce). Store
-        // `$arg` directly; NOT `[Properties::to_raw -v $arg]`
-        // which would try to unwrap Property::Scalar/Nested tags
-        // that our stored values don't carry.
-        let value_expr = format!("${arg}");
+        let arg = lowercase_ident(field_key);
+        // Dict-schema-backed slot: unwrap the typed newtype to its
+        // raw paired dict via `<T>::to`. Other Properties-shaped
+        // slots (none in gtwiz-versal after this change, but the
+        // path still handles legacy IPs whose defaults slip past
+        // the schema extractor) arrive as raw paired dicts; store
+        // `$arg` verbatim without `Properties::to_raw` (which would
+        // try to strip Scalar/Nested tags that aren't present).
+        let value_expr = if local_dict_schemas.contains_key(field_key) {
+            let ret_ty =
+                dict_props_name(ip_name, &[node_local.as_str()], field_key);
+            format!("[{ret_ty}::to -v ${arg}]")
+        } else {
+            format!("${arg}")
+        };
         writeln!(
             body,
             "if {{${{__vw_kw_{arg}_set}}}} \
@@ -969,7 +1296,224 @@ fn emit_split_node_constructor(
         "return [{ret_ty}::from -v [Properties::from -v $_vw_d]]"
     )
     .unwrap();
-    emit_proc(out, &ctor_local, &doc, Some(&ret_ty), &body);
+    // Emit the split-node's own constructor proc into the outer
+    // buffer (same file as its dict-schema sub-procs) with a fully
+    // qualified name — so it lives at `<ip>::<ctor_local>` without
+    // needing to sit inside a `namespace eval <ip> {…}` block. That
+    // lets the whole split-node emission end up in ONE sibling file
+    // wrapped by split markers, instead of being torn between the
+    // main-file namespace-block and the outer-scope schema block.
+    let ctor_qualified = format!("{ip_name}::{ctor_local}");
+    emit_proc(outer_out, &ctor_qualified, &doc, Some(&ret_ty), &body);
+
+    // Split-file close marker — see the matching OPEN above and
+    // `split_into_files` for the peel logic.
+    writeln!(
+        outer_out,
+        "## ==== end split-file: {node_local}.htcl ==== ##"
+    )
+    .unwrap();
+
+    // Consume `out` (the namespace-block buffer) so the reader can
+    // see we intentionally skipped writing into it — the split-node
+    // no longer contributes short-name procs there.
+    let _ = out;
+}
+
+/// Build the XML-driven DictSchema map for a split-node's
+/// Properties-shaped direct params. Runs once per split-node
+/// emission; the returned map is keyed by raw IP-XACT parameter
+/// name (matches the arg-decl / body lookup pattern).
+///
+/// The shape-path passed to `DictSchema::from_paired_default` is
+/// `<stem>::<param_lower>`, where `stem` is the un-indexed stem of
+/// the node's label (`INTF0` → `intf`, `QUAD0_CH0` → `quad_ch`),
+/// so overrides written against `intf::gt_settings` apply across
+/// every `intf0`..`intf7` sibling. Matches the "one override entry
+/// per family" convention documented in
+/// [`crate::overrides::OverridesFile`].
+fn build_split_dict_schemas(
+    n: &Node<'_>,
+    _node_local: &str,
+    opts: &GenerateOptions,
+) -> std::collections::HashMap<String, crate::DictSchema> {
+    let stem_lower = split_stem_lower(&n.label);
+    let mut out = std::collections::HashMap::new();
+
+    // Pass 1 — extract each Properties-shaped param's own schema
+    // from its default value. Empty results (from `0` / `""` /
+    // `NA NA` sentinel defaults) still land in the map so pass 2
+    // can decide whether to synthesize from an anchor.
+    for p in &n.direct {
+        if !is_properties_shaped_param(p) {
+            continue;
+        }
+        let field_key = strip_prefix(&p.name, &n.label).to_string();
+        let field_lower = lowercase_ident(&field_key);
+        let shape_path = if stem_lower.is_empty() {
+            field_lower
+        } else {
+            format!("{stem_lower}::{field_lower}")
+        };
+        let schema = crate::DictSchema::from_paired_default(
+            p.value.default_value(),
+            &shape_path,
+            &opts.overrides,
+        );
+        out.insert(field_key, schema);
+    }
+
+    // Pass 2 — resolve schemas whose own default was uninformative.
+    // The gtwiz-versal LR{n}_SETTINGS / GT_SETTINGS / GT_INTERNAL
+    // shapes all share a field vocabulary that only lives inside
+    // TXRX_OPTIONAL_PORTS's `INTF_LR_SETTINGS.LR0_SETTINGS` payload
+    // (see the Explore report). Find that payload once, then use it
+    // to backfill:
+    //   - each trivial-schema `LR{n}_SETTINGS` slot (16 of them),
+    //   - the tcldict-tagged `GT_SETTINGS` / `GT_INTERNAL` params,
+    //     synthesized as wrappers holding 16 LR sub-slots.
+    let anchor_lr = out
+        .get("TXRX_OPTIONAL_PORTS")
+        .and_then(|s| s.sub_schemas.get("INTF_LR_SETTINGS"))
+        .and_then(|s| s.sub_schemas.get("LR0_SETTINGS"))
+        .cloned();
+    let params_by_key: std::collections::HashMap<&str, &&Parameter> = n
+        .direct
+        .iter()
+        .map(|p| (strip_prefix(&p.name, &n.label), p))
+        .collect();
+    if let Some(lr_template) = anchor_lr.as_ref() {
+        for i in 0..16 {
+            let key = format!("LR{i}_SETTINGS");
+            // Only backfill if the slot exists on the node (LR0..15
+            // are all declared params on gtwiz-versal's intf nodes).
+            if !params_by_key.contains_key(key.as_str()) {
+                continue;
+            }
+            // Always replace with the anchor template — the LR*
+            // params' own defaults are Xilinx sentinels (`NA NA`
+            // extracts to a bogus `NA=NA` field, hardly trivial by
+            // fields.is_empty() but useless as a schema). The
+            // TXRX_OPTIONAL_PORTS anchor carries the real field
+            // vocabulary that Vivado actually accepts.
+            let mut copy = lr_template.clone();
+            // The anchor's fields were built under the txrx shape
+            // path; reapply the destination slot's overrides so
+            // `intf::lrN_settings` gets its own refinements.
+            let dst_shape_path = if stem_lower.is_empty() {
+                lowercase_ident(&key)
+            } else {
+                format!("{stem_lower}::{}", lowercase_ident(&key))
+            };
+            copy.reapply_overrides(&dst_shape_path, &opts.overrides);
+            out.insert(key, copy);
+        }
+        // Synthesize wrappers for tcldict GT_SETTINGS /
+        // GT_INTERNAL. Both take the same LR0..LR15 sub-slot shape
+        // (Vivado accepts `CONFIG.INTF*_GT_SETTINGS(LR<n>_SETTINGS)
+        // {...}` — the parenthesized sub-key IS the wrapper slot).
+        for wrapper_key in ["GT_SETTINGS", "GT_INTERNAL"] {
+            let Some(p) = params_by_key.get(wrapper_key) else {
+                continue;
+            };
+            if !p.has_parameter_type("tcldict") {
+                continue;
+            }
+            let existing = out.get(wrapper_key);
+            if existing.is_some_and(|s| !schema_is_trivial(s)) {
+                continue;
+            }
+            let mut sub = std::collections::BTreeMap::new();
+            for i in 0..16 {
+                let mut copy = lr_template.clone();
+                // Sub-slot's shape path is `<stem>::<wrapper>::lrN_settings`
+                // — refines overrides written for that specific path
+                // (e.g. `intf::gt_settings::lr0_settings`), separate
+                // from the top-level `intf::lrN_settings` slot.
+                let wrapper_lower = wrapper_key.to_ascii_lowercase();
+                let lr_lower = format!("lr{i}_settings");
+                let sub_shape_path = if stem_lower.is_empty() {
+                    format!("{wrapper_lower}::{lr_lower}")
+                } else {
+                    format!("{stem_lower}::{wrapper_lower}::{lr_lower}")
+                };
+                copy.reapply_overrides(&sub_shape_path, &opts.overrides);
+                sub.insert(format!("LR{i}_SETTINGS"), copy);
+            }
+            out.insert(
+                wrapper_key.to_string(),
+                crate::DictSchema {
+                    fields: Vec::new(),
+                    sub_schemas: sub,
+                },
+            );
+        }
+    }
+
+    // Drop trivial schemas — params whose default was `0` / `""`
+    // sentinels with no anchor available. Fall back to raw
+    // Properties for those; a bare typed slot with no fields
+    // would just clutter the LSP surface.
+    out.retain(|_, schema| !schema_is_trivial(schema));
+    out
+}
+
+/// A schema is "trivial" when it has no fields AND no sub-slots —
+/// derived from an empty default (`0`, `""`) or a nonsense `NA NA`
+/// where the parser found no meaningful structure. Callers use
+/// this to decide whether to backfill from an anchor param.
+fn schema_is_trivial(s: &crate::DictSchema) -> bool {
+    s.fields.is_empty() && s.sub_schemas.is_empty()
+}
+
+/// Emit the dict-schema sub-procs (prelude + constructor + any
+/// nested sub-slots) for each entry in `dict_schemas`, all under
+/// `<ip>::<node_local>::`. Deep recursion happens inside
+/// `emit_dict_sub_proc` via `emit_dict_sub_schemas`, so multi-level
+/// XML shapes (`INTF0_TXRX_OPTIONAL_PORTS` → `INTF_LR_SETTINGS` →
+/// `LR0_SETTINGS`) unfold naturally.
+fn emit_split_dict_sub_procs(
+    out: &mut String,
+    ip_name: &str,
+    node_local: &str,
+    node_label: &str,
+    params: &[&Parameter],
+    dict_schemas: &std::collections::HashMap<String, crate::DictSchema>,
+    opts: &GenerateOptions,
+) {
+    // Emit in the same order params appear so review diffs are
+    // deterministic and consumers can visually pair the newtype
+    // with its Properties arg in the outer proc.
+    for p in params {
+        let stripped = strip_prefix(&p.name, node_label);
+        let Some(schema) = dict_schemas.get(stripped) else {
+            continue;
+        };
+        writeln!(out).unwrap();
+        emit_dict_props_prelude(out, ip_name, &[node_local], stripped);
+        writeln!(out).unwrap();
+        emit_dict_sub_proc(out, ip_name, &[node_local], stripped, schema, opts);
+    }
+}
+
+/// Strip the trailing digit(s) from a split-node label and
+/// lowercase — `INTF0` → `"intf"`, `QUAD0_CH1` → `"quad_ch"`.
+/// Used as the shape-path stem when looking up overrides so a
+/// single override entry applies across every indexed instance in
+/// the family.
+fn split_stem_lower(label: &str) -> String {
+    let mut segs: Vec<String> = Vec::new();
+    for seg in label.split('_') {
+        // Strip a trailing digit run from each segment. Keeps
+        // multi-word stems (`QUAD_CH`) intact while collapsing
+        // `INTF0` → `INTF`, `QUAD0_CH1` → `QUAD_CH`.
+        let trimmed = seg.trim_end_matches(|c: char| c.is_ascii_digit());
+        if trimmed.is_empty() {
+            continue;
+        }
+        segs.push(trimmed.to_ascii_lowercase());
+    }
+    segs.join("_")
 }
 
 /// Fully-qualified newtype name for a split-shape node.
@@ -1019,7 +1563,7 @@ fn write_dict_assembly_with_splits(
         let value_expr =
             if let Some(newtype) = dict_schema_newtypes.get(&p.name) {
                 format!("[{newtype}::to -v ${arg}]")
-            } else if is_properties_shaped(p.value.default_value()) {
+            } else if is_properties_shaped_param(p) {
                 // Properties-typed args now arrive as tagged trees
                 // (from other IPs' `configure` procs, or extracted
                 // via `dict get $props CONFIG` + `Property::as_nested`
@@ -1087,6 +1631,77 @@ fn write_dict_assembly_with_splits(
 // ---------------------------------------------------------------------------
 // Shared helpers.
 // ---------------------------------------------------------------------------
+
+/// Break the concatenated generator output into one main file plus
+/// zero-or-more sibling files.
+///
+/// Peel rule: scan the aggregate for the split marker
+/// `## ==== split-file: <name> ==== ##` … (matching close marker).
+/// The interior lands in `subfiles[<name>]`; the open/close markers
+/// in `main` become a `src ./<name>.htcl` line so the main file's
+/// downstream references still resolve at load time.
+///
+/// Content without markers stays in `main` untouched. Callers that
+/// don't want the split at all (unit tests, single-file consumers)
+/// use `MultiFileOutput::into_single()` to re-flatten.
+///
+/// Threshold-based auto-splitting layers on top: the emitters wrap
+/// each large split-node in markers so this pass does the physical
+/// separation. Small nodes don't get markers → they stay inline.
+fn split_into_files(aggregate: String) -> MultiFileOutput {
+    const OPEN: &str = "## ==== split-file: ";
+    const CLOSE: &str = "## ==== end split-file: ";
+    let mut main = String::with_capacity(aggregate.len());
+    let mut subfiles: Vec<(String, String)> = Vec::new();
+    let mut rest = aggregate.as_str();
+    while let Some(open_off) = rest.find(OPEN) {
+        // Everything before the marker stays in main.
+        main.push_str(&rest[..open_off]);
+        rest = &rest[open_off + OPEN.len()..];
+        let Some(open_end) = rest.find('\n') else {
+            // Malformed marker — retain the rest in main and bail.
+            main.push_str(OPEN);
+            main.push_str(rest);
+            return MultiFileOutput { main, subfiles };
+        };
+        let name_line = rest[..open_end].trim();
+        // Strip the trailing ` ==== ##` from the marker line. The
+        // suffix has interleaved whitespace, ``#``, and ``=``; strip
+        // them all in one pass so partial-suffix boundaries (like
+        // "==== " with the trailing space blocking the "====" strip)
+        // don't leak into the filename.
+        let name = name_line
+            .trim_end_matches(|c: char| {
+                c == '#' || c == '=' || c.is_whitespace()
+            })
+            .trim();
+        rest = &rest[open_end + 1..];
+        // Find the matching close marker.
+        let close_needle = format!("{CLOSE}{name}");
+        let Some(close_off) = rest.find(&close_needle) else {
+            // Unpaired open — restore in main and stop splitting.
+            main.push_str(OPEN);
+            main.push_str(name_line);
+            main.push('\n');
+            main.push_str(rest);
+            return MultiFileOutput { main, subfiles };
+        };
+        let body = rest[..close_off].to_string();
+        // Advance past the close marker's line (up to and
+        // including its newline).
+        let after = &rest[close_off..];
+        let close_line_end =
+            after.find('\n').map(|n| n + 1).unwrap_or(after.len());
+        rest = &after[close_line_end..];
+        // Emit the src line into main so the loader still walks
+        // this subfile. Uses a relative `./` path — the CLI
+        // writes the subfile as a sibling of the main output.
+        writeln!(main, "src ./{name}").unwrap();
+        subfiles.push((name.to_string(), body));
+    }
+    main.push_str(rest);
+    MultiFileOutput { main, subfiles }
+}
 
 fn emit_file_header(out: &mut String, component: &Component, vlnv: &str) {
     // Pull in the whole `vivado-cmd` library — the body uses
@@ -1238,7 +1853,7 @@ fn write_dict_assembly(
         let value_expr =
             if let Some(newtype) = dict_schema_newtypes.get(&p.name) {
                 format!("[{newtype}::to -v ${arg}]")
-            } else if is_properties_shaped(p.value.default_value()) {
+            } else if is_properties_shaped_param(p) {
                 // Properties-typed args now arrive as tagged trees
                 // (from other IPs' `configure` procs, or extracted
                 // via `dict get $props CONFIG` + `Property::as_nested`
@@ -1382,7 +1997,7 @@ fn emit_arg_decl_family(
     }
     let lowered =
         lowercase_ident(strip_prefix(&shape_param.name, shape_member_label));
-    let typed_name = if is_properties_shaped(default) {
+    let typed_name = if is_properties_shaped_param(shape_param) {
         format!("{lowered}: Properties")
     } else {
         lowered
@@ -1571,8 +2186,19 @@ fn stem_props_local(stem: &str) -> String {
 /// as the family-based [`stem_props_name`], applied to Xilinx's
 /// `structured_tcldict` parameter surface so top-proc kwargs like
 /// `-ps_pmc_config` get a typed newtype instead of raw Properties.
-fn dict_props_name(ip_name: &str, param_name: &str) -> String {
-    format!("{ip_name}::{}", dict_props_local(param_name))
+/// Fully-qualified newtype name for a dict-schema sub-proc.
+///
+/// `("gtwiz_versal", ["intf", "gt_settings"], "LR0_SETTINGS")` →
+/// `"gtwiz_versal::intf::gt_settings::Lr0Settings"`. The IP name
+/// keeps its snake_case; namespace-prefix segments keep their
+/// lowercase form; the leaf param name becomes PascalCase.
+fn dict_props_name(
+    ip_name: &str,
+    namespace_prefix: &[&str],
+    param_name: &str,
+) -> String {
+    let scope = proc_scope(ip_name, namespace_prefix);
+    format!("{scope}::{}", dict_props_local(param_name))
 }
 
 /// Local (unqualified) form of the dict-schema newtype name —
@@ -1594,7 +2220,11 @@ fn build_dict_schema_newtypes(
 ) -> std::collections::HashMap<String, String> {
     dict_schemas
         .keys()
-        .map(|k| (k.clone(), dict_props_name(ip_name, k)))
+        // Top-level dict-schema newtype lookup for the top-proc
+        // arg-decl (`-ps_pmc_config: versal_cips::PsPmcConfig`).
+        // Nested newtypes referenced by sub-schemas aren't part of
+        // this map — they're referenced by the sub-procs directly.
+        .map(|k| (k.clone(), dict_props_name(ip_name, &[], k)))
         .collect()
 }
 
@@ -1639,6 +2269,13 @@ fn emit_arg_decl(
     prefix_to_strip: &str,
     ip_name: &str,
     dict_schemas: &std::collections::HashMap<String, crate::DictSchema>,
+    // Namespace prefix under which any dict-schema newtype for `p`
+    // has been (or will be) emitted. Empty for top-proc args (the
+    // classic PS_PMC_CONFIG rail); non-empty for split-node procs
+    // that emit their dict-schema sub-procs under
+    // `<ip>::<node_local>::`. Ignored when the param isn't
+    // dict-schema-backed.
+    dict_ns: &[&str],
 ) {
     if opts.include_descriptions {
         if let Some(desc) = p.description.as_deref().filter(|s| !s.is_empty()) {
@@ -1653,9 +2290,17 @@ fn emit_arg_decl(
     // `@default(...)` — the top-proc body's `__vw_kw_<arg>_set`
     // guard skips unset args, and callers explicitly compose the
     // slot via the constructor when they want to override.
-    let dict_schema = dict_schemas.get(&p.name);
+    //
+    // Dict-schema map keys: split-node schemas are keyed by the
+    // STRIPPED slot name (`CHANNEL_MAP`) so the emitted newtype is
+    // `<ip>::intf0::ChannelMap` not `<ip>::intf0::Intf0ChannelMap`.
+    // Top-proc schemas use the raw param name (`PS_PMC_CONFIG`) as
+    // key with an empty prefix_to_strip → strip is a no-op.
+    let schema_key = strip_prefix(&p.name, prefix_to_strip);
+    let dict_schema = dict_schemas.get(schema_key);
     if let Some(_schema) = dict_schema {
-        let ctor = format!("{ip_name}::{}", p.name.to_ascii_lowercase());
+        let ctor_scope = proc_scope(ip_name, dict_ns);
+        let ctor = format!("{ctor_scope}::{}", schema_key.to_ascii_lowercase());
         doc.push(Item::DocComment(format!("Composed via [{ctor}].")));
     }
     let mut words = Vec::new();
@@ -1668,17 +2313,32 @@ fn emit_arg_decl(
                 .collect();
             words.push(Word::Raw(format!("@enum({})", formatted.join(", "))));
         }
+        // Always emit `@default(...)` — a missing default would
+        // make the param required at the analyzer level, but every
+        // IP-XACT parameter is optional in Vivado's semantics (the
+        // IP uses its own internal default when the user doesn't
+        // override). Empty defaults happen when the XML's
+        // `<spirit:value>` is whitespace-only (BOARD_PARAMETER,
+        // ANLT_PARAMETERS in gtwiz_versal, etc.) — quick-xml's
+        // `$text` strips leading/trailing whitespace, so we see
+        // `""`. Emit `@default("")` as the placeholder and let the
+        // runtime `__vw_kw_<arg>_set` guard skip the merge loop
+        // when the caller didn't pass a value — same pattern as
+        // the family / split-node kwarg placeholders.
         let default = p.value.default_value();
         if !default.is_empty() {
             words.push(Word::Raw(format!(
                 "@default({})",
                 format_attribute_value(default)
             )));
+        } else {
+            words.push(Word::Raw("@default(\"\")".into()));
         }
     } else {
-        // Empty-string placeholder default. The runtime guard
-        // (`__vw_kw_<arg>_set`) prevents the placeholder from ever
-        // being dereferenced through the newtype machinery.
+        // Dict-schema-backed param: empty-string placeholder
+        // default. The runtime guard (`__vw_kw_<arg>_set`)
+        // prevents the placeholder from ever being dereferenced
+        // through the newtype machinery.
         words.push(Word::Raw("@default(\"\")".into()));
     }
     let lowered = lowercase_ident(strip_prefix(&p.name, prefix_to_strip));
@@ -1694,10 +2354,17 @@ fn emit_arg_decl(
     //   `Properties::to_raw` at the `set_property -dict` boundary
     //   (see [`write_set_property_dict`]).
     // - Plain scalar: no type annotation.
-    let default = p.value.default_value();
     let typed_name = if dict_schema.is_some() {
-        format!("{lowered}: {}", dict_props_name(ip_name, &p.name))
-    } else if is_properties_shaped(default) {
+        // Dict-schema slot — reference the newtype at whatever
+        // namespace it was emitted under. Top-proc args pass
+        // `dict_ns=&[]`; split-node args pass `dict_ns=&[node_local]`.
+        // Use the stripped key so the PascalCase newtype name isn't
+        // prefixed with the split-node's label (see schema_key).
+        format!(
+            "{lowered}: {}",
+            dict_props_name(ip_name, dict_ns, schema_key)
+        )
+    } else if is_properties_shaped_param(p) {
         format!("{lowered}: Properties")
     } else {
         lowered
@@ -1760,7 +2427,34 @@ fn enum_values_for(
 /// to be acceptable noise; the wrapper still works when the
 /// caller passes a string-shaped raw value (it round-trips through
 /// `Properties::to_raw` returning the same paired list).
+/// Parameter-level Properties-shape decision. Prefers Xilinx's
+/// authoritative vendor tag (`<xilinx:parameterInfo><xilinx:parameterType>tcldict`
+/// on `<spirit:parameter>`) when present, then falls back to the
+/// structural default-value heuristic below.
+///
+/// Xilinx writes the default of a tcldict param as the bare
+/// sentinel `0` (see `INTF0_GT_SETTINGS`, `INTF0_GT_INTERNAL`,
+/// `INTF1_*` in the `gtwiz_versal_v1_0` component.xml), which the
+/// structural heuristic reads as scalar and gets wrong. The
+/// vendor tag captures the array-indexed compound-property
+/// intent — Vivado's Tcl uses `CONFIG.INTF0_GT_SETTINGS(LR0_SETTINGS)
+/// {…}` on those params — so params carrying it must be exposed
+/// as Properties-typed args regardless of their default shape.
+fn is_properties_shaped_param(p: &Parameter) -> bool {
+    p.has_parameter_type("tcldict")
+        || is_properties_shaped(p.value.default_value())
+}
+
 fn is_properties_shaped(default: &str) -> bool {
+    // Fast path via the Tcl-aware paired-list tokenizer — catches
+    // defaults with `{…}`-grouped values (INTF*_TXRX_OPTIONAL_PORTS
+    // and other tcldict params carry braces in their inner
+    // `INTF_LR_SETTINGS {LR0_SETTINGS {…}}` payload). The naive
+    // `split_whitespace` heuristic below tokenizes those braces as
+    // separate items and misclassifies the default as non-paired.
+    if !crate::paired_list::parse_paired_list(default).is_empty() {
+        return true;
+    }
     let tokens: Vec<&str> = default.split_whitespace().collect();
     if tokens.len() < 2 || !tokens.len().is_multiple_of(2) {
         return false;
@@ -1964,7 +2658,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         // Procs live inside `namespace eval <ip> { … }` and get
         // the 2-space indent from `write_namespace_block`. Two
         // procs: `configure` (typed value constructor) and
@@ -1987,11 +2682,15 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         eprintln!("--- generated ---\n{out}\n--- end ---");
         assert!(out.contains("proc create"));
-        assert!(out.contains("proc big_one"));
-        assert!(out.contains("proc big_two"));
+        // Split-node procs use fully-qualified names now — they live
+        // outside the namespace-block so they can be extracted into
+        // sibling `.htcl` files by `split_into_files`.
+        assert!(out.contains("proc wide::big_one"));
+        assert!(out.contains("proc wide::big_two"));
         let parsed = vw_htcl::parse(&out);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let diags = vw_htcl::validate(&parsed.document, &out);
@@ -2018,12 +2717,14 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         // Sub-procs are pure value-constructors — no `cell:`
         // first arg, no bd switch — and return the node's typed
         // newtype instead of `bd_cell`. Assert the shape.
+        // Fully-qualified name shape after the split-file refactor.
         assert!(
-            out.contains("proc big_one {\n    ## Configuration value"),
+            out.contains("proc wide::big_one {\n  ## Configuration value"),
             "{out}"
         );
         assert!(out.contains("} wide::BigOneProps {"), "{out}");
@@ -2039,7 +2740,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         // None of the tiny prefix groups becomes its own proc...
         for name in ["proc tiny_a ", "proc tiny_b ", "proc stray "] {
             assert!(!out.contains(name), "unexpected {name} in:\n{out}");
@@ -2112,7 +2814,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &opts,
-        );
+        )
+        .into_single();
         // Inside the GROUP_A proc, the arg names should be `field0`,
         // not `group_a_field0`.
         assert!(out.contains("@default(0) field0\n"), "{out}");
@@ -2134,7 +2837,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         let parsed = vw_htcl::parse(&out);
         assert!(
             parsed.errors.is_empty(),
@@ -2156,7 +2860,8 @@ mod tests {
                 &Default::default(),
                 &::std::collections::HashMap::new(),
                 &GenerateOptions::default(),
-            ),
+            )
+            .into_single(),
             generate(
                 &mk_split_component(6),
                 &Default::default(),
@@ -2165,7 +2870,8 @@ mod tests {
                     split_threshold: 5,
                     ..GenerateOptions::default()
                 },
-            ),
+            )
+            .into_single(),
         ] {
             assert!(out.contains("@enum(0, 1) @default(0) bd"), "{out}");
             assert!(out.contains("if {$bd} {"), "{out}");
@@ -2187,7 +2893,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         assert!(out.contains("## A demo IP."), "{out}");
         assert!(out.contains("## Bus width in bits."), "{out}");
     }
@@ -2199,7 +2906,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         assert!(out.contains("@default(32) bus_width"), "{out}");
         assert!(out.contains("@enum(FAST, SLOW)"), "{out}");
         assert!(out.contains("@default(FAST) mode"), "{out}");
@@ -2212,7 +2920,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         // Post-refactor these lappend lines live inside `configure`,
         // not `create`. `create`'s body just unwraps `-config` and
         // splats the resulting dict via `set_property -dict`.
@@ -2230,7 +2939,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         let cfg_start = out.find("proc configure {").expect("no configure");
         let cfg_body = &out[cfg_start..];
         let cfg_end = cfg_body
@@ -2257,7 +2967,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         let create_start = out.find("proc create {").expect("no create");
         // Argspec ends at `} bd_cell {`.
         let create_body = &out[create_start..];
@@ -2290,7 +3001,8 @@ mod tests {
             &Default::default(),
             &::std::collections::HashMap::new(),
             &GenerateOptions::default(),
-        );
+        )
+        .into_single();
         let create_start = out.find("proc create {").expect("no create");
         let create_range = &out[create_start..];
         // Unwrap step.
@@ -2310,5 +3022,56 @@ mod tests {
         );
         assert!(create_range
             .contains("set_property -dict $_dict -objects [get_ips $name]"));
+    }
+
+    // ------------------------------------------------------------------
+    // is_properties_shaped_param — Xilinx vendor-tag routing.
+    // ------------------------------------------------------------------
+
+    use ipxact::{ParameterInfo, VendorExtensions};
+
+    fn mk_param(default: &str, tcldict: bool) -> Parameter {
+        Parameter {
+            name: "X".into(),
+            value: ParamValue {
+                text: default.into(),
+                ..Default::default()
+            },
+            vendor_extensions: if tcldict {
+                Some(VendorExtensions {
+                    xilinx_parameter_info: Some(ParameterInfo {
+                        parameter_type: vec!["tcldict".into()],
+                    }),
+                })
+            } else {
+                None
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tcldict_tag_overrides_scalar_default() {
+        // The `INTF0_GT_SETTINGS` shape — vendor tag says
+        // `tcldict`, default is Xilinx's `0` sentinel that reads
+        // as scalar. The vendor tag must win.
+        let p = mk_param("0", true);
+        assert!(is_properties_shaped_param(&p));
+    }
+
+    #[test]
+    fn structural_shape_still_wins_without_tag() {
+        // The `INTF0_LR0_SETTINGS` shape — no vendor tag but the
+        // default's paired-list shape gives it away.
+        let p = mk_param("NA NA", false);
+        assert!(is_properties_shaped_param(&p));
+    }
+
+    #[test]
+    fn neither_tag_nor_shape_stays_scalar() {
+        // Plain scalar param. Was scalar before this change,
+        // stays scalar after.
+        let p = mk_param("0", false);
+        assert!(!is_properties_shaped_param(&p));
     }
 }

@@ -11,6 +11,7 @@ vw-quote = { path = "../vw-quote" }
 thiserror.workspace = true
 serde.workspace = true
 quick-xml = { version = "0.37", features = ["serialize"] }
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

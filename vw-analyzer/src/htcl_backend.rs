@@ -9,7 +9,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity,
     DocumentSymbol, Documentation, Hover, HoverContents, InsertTextFormat,
@@ -17,11 +17,12 @@ use tower_lsp::lsp_types::{
     Position, Range, SignatureHelp, SignatureInformation, SymbolInformation,
     SymbolKind, TextEdit, Url, WorkspaceEdit,
 };
+use tracing::debug;
 use vw_htcl::{
     complete_at, definition_at, hover_at, parse, rename_at, signature_help_at,
     validate_with_all_extras_and_vars, Attribute, AttributeValue, CommandKind,
-    Completion, CompletionKind, HoverTarget, LineCol, LineIndex, ProcArg,
-    ProcSignature, RenameEdit, Severity, Stmt,
+    Completion, CompletionKind, HoverTarget, LineCol, LineIndex, ParseOutput,
+    ProcArg, ProcSignature, RenameEdit, Severity, Stmt,
 };
 
 use crate::backend::LanguageBackend;
@@ -39,8 +40,53 @@ pub struct HtclBackend {
     workspace_roots: Arc<RwLock<Vec<std::path::PathBuf>>>,
 }
 
+/// Cached analysis for one open document. Populated by the
+/// background indexer spawned from `set_text`, read by every
+/// request handler. Parses + workspace-view + diagnostics all
+/// bundled together — the source strings live in
+/// `view.view_source` and `local_text`, and every span in
+/// `parsed_view`/`parsed_local` indexes into them, so passing the
+/// whole `Arc<DocAnalysis>` around keeps span interpretation safe.
+pub(crate) struct DocAnalysis {
+    /// Document text at index time — sources for every span in
+    /// `parsed_local`, and for line/col translation via
+    /// `local_line_index`.
+    pub local_text: String,
+    /// Concatenated workspace view (local text + every
+    /// transitively `src`d file). Source for spans in
+    /// `parsed_view` and for `line_index`.
+    pub view: crate::workspace::WorkspaceView,
+    pub parsed_local: ParseOutput,
+    pub parsed_view: ParseOutput,
+    pub local_line_index: LineIndex,
+    /// Diagnostics computed at index time — parse errors from the
+    /// local doc plus validator errors from the workspace view
+    /// filtered to local-file spans. Served verbatim by
+    /// `LanguageBackend::diagnostics`.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 struct DocState {
     text: String,
+    /// Monotonic per-URI counter bumped on every `set_text`. The
+    /// spawned indexer captures the generation it was created for
+    /// and only pushes its result to the watch channel if the
+    /// counter still matches — newer set_text having bumped it
+    /// means the newer indexer will supersede us.
+    generation: u64,
+    /// Watch channel carrying the latest completed analysis.
+    /// `None` while indexing is in flight; `Some(Arc<..>)` once
+    /// the indexer commits. `set_text` sends `None` to invalidate.
+    /// Request handlers subscribe and `.changed().await` until
+    /// `borrow()` returns `Some`.
+    tx: watch::Sender<Option<Arc<DocAnalysis>>>,
+    /// Handle to the in-flight indexer. `set_text` aborts the
+    /// previous handle before spawning a new one — keeps only ONE
+    /// index running at a time so rapid typing doesn't back up
+    /// (each keystroke's stale index runs to completion under the
+    /// generation guard, but the ABORT drops it at the next .await
+    /// point which shortens the wall-clock for the freshest text).
+    index_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HtclBackend {
@@ -57,18 +103,6 @@ impl HtclBackend {
         self.workspace_roots.read().await.clone()
     }
 
-    /// Build a workspace view honoring the editor-supplied root
-    /// fallback. Convenience wrapper around
-    /// [`crate::workspace::build_view`].
-    async fn build_view(
-        &self,
-        uri: &Url,
-        text: &str,
-    ) -> crate::workspace::WorkspaceView {
-        let roots = self.workspace_roots_snapshot().await;
-        crate::workspace::build_view(uri, text, &roots)
-    }
-
     /// Resolve a `src` import path from `entry_file`'s directory,
     /// honoring the editor-supplied root fallback.
     async fn resolve_import(
@@ -79,44 +113,74 @@ impl HtclBackend {
         let roots = self.workspace_roots_snapshot().await;
         crate::workspace::resolve_import(entry_file, raw, &roots)
     }
-}
 
-#[async_trait]
-impl LanguageBackend for HtclBackend {
-    fn language_id(&self) -> &str {
-        "htcl"
-    }
-
-    fn handles(&self, uri: &Url) -> bool {
-        uri.path().ends_with(".htcl")
-    }
-
-    async fn set_text(&self, uri: Url, text: String) {
-        self.docs.write().await.insert(uri, DocState { text });
-    }
-
-    async fn set_workspace_roots(&self, roots: Vec<std::path::PathBuf>) {
-        *self.workspace_roots.write().await = roots;
-    }
-
-    async fn close(&self, uri: &Url) {
-        self.docs.write().await.remove(uri);
-    }
-
-    async fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
-        let docs = self.docs.read().await;
-        let Some(doc) = docs.get(uri) else {
-            return Vec::new();
+    /// Return the cached analysis for `uri`, awaiting the in-flight
+    /// indexer if one is currently running. Returns `None` when the
+    /// document isn't tracked (never `set_text`'d or already
+    /// `close`d).
+    ///
+    /// Contract with `set_text`: every time a new set_text fires
+    /// on this URI, the watch channel receives `Some(...)` only
+    /// after the indexer for THAT set_text's text commits under
+    /// the generation guard. So `analysis_for` naturally waits for
+    /// the LATEST index. Older in-flight indexers that finish
+    /// under a stale generation are silently discarded — waiters
+    /// don't get bogus results.
+    pub(crate) async fn analysis_for(
+        &self,
+        uri: &Url,
+    ) -> Option<Arc<DocAnalysis>> {
+        // Subscribe FIRST, then check the current value. Reversing
+        // this creates a race: if the indexer sends `Some(...)`
+        // between the fast-path `borrow()` and `subscribe()`, the
+        // Receiver would be marked as seen at the fresh value and
+        // its `changed().await` would hang waiting for a
+        // never-coming next update. `subscribe()` seeds at the
+        // current value AND records the sequence position, so the
+        // subsequent `borrow_and_update()` correctly returns the
+        // current value regardless of who won the race.
+        let mut rx = {
+            let docs = self.docs.read().await;
+            docs.get(uri)?.tx.subscribe()
         };
-        // Parse errors are file-local: report from the open document's
-        // own parse. (Imports' parse errors are diagnosed when their
-        // file is the open one.)
-        let parsed_local = parse(&doc.text);
-        let line_index = LineIndex::new(&doc.text);
-        let mut out = Vec::new();
+        loop {
+            {
+                let borrowed = rx.borrow_and_update();
+                if let Some(a) = borrowed.clone() {
+                    return Some(a);
+                }
+            }
+            // `None` is the "indexing in progress" state; wait for
+            // the indexer's next send. `changed()` returns Err only
+            // when the sender is dropped — i.e. the doc was
+            // closed — in which case we bail with `None`.
+            if rx.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+
+    /// Build a fresh `DocAnalysis` for `text` synchronously
+    /// (parses + workspace view + validate). Called from the
+    /// spawned indexer task. Extracted so it can also be invoked
+    /// synchronously from tests without needing the async task
+    /// plumbing.
+    pub(crate) fn build_analysis(
+        uri: &Url,
+        text: String,
+        workspace_roots: &[std::path::PathBuf],
+    ) -> Arc<DocAnalysis> {
+        let view = crate::workspace::build_view(uri, &text, workspace_roots);
+        let parsed_local = parse(&text);
+        let local_line_index = LineIndex::new(&text);
+        let parsed_view = parse(&view.view_source);
+        let line_index = LineIndex::new(&view.view_source);
+
+        let mut diagnostics = Vec::new();
+        // Local parse errors.
         for err in &parsed_local.errors {
-            let (start, end) = line_index.range(err.span);
-            out.push(Diagnostic {
+            let (start, end) = local_line_index.range(err.span);
+            diagnostics.push(Diagnostic {
                 range: Range {
                     start: lc_to_pos(start),
                     end: lc_to_pos(end),
@@ -127,14 +191,7 @@ impl LanguageBackend for HtclBackend {
                 ..Default::default()
             });
         }
-
-        // For validator diagnostics: validate the workspace view so
-        // imported proc signatures are in scope, then keep only the
-        // diagnostics that land in this file. That way calling an
-        // imported proc no longer reads as "unknown proc" but a typo
-        // *in* this file still does.
-        let view = self.build_view(uri, &doc.text).await;
-        let parsed_view = parse(&view.view_source);
+        // Workspace-view validator, filtered to local-file spans.
         for d in validate_with_all_extras_and_vars(
             &parsed_view.document,
             &view.view_source,
@@ -152,7 +209,7 @@ impl LanguageBackend for HtclBackend {
                 Severity::Error => DiagnosticSeverity::ERROR,
                 Severity::Warning => DiagnosticSeverity::WARNING,
             };
-            out.push(Diagnostic {
+            diagnostics.push(Diagnostic {
                 range: Range {
                     start: lc_to_pos(start),
                     end: lc_to_pos(end),
@@ -163,16 +220,167 @@ impl LanguageBackend for HtclBackend {
                 ..Default::default()
             });
         }
-        out
+
+        Arc::new(DocAnalysis {
+            local_text: text,
+            view,
+            parsed_local,
+            parsed_view,
+            local_line_index,
+            diagnostics,
+        })
+    }
+}
+
+#[async_trait]
+impl LanguageBackend for HtclBackend {
+    fn language_id(&self) -> &str {
+        "htcl"
+    }
+
+    fn handles(&self, uri: &Url) -> bool {
+        uri.path().ends_with(".htcl")
+    }
+
+    async fn set_text(&self, uri: Url, text: String) {
+        debug!(%uri, bytes = text.len(), "set_text");
+        // Capture the previous indexer task (if any) so we can abort
+        // it AFTER releasing the write lock — abort() itself is
+        // cheap but keeping the lock held for it stalls other
+        // handlers wanting to read the docs map.
+        let (tx, generation, prev_task) = {
+            let mut docs = self.docs.write().await;
+            match docs.get_mut(&uri) {
+                Some(state) => {
+                    state.generation += 1;
+                    state.text = text.clone();
+                    // Invalidate any waiters on the previous
+                    // analysis. `send_replace` (unlike `send`)
+                    // updates the stored value even when the
+                    // channel currently has no receivers —
+                    // critical here because the previous publish
+                    // task has usually finished and dropped its
+                    // receiver by the time the user types the
+                    // next keystroke. With plain `send()` the
+                    // send fails silently and the next analysis_for
+                    // reads the STALE analysis, so publishes fire
+                    // instantly with pre-typing diagnostics.
+                    let _ = state.tx.send_replace(None);
+                    let prev = state.index_task.take();
+                    (state.tx.clone(), state.generation, prev)
+                }
+                None => {
+                    let (tx, _rx) = watch::channel(None);
+                    docs.insert(
+                        uri.clone(),
+                        DocState {
+                            text: text.clone(),
+                            generation: 1,
+                            tx: tx.clone(),
+                            index_task: None,
+                        },
+                    );
+                    (tx, 1, None)
+                }
+            }
+        };
+        if let Some(handle) = prev_task {
+            handle.abort();
+        }
+
+        // Spawn the fresh indexer. Cloned Arcs so the async task
+        // owns 'static state — HtclBackend itself isn't cloneable,
+        // but its RwLocks are.
+        let docs_arc = self.docs.clone();
+        let roots_arc = self.workspace_roots.clone();
+        let uri_task = uri.clone();
+        let handle = tokio::spawn(async move {
+            let roots = roots_arc.read().await.clone();
+            // parse + validate are sync + potentially long
+            // (hundreds of ms on gtwiz-versal). Run on a
+            // spawn_blocking so the async worker isn't tied up.
+            // The spawn_blocking work runs to completion even
+            // after abort(); the generation guard below ensures a
+            // superseded result gets discarded.
+            let uri_inner = uri_task.clone();
+            let analysis = match tokio::task::spawn_blocking(move || {
+                HtclBackend::build_analysis(&uri_inner, text, &roots)
+            })
+            .await
+            {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            // Guard: only commit if this task is still the current
+            // generation for this URI. Otherwise the newer set_text
+            // has already superseded us.
+            let docs = docs_arc.read().await;
+            if let Some(state) = docs.get(&uri_task) {
+                if state.generation == generation {
+                    debug!(uri = %uri_task, generation, "index committed");
+                    // `send_replace` for the same reason as in
+                    // `set_text`'s invalidation: the receiver
+                    // count could have dropped to zero between
+                    // spawn and commit, and a plain `send()`
+                    // would silently swallow the write.
+                    let _ = state.tx.send_replace(Some(analysis));
+                } else {
+                    debug!(
+                        uri = %uri_task,
+                        generation,
+                        current = state.generation,
+                        "index superseded, discarded",
+                    );
+                }
+            }
+        });
+
+        // Store the handle so a subsequent set_text can abort us.
+        let mut docs = self.docs.write().await;
+        if let Some(state) = docs.get_mut(&uri) {
+            if state.generation == generation {
+                state.index_task = Some(handle);
+            } else {
+                // A newer set_text landed between our two lock
+                // acquisitions. Kill our task, the newer set_text
+                // has already installed its own.
+                handle.abort();
+            }
+        } else {
+            // Doc was closed while we were spawning. Kill our task.
+            handle.abort();
+        }
+        let _ = tx; // silence unused warning when watching sends aren't used further
+    }
+
+    async fn set_workspace_roots(&self, roots: Vec<std::path::PathBuf>) {
+        *self.workspace_roots.write().await = roots;
+    }
+
+    async fn close(&self, uri: &Url) {
+        let prev_task = {
+            let mut docs = self.docs.write().await;
+            docs.remove(uri).and_then(|s| s.index_task)
+        };
+        if let Some(handle) = prev_task {
+            handle.abort();
+        }
+    }
+
+    async fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
+        // All diagnostics precomputed at index time. No work here.
+        let Some(analysis) = self.analysis_for(uri).await else {
+            return Vec::new();
+        };
+        analysis.diagnostics.clone()
     }
 
     async fn document_symbols(&self, uri: &Url) -> Vec<DocumentSymbol> {
-        let docs = self.docs.read().await;
-        let Some(doc) = docs.get(uri) else {
+        let Some(analysis) = self.analysis_for(uri).await else {
             return Vec::new();
         };
-        let parsed = parse(&doc.text);
-        let line_index = LineIndex::new(&doc.text);
+        let parsed = &analysis.parsed_local;
+        let line_index = &analysis.local_line_index;
         let mut symbols = Vec::new();
         for stmt in &parsed.document.stmts {
             let Stmt::Command(cmd) = stmt else { continue };
@@ -216,14 +424,21 @@ impl LanguageBackend for HtclBackend {
         const MAX_RESULTS: usize = 500;
 
         let needle = query.to_ascii_lowercase();
-        let docs = self.docs.read().await;
+        // Snapshot the list of open URIs — we release the docs
+        // lock before calling `analysis_for` on each so an
+        // in-flight indexer's write-lock acquisition doesn't
+        // deadlock against our read lock.
+        let uris: Vec<Url> = self.docs.read().await.keys().cloned().collect();
         // Files we've already harvested — dedupe so a header imported
         // by multiple open docs doesn't double up. Keyed on the URI as
         // a string for hashability.
         let mut seen_files: HashMap<String, ()> = HashMap::new();
         let mut out: Vec<SymbolInformation> = Vec::new();
 
-        for (uri, doc) in docs.iter() {
+        for uri in &uris {
+            let Some(analysis) = self.analysis_for(uri).await else {
+                continue;
+            };
             // Visit the open doc itself first, then everything it
             // transitively `src`s. `build_view` already canonicalizes
             // paths during the walk, so the import file_uris are
@@ -231,7 +446,7 @@ impl LanguageBackend for HtclBackend {
             if seen_files.insert(uri.to_string(), ()).is_none() {
                 collect_workspace_symbols(
                     uri,
-                    &doc.text,
+                    &analysis.local_text,
                     &needle,
                     &mut out,
                     MAX_RESULTS,
@@ -241,13 +456,12 @@ impl LanguageBackend for HtclBackend {
                 }
             }
 
-            let view = self.build_view(uri, &doc.text).await;
-            for import in &view.imports {
+            for import in &analysis.view.imports {
                 let key = import.file_uri.to_string();
                 if seen_files.insert(key, ()).is_some() {
                     continue;
                 }
-                let text = &view.view_source
+                let text = &analysis.view.view_source
                     [import.start as usize..import.end as usize];
                 collect_workspace_symbols(
                     &import.file_uri,
@@ -269,11 +483,10 @@ impl LanguageBackend for HtclBackend {
         uri: &Url,
         position: Position,
     ) -> Vec<Location> {
-        let docs = self.docs.read().await;
-        let Some(doc) = docs.get(uri) else {
+        let Some(analysis) = self.analysis_for(uri).await else {
             return Vec::new();
         };
-        let line_index = LineIndex::new(&doc.text);
+        let line_index = &analysis.local_line_index;
         let offset = line_index.offset_of(LineCol {
             line: position.line,
             character: position.character,
@@ -282,7 +495,7 @@ impl LanguageBackend for HtclBackend {
         // Special case: cursor on a `src @dep/foo` path → jump to the
         // imported file. Resolved through the same `vw-lib` machinery
         // the CLI uses, so editor and CLI agree on the same target.
-        let parsed_local = parse(&doc.text);
+        let parsed_local = &analysis.parsed_local;
         if let Some(import) = src_import_at(&parsed_local.document, offset) {
             if let Some(raw) = import.path.as_deref() {
                 let Ok(file_path) = uri.to_file_path() else {
@@ -304,8 +517,8 @@ impl LanguageBackend for HtclBackend {
 
         // General case: resolve against the workspace view so calls to
         // imported procs jump to the right file.
-        let view = self.build_view(uri, &doc.text).await;
-        let parsed_view = parse(&view.view_source);
+        let view = &analysis.view;
+        let parsed_view = &analysis.parsed_view;
         let Some(target_span) =
             definition_at(&parsed_view.document, &view.view_source, offset)
         else {
@@ -317,7 +530,8 @@ impl LanguageBackend for HtclBackend {
         // file whose appended region contains it.
         match view.locate(target_span.start) {
             None => {
-                let (start, end) = line_index.range(target_span);
+                // Local hit — line_index is over analysis.local_text.
+                let (start, end) = analysis.local_line_index.range(target_span);
                 vec![Location {
                     uri: uri.clone(),
                     range: Range {
@@ -353,17 +567,15 @@ impl LanguageBackend for HtclBackend {
     }
 
     async fn hover(&self, uri: &Url, position: Position) -> Option<Hover> {
-        let docs = self.docs.read().await;
-        let doc = docs.get(uri)?;
-        let line_index = LineIndex::new(&doc.text);
-        let offset = line_index.offset_of(LineCol {
+        let analysis = self.analysis_for(uri).await?;
+        let offset = analysis.local_line_index.offset_of(LineCol {
             line: position.line,
             character: position.character,
         });
         // Use the workspace view so a hover on a call to an imported
         // proc shows that proc's signature, not nothing.
-        let view = self.build_view(uri, &doc.text).await;
-        let parsed = parse(&view.view_source);
+        let parsed = &analysis.parsed_view;
+        let view = &analysis.view;
         let target = hover_at(&parsed.document, &view.view_source, offset)?;
         // The hover span is in view-source coordinates; only translate
         // back to line/col when it lands in the local file (which is
@@ -371,7 +583,7 @@ impl LanguageBackend for HtclBackend {
         if target.span().start >= view.local_len {
             return None;
         }
-        let (start, end) = line_index.range(target.span());
+        let (start, end) = analysis.local_line_index.range(target.span());
         // The proc's own doc comments live on the surrounding Command,
         // not on its `Proc` payload — fetch them up here so the
         // formatters can stay focused on shape, not lookup plumbing.
@@ -402,11 +614,10 @@ impl LanguageBackend for HtclBackend {
         uri: &Url,
         position: Position,
     ) -> Vec<CompletionItem> {
-        let docs = self.docs.read().await;
-        let Some(doc) = docs.get(uri) else {
+        let Some(analysis) = self.analysis_for(uri).await else {
             return Vec::new();
         };
-        let line_index = LineIndex::new(&doc.text);
+        let line_index = &analysis.local_line_index;
         let offset = line_index.offset_of(LineCol {
             line: position.line,
             character: position.character,
@@ -414,14 +625,14 @@ impl LanguageBackend for HtclBackend {
 
         // `src <partial>` is filesystem-aware, so it takes its own
         // path before we fall back to the htcl-level analyzer.
-        let line = vw_htcl::cmdline::analyze(&doc.text, offset);
+        let line = vw_htcl::cmdline::analyze(&analysis.local_text, offset);
         if crate::src_complete::is_src_path_context(&line) {
             if let Ok(entry_file) = uri.to_file_path() {
                 let resolver = crate::workspace::build_resolver(&entry_file);
                 return crate::src_complete::src_path_completions(
                     &entry_file,
                     &line,
-                    &line_index,
+                    line_index,
                     &resolver,
                 );
             }
@@ -429,8 +640,8 @@ impl LanguageBackend for HtclBackend {
 
         // Workspace view here too: command-position completion picks
         // up imported proc names.
-        let view = self.build_view(uri, &doc.text).await;
-        let parsed = parse(&view.view_source);
+        let view = &analysis.view;
+        let parsed = &analysis.parsed_view;
         complete_at(&parsed.document, &view.view_source, offset)
             .into_iter()
             // The completion result's `replace` span is in view
@@ -438,7 +649,7 @@ impl LanguageBackend for HtclBackend {
             // drop it (shouldn't happen for in-file cursors, but
             // defensive).
             .filter(|c| c.replace.start < view.local_len)
-            .map(|c| completion_item(c, &line_index))
+            .map(|c| completion_item(c, line_index))
             .collect()
     }
 
@@ -447,10 +658,8 @@ impl LanguageBackend for HtclBackend {
         uri: &Url,
         position: Position,
     ) -> Option<SignatureHelp> {
-        let docs = self.docs.read().await;
-        let doc = docs.get(uri)?;
-        let line_index = LineIndex::new(&doc.text);
-        let offset = line_index.offset_of(LineCol {
+        let analysis = self.analysis_for(uri).await?;
+        let offset = analysis.local_line_index.offset_of(LineCol {
             line: position.line,
             character: position.character,
         });
@@ -458,8 +667,8 @@ impl LanguageBackend for HtclBackend {
         // so the cmdline scan can step into a `[ … ]` substitution
         // (the parser now carries a `body` inside `CmdSubst` and the
         // scan already treats `[` as a command boundary).
-        let view = self.build_view(uri, &doc.text).await;
-        let parsed = parse(&view.view_source);
+        let view = &analysis.view;
+        let parsed = &analysis.parsed_view;
         let help =
             signature_help_at(&parsed.document, &view.view_source, offset)?;
         Some(signature_help_response(&help))
@@ -471,9 +680,8 @@ impl LanguageBackend for HtclBackend {
         position: Position,
         new_name: &str,
     ) -> Option<WorkspaceEdit> {
-        let docs = self.docs.read().await;
-        let doc = docs.get(uri)?;
-        let line_index = LineIndex::new(&doc.text);
+        let analysis = self.analysis_for(uri).await?;
+        let line_index = &analysis.local_line_index;
         let offset = line_index.offset_of(LineCol {
             line: position.line,
             character: position.character,
@@ -482,14 +690,19 @@ impl LanguageBackend for HtclBackend {
         // `rename_at` refuses cross-file targets by returning None.
         // No workspace view: we don't want a rename to try to touch
         // imported files whose contents we're only synthesizing.
-        let parsed = parse(&doc.text);
-        let edits = rename_at(&parsed.document, &doc.text, offset, new_name)?;
+        let parsed = &analysis.parsed_local;
+        let edits = rename_at(
+            &parsed.document,
+            &analysis.local_text,
+            offset,
+            new_name,
+        )?;
         if edits.is_empty() {
             return None;
         }
         let text_edits = edits
             .into_iter()
-            .map(|e| rename_edit_to_lsp(e, &line_index))
+            .map(|e| rename_edit_to_lsp(e, line_index))
             .collect();
         let mut changes = HashMap::new();
         changes.insert(uri.clone(), text_edits);

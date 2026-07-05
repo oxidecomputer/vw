@@ -22,6 +22,8 @@ pub mod cips_dict;
 pub mod family;
 pub mod generate;
 pub mod group;
+pub mod overrides;
+pub mod paired_list;
 pub mod presets;
 pub mod summary;
 pub mod tree;

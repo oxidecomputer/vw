@@ -25,13 +25,25 @@
 //! `flows/automation/deprecated/cips_pswiz_key_and_value.csv` — its
 //! content is a subset of the two supported CSVs above.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
+use crate::overrides::OverridesFile;
+use crate::paired_list::{parse_paired_list, PairedValue};
+
+#[derive(Debug, Clone, Default)]
 pub struct DictSchema {
+    /// Scalar fields at this level — each becomes a typed
+    /// `@default(…) name` proc arg in the emitted constructor.
     pub fields: Vec<DictField>,
+    /// Sub-schemas for nested paired-list slots at this level. Keyed
+    /// by the same upper-snake XML name the field would carry; the
+    /// emitter picks a nested-namespace proc name from that key.
+    /// `LR0_SETTINGS` → sub-schema whose `fields` are `RX_HD_EN`,
+    /// `TX_HD_EN`, etc., emitted as
+    /// `gtwiz_versal::intf::gt_settings::lr0_settings`.
+    pub sub_schemas: BTreeMap<String, DictSchema>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +61,137 @@ pub struct DictField {
     /// or from `param_mapping_presets.csv`. Empty when no enum data
     /// was found.
     pub enum_values: BTreeSet<String>,
+}
+
+impl DictSchema {
+    /// Build a nested `DictSchema` from a paired-list default value.
+    ///
+    /// This is the entry point for typed-constructor emission on
+    /// Properties-shaped params that AREN'T sourced from Xilinx's
+    /// `structured_tcldict` CSVs — gtwiz-versal's
+    /// `INTF*_TXRX_OPTIONAL_PORTS`, `INTF*_CHANNEL_MAP`, etc. The
+    /// paired-list parser turns the XML default into a tree of
+    /// `PairedValue::Scalar` (leaves) and `PairedValue::Nested`
+    /// (sub-slots); this walks that tree, applying `overrides` at
+    /// each level to attach `@enum(...)` restrictions and default
+    /// refinements where the XML is silent.
+    ///
+    /// `shape_path` is the `::`-separated ident chain the caller
+    /// will use to look up overrides — e.g. `"intf::gt_settings"`
+    /// for the top-level `gt_settings` slot on the `intf` family.
+    /// Sub-schemas recurse with the current field name appended
+    /// (`"intf::gt_settings::lr0_settings"` for the LR0 slot).
+    pub fn from_paired_default(
+        default: &str,
+        shape_path: &str,
+        overrides: &OverridesFile,
+    ) -> Self {
+        let pairs = parse_paired_list(default);
+        Self::from_pairs(&pairs, shape_path, overrides)
+    }
+
+    /// Walk `self`'s fields and re-apply `overrides` at the given
+    /// `shape_path`. Used when a schema is COPIED from an anchor
+    /// param to a different slot — the anchor's fields were built
+    /// with the anchor's shape path, but at the copy site the same
+    /// fields are surfaced under a different shape path that may
+    /// have its own overrides. Idempotent: a field with no matching
+    /// override in either place stays unchanged.
+    pub fn reapply_overrides(
+        &mut self,
+        shape_path: &str,
+        overrides: &OverridesFile,
+    ) {
+        for f in &mut self.fields {
+            let field_lookup = lower(&f.name);
+            let Some(fo) = overrides.field(shape_path, &field_lookup) else {
+                continue;
+            };
+            if let Some(default) = &fo.default {
+                f.default = default.clone();
+            }
+            if let Some(enum_values) = &fo.enum_values {
+                f.enum_values = enum_values.iter().cloned().collect();
+            }
+        }
+        for (sub_name, sub) in &mut self.sub_schemas {
+            let sub_path = format!("{shape_path}::{}", lower(sub_name));
+            sub.reapply_overrides(&sub_path, overrides);
+        }
+    }
+
+    fn from_pairs(
+        pairs: &[(String, PairedValue)],
+        shape_path: &str,
+        overrides: &OverridesFile,
+    ) -> Self {
+        let mut fields = Vec::new();
+        let mut sub_schemas = BTreeMap::new();
+        for (raw_name, value) in pairs {
+            match value {
+                PairedValue::Nested(inner) => {
+                    // Nested slot — recurse. Sub-shape path extends
+                    // the current path with the lowercase form of
+                    // this key, matching the convention the emitter
+                    // uses when writing the sub-proc's namespace
+                    // segment.
+                    let sub_path = if shape_path.is_empty() {
+                        lower(raw_name)
+                    } else {
+                        format!("{shape_path}::{}", lower(raw_name))
+                    };
+                    let sub = Self::from_pairs(inner, &sub_path, overrides);
+                    sub_schemas.insert(raw_name.clone(), sub);
+                }
+                PairedValue::Scalar(default) => {
+                    // Merge overrides on top of the XML default.
+                    // Field key inside the override file is the
+                    // lowercase form (matching the emitted arg name);
+                    // the underlying DictField preserves the raw
+                    // upper-snake name for downstream `set_property`
+                    // key composition.
+                    let field_lookup = lower(raw_name);
+                    let field_override =
+                        overrides.field(shape_path, &field_lookup);
+                    let (final_default, enum_values) = match field_override {
+                        Some(fo) => {
+                            let d = fo
+                                .default
+                                .clone()
+                                .unwrap_or_else(|| default.clone());
+                            let e = fo
+                                .enum_values
+                                .clone()
+                                .map(|v| v.into_iter().collect::<BTreeSet<_>>())
+                                .unwrap_or_default();
+                            (d, e)
+                        }
+                        None => (default.clone(), BTreeSet::new()),
+                    };
+                    fields.push(DictField {
+                        name: raw_name.clone(),
+                        default: final_default,
+                        description: None,
+                        enum_values,
+                    });
+                }
+            }
+        }
+        Self {
+            fields,
+            sub_schemas,
+        }
+    }
+}
+
+/// Lowercase form of a field/slot name used for override lookup and
+/// (downstream) as the emitted arg / namespace segment. Uppercase
+/// letters map to lowercase; underscores and digits pass through
+/// verbatim. Matches `generate::lowercase_ident`'s behavior on
+/// upper-snake input (no digit-suffix handling needed here — Xilinx
+/// keys don't start with digits).
+fn lower(s: &str) -> String {
+    s.to_ascii_lowercase()
 }
 
 /// Returns the schema for each `structured_tcldict` parameter we can
@@ -97,7 +240,13 @@ fn load_ps_pmc_schema(data_root: &Path) -> Option<DictSchema> {
 
     let mut sorted: Vec<DictField> = fields.into_values().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
-    Some(DictSchema { fields: sorted })
+    Some(DictSchema {
+        fields: sorted,
+        // PS_PMC_CONFIG is a flat CSV-driven schema — no nested
+        // sub-slots. The from_paired_default path is what populates
+        // sub_schemas for XML-derived schemas.
+        sub_schemas: BTreeMap::new(),
+    })
 }
 
 /// Names of `<spirit:parameter>` entries that live at the top level of
@@ -588,5 +737,150 @@ CLOCK_MODE,REF CLK 33.33 MHz
         assert_eq!(by_name["BOOT_MODE"].default, "Custom");
         assert!(by_name["BOOT_MODE"].enum_values.contains("Custom"));
         assert!(by_name["BOOT_MODE"].enum_values.contains("JTAG Boot"));
+    }
+
+    // ------------------------------------------------------------------
+    // DictSchema::from_paired_default — XML-driven schema extraction.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn from_paired_default_flat_schema() {
+        // The `intf::channel_map` shape — flat pairs, no nesting.
+        let src = "INTF0_RX0 QUAD0_RX0 INTF0_TX0 QUAD0_TX0";
+        let s = DictSchema::from_paired_default(
+            src,
+            "intf::channel_map",
+            &OverridesFile::default(),
+        );
+        assert_eq!(s.fields.len(), 2);
+        assert!(s.sub_schemas.is_empty());
+        assert_eq!(s.fields[0].name, "INTF0_RX0");
+        assert_eq!(s.fields[0].default, "QUAD0_RX0");
+        assert!(s.fields[0].enum_values.is_empty());
+    }
+
+    #[test]
+    fn from_paired_default_nested_lr_schema() {
+        // `INTF_LR_SETTINGS` shape — the nested-slot case.
+        let src = "LR0_SETTINGS {RX_HD_EN 0 TX_HD_EN 0} LR1_SETTINGS { }";
+        let s = DictSchema::from_paired_default(
+            src,
+            "intf::txrx_optional_ports",
+            &OverridesFile::default(),
+        );
+        // No scalar fields at this level — every entry is a nested
+        // slot. Both LR0_SETTINGS and LR1_SETTINGS become sub-schemas.
+        assert!(s.fields.is_empty());
+        assert_eq!(s.sub_schemas.len(), 2);
+        let lr0 = s.sub_schemas.get("LR0_SETTINGS").expect("LR0 present");
+        assert_eq!(lr0.fields.len(), 2);
+        assert_eq!(lr0.fields[0].name, "RX_HD_EN");
+        assert_eq!(lr0.fields[0].default, "0");
+        let lr1 = s.sub_schemas.get("LR1_SETTINGS").expect("LR1 present");
+        assert!(lr1.fields.is_empty());
+        assert!(lr1.sub_schemas.is_empty());
+    }
+
+    #[test]
+    fn from_paired_default_two_levels_matches_txrx_shape() {
+        // `INTF0_TXRX_OPTIONAL_PORTS` shape distilled — flat outer
+        // pairs terminating in a nested INTF_LR_SETTINGS whose
+        // values are themselves paired dicts.
+        let src = "GT_TYPE GTY GT_DIRECTION DUPLEX \
+                   INTF_LR_SETTINGS {LR0_SETTINGS {RX_HD_EN 0}}";
+        let s = DictSchema::from_paired_default(
+            src,
+            "intf::txrx_optional_ports",
+            &OverridesFile::default(),
+        );
+        // Two flat scalar fields, one nested sub-schema.
+        assert_eq!(s.fields.len(), 2);
+        assert_eq!(s.fields[0].name, "GT_TYPE");
+        assert_eq!(s.fields[1].name, "GT_DIRECTION");
+        assert_eq!(s.sub_schemas.len(), 1);
+        let intf_lr = s
+            .sub_schemas
+            .get("INTF_LR_SETTINGS")
+            .expect("INTF_LR_SETTINGS present");
+        assert_eq!(intf_lr.sub_schemas.len(), 1);
+        let lr0 = intf_lr
+            .sub_schemas
+            .get("LR0_SETTINGS")
+            .expect("LR0 sub-schema");
+        assert_eq!(lr0.fields.len(), 1);
+        assert_eq!(lr0.fields[0].name, "RX_HD_EN");
+    }
+
+    #[test]
+    fn overrides_apply_to_matching_shape_path() {
+        // Field-level enum refinement on a specific shape path.
+        // XML default is silent on RX_PAM_SEL's bounds; the
+        // override attaches `@enum(NRZ, PAM4)`.
+        use crate::overrides::{FieldOverride, OverridesFile, ShapeOverrides};
+        let mut ov = OverridesFile::default();
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "rx_pam_sel".to_string(),
+            FieldOverride {
+                enum_values: Some(vec!["NRZ".into(), "PAM4".into()]),
+                default: None,
+            },
+        );
+        ov.shapes.insert(
+            "intf::gt_settings::lr0_settings".into(),
+            ShapeOverrides { fields },
+        );
+        // Note the shape path passed at the root is the outer shape;
+        // the LR0_SETTINGS sub-schema descends to
+        // `intf::gt_settings::lr0_settings`.
+        let src = "LR0_SETTINGS {RX_PAM_SEL NRZ RX_HD_EN 0}";
+        let s = DictSchema::from_paired_default(src, "intf::gt_settings", &ov);
+        let lr0 = s
+            .sub_schemas
+            .get("LR0_SETTINGS")
+            .expect("LR0_SETTINGS sub-schema");
+        let rx_pam = lr0
+            .fields
+            .iter()
+            .find(|f| f.name == "RX_PAM_SEL")
+            .expect("RX_PAM_SEL field");
+        assert_eq!(
+            rx_pam.enum_values,
+            ["NRZ".to_string(), "PAM4".to_string()]
+                .into_iter()
+                .collect()
+        );
+        // Non-overridden field keeps the XML default and empty enum.
+        let rx_hd = lr0
+            .fields
+            .iter()
+            .find(|f| f.name == "RX_HD_EN")
+            .expect("RX_HD_EN field");
+        assert!(rx_hd.enum_values.is_empty());
+        assert_eq!(rx_hd.default, "0");
+    }
+
+    #[test]
+    fn override_default_replaces_xml_default() {
+        use crate::overrides::{FieldOverride, OverridesFile, ShapeOverrides};
+        let mut ov = OverridesFile::default();
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "rx_line_rate".to_string(),
+            FieldOverride {
+                enum_values: None,
+                default: Some("25.78125".into()),
+            },
+        );
+        ov.shapes
+            .insert("intf::lr0_settings".into(), ShapeOverrides { fields });
+        let src = "RX_LINE_RATE 10.3125 RX_HD_EN 0";
+        let s = DictSchema::from_paired_default(src, "intf::lr0_settings", &ov);
+        let rx_line = s
+            .fields
+            .iter()
+            .find(|f| f.name == "RX_LINE_RATE")
+            .expect("RX_LINE_RATE field");
+        assert_eq!(rx_line.default, "25.78125");
     }
 }

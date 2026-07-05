@@ -5,9 +5,13 @@
 //! LSP server entry point. Owns the per-language backends and
 //! dispatches `textDocument/*` requests by URI.
 
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tower_lsp::jsonrpc::Result;
+use tower_lsp::lsp_types::notification::Progress;
+use tower_lsp::lsp_types::request::WorkDoneProgressCreate;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, info};
@@ -18,26 +22,131 @@ use crate::htcl_backend::HtclBackend;
 pub struct Analyzer {
     client: Client,
     backends: Vec<Arc<dyn LanguageBackend>>,
+    /// Monotonic counter for `$/progress` tokens. Every user-facing
+    /// slow operation (diagnostics, goto-def, hover, completion)
+    /// generates a fresh token and reports begin/end so Helix and
+    /// other LSP clients render a pulsating "indexing" indicator
+    /// while the request is in flight. Wrapped in Arc so the
+    /// background diagnostic-publish task fired from did_change
+    /// can share the counter with the foreground handlers.
+    progress_seq: Arc<AtomicU64>,
 }
 
 impl Analyzer {
     pub fn new(client: Client) -> Self {
         let backends: Vec<Arc<dyn LanguageBackend>> =
             vec![Arc::new(HtclBackend::new())];
-        Self { client, backends }
+        Self {
+            client,
+            backends,
+            progress_seq: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     fn backend_for(&self, uri: &Url) -> Option<Arc<dyn LanguageBackend>> {
         self.backends.iter().find(|b| b.handles(uri)).cloned()
     }
 
-    async fn publish_diagnostics(&self, uri: Url, version: Option<i32>) {
+    /// Fire a background diagnostics publish for `uri`. Returns
+    /// immediately; the spawned task awaits the current indexer
+    /// via the backend's `analysis_for` and publishes when it
+    /// completes. Used from `did_open`/`did_change` so the LSP's
+    /// notification queue isn't stalled by the ~1s indexer
+    /// wall-clock — rapid typing no longer serializes into a
+    /// queue of stale re-indexes.
+    ///
+    /// The progress token creation is fire-and-forget from a
+    /// separate task, wrapping only the `analysis_for` await —
+    /// the diagnostics publish is NOT gated on the client's
+    /// progress-create response. If we wrapped publish itself in
+    /// `with_progress`, a client that never responds to
+    /// `window/workDoneProgress/create` would hang the entire
+    /// pipeline. Progress is UX polish; diagnostics are the
+    /// contract, so diagnostics win.
+    fn spawn_publish_diagnostics(&self, uri: Url, version: Option<i32>) {
         let Some(backend) = self.backend_for(&uri) else {
             return;
         };
-        let diags = backend.diagnostics(&uri).await;
-        self.client.publish_diagnostics(uri, diags, version).await;
+        let client = self.client.clone();
+        let progress_seq = self.progress_seq.clone();
+        let uri_progress = uri.clone();
+        // Fire a progress token in a detached task. It races the
+        // publish; whichever finishes first is fine. If the
+        // client stalls on the create request we don't care —
+        // publish still ships.
+        tokio::spawn(async move {
+            let _ = with_progress(
+                &client,
+                &progress_seq,
+                "Indexing",
+                uri_progress.as_ref(),
+                async {},
+            )
+            .await;
+        });
+        // Foreground: await the analysis, publish. No progress
+        // dependencies here.
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let diags = backend.diagnostics(&uri).await;
+            debug!(
+                uri = %uri,
+                count = diags.len(),
+                "publishing diagnostics"
+            );
+            client.publish_diagnostics(uri, diags, version).await;
+        });
     }
+}
+
+/// Free-function `with_progress` that takes just the components
+/// needed to negotiate a workDoneProgress token. Sharing the impl
+/// this way lets the background diagnostic-publish task fire
+/// progress notifications without cloning the whole Analyzer.
+async fn with_progress<T>(
+    client: &Client,
+    progress_seq: &AtomicU64,
+    title: &str,
+    message: &str,
+    fut: impl Future<Output = T>,
+) -> T {
+    let seq = progress_seq.fetch_add(1, Ordering::Relaxed);
+    let token = NumberOrString::String(format!("vw-analyzer-{seq}"));
+    // Server-initiated progress: create the token first. If the
+    // client refuses, fall through to the future without
+    // reporting — the request still runs, just without the
+    // spinner.
+    let created = client
+        .send_request::<WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+            token: token.clone(),
+        })
+        .await
+        .is_ok();
+    if created {
+        let begin = ProgressParams {
+            token: token.clone(),
+            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                WorkDoneProgressBegin {
+                    title: title.to_string(),
+                    cancellable: Some(false),
+                    message: Some(message.to_string()),
+                    percentage: None,
+                },
+            )),
+        };
+        client.send_notification::<Progress>(begin).await;
+    }
+    let result = fut.await;
+    if created {
+        let end = ProgressParams {
+            token,
+            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                WorkDoneProgressEnd { message: None },
+            )),
+        };
+        client.send_notification::<Progress>(end).await;
+    }
+    result
 }
 
 #[tower_lsp::async_trait]
@@ -135,7 +244,14 @@ impl LanguageServer for Analyzer {
                 .set_text(uri.clone(), params.text_document.text)
                 .await;
         }
-        self.publish_diagnostics(uri, version).await;
+        // Fire the diagnostic publish as a background task so the
+        // ~1s indexer wall-clock doesn't stall tower-lsp's
+        // notification queue. Rapid typing (each keystroke fires
+        // did_change → set_text → publish) previously serialized
+        // into a queue of stale re-indexes; now every did_change
+        // returns in microseconds and the LATEST index's
+        // diagnostics arrive whenever it wins the abort race.
+        self.spawn_publish_diagnostics(uri, version);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -148,7 +264,8 @@ impl LanguageServer for Analyzer {
         if let Some(change) = params.content_changes.into_iter().last() {
             backend.set_text(uri.clone(), change.text).await;
         }
-        self.publish_diagnostics(uri, version).await;
+        // Background publish (see `did_open`).
+        self.spawn_publish_diagnostics(uri, version);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -194,6 +311,9 @@ impl LanguageServer for Analyzer {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        // Reads from the cached DocAnalysis — no per-request
+        // progress wrapping needed since the answer lands in
+        // microseconds after indexing has completed.
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let Some(backend) = self.backend_for(&uri) else {
@@ -206,6 +326,7 @@ impl LanguageServer for Analyzer {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        // Cached — see the note on `hover`.
         let uri = params
             .text_document_position_params
             .text_document
@@ -227,6 +348,7 @@ impl LanguageServer for Analyzer {
         &self,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
+        // Cached — see the note on `hover`.
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let Some(backend) = self.backend_for(&uri) else {

@@ -1194,7 +1194,6 @@ dependencies = [
 [[package]]
 name = "ipxact"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/ipe?branch=ry%2Finit#0360158d06554a7019aba9d17c9d654119f48d5c"
 dependencies = [
  "quick-xml",
  "serde",
@@ -2791,6 +2790,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 1.0.69",
+ "toml",
  "vw-htcl",
  "vw-quote",
 ]
