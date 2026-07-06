@@ -318,7 +318,7 @@ fn value_type(
     sig_table: &HashMap<String, &ProcSignature>,
     var_table: &VarTypeTable,
 ) -> Option<crate::ast::TypeExpr> {
-    use crate::ast::{Stmt, WordPart};
+    use crate::ast::{Stmt, TypeExpr, WordPart};
     match word.parts.as_slice() {
         [WordPart::VarRef { name, .. }] => var_table.get(name).cloned(),
         [WordPart::CmdSubst { body, .. }] => {
@@ -329,8 +329,34 @@ fn value_type(
             let call_name = last_cmd.words.first()?.as_text()?;
             sig_table.get(call_name)?.return_type.clone()
         }
+        // Bare `true` / `false` literals — the ONLY textual values
+        // whose type we infer, and only because they're the
+        // canonical HTCL bool literals. Everything else (bare
+        // words, quoted strings, mixed compounds) stays untyped
+        // (gradual typing). Position matters: this makes the
+        // check symmetric so `set flag true` binds `flag: bool`
+        // and a subsequent `-slot $flag` at a `bool` arg matches.
+        [WordPart::Text { value, .. }]
+            if value == "true" || value == "false" =>
+        {
+            Some(TypeExpr::Named {
+                name: "bool".into(),
+                span: word.span,
+            })
+        }
         _ => None,
     }
+}
+
+/// True when a `TypeExpr` names the HTCL `bool` primitive. Kept
+/// as a helper (rather than inlined) so the check has a single
+/// point of change if we ever alias `bool` under a namespace
+/// (e.g. `htcl::bool`).
+fn is_bool_type(ty: &crate::ast::TypeExpr) -> bool {
+    matches!(
+        ty,
+        crate::ast::TypeExpr::Named { name, .. } if name == "bool"
+    )
 }
 
 fn validate_stmts(
@@ -1585,6 +1611,36 @@ fn validate_command(
                                         flag_name,
                                         render_type_inline(declared),
                                         render_type_inline(&actual),
+                                    ),
+                                    span: value.span,
+                                });
+                            }
+                        } else if is_bool_type(declared) {
+                            // `bool`-typed slot with a value the
+                            // `value_type` pass can't infer. The
+                            // ONLY textual values that produce a
+                            // known `bool` are the bare `true` /
+                            // `false` literals (see `value_type`);
+                            // any other whole-word text literal at
+                            // this slot is a mistyped bool
+                            // (`-flag 1`, `-flag yes`, `-flag
+                            // potato`). Reject with a message
+                            // naming the offending literal so the
+                            // caller can rewrite it.
+                            //
+                            // Skips vars/cmdsubst and compound
+                            // words: those return None from
+                            // value_type because we couldn't
+                            // deduce the type, not because they're
+                            // definitively wrong.
+                            if let Some(lit) = value.as_text() {
+                                diags.push(Diagnostic {
+                                    severity: Severity::Error,
+                                    message: format!(
+                                        "type mismatch for -{}: expected \
+                                         `bool`, found literal `{}` (use \
+                                         `true` or `false`)",
+                                        flag_name, lit,
                                     ),
                                     span: value.span,
                                 });
@@ -3146,6 +3202,76 @@ proc Properties::to {v} { return $v }\n";
             type_errs.len(),
             1,
             "expected 1 type diag through `set`, got {d:?}",
+        );
+    }
+
+    // ------ bool literal check ----------------------------------
+    //
+    // Sanity check the four legs of the bool-typed slot machinery:
+    // `true` and `false` land clean, `1` and arbitrary garbage
+    // both error with a message that names the offending literal
+    // and the arg.
+
+    fn bool_slot_fixture(value: &str) -> String {
+        format!(
+            "proc take {{ @default(false) flag: bool }} {{ }}\n\
+             take -flag {value}\n",
+        )
+    }
+
+    #[test]
+    fn bool_literal_true_no_diagnostic() {
+        let src = bool_slot_fixture("true");
+        let d = diags(&src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("type mismatch")),
+            "unexpected type diag on `true`: {d:?}",
+        );
+    }
+
+    #[test]
+    fn bool_literal_false_no_diagnostic() {
+        let src = bool_slot_fixture("false");
+        let d = diags(&src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("type mismatch")),
+            "unexpected type diag on `false`: {d:?}",
+        );
+    }
+
+    #[test]
+    fn bool_literal_integer_1_errors() {
+        // The specific class of bug this pass exists to catch —
+        // `-enable_reg_interface 1` accepted silently today.
+        let src = bool_slot_fixture("1");
+        let d = diags(&src);
+        let type_errs: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("type mismatch"))
+            .collect();
+        assert_eq!(type_errs.len(), 1, "expected 1 diag, got {d:?}");
+        let msg = &type_errs[0].message;
+        assert!(msg.contains("bool"), "message names type: {msg}");
+        assert!(msg.contains("1"), "message names literal: {msg}");
+        assert!(msg.contains("-flag"), "message names arg: {msg}");
+    }
+
+    #[test]
+    fn bool_literal_arbitrary_string_errors() {
+        // Guards against `potato` / `yes` / `on` sliding through
+        // as "Tcl also accepts this as truthy" — HTCL's bool
+        // surface is exactly `true` / `false`.
+        let src = bool_slot_fixture("potato");
+        let d = diags(&src);
+        let type_errs: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("type mismatch"))
+            .collect();
+        assert_eq!(type_errs.len(), 1, "expected 1 diag, got {d:?}");
+        assert!(
+            type_errs[0].message.contains("potato"),
+            "message names offending literal: {}",
+            type_errs[0].message,
         );
     }
 }

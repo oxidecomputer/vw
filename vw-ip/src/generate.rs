@@ -539,6 +539,7 @@ fn generate_single(
     let dict_schema_newtypes =
         build_dict_schema_newtypes(&ip_name, dict_schemas);
     let configure_body = build_single_configure_body(
+        component,
         parameters,
         &ip_name,
         &dict_schema_newtypes,
@@ -664,12 +665,20 @@ fn build_single_create_body(vlnv: &str, ip_name: &str) -> String {
 /// Build `<ip>::configure`'s body (single shape). Pure dict
 /// assembly + wrap in `<ip>::Config`. Zero side effects.
 fn build_single_configure_body(
+    component: &Component,
     parameters: &[&Parameter],
     ip_name: &str,
     dict_schema_newtypes: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut out = String::new();
-    write_dict_assembly(&mut out, parameters, "", &[], dict_schema_newtypes);
+    write_dict_assembly(
+        &mut out,
+        component,
+        parameters,
+        "",
+        &[],
+        dict_schema_newtypes,
+    );
     let config_ty = config_name(ip_name);
     // Lift the assembled `_vw_d` (flat `CONFIG.<PARAM> value` pairs
     // with bare-string values) into a NESTED, tagged Properties
@@ -1004,6 +1013,7 @@ fn generate_split(
     let mut configure_body = String::new();
     write_dict_assembly_with_splits(
         &mut configure_body,
+        component,
         &tree.direct,
         &family_merges,
         &dict_schema_newtypes,
@@ -1320,6 +1330,12 @@ fn emit_split_node_constructor(
             let ret_ty =
                 dict_props_name(ip_name, &[node_local.as_str()], field_key);
             format!("[{ret_ty}::to -v ${arg}]")
+        } else if let Some(kind) = bool_kind(component, p) {
+            // Split-node scalar bool field — pure or pseudo-bool
+            // (kind picks the wire form). Same `if`-shape as the
+            // top-proc and composed-family paths so `$arg` stays
+            // a whole-word VarRef the usage walker sees.
+            bool_value_expr(&arg, kind)
         } else {
             format!("${arg}")
         };
@@ -1578,6 +1594,7 @@ fn split_props_local(label: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 fn write_dict_assembly_with_splits(
     out: &mut String,
+    component: &Component,
     parameters: &[&Parameter],
     families: &[FamilyMerge<'_>],
     dict_schema_newtypes: &std::collections::HashMap<String, String>,
@@ -1614,6 +1631,23 @@ fn write_dict_assembly_with_splits(
                 // sub-slots. Without this the tagged-tree elements
                 // would confuse the shim's structural lifter.
                 format!("[Properties::to_raw -v ${arg}]")
+            } else if let Some(kind) = bool_kind(component, p) {
+                // Marshal the HTCL bool literal to whichever
+                // lexical form the IP-XACT declaration expects:
+                //   * `Pure` (`spirit:format="bool"`)   → true/false
+                //   * `Pseudo` (long+choice{0,1})       → 1/0
+                // Uses `[if $arg …]` (not `[expr {$arg?…}]`) so
+                // `$arg` appears as a whole-word VarRef in the
+                // emitted AST — the brace-wrapped form would put
+                // the reference inside a braced-text part where
+                // the analyzer's usage walker can't see it,
+                // producing spurious "unused proc arg" warnings
+                // for every bool arg. Defense-in-depth for
+                // callers reaching here via `extern::` (analyzer
+                // bypassed): Tcl's `if` still coerces via
+                // `string is boolean` semantics on non-canonical
+                // input.
+                bool_value_expr(&arg, kind)
             } else {
                 format!("${arg}")
             };
@@ -1839,6 +1873,7 @@ fn emit_proc(
 /// [`emit_config_finalize`] for the corresponding apply side.
 fn write_dict_assembly(
     out: &mut String,
+    component: &Component,
     parameters: &[&Parameter],
     prefix_to_strip: &str,
     // Composed families to merge atomically into the same dict.
@@ -1904,6 +1939,23 @@ fn write_dict_assembly(
                 // sub-slots. Without this the tagged-tree elements
                 // would confuse the shim's structural lifter.
                 format!("[Properties::to_raw -v ${arg}]")
+            } else if let Some(kind) = bool_kind(component, p) {
+                // Marshal the HTCL bool literal to whichever
+                // lexical form the IP-XACT declaration expects:
+                //   * `Pure` (`spirit:format="bool"`)   → true/false
+                //   * `Pseudo` (long+choice{0,1})       → 1/0
+                // Uses `[if $arg …]` (not `[expr {$arg?…}]`) so
+                // `$arg` appears as a whole-word VarRef in the
+                // emitted AST — the brace-wrapped form would put
+                // the reference inside a braced-text part where
+                // the analyzer's usage walker can't see it,
+                // producing spurious "unused proc arg" warnings
+                // for every bool arg. Defense-in-depth for
+                // callers reaching here via `extern::` (analyzer
+                // bypassed): Tcl's `if` still coerces via
+                // `string is boolean` semantics on non-canonical
+                // input.
+                bool_value_expr(&arg, kind)
             } else {
                 format!("${arg}")
             };
@@ -2172,7 +2224,18 @@ fn emit_family_constructor(
         // reduce to `$arg`. The old `Properties::to_raw` step
         // required Property::Scalar/Nested tags that our new
         // configure-based value flow no longer produces.
-        let value_expr = format!("${arg}");
+        //
+        // Bool-typed sub-slots get the same marshaling as
+        // top-level bool args — the composed-family paired list
+        // ends up merged into the top proc's `_vw_d` via a
+        // `foreach`, so the canonical wire form (`true`/`false`
+        // for pure bool, `1`/`0` for pseudo bool per BoolKind)
+        // needs to be in place before that step.
+        let value_expr = if let Some(kind) = bool_kind(component, p) {
+            bool_value_expr(&arg, kind)
+        } else {
+            format!("${arg}")
+        };
         writeln!(
             body,
             "if {{${{__vw_kw_{arg}_set}}}} \
@@ -2299,6 +2362,130 @@ struct FamilyMerge<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Normalize an IP-XACT `spirit:format="bool"` default value into
+/// the canonical HTCL literal `true` / `false`. XML defaults for
+/// bool params come in a mix of shapes: quick-xml emits `true` /
+/// `false` for boolean-typed values, but plenty of IPs still
+/// stamp `1` / `0` even when `spirit:format="bool"` is declared,
+/// and empty defaults mean "the IP has an internal default; if
+/// the caller doesn't override, the wrapper's guard block skips
+/// the assignment entirely."
+///
+/// The `false` fallback for empty and unrecognized values is safe
+/// because it flows into `@default(false)` — the runtime
+/// `__vw_kw_<arg>_set` guard only merges the value into the
+/// property dict when the caller passed the flag explicitly, so
+/// the default is inert unless referenced.
+fn normalize_bool_default(default: &str) -> &'static str {
+    match default.trim() {
+        "1" | "true" | "TRUE" | "True" => "true",
+        // Empty defaults / unrecognized shapes get the safer
+        // `false` fallback — the `__vw_kw_<arg>_set` guard makes
+        // this inert unless the caller sets the flag explicitly.
+        _ => "false",
+    }
+}
+
+/// Which lexical form a bool-typed parameter takes on the wire to
+/// Vivado's `set_property`. HTCL surface is the same either way
+/// (bare `true` / `false`); the wrapper's marshaling picks the
+/// lexical based on how the IP-XACT declares the underlying
+/// parameter.
+///
+/// See `bool_kind` for the classification rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoolKind {
+    /// IP-XACT `spirit:format="bool"`. Vivado's parameter engine
+    /// normalizes this family and accepts the canonical `true` /
+    /// `false` string. Emit `[if $arg {list true} {list false}]`.
+    Pure,
+    /// Pseudo-boolean: IP-XACT `spirit:format="long"` bound to a
+    /// two-entry choice pair `(text="false" → 0, text="true" →
+    /// 1)`. Vivado STORES the numeric `0` / `1` — passing
+    /// `true` / `false` errors at `set_property` or fails later
+    /// at `validate_ip`. Emit `[if $arg {list 1} {list 0}]`.
+    ///
+    /// Extremely common on CoreGen-lineage IPs — cpm5's
+    /// component.xml alone has ~3,500 params of this shape. See
+    /// the audit in the pseudo-bool implementation planning.
+    Pseudo,
+}
+
+/// Classify a parameter as bool-typed at the HTCL surface, and
+/// return the wire form the wrapper should marshal to. `None`
+/// when the parameter isn't bool-typed (a scalar string / int /
+/// float / dict / enum / newtype-composed slot).
+///
+/// The classification is deliberately schema-driven, not
+/// heuristic: `Pure` requires the IP-XACT `spirit:format="bool"`
+/// tag; `Pseudo` requires `format="long"` PLUS a `choiceRef`
+/// resolving to a choice with EXACTLY two enumerations valued
+/// `0` and `1` with labels `false` / `true` (case-insensitive).
+/// The 8-choice audit of cpm5 confirmed this signature has no
+/// false positives — string enums like `{REFCLK0=0, REFCLK1=1}`
+/// or size enums like `{16KB=0, 32KB=1}` all miss the label
+/// match and correctly stay untyped.
+fn bool_kind(component: &Component, p: &Parameter) -> Option<BoolKind> {
+    if p.is_bool() {
+        return Some(BoolKind::Pure);
+    }
+    if param_is_pseudo_bool(component, p) {
+        return Some(BoolKind::Pseudo);
+    }
+    None
+}
+
+/// Detect pseudo-boolean parameters: `spirit:format="long"` with
+/// a `choiceRef` pointing at a `{(text="false" → 0), (text="true"
+/// → 1)}` choice. See `BoolKind::Pseudo` for the motivation.
+fn param_is_pseudo_bool(component: &Component, p: &Parameter) -> bool {
+    if p.value.format.as_deref() != Some("long") {
+        return false;
+    }
+    let Some(choice_ref) = p.value.choice_ref.as_deref() else {
+        return false;
+    };
+    let Some(choice) = component.find_choice(choice_ref) else {
+        return false;
+    };
+    if choice.enumerations.len() != 2 {
+        return false;
+    }
+    let mut saw_true = false;
+    let mut saw_false = false;
+    for e in &choice.enumerations {
+        let label = e.label.as_deref().unwrap_or("").trim();
+        match (label.to_ascii_lowercase().as_str(), e.value.trim()) {
+            ("true", "1") => saw_true = true,
+            ("false", "0") => saw_false = true,
+            _ => return false,
+        }
+    }
+    saw_true && saw_false
+}
+
+/// The Tcl `value_expr` fragment for a bool-typed param's
+/// marshaling site. Callers write it into their
+/// `if {${__vw_kw_<arg>_set}} { … <value_expr> }` template.
+///
+/// `if`-form rather than `expr`-form so `$arg` appears as a
+/// whole-word VarRef the analyzer's usage walker can see —
+/// otherwise every bool arg produces a spurious "unused proc
+/// arg" warning.
+fn bool_value_expr(arg: &str, kind: BoolKind) -> String {
+    let (t, f) = match kind {
+        BoolKind::Pure => ("true", "false"),
+        BoolKind::Pseudo => ("1", "0"),
+    };
+    format!("[if ${arg} {{list {t}}} {{list {f}}}]")
+}
+
+// The arg count is intentionally high — this fn threads every
+// input the analyzer needs to type-annotate and default a single
+// proc arg (doc, component, presets, param, opts, prefix strip,
+// ip name, dict schema map, dict namespace). Bundling them into
+// a struct would just push the same coupling into the caller.
+#[allow(clippy::too_many_arguments)]
 fn emit_arg_decl(
     doc: &mut Doc,
     component: &Component,
@@ -2344,34 +2531,53 @@ fn emit_arg_decl(
     }
     let mut words = Vec::new();
     if dict_schema.is_none() {
-        let enum_values = enum_values_for(component, presets, p);
-        if !enum_values.is_empty() {
-            let formatted: Vec<String> = enum_values
-                .iter()
-                .map(|v| format_attribute_value(v))
-                .collect();
-            words.push(Word::Raw(format!("@enum({})", formatted.join(", "))));
-        }
-        // Always emit `@default(...)` — a missing default would
-        // make the param required at the analyzer level, but every
-        // IP-XACT parameter is optional in Vivado's semantics (the
-        // IP uses its own internal default when the user doesn't
-        // override). Empty defaults happen when the XML's
-        // `<spirit:value>` is whitespace-only (BOARD_PARAMETER,
-        // ANLT_PARAMETERS in gtwiz_versal, etc.) — quick-xml's
-        // `$text` strips leading/trailing whitespace, so we see
-        // `""`. Emit `@default("")` as the placeholder and let the
-        // runtime `__vw_kw_<arg>_set` guard skip the merge loop
-        // when the caller didn't pass a value — same pattern as
-        // the family / split-node kwarg placeholders.
-        let default = p.value.default_value();
-        if !default.is_empty() {
-            words.push(Word::Raw(format!(
-                "@default({})",
-                format_attribute_value(default)
-            )));
+        // Bool-typed params (pure IP-XACT `format="bool"` OR
+        // pseudo-bool `format="long"` + `{false=0,true=1}`
+        // choice) get the HTCL `bool` type. Skip `@enum`
+        // emission — bool accepts exactly `true` / `false` and
+        // the analyzer's literal check enforces it structurally;
+        // an `@enum(true, false)` annotation would be redundant.
+        // Normalize the XML default to the canonical `true` /
+        // `false` lexical form so `@default(...)` matches the
+        // HTCL surface (the wire-form marshaling to `1`/`0` for
+        // pseudo-bool happens later at the set_property emit
+        // site).
+        if bool_kind(component, p).is_some() {
+            let default = normalize_bool_default(p.value.default_value());
+            words.push(Word::Raw(format!("@default({default})")));
         } else {
-            words.push(Word::Raw("@default(\"\")".into()));
+            let enum_values = enum_values_for(component, presets, p);
+            if !enum_values.is_empty() {
+                let formatted: Vec<String> = enum_values
+                    .iter()
+                    .map(|v| format_attribute_value(v))
+                    .collect();
+                words.push(Word::Raw(format!(
+                    "@enum({})",
+                    formatted.join(", ")
+                )));
+            }
+            // Always emit `@default(...)` — a missing default would
+            // make the param required at the analyzer level, but every
+            // IP-XACT parameter is optional in Vivado's semantics (the
+            // IP uses its own internal default when the user doesn't
+            // override). Empty defaults happen when the XML's
+            // `<spirit:value>` is whitespace-only (BOARD_PARAMETER,
+            // ANLT_PARAMETERS in gtwiz_versal, etc.) — quick-xml's
+            // `$text` strips leading/trailing whitespace, so we see
+            // `""`. Emit `@default("")` as the placeholder and let the
+            // runtime `__vw_kw_<arg>_set` guard skip the merge loop
+            // when the caller didn't pass a value — same pattern as
+            // the family / split-node kwarg placeholders.
+            let default = p.value.default_value();
+            if !default.is_empty() {
+                words.push(Word::Raw(format!(
+                    "@default({})",
+                    format_attribute_value(default)
+                )));
+            } else {
+                words.push(Word::Raw("@default(\"\")".into()));
+            }
         }
     } else {
         // Dict-schema-backed param: empty-string placeholder
@@ -2405,6 +2611,14 @@ fn emit_arg_decl(
         )
     } else if is_properties_shaped_param(p) {
         format!("{lowered}: Properties")
+    } else if bool_kind(component, p).is_some() {
+        // HTCL `bool` primitive — same surface for pure
+        // (`format="bool"`) and pseudo (`format="long"` +
+        // false/true choice) bools. The analyzer's bool literal
+        // check gates values through this slot; wire-form
+        // marshaling picks true/false vs 1/0 at the
+        // `lappend _vw_d` site based on the same `bool_kind`.
+        format!("{lowered}: bool")
     } else {
         lowered
     };
