@@ -25,7 +25,10 @@
       "Bash(awk '{ ok+=$4; failed+=$6 } END { print ok \" passed, \" failed \" failed\" }')",
       "Bash(cargo clippy *)",
       "Bash(awk *)",
-      "Bash(/home/ry/src/vw/target/debug/vw run *)"
+      "Bash(/home/ry/src/vw/target/debug/vw run *)",
+      "Bash(python3 -c ' *)",
+      "Bash(pdftotext ~/doc-puddle/pg331.pdf -)",
+      "Bash(pdftotext ~/doc-puddle/pg442.pdf -)"
     ]
   }
 }
