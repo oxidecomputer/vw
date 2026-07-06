@@ -233,7 +233,7 @@ fn emit_dict_props_prelude(
     writeln!(
         out,
         "proc {qualified}::repr {{ v: {qualified} }} string \
-         {{ return [Properties::repr -v $v] }}"
+         {{ return [Properties::repr -v [{qualified}::to -v $v]] }}"
     )
     .unwrap();
     writeln!(
@@ -1138,7 +1138,7 @@ fn emit_config_prelude(out: &mut String, ip_name: &str) {
     writeln!(
         out,
         "proc {qualified}::repr {{ v: {qualified} }} string \
-         {{ return [Properties::repr -v $v] }}"
+         {{ return [Properties::repr -v [{qualified}::to -v $v]] }}"
     )
     .unwrap();
     writeln!(
@@ -1181,7 +1181,7 @@ fn emit_split_props_prelude(out: &mut String, ip_name: &str, label: &str) {
     writeln!(
         out,
         "proc {qualified}::repr {{ v: {qualified} }} string \
-         {{ return [Properties::repr -v $v] }}"
+         {{ return [Properties::repr -v [{qualified}::to -v $v]] }}"
     )
     .unwrap();
     writeln!(
@@ -2080,7 +2080,7 @@ fn emit_family_prelude(out: &mut String, ip_name: &str, f: &IndexedFamily<'_>) {
     writeln!(
         out,
         "proc {stem_props}::repr {{ v: {stem_props} }} string \
-         {{ return [Properties::repr -v $v] }}"
+         {{ return [Properties::repr -v [{stem_props}::to -v $v]] }}"
     )
     .unwrap();
     writeln!(

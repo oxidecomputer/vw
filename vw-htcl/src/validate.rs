@@ -190,7 +190,8 @@ pub fn validate_with_all_extras_and_vars<'doc>(
     let newtype_names: std::collections::HashSet<String> =
         type_table.keys().cloned().collect();
     validate_qualified_positions(document, &newtype_names, &mut diags);
-    validate_stmts(&document.stmts, source, &table, &mut diags);
+    let mut var_table = VarTypeTable::new();
+    validate_stmts(&document.stmts, source, &table, &mut var_table, &mut diags);
     // Undefined-variable check. Errors (fail `vw check` / red LSP
     // squiggle), mirror shape to unused-var pass but with the
     // set-operation flipped. `extra_top_level_vars` seeds the
@@ -276,18 +277,109 @@ fn validate_src_imports(
 /// that calls nested inside a proc are checked just like top-level
 /// ones. The signature table is document-wide, so a call resolves to
 /// its (top-level) proc at any depth.
+/// Variable-type table keyed by name. Populated as `validate_stmts`
+/// walks `set VAR <value>` and proc-parameter bindings; consulted by
+/// `value_type` when it hits a `$var` reference at a call site.
+///
+/// Nominal / strict: entries hold the DECLARED `TypeExpr` (from a
+/// proc's `return_type` or a `ProcArg.type_annotation`) without any
+/// alias-walking. Comparing two entries via [`types_match`] gives
+/// newtype identity — `Quad0Ch1Props` and `Quad1Ch0Props` are
+/// distinct even though both alias to `Properties`.
+///
+/// Scope discipline: each proc body owns its own table (created in
+/// the `CommandKind::Proc` arm of `validate_stmts`). Nested
+/// `namespace eval` blocks share the enclosing table (matches Tcl
+/// semantics — `namespace eval` creates a namespace but doesn't
+/// open a new local-variable scope). Bodies of `[ … ]` command
+/// substitutions also share the enclosing table so `set` inside
+/// brackets is visible outside.
+type VarTypeTable = HashMap<String, crate::ast::TypeExpr>;
+
+/// Infer the type of a value word — the argument on the right of a
+/// `-flag` at a call site, or the RHS of a `set VAR`.
+///
+/// Covers the two forms the call-site type-check actually needs:
+///
+/// - A whole-word command substitution `[proc-call …]` returns the
+///   called proc's `return_type`. Multi-command bodies (`[a; b]`)
+///   take the LAST command's return type — matches Tcl's "value of
+///   the last command wins" for `[…]` substitution.
+/// - A whole-word variable reference `$foo` / `${foo}` returns the
+///   type recorded in `var_table` (from a prior `set` or a proc
+///   parameter with a `type_annotation`).
+///
+/// Anything else — literals, quoted strings, mixed compounds like
+/// `prefix-$var` — returns `None`. Callers treat `None` as "unknown
+/// type, skip the check" (gradual typing). We don't error on what
+/// we can't infer.
+fn value_type(
+    word: &crate::ast::Word,
+    sig_table: &HashMap<String, &ProcSignature>,
+    var_table: &VarTypeTable,
+) -> Option<crate::ast::TypeExpr> {
+    use crate::ast::{Stmt, WordPart};
+    match word.parts.as_slice() {
+        [WordPart::VarRef { name, .. }] => var_table.get(name).cloned(),
+        [WordPart::CmdSubst { body, .. }] => {
+            let last_cmd = body.iter().rev().find_map(|s| match s {
+                Stmt::Command(c) => Some(c),
+                _ => None,
+            })?;
+            let call_name = last_cmd.words.first()?.as_text()?;
+            sig_table.get(call_name)?.return_type.clone()
+        }
+        _ => None,
+    }
+}
+
 fn validate_stmts(
     stmts: &[Stmt],
     source: &str,
     table: &HashMap<String, &ProcSignature>,
+    var_table: &mut VarTypeTable,
     diags: &mut Vec<Diagnostic>,
 ) {
     for stmt in stmts {
         let Stmt::Command(cmd) = stmt else { continue };
-        validate_command(cmd, source, table, diags);
+        // Bind `set VAR <value>` into the var table BEFORE
+        // recursing — so downstream `$VAR` references in the same
+        // scope see the type. `validate_command` bails on
+        // `CommandKind::Set` (not a "call"), so this is the only
+        // place set-binding is observed.
+        if matches!(cmd.kind, CommandKind::Set) {
+            if let (Some(name_word), Some(value_word)) =
+                (cmd.words.get(1), cmd.words.get(2))
+            {
+                if let Some(name) = name_word.as_text() {
+                    if let Some(ty) = value_type(value_word, table, var_table) {
+                        var_table.insert(name.to_string(), ty);
+                    }
+                }
+            }
+        }
+        validate_command(cmd, source, table, var_table, diags);
         match &cmd.kind {
             CommandKind::Proc(proc) => {
-                validate_stmts(&proc.body, source, table, diags);
+                // Fresh scope per proc body. Seed with typed
+                // parameters so `-slot $arg` inside the body knows
+                // `arg`'s declared type without the caller having
+                // to `set` it locally.
+                let mut proc_scope = VarTypeTable::new();
+                if let Some(sig) = &proc.signature {
+                    for a in &sig.args {
+                        if let Some(ty) = &a.type_annotation {
+                            proc_scope.insert(a.name.clone(), ty.clone());
+                        }
+                    }
+                }
+                validate_stmts(
+                    &proc.body,
+                    source,
+                    table,
+                    &mut proc_scope,
+                    diags,
+                );
             }
             CommandKind::NamespaceEval(ns) => {
                 // Calls inside the namespace body are validated the
@@ -296,18 +388,23 @@ fn validate_stmts(
                 // anywhere resolves to the same entry. (Bare,
                 // sibling-relative calls inside a namespace body
                 // aren't auto-qualified yet — write the qualified
-                // name explicitly.)
-                validate_stmts(&ns.body, source, table, diags);
+                // name explicitly.) Var scope is shared with the
+                // enclosing frame, matching Tcl's rule that
+                // `namespace eval` creates a namespace but not a
+                // fresh local-variable scope.
+                validate_stmts(&ns.body, source, table, var_table, diags);
             }
             _ => {}
         }
         // Also descend into any `[ … ]` command substitutions on this
         // command's words so calls written inline get validated the
-        // same as top-level ones.
+        // same as top-level ones. Var-table shared with the
+        // enclosing scope — a `set X …` inside `[…]` is visible
+        // outside, per Tcl.
         for word in &cmd.words {
             for part in &word.parts {
                 if let WordPart::CmdSubst { body, .. } = part {
-                    validate_stmts(body, source, table, diags);
+                    validate_stmts(body, source, table, var_table, diags);
                 }
             }
         }
@@ -1342,6 +1439,7 @@ fn validate_command(
     cmd: &Command,
     source: &str,
     table: &HashMap<String, &ProcSignature>,
+    var_table: &VarTypeTable,
     diags: &mut Vec<Diagnostic>,
 ) {
     let call_name = match &cmd.kind {
@@ -1458,6 +1556,41 @@ fn validate_command(
                 }
                 if let Some(value) = value_word {
                     validate_value(call_name, arg, value, source, diags);
+                    // Nominal type check for the value expression.
+                    // Only fires when BOTH sides have known types —
+                    // the caller wrote a `: TYPE` annotation on the
+                    // arg (populated by proc_args parsing into
+                    // `ProcArg.type_annotation`) AND the value word
+                    // is one whose type `value_type` can infer
+                    // (`[proc-call]` return type or `$var` binding).
+                    // Literals and mixed compounds silently skip
+                    // (gradual typing).
+                    //
+                    // Identity via `types_match` — no alias walking
+                    // (see `VarTypeTable` docs). `Quad0Ch1Props ≠
+                    // Quad1Ch0Props ≠ Properties` even when both
+                    // alias the same underlying; that's what
+                    // catches the copy-paste-wrong-constructor bug
+                    // this check exists for.
+                    if let Some(declared) = &arg.type_annotation {
+                        if let Some(actual) =
+                            value_type(value, table, var_table)
+                        {
+                            if !types_match(declared, &actual) {
+                                diags.push(Diagnostic {
+                                    severity: Severity::Error,
+                                    message: format!(
+                                        "type mismatch for -{}: expected \
+                                         `{}`, found `{}`",
+                                        flag_name,
+                                        render_type_inline(declared),
+                                        render_type_inline(&actual),
+                                    ),
+                                    span: value.span,
+                                });
+                            }
+                        }
+                    }
                 } else {
                     diags.push(Diagnostic {
                         severity: Severity::Error,
@@ -2930,5 +3063,89 @@ proc Properties::to {v} { return $v }\n";
         let src = "src @gtwiz-versal\nsrc @other\n";
         let d = src_diags(src, &[]);
         assert!(d.is_empty(), "unexpected diags: {d:?}");
+    }
+
+    // ------ call-site type check ---------------------------------
+    //
+    // Three fixtures exercise the arg-type check:
+    //
+    // 1. Matching newtypes → no diagnostic (happy path).
+    // 2. Mismatched newtypes (the copy-paste-wrong-constructor
+    //    bug in ip/gtm.htcl) → one diagnostic naming both types.
+    // 3. Unknown-type value (literal string) → silent skip
+    //    (gradual typing). Sanity-checks that the check doesn't
+    //    over-fire on values we can't infer.
+
+    /// Set up a minimal document with two newtypes and one taker
+    /// proc that accepts a `-slot` of each. Callers append their
+    /// own top-level call.
+    fn typed_slots_fixture(tail: &str) -> String {
+        format!(
+            "type ns::TypeA = Properties\n\
+             type ns::TypeB = Properties\n\
+             proc make_a {{}} ns::TypeA {{ return {{}} }}\n\
+             proc make_b {{}} ns::TypeB {{ return {{}} }}\n\
+             proc take {{ @default(\"\") slot: ns::TypeA }} {{ }}\n\
+             {tail}",
+        )
+    }
+
+    #[test]
+    fn type_check_matching_types_no_diagnostic() {
+        // `-slot [make_a]` — expected ns::TypeA, actual ns::TypeA.
+        let src = typed_slots_fixture("take -slot [make_a]\n");
+        let d = diags(&src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("type mismatch")),
+            "unexpected type diags: {d:?}",
+        );
+    }
+
+    #[test]
+    fn type_check_mismatched_types_errors() {
+        // `-slot [make_b]` — expected ns::TypeA, actual ns::TypeB.
+        // This is the class of bug the check exists to catch.
+        let src = typed_slots_fixture("take -slot [make_b]\n");
+        let d = diags(&src);
+        let type_errs: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("type mismatch"))
+            .collect();
+        assert_eq!(type_errs.len(), 1, "expected 1 type diag, got {d:?}");
+        let msg = &type_errs[0].message;
+        assert!(
+            msg.contains("ns::TypeA") && msg.contains("ns::TypeB"),
+            "message should name both types: {msg}",
+        );
+        assert!(msg.contains("-slot"), "message should name the arg: {msg}",);
+    }
+
+    #[test]
+    fn type_check_unknown_value_is_silent() {
+        // `-slot hello` — value is a plain literal, type unknown.
+        // The check must NOT fire (gradual typing).
+        let src = typed_slots_fixture("take -slot hello\n");
+        let d = diags(&src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("type mismatch")),
+            "unexpected type diag on untyped literal: {d:?}",
+        );
+    }
+
+    #[test]
+    fn type_check_var_binding_flows_through_set() {
+        // `set x [make_b]; take -slot $x` — actual type flows
+        // through the `set` binding into the `$x` reference.
+        let src = typed_slots_fixture("set x [make_b]\ntake -slot $x\n");
+        let d = diags(&src);
+        let type_errs: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("type mismatch"))
+            .collect();
+        assert_eq!(
+            type_errs.len(),
+            1,
+            "expected 1 type diag through `set`, got {d:?}",
+        );
     }
 }
