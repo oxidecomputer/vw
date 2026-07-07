@@ -769,7 +769,45 @@ fn infer_return_type(returns: Option<&[String]>) -> Option<String> {
     // could swap in regex; substring search is good enough for
     // the v1 phrase set.
     let table: &[(&str, &str)] = &[
+        // Singular creator/current handles. These fire BEFORE the
+        // `nothing` catchall so a page like "returns the name of
+        // the newly created cell object, or returns nothing if
+        // the command fails" gets the meaningful type instead of
+        // the failure-sentinel `unit`.
+        //
+        // Ordering within this group: exact BD types before the
+        // generic `cell/pin/port/net` forms so `intf_port`
+        // outranks `port`, etc.
+        ("newly created interface port object", "bd_intf_port"),
+        ("newly created interface pin object", "bd_intf_pin"),
+        ("newly created interface net object", "bd_intf_net"),
+        ("current interface port object", "bd_intf_port"),
+        ("current interface pin object", "bd_intf_pin"),
+        ("current interface net object", "bd_intf_net"),
+        ("newly created cell object", "bd_cell"),
+        ("newly created pin object", "bd_pin"),
+        ("newly created port object", "bd_port"),
+        ("newly created net object", "bd_net"),
+        ("newly created master address segment object", "bd_addr_seg"),
+        ("newly created address segment object", "bd_addr_seg"),
+        ("newly created address segment", "bd_addr_seg"),
+        ("current ip integrator cell instance object", "bd_cell"),
+        ("current cell object", "bd_cell"),
+        ("current pin object", "bd_pin"),
+        ("current port object", "bd_port"),
+        ("current net object", "bd_net"),
+        ("current instance object", "bd_cell"),
+        // Report-shaped commands whose prose starts "Returns a
+        // list of strings …" — `list<string>` even when the rest
+        // of the description mentions "nothing".
+        ("returns a list of strings", "list<string>"),
+        // Name-of-object pages return `string` (a path/name).
+        ("returns the name of the design object", "string"),
+        ("name of the design object", "string"),
         // "nothing" / "Tcl_OK on success" — side-effecting commands.
+        // Placed AFTER the creator/current patterns so those
+        // pull the actual return type from the descriptive prose
+        // before falling to the failure-sentinel.
         ("returns nothing", "unit"),
         ("nothing", "unit"),
         // Lists of typed handles. Order matters within each type
