@@ -351,16 +351,34 @@ fn emit_dict_sub_proc(
         .unwrap();
     }
     // Sub-slot merges: unwrap the typed newtype to its raw paired
-    // dict via `<T>::to` + `Properties::to_raw`, and stash it under
-    // the slot's original XML key so `set_property -dict` sees the
-    // nested-paired-dict shape Vivado expects.
+    // dict via `<T>::to`, and stash it under the slot's original
+    // XML key. The sub-dict IS the raw paired-list form Vivado
+    // accepts for tcldict-typed compound properties — a
+    // `Properties::to_raw` wrap here would try to flatten as a
+    // TAGGED tree (`Property::Scalar` / `Property::Nested`), but
+    // the wrapper's `_vw_d` holds bare-string leaves (see the
+    // scalar `dict set _vw_d KEY $arg` above), not tagged
+    // `Property::Scalar(x)`. Match the sibling emission at
+    // `emit_split_node_constructor` — same shape, same reason.
     for (raw_name, sub_ret_ty) in &sub_ctors {
         let arg = lowercase_ident(raw_name);
+        // Wrap the dict-set in a `catch` that prepends the HTCL
+        // arg name on error. Historically fired on the
+        // `Properties::to_raw` mistake above; retained
+        // defensively — if a caller reaches this proc with a
+        // malformed sub-value some future code path relies on,
+        // the message still points at the offending slot by its
+        // HTCL surface name (`lr0_settings.…`).
         writeln!(
             body,
-            "if {{${{__vw_kw_{arg}_set}}}} \
-             {{ dict set _vw_d {raw_name} \
-                [Properties::to_raw -v [{sub_ret_ty}::to -v ${arg}]] }}",
+            "if {{${{__vw_kw_{arg}_set}}}} {{\n      \
+                if {{[catch {{\n        \
+                    dict set _vw_d {raw_name} \
+                    [{sub_ret_ty}::to -v ${arg}]\n      \
+                }} __vw_msg]}} {{\n        \
+                    error \"{arg}.$__vw_msg\"\n      \
+                }}\n    \
+            }}",
         )
         .unwrap();
     }
@@ -544,6 +562,8 @@ fn generate_single(
         &ip_name,
         &dict_schema_newtypes,
     );
+    let configure_body =
+        wrap_body_qualified_prefix(&configure_body, &ip_name, "configure");
     let create_body = build_single_create_body(&vlnv, &ip_name);
 
     // Emit both procs inside `namespace eval <ip> { … }` so
@@ -660,6 +680,39 @@ fn build_single_create_body(vlnv: &str, ip_name: &str) -> String {
     writeln!(out, "if {{$bd}} {{ return $cell }} else {{ return $name }}")
         .unwrap();
     out
+}
+
+/// Wrap a proc's assembled body with a `try/on error` that
+/// prepends `<ip>.<proc_local>.` to any error message escaping
+/// from the body — so a nested Properties tree failure at
+/// `<ip>::configure`'s outermost scope surfaces to the user as
+///
+/// ```text
+/// gtwiz_versal.configure.intf0.gt_settings.lr0_settings.tx_refclk_frequency.unknown variant: 156.25
+/// ```
+///
+/// The per-arg dict-set catches inside intermediate constructor
+/// procs (see `emit_dict_sub_proc` and the sibling emissions in
+/// `write_dict_assembly` / `write_dict_assembly_with_splits`)
+/// grow the arg-name path; this wrapper adds the top-level
+/// `<ip>.<proc_local>` prefix so the message reads as a fully
+/// qualified dotted path from IP name to leaf field.
+///
+/// `try` (Tcl 8.6+) propagates the body's `return` code cleanly
+/// through the default `on ok` behavior — the error handler only
+/// fires when the body errors, not when it returns normally.
+fn wrap_body_qualified_prefix(
+    body: &str,
+    ip_name: &str,
+    proc_local: &str,
+) -> String {
+    format!(
+        "try {{\n\
+         {body}\
+         }} on error {{__vw_msg}} {{\n  \
+             error \"{ip_name}.{proc_local}.$__vw_msg\"\n\
+         }}\n"
+    )
 }
 
 /// Build `<ip>::configure`'s body (single shape). Pure dict
@@ -1090,6 +1143,8 @@ fn generate_split(
     if !families.is_empty() || !split_nodes.is_empty() {
         writeln!(procs).unwrap();
     }
+    let configure_body =
+        wrap_body_qualified_prefix(&configure_body, &ip_name, "configure");
     emit_proc(
         &mut procs,
         "configure",
@@ -1339,10 +1394,19 @@ fn emit_split_node_constructor(
         } else {
             format!("${arg}")
         };
+        // Wrap the dict-set in a catch prepending the HTCL arg
+        // name — see the sibling emission in
+        // `emit_dict_sub_proc` for the diagnostic-path
+        // rationale.
         writeln!(
             body,
-            "if {{${{__vw_kw_{arg}_set}}}} \
-             {{ dict set _vw_d {field_key} {value_expr} }}"
+            "if {{${{__vw_kw_{arg}_set}}}} {{\n    \
+                if {{[catch {{\n      \
+                    dict set _vw_d {field_key} {value_expr}\n    \
+                }} __vw_msg]}} {{\n      \
+                    error \"{arg}.$__vw_msg\"\n    \
+                }}\n  \
+            }}"
         )
         .unwrap();
     }
@@ -1651,11 +1715,24 @@ fn write_dict_assembly_with_splits(
             } else {
                 format!("${arg}")
             };
+        // Wrap the merge in a `catch` prepending the HTCL arg
+        // name on error — mirrors the sub-proc emission in
+        // `emit_dict_sub_proc`. Only nested-Properties args
+        // actually risk erroring here (`Properties::to_raw`
+        // walks a tagged tree that might have a mistyped
+        // leaf); scalar/bool args store bare strings that
+        // can't fail at `lappend` time, so the catch is
+        // no-op-cheap for them.
         writeln!(
             out,
-            "if {{${{__vw_kw_{arg}_set}}}} \
-             {{ lappend _vw_d CONFIG.{} {value_expr} }}",
-            p.name
+            "if {{${{__vw_kw_{arg}_set}}}} {{\n  \
+                if {{[catch {{\n    \
+                    lappend _vw_d CONFIG.{name} {value_expr}\n  \
+                }} __vw_msg]}} {{\n    \
+                    error \"{arg}.$__vw_msg\"\n  \
+                }}\n\
+            }}",
+            name = p.name,
         )
         .unwrap();
     }
@@ -1959,11 +2036,24 @@ fn write_dict_assembly(
             } else {
                 format!("${arg}")
             };
+        // Wrap the merge in a `catch` prepending the HTCL arg
+        // name on error — mirrors the sub-proc emission in
+        // `emit_dict_sub_proc`. Only nested-Properties args
+        // actually risk erroring here (`Properties::to_raw`
+        // walks a tagged tree that might have a mistyped
+        // leaf); scalar/bool args store bare strings that
+        // can't fail at `lappend` time, so the catch is
+        // no-op-cheap for them.
         writeln!(
             out,
-            "if {{${{__vw_kw_{arg}_set}}}} \
-             {{ lappend _vw_d CONFIG.{} {value_expr} }}",
-            p.name
+            "if {{${{__vw_kw_{arg}_set}}}} {{\n  \
+                if {{[catch {{\n    \
+                    lappend _vw_d CONFIG.{name} {value_expr}\n  \
+                }} __vw_msg]}} {{\n    \
+                    error \"{arg}.$__vw_msg\"\n  \
+                }}\n\
+            }}",
+            name = p.name,
         )
         .unwrap();
     }

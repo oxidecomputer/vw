@@ -79,6 +79,16 @@ pub struct PreparedCommand {
     /// case (since the wrapped `tcl` already returns a formatted
     /// string from the type's `repr` proc).
     pub expected_return_type: Option<vw_htcl::TypeExpr>,
+    /// True when the top-level command is `set VAR <expr>` — a
+    /// binding operation. The App suppresses the Result echo for
+    /// these: the user picked a name to hold the value; they
+    /// didn't ask to see it. `puts $VAR` is the explicit
+    /// "show me" form when they want the value displayed.
+    ///
+    /// Applies to the LITERAL `set` command only. `[set x y]`
+    /// inside a bracketed expression doesn't count — that's a
+    /// nested Tcl call, not a top-level binding.
+    pub is_set_binding: bool,
 }
 
 #[derive(Debug)]
@@ -203,6 +213,26 @@ pub fn prepare_with_observer(
     let prior_sigs = session.signature_table();
     let prior_types = session.type_decl_table();
     let prior_vars = session.top_level_var_names();
+    // Prior-batch variable TYPES for the putr rewrite. Without
+    // this seed, `putr $prior_var` at a fresh prompt would fall
+    // through to plain `puts` (the var came from a previous
+    // batch's `set`, invisible to the current parse alone) and
+    // dump the raw tagged Tcl list instead of dispatching
+    // through the type's `repr`.
+    let prior_var_types = session.top_level_var_types();
+
+    // Build the `putr` rewrite map: for every `putr <expr>`
+    // command in the document, the value's replacement Tcl. The
+    // lowering consults this map per-command via
+    // `vw_htcl::lower_command_with_putr`. Empty when the source
+    // contained no `putr` calls; safe (and cheap) to build
+    // unconditionally.
+    let putr_map = vw_htcl::putr::rewrite_with_extras(
+        &program.source,
+        &parsed.document,
+        &prior_sigs,
+        &prior_var_types,
+    );
     // Names of every dep the workspace resolver knows about.
     // Passed to the validator so `src @<name>` where `<name>`
     // isn't in vw.toml fires a spanned Error diagnostic.
@@ -327,6 +357,7 @@ pub fn prepare_with_observer(
                 via: Vec::new(),
             },
             expected_return_type: None,
+            is_set_binding: false,
         });
     }
     for info in overload_table.values() {
@@ -340,6 +371,7 @@ pub fn prepare_with_observer(
                 via: Vec::new(),
             },
             expected_return_type: None,
+            is_set_binding: false,
         });
     }
 
@@ -358,6 +390,7 @@ pub fn prepare_with_observer(
                 via: Vec::new(),
             },
             expected_return_type: None,
+            is_set_binding: false,
         });
     }
 
@@ -402,6 +435,7 @@ pub fn prepare_with_observer(
                     via: Vec::new(),
                 },
                 expected_return_type: None,
+                is_set_binding: false,
             });
         }
     }
@@ -432,9 +466,15 @@ pub fn prepare_with_observer(
                         &program.source,
                         &table,
                         Some(&mangled),
+                        &putr_map,
                     )
                 }
-                None => vw_htcl::lower_command(cmd, &program.source, &table),
+                None => vw_htcl::lower_command_with_putr(
+                    cmd,
+                    &program.source,
+                    &table,
+                    &putr_map,
+                ),
             };
         let rewritten = vw_htcl::rewrite_externs(&lowered_raw);
         for name in rewritten.names {
@@ -454,10 +494,12 @@ pub fn prepare_with_observer(
             Some(ty) => wrap_with_repr(&rewritten.text, ty, &type_decl_table),
             None => rewritten.text,
         };
+        let is_set_binding = matches!(cmd.kind, vw_htcl::CommandKind::Set);
         commands.push(PreparedCommand {
             tcl: final_tcl,
             origin,
             expected_return_type,
+            is_set_binding,
         });
     }
 

@@ -29,6 +29,15 @@ use crate::ast::{
 
 pub type SignatureTable<'a> = HashMap<String, &'a ProcSignature>;
 
+/// Empty putr rewrite map used as the default when a caller
+/// doesn't have one. See [`lower_command_with_putr`] for the
+/// keyed-lookup semantics.
+fn empty_putr_map() -> &'static crate::putr::RewriteMap {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<crate::putr::RewriteMap> = OnceLock::new();
+    EMPTY.get_or_init(crate::putr::RewriteMap::new)
+}
+
 /// Walk `doc` and collect every proc's signature — top-level and
 /// nested inside `namespace eval` blocks. Namespaced procs register
 /// under their qualified name (`<ns>::<proc>`), matching the
@@ -79,16 +88,44 @@ fn collect_into<'a>(
 }
 
 /// Lower one top-level command into its Tcl equivalent for the EDA
-/// backend.
+/// backend. See [`lower_command_with_putr`] for the variant that
+/// takes a `putr` rewrite map; callers with no putr calls (or who
+/// don't care) can invoke this simpler form.
 pub fn lower_command(
     cmd: &Command,
     source: &str,
     table: &SignatureTable<'_>,
 ) -> String {
+    lower_command_with_putr(cmd, source, table, empty_putr_map())
+}
+
+/// Lower one top-level command, consulting `putr_map` first: when
+/// `cmd.span` is a key in the map, the map's replacement Tcl is
+/// used verbatim in place of the standard lowering. This is how
+/// `putr $x` becomes `puts [T::repr -v $x]` at emit time without
+/// mutating the source string.
+///
+/// Recurses into proc bodies / namespace-eval bodies / cmd-subst
+/// bodies with the same `putr_map`, so `putr` calls buried inside
+/// any of those still get the rewrite.
+pub fn lower_command_with_putr(
+    cmd: &Command,
+    source: &str,
+    table: &SignatureTable<'_>,
+    putr_map: &crate::putr::RewriteMap,
+) -> String {
+    // Fast path: if this command IS a putr rewrite target, emit
+    // the replacement verbatim. No further descent needed — the
+    // replacement is a complete Tcl expression.
+    if let Some(replacement) = putr_map.get(&cmd.span) {
+        return replacement.clone();
+    }
     match &cmd.kind {
-        CommandKind::Proc(proc) => lower_proc_decl(proc, source, table),
+        CommandKind::Proc(proc) => {
+            lower_proc_decl(proc, source, table, putr_map)
+        }
         CommandKind::NamespaceEval(ns) => {
-            lower_namespace_eval(ns, source, table)
+            lower_namespace_eval(ns, source, table, putr_map)
         }
         // `src` is a module import; by the time we lower we expect the
         // [`crate::loader`] flatten pass to have already inlined every
@@ -123,7 +160,7 @@ pub fn lower_command(
             // anywhere — top-level, inside a proc body, inside a
             // `[ ... ]`, inside an `eval` — work uniformly without
             // the lowerer needing to see every call site.
-            lower_words(&cmd.words, source, table)
+            lower_words(&cmd.words, source, table, putr_map)
         }
     }
 }
@@ -137,12 +174,13 @@ fn lower_namespace_eval(
     ns: &NamespaceEval,
     source: &str,
     table: &SignatureTable<'_>,
+    putr_map: &crate::putr::RewriteMap,
 ) -> String {
     let name = ns.name.as_deref().unwrap_or("");
     let mut body = String::new();
     for stmt in &ns.body {
         let Stmt::Command(cmd) = stmt else { continue };
-        let line = lower_command(cmd, source, table);
+        let line = lower_command_with_putr(cmd, source, table, putr_map);
         if !line.is_empty() {
             body.push_str(&line);
             body.push('\n');
@@ -178,8 +216,9 @@ fn lower_proc_decl(
     proc: &Proc,
     source: &str,
     table: &SignatureTable<'_>,
+    putr_map: &crate::putr::RewriteMap,
 ) -> String {
-    lower_proc_decl_with_name(proc, source, table, None)
+    lower_proc_decl_with_name(proc, source, table, None, putr_map)
 }
 
 /// Like [`lower_proc_decl`] but uses `name_override` as the emitted
@@ -194,6 +233,7 @@ pub fn lower_proc_decl_with_name(
     source: &str,
     table: &SignatureTable<'_>,
     name_override: Option<&str>,
+    putr_map: &crate::putr::RewriteMap,
 ) -> String {
     let name = name_override.or(proc.name.as_deref()).unwrap_or("");
     // Re-emit the body by walking its parsed statements rather
@@ -232,7 +272,7 @@ pub fn lower_proc_decl_with_name(
                 out.push('\n');
                 cur_line += 1;
             }
-            let line = lower_command(cmd, source, table);
+            let line = lower_command_with_putr(cmd, source, table, putr_map);
             if line.is_empty() {
                 continue;
             }
@@ -425,6 +465,7 @@ fn lower_words(
     words: &[Word],
     source: &str,
     table: &SignatureTable<'_>,
+    putr_map: &crate::putr::RewriteMap,
 ) -> String {
     // Preserve source-level adjacency between consecutive words.
     // The parser splits `{*}$var` into two AST words ({*} as a
@@ -442,16 +483,23 @@ fn lower_words(
                 out.push(' ');
             }
         }
-        out.push_str(&lower_word(w, source, table));
+        out.push_str(&lower_word(w, source, table, putr_map));
     }
     out
 }
 
-fn lower_word(word: &Word, source: &str, table: &SignatureTable<'_>) -> String {
+fn lower_word(
+    word: &Word,
+    source: &str,
+    table: &SignatureTable<'_>,
+    putr_map: &crate::putr::RewriteMap,
+) -> String {
     match word.form {
-        WordForm::Bare => lower_word_parts(&word.parts, source, table),
+        WordForm::Bare => {
+            lower_word_parts(&word.parts, source, table, putr_map)
+        }
         WordForm::Quoted => {
-            let inner = lower_word_parts(&word.parts, source, table);
+            let inner = lower_word_parts(&word.parts, source, table, putr_map);
             format!("\"{inner}\"")
         }
         WordForm::Braced => word.span.slice(source).to_string(),
@@ -462,6 +510,7 @@ fn lower_word_parts(
     parts: &[WordPart],
     source: &str,
     table: &SignatureTable<'_>,
+    putr_map: &crate::putr::RewriteMap,
 ) -> String {
     let mut out = String::new();
     for part in parts {
@@ -479,9 +528,9 @@ fn lower_word_parts(
                 let lowered: Vec<String> = body
                     .iter()
                     .filter_map(|s| match s {
-                        Stmt::Command(c) => {
-                            Some(lower_command(c, source, table))
-                        }
+                        Stmt::Command(c) => Some(lower_command_with_putr(
+                            c, source, table, putr_map,
+                        )),
                         _ => None,
                     })
                     .filter(|s| !s.trim().is_empty())

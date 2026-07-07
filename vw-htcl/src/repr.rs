@@ -526,7 +526,26 @@ fn emit_dict_repr(mangled: &str, k: &TypeExpr, v: &TypeExpr) -> String {
                 ::vw::kwargs $args {{v \"\"}}\n    \
                 set out [list]\n    \
                 foreach {{k val}} $v {{\n      \
-                    lappend out [{ktr} -v $k] [{vtr} -v $val]\n    \
+                    # Recurse into the element to_raw calls with a\n      \
+                    # catch that prepends this level's key on error,\n      \
+                    # so a failure deep inside a nested Properties\n      \
+                    # tree bubbles up as a dotted path (e.g.\n      \
+                    # `LR0_SETTINGS.RX_REFCLK_FREQUENCY.<orig-msg>`).\n      \
+                    if {{[catch {{\n        \
+                        set __vw_kraw [{ktr} -v $k]\n        \
+                        set __vw_vraw [{vtr} -v $val]\n      \
+                    }} __vw_msg]}} {{\n        \
+                        # Lowercase the key in the error so\n        \
+                        # nested-property failures surface with\n        \
+                        # the HTCL-surface arg name\n        \
+                        # (`tx_refclk_frequency`) rather than\n        \
+                        # the Vivado SCREAM_CASE dict key\n        \
+                        # (`TX_REFCLK_FREQUENCY`). Innocuous for\n        \
+                        # non-Vivado dicts — lowercasing an\n        \
+                        # already-lowercase key is a no-op.\n        \
+                        error \"[string tolower $k].$__vw_msg\"\n      \
+                    }}\n      \
+                    lappend out $__vw_kraw $__vw_vraw\n    \
                 }}\n    \
                 return $out\n  \
             }}\n  \

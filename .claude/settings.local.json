@@ -28,7 +28,8 @@
       "Bash(/home/ry/src/vw/target/debug/vw run *)",
       "Bash(python3 -c ' *)",
       "Bash(pdftotext ~/doc-puddle/pg331.pdf -)",
-      "Bash(pdftotext ~/doc-puddle/pg442.pdf -)"
+      "Bash(pdftotext ~/doc-puddle/pg442.pdf -)",
+      "Bash(grep *)"
     ]
   }
 }

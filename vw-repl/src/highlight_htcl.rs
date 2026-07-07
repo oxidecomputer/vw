@@ -65,10 +65,14 @@ const BUILTIN_KEYWORDS: &[&str] = &[
 ];
 
 /// Built-in commands; styled distinct from user-proc calls.
+/// `putr` is compile-time-rewritten to `puts [T::repr -v $x]` by
+/// `vw_htcl::putr::rewrite` before any code reaches Tcl, but the
+/// user writes it exactly like they write `puts` — same color for
+/// visual consistency.
 const BUILTIN_FUNCS: &[&str] = &[
-    "puts", "lappend", "lindex", "llength", "lrange", "lsearch", "lset",
-    "lsort", "dict", "list", "string", "incr", "format", "scan", "regexp",
-    "regsub", "join", "split", "concat", "subst", "info",
+    "puts", "putr", "lappend", "lindex", "llength", "lrange", "lsearch",
+    "lset", "lsort", "dict", "list", "string", "incr", "format", "scan",
+    "regexp", "regsub", "join", "split", "concat", "subst", "info",
 ];
 
 /// Declaration keywords that name the next identifier as a decl.

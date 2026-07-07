@@ -294,7 +294,7 @@ fn validate_src_imports(
 /// open a new local-variable scope). Bodies of `[ … ]` command
 /// substitutions also share the enclosing table so `set` inside
 /// brackets is visible outside.
-type VarTypeTable = HashMap<String, crate::ast::TypeExpr>;
+pub(crate) type VarTypeTable = HashMap<String, crate::ast::TypeExpr>;
 
 /// Infer the type of a value word — the argument on the right of a
 /// `-flag` at a call site, or the RHS of a `set VAR`.
@@ -313,10 +313,27 @@ type VarTypeTable = HashMap<String, crate::ast::TypeExpr>;
 /// `prefix-$var` — returns `None`. Callers treat `None` as "unknown
 /// type, skip the check" (gradual typing). We don't error on what
 /// we can't infer.
-fn value_type(
+pub(crate) fn value_type(
     word: &crate::ast::Word,
     sig_table: &HashMap<String, &ProcSignature>,
     var_table: &VarTypeTable,
+) -> Option<crate::ast::TypeExpr> {
+    value_type_with_procs(word, sig_table, var_table, None)
+}
+
+/// Companion to [`value_type`] that also has access to a proc
+/// table for return-type inference on unannotated procs. When a
+/// `[proc-call]` word hits a signature whose `return_type` is
+/// `None`, the caller can supply the corresponding [`Proc`] node
+/// via `proc_table` and this function walks the body's last
+/// `return` statement to infer the type — handles the common
+/// pattern where a user proc doesn't declare a return type but
+/// its body ends with `return $x` or `return [typed_proc]`.
+pub(crate) fn value_type_with_procs(
+    word: &crate::ast::Word,
+    sig_table: &HashMap<String, &ProcSignature>,
+    var_table: &VarTypeTable,
+    proc_table: Option<&HashMap<String, &crate::ast::Proc>>,
 ) -> Option<crate::ast::TypeExpr> {
     use crate::ast::{Stmt, TypeExpr, WordPart};
     match word.parts.as_slice() {
@@ -327,7 +344,19 @@ fn value_type(
                 _ => None,
             })?;
             let call_name = last_cmd.words.first()?.as_text()?;
-            sig_table.get(call_name)?.return_type.clone()
+            let sig = sig_table.get(call_name)?;
+            // Annotated return type wins.
+            if let Some(ty) = &sig.return_type {
+                return Some(ty.clone());
+            }
+            // Fallback: walk the proc body to infer. Only fires
+            // when a proc_table is supplied — top-level callers
+            // (per-batch var-type builders, putr rewrite) pass one
+            // through; internal callers that just want fast
+            // annotation-based lookup pass `None`.
+            let procs = proc_table?;
+            let proc = procs.get(call_name)?;
+            infer_return_type_from_body(proc, sig_table, procs)
         }
         // Bare `true` / `false` literals — the ONLY textual values
         // whose type we infer, and only because they're the
@@ -345,6 +374,104 @@ fn value_type(
             })
         }
         _ => None,
+    }
+}
+
+/// Walk `proc`'s body left-to-right, tracking `set VAR <value>`
+/// bindings via [`value_type_with_procs`], then find the last
+/// `return X` statement and resolve `X`'s type. `None` when the
+/// body doesn't end with an inferrable return.
+///
+/// Recursion depth is bounded implicitly by the finite proc-set
+/// in a document: we don't cache visited procs here since v1
+/// documents don't hit deep recursion in practice. If a real
+/// program starts driving this in circles, add a `HashSet<&str>`
+/// guard on the proc name.
+fn infer_return_type_from_body(
+    proc: &crate::ast::Proc,
+    sig_table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+) -> Option<crate::ast::TypeExpr> {
+    use crate::ast::{CommandKind, Stmt};
+    let mut local_vars = VarTypeTable::new();
+    // Seed the local var table with the proc's typed parameters —
+    // so a body like `proc pass_through {x: MyType} { return $x }`
+    // resolves through `$x` to `MyType`.
+    if let Some(sig) = &proc.signature {
+        for arg in &sig.args {
+            if let Some(ty) = &arg.type_annotation {
+                local_vars.insert(arg.name.clone(), ty.clone());
+            }
+        }
+    }
+    // Walk `set` bindings in body order.
+    let mut return_word: Option<&crate::ast::Word> = None;
+    for stmt in &proc.body {
+        let Stmt::Command(cmd) = stmt else { continue };
+        // Track `set VAR <value>`.
+        if matches!(cmd.kind, CommandKind::Set) {
+            if let (Some(name_word), Some(value_word)) =
+                (cmd.words.get(1), cmd.words.get(2))
+            {
+                if let Some(name) = name_word.as_text() {
+                    if let Some(ty) = value_type_with_procs(
+                        value_word,
+                        sig_table,
+                        &local_vars,
+                        Some(proc_table),
+                    ) {
+                        local_vars.insert(name.to_string(), ty);
+                    }
+                }
+            }
+        }
+        // Track the last `return <word>` we see. Body execution
+        // ordinarily halts at `return`, but syntactically it's
+        // valid to have more code after (dead code); take the
+        // LAST occurrence since that's what the user's intent
+        // most likely reflects when reading the body.
+        if cmd.words.first().and_then(|w| w.as_text()) == Some("return") {
+            return_word = cmd.words.get(1);
+        }
+    }
+    let word = return_word?;
+    value_type_with_procs(word, sig_table, &local_vars, Some(proc_table))
+}
+
+/// Build a name → `Proc` lookup for return-type inference. Walks
+/// top-level statements plus namespace-eval bodies (using the
+/// namespace as a `<ns>::<name>` prefix, matching how
+/// [`build_signature_table`] qualifies proc names).
+pub(crate) fn build_proc_table(
+    document: &crate::ast::Document,
+) -> HashMap<String, &crate::ast::Proc> {
+    let mut out = HashMap::new();
+    collect_procs(&document.stmts, "", &mut out);
+    out
+}
+
+fn collect_procs<'doc>(
+    stmts: &'doc [Stmt],
+    prefix: &str,
+    out: &mut HashMap<String, &'doc crate::ast::Proc>,
+) {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        match &cmd.kind {
+            CommandKind::Proc(proc) => {
+                if let Some(name) = proc.name.as_deref() {
+                    let qualified = qualify(prefix, name);
+                    // Later `proc` shadows earlier — same as sig_table.
+                    out.insert(qualified, proc);
+                }
+            }
+            CommandKind::NamespaceEval(ns) => {
+                let ns_name = ns.name.as_deref().unwrap_or("");
+                let new_prefix = qualify(prefix, ns_name);
+                collect_procs(&ns.body, &new_prefix, out);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1432,6 +1559,15 @@ fn is_known_tcl_builtin(name: &str) -> bool {
             | "expr"
             // I/O & filesystem.
             | "puts"
+            // `putr` is our compile-time repr-dispatching shim:
+            // `putr $x` gets rewritten in `crate::putr::rewrite`
+            // to `puts [T::repr -v $x]` when the argument's type
+            // is statically known, else to plain `puts $x`. The
+            // rewrite fires before any code reaches Tcl, so at
+            // eval time `putr` isn't a real command — the
+            // analyzer needs to recognize it as a builtin so
+            // undefined-proc checks don't flag the call sites.
+            | "putr"
             | "gets"
             | "read"
             | "close"

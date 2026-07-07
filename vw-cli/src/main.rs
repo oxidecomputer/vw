@@ -1131,6 +1131,34 @@ fn render_path(
 /// the backend exactly once. Dedup is owned by the caller so
 /// repeated invocations across signatures don't re-ship the same
 /// proc.
+/// Turn a sequence of [`vw_repl::highlight::Piece`]s (a repr-line
+/// highlight result) into an ANSI-colored string using the same
+/// palette the REPL's ratatui renderer uses. The `colored` crate
+/// underlying each `.truecolor`/`.dimmed` call automatically
+/// suppresses the escape sequences when `NO_COLOR` is set or
+/// stdout isn't a TTY — no additional gating needed here.
+fn ansi_from_pieces(pieces: &[vw_repl::highlight::Piece]) -> String {
+    use colored::Colorize;
+    use vw_repl::highlight::StyleKind;
+    let mut out = String::new();
+    for p in pieces {
+        // Palette constants mirror the ratatui RGB values in
+        // `vw-repl/src/highlight.rs::{key_style, variant_style,
+        // scalar_style}` and the DIM modifier on `punct_style`.
+        // Keep the two backends in sync — if the ratatui palette
+        // changes, this needs the same edit.
+        let styled = match p.kind {
+            StyleKind::Plain => p.text.clone(),
+            StyleKind::Key => p.text.truecolor(80, 150, 255).to_string(),
+            StyleKind::Variant => p.text.truecolor(100, 200, 200).to_string(),
+            StyleKind::Punct => p.text.dimmed().to_string(),
+            StyleKind::Scalar => p.text.truecolor(120, 200, 120).to_string(),
+        };
+        out.push_str(&styled);
+    }
+    out
+}
+
 /// Stream-sink rendering for `vw run`. Mirrors the REPL's
 /// scrollback colors + stack-frame rewriting so both surfaces
 /// look the same:
@@ -1224,7 +1252,27 @@ fn render_chunk(
                 line.truecolor(255, 140, 0).to_string()
             }
             vw_vivado::StreamKind::Info => line.bright_black().to_string(),
-            vw_vivado::StreamKind::Stdout => line.to_string(),
+            // Stdout is where the shim's `puts` output lands,
+            // including compiler-emitted enum reprs like
+            //   CPM_PCIE0_MODES Scalar(None)
+            //   CONFIG Nested(
+            //     …
+            //   )
+            // Route it through the REPL's shape-based highlighter
+            // so `vw run` and the REPL scrollback look identical
+            // for repr-shaped lines. Non-repr text (plain `puts`
+            // messages, error messages that reach Stdout, etc.)
+            // fails the parse and falls through to the raw line.
+            // The `colored` crate that underpins ansi_from_pieces
+            // already respects NO_COLOR + tty-detection, so the
+            // integration inherits the standard "quiet when piped
+            // or NO_COLOR is set" behavior for free.
+            vw_vivado::StreamKind::Stdout => {
+                match vw_repl::highlight::highlight_line_pieces(line) {
+                    Some(pieces) => ansi_from_pieces(&pieces),
+                    None => line.to_string(),
+                }
+            }
         };
         let _ = writeln!(out, "{styled_prefix}{styled_line}");
     }
@@ -1295,6 +1343,11 @@ async fn run_htcl(
     let source = program.source.clone();
     let parsed = vw_htcl::parse(&source);
     let line_index = vw_htcl::LineIndex::new(&source);
+    // Compile-time `putr` rewrite map: every `putr <expr>` command
+    // in the document gets a replacement Tcl string keyed by its
+    // span. `vw_htcl::lower_command_with_putr` consults the map at
+    // emit time. See `vw-htcl/src/putr.rs` for the walker.
+    let putr_map = vw_htcl::putr::rewrite(&source, &parsed.document);
 
     let mut had_errors = false;
     for err in &parsed.errors {
@@ -1522,9 +1575,12 @@ async fn run_htcl(
                     &source,
                     &table,
                     Some(&mangled),
+                    &putr_map,
                 )
             }
-            None => vw_htcl::lower_command(cmd, &source, &table),
+            None => vw_htcl::lower_command_with_putr(
+                cmd, &source, &table, &putr_map,
+            ),
         };
         // Rewrite `extern::name` → `::name` (the textual pass the
         // REPL also runs) so calls to runtime-Tcl/Vivado procs

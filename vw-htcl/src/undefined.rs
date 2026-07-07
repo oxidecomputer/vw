@@ -75,6 +75,56 @@ pub fn top_level_var_names(
     decls.into_keys().collect()
 }
 
+/// Companion to [`top_level_var_names`] that also returns the
+/// inferred type of each top-level `set VAR <value>` binding when
+/// the RHS's type is statically knowable. Used by the REPL to
+/// carry variable-type context across batches so `putr $foo` in
+/// batch N sees the type that batch N-1's `set foo […]` produced.
+///
+/// Only the whole-word `[proc-call]`, `$var-copy`, and bare
+/// `true`/`false` shapes are typed — everything else stays out
+/// (matches [`crate::validate::value_type`]'s coverage). Missing
+/// entries are fine: the caller merges these into an initial
+/// `VarTypeTable` and falls back to plain `puts` when a name
+/// isn't present.
+pub fn top_level_var_types(
+    document: &Document,
+    sig_table: &HashMap<String, &crate::ast::ProcSignature>,
+) -> HashMap<String, crate::ast::TypeExpr> {
+    use crate::ast::CommandKind;
+    // Threaded var_table so a later `set y $x` picks up the type
+    // an earlier `set x [typed_proc]` recorded — matches the
+    // rewrite walker's own scope discipline for consistency.
+    let mut var_table = crate::validate::VarTypeTable::new();
+    // Proc table for return-type INFERENCE on unannotated procs.
+    // A user proc like `proc configure_gtm {} { set cfg [typed]; …; return $cfg }`
+    // has no annotated return type — `value_type` alone would
+    // report None for `[configure_gtm]`. The proc-table lookup
+    // lets `value_type_with_procs` walk the body's last `return`
+    // to figure out the type flows out. Without this, `putr
+    // $_gtm` after `set _gtm [configure_gtm]` falls to plain
+    // puts and dumps the raw tagged tree.
+    let proc_table = crate::validate::build_proc_table(document);
+    for stmt in &document.stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        if !matches!(cmd.kind, CommandKind::Set) {
+            continue;
+        }
+        let Some(name_word) = cmd.words.get(1) else { continue };
+        let Some(value_word) = cmd.words.get(2) else { continue };
+        let Some(name) = name_word.as_text() else { continue };
+        if let Some(ty) = crate::validate::value_type_with_procs(
+            value_word,
+            sig_table,
+            &var_table,
+            Some(&proc_table),
+        ) {
+            var_table.insert(name.to_string(), ty);
+        }
+    }
+    var_table
+}
+
 /// Top-level entry. Walks the document as one scope (for top-level
 /// `set`/`$var` references), then recurses into every proc body /
 /// namespace-eval body as an independent scope.

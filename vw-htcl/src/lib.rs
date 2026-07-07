@@ -39,6 +39,7 @@ pub mod lower;
 pub mod overload;
 pub mod parser;
 pub mod proc_args;
+pub mod putr;
 pub mod rename;
 pub mod repr;
 pub mod scope;
@@ -47,7 +48,7 @@ pub mod span;
 pub mod src_path;
 pub mod type_parse;
 pub mod undefined;
-pub use undefined::top_level_var_names;
+pub use undefined::{top_level_var_names, top_level_var_types};
 pub mod unused;
 pub mod validate;
 
@@ -61,8 +62,8 @@ pub use loader::{
 };
 pub use lower::{
     extern_rename_prelude, is_extern_call, lower_command,
-    lower_proc_decl_with_name, rewrite_externs, signature_table, ExternRewrite,
-    SignatureTable, EXTERN_PREFIX,
+    lower_command_with_putr, lower_proc_decl_with_name, rewrite_externs,
+    signature_table, ExternRewrite, SignatureTable, EXTERN_PREFIX,
 };
 pub use overload::emit_dispatcher;
 pub use rename::{rename_at, RenameEdit};

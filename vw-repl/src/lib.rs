@@ -19,7 +19,7 @@
 //! slices.
 
 mod app;
-mod highlight;
+pub mod highlight;
 mod highlight_htcl;
 mod history;
 pub mod lower;

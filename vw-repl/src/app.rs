@@ -243,6 +243,13 @@ pub struct App {
     /// Tcl, and (b) suppress the Result push entirely for
     /// `unit`-typed expressions.
     pending_return_types: Vec<Option<vw_htcl::TypeExpr>>,
+    /// Parallel to `pending_return_types`, one entry per lowered
+    /// command. True when the command is a top-level `set VAR
+    /// <expr>` — the app suppresses the Result echo for those:
+    /// binding is a plumbing operation, not a display, and
+    /// echoing the raw value can leak the internal tagged Tcl
+    /// list form (`{Scalar x}` rather than the parens repr).
+    pending_is_set_binding: Vec<bool>,
     /// For per-Input-entry timer freezing: one entry per
     /// echoed top-level statement in the current batch, in
     /// source order. Each carries the scrollback index of its
@@ -500,6 +507,7 @@ impl App {
             pending_batch: None,
             pending_origins: Vec::new(),
             pending_return_types: Vec::new(),
+            pending_is_set_binding: Vec::new(),
             pending_input_boundaries: Vec::new(),
             pending_eval_index: 0,
             exit: false,
@@ -1980,6 +1988,8 @@ impl App {
             .iter()
             .map(|c| c.expected_return_type.clone())
             .collect();
+        self.pending_is_set_binding =
+            lowered.commands.iter().map(|c| c.is_set_binding).collect();
         self.pending_eval_index = 0;
 
         // Commit to the session only after every command in the
@@ -2167,9 +2177,15 @@ impl App {
                 result,
                 last_in_batch,
             } => {
-                // Grab the return type for THIS command (the one
-                // that just finished) before we advance the index
-                // and possibly clear the buffer.
+                // Grab the return type + set-binding flag for
+                // THIS command (the one that just finished)
+                // before we advance the index and possibly clear
+                // the buffer.
+                let finished_is_set_binding = self
+                    .pending_is_set_binding
+                    .get(self.pending_eval_index)
+                    .copied()
+                    .unwrap_or(false);
                 let finished_return_type = self
                     .pending_return_types
                     .get(self.pending_eval_index)
@@ -2236,22 +2252,45 @@ impl App {
                             //     — the wrapped Tcl already ran the
                             //     type's `repr` proc, so `out.value`
                             //     is the formatted display string.
-                            //   - Untyped expressions fall back to the
-                            //     legacy heuristic, kept for now while
-                            //     the wrapper libraries grow
-                            //     annotations.
-                            let suppress = matches!(
+                            //   - Untyped expressions we can't repr
+                            //     through the type's proc: skip the
+                            //     push. `out.value` in this case
+                            //     is the raw Tcl representation
+                            //     (`{Scalar x}` tagged-list form
+                            //     for our nested Properties trees)
+                            //     — displaying that leaks the
+                            //     internal encoding rather than
+                            //     the compiler-emitted
+                            //     `Variant(payload)` repr shape.
+                            //     If a caller wants to inspect an
+                            //     untyped value, `puts` is the
+                            //     explicit form.
+                            //   - `set VAR <expr>` is a binding,
+                            //     not a display. The value the
+                            //     user asked to name is now bound;
+                            //     showing it isn't part of what
+                            //     they wrote. Same suppression
+                            //     applies for consistency with
+                            //     the "no unrepr'd values leak"
+                            //     rule above.
+                            let suppress_unit = matches!(
                                 finished_return_type.as_ref(),
                                 Some(vw_htcl::TypeExpr::Named { name, .. })
                                     if name == "unit"
                             );
+                            let suppress_untyped =
+                                finished_return_type.is_none();
+                            let suppress = suppress_unit
+                                || suppress_untyped
+                                || finished_is_set_binding;
                             if !suppress && !out.value.is_empty() {
-                                let text = if finished_return_type.is_some() {
-                                    out.value.clone()
-                                } else {
-                                    pretty_kv_list(&out.value)
-                                        .unwrap_or_else(|| out.value.clone())
-                                };
+                                // finished_return_type is Some
+                                // here (untyped is suppressed
+                                // above), so the wrap_with_repr
+                                // path has already rendered
+                                // through the type's `repr`
+                                // proc. Push verbatim.
+                                let text = out.value.clone();
                                 self.push(ScrollbackKind::Result, text);
                             }
                             if let Some(batch) = self.pending_batch.take() {
@@ -2777,132 +2816,6 @@ fn resolve_stack_frames(
         },
         input_file,
     )
-}
-
-/// If `text` looks like a Tcl key-value list (an even number of
-/// elements where the keys are property-name-shaped), reformat it
-/// one pair per line. Returns `None` to mean "leave the original
-/// output alone" — the caller falls back to the raw string for
-/// scalars, odd-length lists, lists of non-key-shaped tokens, etc.
-///
-/// We do this on Tcl return values, where `report_property`-style
-/// dicts (`KEY1 VAL1 KEY2 VAL2 …`) are common and unreadable as a
-/// single wrapped line.
-fn pretty_kv_list(text: &str) -> Option<String> {
-    let elements = tcl_list_split(text.trim())?;
-    // Heuristic: at least 2 pairs, even count, keys look like
-    // property names. Two pairs is the minimum where the
-    // one-per-line layout actually helps — a single pair is fine
-    // as-is.
-    if elements.len() < 4 || elements.len() % 2 != 0 {
-        return None;
-    }
-    for chunk in elements.chunks(2) {
-        if !is_propname_like(&chunk[0]) {
-            return None;
-        }
-    }
-    let mut out = String::with_capacity(text.len() + elements.len());
-    for (i, chunk) in elements.chunks(2).enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(&chunk[0]);
-        out.push(' ');
-        // Re-brace values that contain whitespace or are empty so
-        // the displayed line is itself valid Tcl — the user can
-        // copy any line straight back into a `set` / `dict set`
-        // call.
-        let val = &chunk[1];
-        if val.is_empty()
-            || val.chars().any(char::is_whitespace)
-            || val.contains('"')
-        {
-            out.push('{');
-            out.push_str(val);
-            out.push('}');
-        } else {
-            out.push_str(val);
-        }
-    }
-    Some(out)
-}
-
-/// Minimal Tcl-list tokenizer: split on whitespace at the top
-/// level, honoring `{…}` grouping with nesting and `\<char>`
-/// escapes. Returns `None` on unbalanced braces — caller falls
-/// back to the raw string when this happens (better to show
-/// something than nothing). Doesn't handle `"…"` grouping because
-/// Vivado's list returns never use it; if that changes, add a
-/// branch mirroring the brace one.
-fn tcl_list_split(s: &str) -> Option<Vec<String>> {
-    let mut out = Vec::new();
-    let mut chars = s.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() {
-            chars.next();
-            continue;
-        }
-        if c == '{' {
-            chars.next();
-            let mut depth = 1usize;
-            let mut buf = String::new();
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' => {
-                        if let Some(esc) = chars.next() {
-                            buf.push(c);
-                            buf.push(esc);
-                        }
-                    }
-                    '{' => {
-                        depth += 1;
-                        buf.push(c);
-                    }
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                        buf.push(c);
-                    }
-                    _ => buf.push(c),
-                }
-            }
-            if depth != 0 {
-                return None;
-            }
-            out.push(buf);
-        } else {
-            let mut buf = String::new();
-            while let Some(&c) = chars.peek() {
-                if c.is_whitespace() {
-                    break;
-                }
-                if c == '\\' {
-                    chars.next();
-                    if let Some(esc) = chars.next() {
-                        buf.push(esc);
-                    }
-                    continue;
-                }
-                buf.push(c);
-                chars.next();
-            }
-            out.push(buf);
-        }
-    }
-    Some(out)
-}
-
-/// "Looks like a property name": ASCII alphanumeric with `_`, `.`,
-/// `-`. Used by `pretty_kv_list` to filter out lists-of-arbitrary-
-/// strings that just happen to be even-length. Empty strings fail
-/// (would render `  ` and look broken).
-fn is_propname_like(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 fn render_origin_path(file: Option<&std::path::Path>, line: u32) -> String {
@@ -3489,56 +3402,6 @@ WARNING: [port::plumb_if_pin-1] skipping foo
             .filter(|l| l.contains("port::plumb_if_pin"))
             .count();
         assert_eq!(count, 2, "got:\n{out}"); // header + 1 frame
-    }
-
-    // --- pretty kv list -----------------------------------------
-
-    #[test]
-    fn tcl_list_split_handles_braces_and_nesting() {
-        assert_eq!(
-            tcl_list_split("a b c d").unwrap(),
-            vec!["a", "b", "c", "d"]
-        );
-        assert_eq!(
-            tcl_list_split("KEY {nested value} OTHER 1").unwrap(),
-            vec!["KEY", "nested value", "OTHER", "1"]
-        );
-        assert_eq!(
-            tcl_list_split("OUTER {INNER {DEEP value}} END 2").unwrap(),
-            vec!["OUTER", "INNER {DEEP value}", "END", "2"]
-        );
-        // Unbalanced braces → None.
-        assert!(tcl_list_split("a {b c").is_none());
-    }
-
-    #[test]
-    fn pretty_kv_list_breaks_pairs_onto_lines() {
-        let s = "CLASS bd_cell NAME cips PATH /cips";
-        let out = pretty_kv_list(s).unwrap();
-        assert_eq!(out, "CLASS bd_cell\nNAME cips\nPATH /cips");
-    }
-
-    #[test]
-    fn pretty_kv_list_rebraces_values_with_whitespace() {
-        let s = "ALLOWED_SIM_MODELS {tlm rtl} CLASS bd_cell COMBINED rtl_tlm";
-        let out = pretty_kv_list(s).unwrap();
-        assert_eq!(
-            out,
-            "ALLOWED_SIM_MODELS {tlm rtl}\nCLASS bd_cell\nCOMBINED rtl_tlm"
-        );
-    }
-
-    #[test]
-    fn pretty_kv_list_declines_non_kv_lists() {
-        // Odd-length: not a dict.
-        assert!(pretty_kv_list("a b c").is_none());
-        // Two elements: declined (single pair gains nothing from
-        // reflow).
-        assert!(pretty_kv_list("a b").is_none());
-        // Non-propname keys: looks more like prose than a dict.
-        assert!(pretty_kv_list("hello world foo bar").is_some());
-        // … but the same elements with one non-propname key fail.
-        assert!(pretty_kv_list("hello world foo! bar").is_none());
     }
 
     // --- request/response ordering ---------------------------------

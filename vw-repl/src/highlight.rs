@@ -34,6 +34,52 @@ use winnow::error::ContextError;
 use winnow::token::take_while;
 use winnow::{ModalResult, Parser};
 
+/// Semantic role of a highlighted piece of text. Backend-agnostic:
+/// callers (the REPL's ratatui renderer, `vw run`'s ANSI stdout
+/// renderer, or anything else consuming
+/// [`highlight_line_pieces`]) map each variant to whatever styling
+/// primitives their target supports. The RGB values in
+/// [`key_style`] / [`variant_style`] / [`scalar_style`] and the
+/// dim modifier in [`punct_style`] are the CANONICAL palette; every
+/// backend should reproduce these colors so the two rendering
+/// surfaces look identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleKind {
+    /// Uncolored spacing (indent, inter-token whitespace,
+    /// trailing runs). Backends emit the text verbatim.
+    Plain,
+    /// Dict key (`CONFIG`, `CPM_PCIE0_MODES`, …).
+    Key,
+    /// Enum variant name (`Scalar`, `Nested`, …).
+    Variant,
+    /// Structural punctuation (`(` / `)`).
+    Punct,
+    /// Scalar payload (the string inside `Scalar(…)`).
+    Scalar,
+}
+
+/// One styled fragment of a highlighted repr line.
+#[derive(Debug, Clone)]
+pub struct Piece {
+    pub text: String,
+    pub kind: StyleKind,
+}
+
+impl Piece {
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StyleKind::Plain,
+        }
+    }
+    fn styled(text: impl Into<String>, kind: StyleKind) -> Self {
+        Self {
+            text: text.into(),
+            kind,
+        }
+    }
+}
+
 /// Style for dict keys (`CONFIG`, `CPM_PCIE0_MODES`, …) — the
 /// identifier immediately preceding a value.
 pub fn key_style() -> Style {
@@ -57,50 +103,82 @@ pub fn scalar_style() -> Style {
     Style::default().fg(Color::Rgb(120, 200, 120))
 }
 
+/// Convert a [`StyleKind`] to the ratatui [`Style`] the REPL's
+/// scrollback uses. Kept as a single map so the REPL and any other
+/// ratatui-based consumer stay in sync with the canonical palette.
+pub fn ratatui_style(kind: StyleKind) -> Style {
+    match kind {
+        StyleKind::Plain => Style::default(),
+        StyleKind::Key => key_style(),
+        StyleKind::Variant => variant_style(),
+        StyleKind::Punct => punct_style(),
+        StyleKind::Scalar => scalar_style(),
+    }
+}
+
 /// Try to recognize `line` as a compiler-emitted enum-repr line
-/// and return a styled span sequence. Returns `None` when the
-/// line doesn't match the repr grammar — caller falls back to
-/// rendering the raw text with its default body style.
-pub fn highlight_line(line: &str) -> Option<Vec<Span<'static>>> {
+/// and return a backend-agnostic piece sequence. Returns `None`
+/// when the line doesn't match the repr grammar — callers fall
+/// back to rendering the raw text with their default body style.
+///
+/// Callers targeting a ratatui surface (the REPL scrollback) can
+/// use [`highlight_line`] for a Span-typed shortcut; callers
+/// targeting a plain terminal (`vw run`'s stdout stream) consume
+/// pieces directly and produce ANSI escapes.
+pub fn highlight_line_pieces(line: &str) -> Option<Vec<Piece>> {
     let mut input = line;
-    parse_line.parse_next(&mut input).ok().filter(|spans| {
+    parse_line.parse_next(&mut input).ok().filter(|pieces| {
         // Reject parses that didn't consume the whole line — a
         // partial match means we'd silently style some tokens
         // and drop the rest. Better to fall through to plain.
-        input.is_empty() && !spans.is_empty()
+        input.is_empty() && !pieces.is_empty()
+    })
+}
+
+/// Ratatui-flavored wrapper around [`highlight_line_pieces`]. The
+/// REPL's scrollback renderer consumes ratatui `Span`s directly.
+pub fn highlight_line(line: &str) -> Option<Vec<Span<'static>>> {
+    highlight_line_pieces(line).map(|pieces| {
+        pieces
+            .into_iter()
+            .map(|p| match p.kind {
+                StyleKind::Plain => Span::raw(p.text),
+                _ => Span::styled(p.text, ratatui_style(p.kind)),
+            })
+            .collect()
     })
 }
 
 // Top-level line shapes:
 //   `INDENT? ')' [SP] EOL`             — multi-line close
 //   `INDENT? KEY SP VALUE [SP]? EOL`   — dict entry
-fn parse_line(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
+fn parse_line(input: &mut &str) -> ModalResult<Vec<Piece>> {
+    let mut pieces: Vec<Piece> = Vec::new();
     let indent = space0::<_, ContextError>.parse_next(input)?;
     if !indent.is_empty() {
-        spans.push(Span::raw(indent.to_string()));
+        pieces.push(Piece::plain(indent));
     }
     // Multi-line-close line: bare `)`, optionally followed by trailing whitespace.
     if input.starts_with(')') {
         let close = ")";
         *input = &input[1..];
-        spans.push(Span::styled(close.to_string(), punct_style()));
+        pieces.push(Piece::styled(close, StyleKind::Punct));
         let trailing = space0::<_, ContextError>.parse_next(input)?;
         if !trailing.is_empty() {
-            spans.push(Span::raw(trailing.to_string()));
+            pieces.push(Piece::plain(trailing));
         }
-        return Ok(spans);
+        return Ok(pieces);
     }
     // Dict-entry line: KEY SP VALUE
     let key = parse_dict_key(input)?;
-    spans.push(Span::styled(key.to_string(), key_style()));
+    pieces.push(Piece::styled(key, StyleKind::Key));
     let sp = take_while(1.., |c: char| c == ' ').parse_next(input)?;
-    spans.push(Span::raw(sp.to_string()));
+    pieces.push(Piece::plain(sp));
     // Top-level: require the value to use parens to avoid false-
     // positives on plain prose `puts "Word Other"` Stdout lines.
-    let value_spans = parse_value(input, true)?;
-    spans.extend(value_spans);
-    Ok(spans)
+    let value_pieces = parse_value(input, true)?;
+    pieces.extend(value_pieces);
+    Ok(pieces)
 }
 
 // VALUE is one of:
@@ -120,9 +198,9 @@ fn parse_line(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
 fn parse_value(
     input: &mut &str,
     require_parens: bool,
-) -> ModalResult<Vec<Span<'static>>> {
+) -> ModalResult<Vec<Piece>> {
     let variant = parse_ident(input)?;
-    let mut out = vec![Span::styled(variant.to_string(), variant_style())];
+    let mut out = vec![Piece::styled(variant, StyleKind::Variant)];
     if !input.starts_with('(') {
         if require_parens {
             return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
@@ -130,7 +208,7 @@ fn parse_value(
         return Ok(out);
     }
     *input = &input[1..];
-    out.push(Span::styled("(".to_string(), punct_style()));
+    out.push(Piece::styled("(", StyleKind::Punct));
     if input.is_empty() {
         // `Variant(` at end of line — multi-line open. The
         // closing `)` will appear on a later line and be matched
@@ -141,11 +219,11 @@ fn parse_value(
     // matching close paren, with `(`/`)` balanced. Could be:
     //   - a scalar string (no inner parens): color green
     //   - a sub-entry KEY VARIANT(...) [SP KEY VARIANT(...)]*: recurse
-    let payload_spans = parse_inline_payload(input)?;
-    out.extend(payload_spans);
+    let payload_pieces = parse_inline_payload(input)?;
+    out.extend(payload_pieces);
     if input.starts_with(')') {
         *input = &input[1..];
-        out.push(Span::styled(")".to_string(), punct_style()));
+        out.push(Piece::styled(")", StyleKind::Punct));
     }
     Ok(out)
 }
@@ -154,7 +232,7 @@ fn parse_value(
 // either a single scalar (text with no parens) or a sequence of
 // inline dict-entry-shaped sub-values (`KEY VARIANT(...) ...`).
 // Stops at the closing `)` of the surrounding call.
-fn parse_inline_payload(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
+fn parse_inline_payload(input: &mut &str) -> ModalResult<Vec<Piece>> {
     // Look ahead: does the payload look like `IDENT SP IDENT (`?
     // If so it's a sub-entry — recurse. Otherwise treat it as a
     // scalar value.
@@ -165,11 +243,11 @@ fn parse_inline_payload(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
         out.extend(entry);
         // Optional further sub-entries separated by space (for
         // dicts with multiple inline children).
-        let more: Vec<Vec<Span<'static>>> = repeat(
+        let more: Vec<Vec<Piece>> = repeat(
             0..,
             (
                 take_while(1.., |c: char| c == ' ')
-                    .map(|s: &str| Span::raw(s.to_string())),
+                    .map(|s: &str| Piece::plain(s)),
                 parse_sub_entry,
             )
                 .map(|(sp, mut e)| {
@@ -207,21 +285,21 @@ fn parse_inline_payload(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
         }
         let scalar = &start[..end];
         *input = &start[end..];
-        Ok(vec![Span::styled(scalar.to_string(), scalar_style())])
+        Ok(vec![Piece::styled(scalar, StyleKind::Scalar)])
     }
 }
 
 // A sub-entry inside an inline payload: KEY SP VARIANT [( ... )].
-fn parse_sub_entry(input: &mut &str) -> ModalResult<Vec<Span<'static>>> {
+fn parse_sub_entry(input: &mut &str) -> ModalResult<Vec<Piece>> {
     let mut out = Vec::new();
     let key = parse_ident(input)?;
-    out.push(Span::styled(key.to_string(), key_style()));
+    out.push(Piece::styled(key, StyleKind::Key));
     let sp = take_while(1.., |c: char| c == ' ').parse_next(input)?;
-    out.push(Span::raw(sp.to_string()));
+    out.push(Piece::plain(sp));
     // Sub-entry: bare-ident variant allowed (we're already inside
     // an established `Variant(...)` so the context is unambiguous).
-    let value_spans = parse_value(input, false)?;
-    out.extend(value_spans);
+    let value_pieces = parse_value(input, false)?;
+    out.extend(value_pieces);
     Ok(out)
 }
 

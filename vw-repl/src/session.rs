@@ -125,6 +125,37 @@ impl Session {
         names
     }
 
+    /// Companion to [`top_level_var_names`] returning inferred
+    /// types for the top-level `set` bindings across every
+    /// committed batch. Later batches shadow earlier ones so
+    /// re-binding `set foo […]` overrides the previous entry.
+    ///
+    /// The signature table is rebuilt per batch here — batches
+    /// commit in order and each is inspected independently, so
+    /// value_type inside a batch resolves against that batch's
+    /// own procs. Cross-batch signature resolution would require
+    /// threading the full accumulated sig table, which currently
+    /// isn't needed for the putr use case (values reach `set`
+    /// through proc calls the batch itself defines or imports).
+    pub fn top_level_var_types(
+        &self,
+    ) -> std::collections::HashMap<String, vw_htcl::TypeExpr> {
+        let mut types = std::collections::HashMap::new();
+        for batch in &self.batches {
+            let mut sig_diags = Vec::new();
+            let sig_table = vw_htcl::validate::build_signature_table(
+                &batch.document,
+                &mut sig_diags,
+            );
+            let batch_types =
+                vw_htcl::top_level_var_types(&batch.document, &sig_table);
+            for (name, ty) in batch_types {
+                types.insert(name, ty);
+            }
+        }
+        types
+    }
+
     /// Look up the most-recent proc location across every batch.
     /// Returns `None` when no batch has declared that proc — the
     /// error renderer's drill-down path silently skips such frames
