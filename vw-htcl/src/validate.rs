@@ -191,7 +191,18 @@ pub fn validate_with_all_extras_and_vars<'doc>(
         type_table.keys().cloned().collect();
     validate_qualified_positions(document, &newtype_names, &mut diags);
     let mut var_table = VarTypeTable::new();
-    validate_stmts(&document.stmts, source, &table, &mut var_table, &mut diags);
+    // Build a proc table once so the return-type check can walk
+    // any proc's body without re-scanning the document per call.
+    let proc_table = build_proc_table(document);
+    validate_stmts(
+        &document.stmts,
+        source,
+        &table,
+        &proc_table,
+        &newtype_qualified_names,
+        &mut var_table,
+        &mut diags,
+    );
     // Undefined-variable check. Errors (fail `vw check` / red LSP
     // squiggle), mirror shape to unused-var pass but with the
     // set-operation flipped. `extra_top_level_vars` seeds the
@@ -377,6 +388,268 @@ pub(crate) fn value_type_with_procs(
     }
 }
 
+/// Validate that every `return X` statement in `proc`'s body
+/// produces a value whose type matches the proc's declared
+/// return type. Only fires when the proc has a `return_type`
+/// annotation (untyped procs skip the check entirely).
+///
+/// Descends into the braced bodies of `if`/`elseif`/`else`/
+/// `while`/`for`/`foreach`/`catch` — a `return` buried inside
+/// an early-exit branch still gets checked. Nested control
+/// blocks recurse through the same walker so an arbitrary
+/// depth of `if { if { return X } }` still catches wrong-typed
+/// returns.
+///
+/// Bare `return` (no argument) in an annotated proc is a hard
+/// error — the annotation is a promise to produce a value.
+pub(crate) fn validate_proc_returns(
+    proc: &crate::ast::Proc,
+    source: &str,
+    sig_table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+    newtype_names: &std::collections::HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(declared) = &proc.return_type else {
+        return;
+    };
+    // Newtype-triplet exemption: `T::from`, `T::to`, `T::repr`,
+    // `T::empty` are compiler-emitted (or generator-emitted)
+    // identity conversions between a newtype and its underlying.
+    // Under strict nominal identity, `return $v` where `$v: string`
+    // in a proc returning `T` would flag as a mismatch — but
+    // that's the WHOLE POINT of the from/to/repr layer: cross
+    // the newtype boundary via `return $v` (Tcl-level identity).
+    // Skip the check when the proc name is `T::<suffix>` for a
+    // declared newtype `T` and a triplet suffix.
+    if let Some(name) = proc.name.as_deref() {
+        if is_newtype_triplet_name(name, newtype_names) {
+            return;
+        }
+    }
+    // Enum-overload-arm exemption: `proc f {v: E::A} string { … }`
+    // is the specialization shape for the overload dispatcher —
+    // `v` is the enum variant's payload, which at Tcl runtime is
+    // just the underlying type's raw value (a `string` for
+    // `E::A: string`). Returning it as its underlying is
+    // structurally identity, same rationale as the newtype
+    // triplet. Detect by first-arg type being `Qualified` —
+    // that's the only shape overload arms use.
+    if let Some(sig) = &proc.signature {
+        if let Some(first) = sig.args.first() {
+            if matches!(
+                first.type_annotation,
+                Some(crate::ast::TypeExpr::Qualified { .. })
+            ) {
+                return;
+            }
+        }
+    }
+    // Seed a var table with typed parameters. Walker updates it
+    // as it visits `set` bindings so downstream `return $VAR`
+    // resolves via the same scope-aware inference the outer
+    // arg-type check uses.
+    let mut local_vars = VarTypeTable::new();
+    if let Some(sig) = &proc.signature {
+        for arg in &sig.args {
+            if let Some(ty) = &arg.type_annotation {
+                local_vars.insert(arg.name.clone(), ty.clone());
+            }
+        }
+    }
+    walk_returns(
+        &proc.body,
+        source,
+        sig_table,
+        proc_table,
+        &mut local_vars,
+        declared,
+        diags,
+    );
+}
+
+/// True when `proc_name` matches the newtype-triplet pattern
+/// `<T>::<suffix>` where `T` is a declared newtype and `suffix`
+/// is one of `from`, `to`, `repr`, `empty`. These procs are
+/// identity conversions across the newtype boundary, so their
+/// `return $v` bodies would trip the strict-nominal check by
+/// design; the check exempts them.
+fn is_newtype_triplet_name(
+    proc_name: &str,
+    newtype_names: &std::collections::HashSet<String>,
+) -> bool {
+    for suffix in ["from", "to", "repr", "empty"] {
+        let marker = format!("::{suffix}");
+        if let Some(prefix) = proc_name.strip_suffix(&marker) {
+            if newtype_names.contains(prefix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Recursive walker used by [`validate_proc_returns`]. Tracks
+/// `set` bindings, records `return X` statements it finds, and
+/// descends into parsed control-flow bodies.
+fn walk_returns(
+    stmts: &[crate::ast::Stmt],
+    source: &str,
+    sig_table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+    var_table: &mut VarTypeTable,
+    declared: &crate::ast::TypeExpr,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::ast::{Stmt, WordForm};
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        // Track `set VAR <value>` bindings the same way the
+        // rewrite walker does — later `return $VAR` needs to see
+        // the type.
+        if matches!(cmd.kind, CommandKind::Set) {
+            if let (Some(name_word), Some(value_word)) =
+                (cmd.words.get(1), cmd.words.get(2))
+            {
+                if let Some(name) = name_word.as_text() {
+                    if let Some(ty) = value_type_with_procs(
+                        value_word,
+                        sig_table,
+                        var_table,
+                        Some(proc_table),
+                    ) {
+                        var_table.insert(name.to_string(), ty);
+                    }
+                }
+            }
+        }
+        // `return X` — the actual check.
+        let head_text = cmd.words.first().and_then(|w| w.as_text());
+        if head_text == Some("return") {
+            check_return(
+                cmd, sig_table, proc_table, var_table, declared, diags,
+            );
+        }
+        // Descend into control-flow braced bodies. Heuristic:
+        // for known control-flow heads, parse every WordForm::
+        // Braced word as a candidate body. Condition-shaped
+        // braces (like `if {$x == 1}`) parse without errors but
+        // don't contain `return` calls, so they contribute
+        // nothing — a benign no-op. `for INIT COND NEXT BODY`'s
+        // INIT and NEXT can hold `set` calls that would affect
+        // var_table if we tracked them; we don't, since the
+        // walker isn't a live-execution simulator and Tcl's
+        // control-flow scope semantics are already muddy.
+        if matches!(
+            head_text,
+            Some(
+                "if" | "elseif"
+                    | "else"
+                    | "while"
+                    | "for"
+                    | "foreach"
+                    | "catch"
+            )
+        ) {
+            for word in cmd.words.iter().skip(1) {
+                if word.form != WordForm::Braced {
+                    continue;
+                }
+                // The word's span covers `{...}` including the
+                // outer braces. Strip 1 byte from each end for
+                // the interior text; parse as a fragment; shift
+                // spans by the interior start.
+                let word_start = word.span.start as usize;
+                let word_end = word.span.end as usize;
+                if word_end <= word_start + 2 {
+                    // `{}` — empty body, nothing to check.
+                    continue;
+                }
+                let interior_start = word_start + 1;
+                let interior_end = word_end - 1;
+                let body_text = &source[interior_start..interior_end];
+                let (mut body_stmts, _errs) = crate::parser::parse_fragment(
+                    body_text,
+                    crate::parser::Mode::Toplevel,
+                );
+                for s in &mut body_stmts {
+                    crate::parser::shift_stmt(s, interior_start as u32);
+                }
+                // Populate procs INSIDE the parsed body so nested
+                // structures behave — mostly irrelevant for
+                // returns but keeps recursion consistent.
+                crate::parser::populate_procs(
+                    &mut body_stmts,
+                    source,
+                    &mut Vec::new(),
+                );
+                walk_returns(
+                    &body_stmts,
+                    source,
+                    sig_table,
+                    proc_table,
+                    var_table,
+                    declared,
+                    diags,
+                );
+            }
+        }
+    }
+}
+
+/// Check a single `return X` (or bare `return`) against the
+/// declared return type. Emits diagnostics directly.
+fn check_return(
+    cmd: &crate::ast::Command,
+    sig_table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+    var_table: &VarTypeTable,
+    declared: &crate::ast::TypeExpr,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // `return` alone — bare — violates the annotation's promise
+    // to produce a value UNLESS the declared type is `unit`,
+    // which means "no meaningful value" and matches bare-return
+    // semantics. Common in side-effecting procs that early-out.
+    let Some(arg) = cmd.words.get(1) else {
+        let is_unit = matches!(
+            declared,
+            crate::ast::TypeExpr::Named { name, .. } if name == "unit"
+        );
+        if !is_unit {
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!(
+                    "bare `return` in proc annotated `{}` — the return \
+                     type requires a value; use `return $X`",
+                    render_type_inline(declared),
+                ),
+                span: cmd.span,
+            });
+        }
+        return;
+    };
+    // Try to infer the returned expression's type. If we can't,
+    // skip — gradual typing (same policy as the arg-type check).
+    let Some(actual) =
+        value_type_with_procs(arg, sig_table, var_table, Some(proc_table))
+    else {
+        return;
+    };
+    if !types_match(declared, &actual) {
+        diags.push(Diagnostic {
+            severity: Severity::Error,
+            message: format!(
+                "return type mismatch: proc declared `{}`, but this \
+                 `return` produces `{}`",
+                render_type_inline(declared),
+                render_type_inline(&actual),
+            ),
+            span: cmd.span,
+        });
+    }
+}
+
 /// Walk `proc`'s body left-to-right, tracking `set VAR <value>`
 /// bindings via [`value_type_with_procs`], then find the last
 /// `return X` statement and resolve `X`'s type. `None` when the
@@ -490,6 +763,8 @@ fn validate_stmts(
     stmts: &[Stmt],
     source: &str,
     table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+    newtype_names: &std::collections::HashSet<String>,
     var_table: &mut VarTypeTable,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -514,6 +789,19 @@ fn validate_stmts(
         validate_command(cmd, source, table, var_table, diags);
         match &cmd.kind {
             CommandKind::Proc(proc) => {
+                // Return-type check: fires only when the proc has
+                // an annotated return type. Every `return X` in
+                // the body (including inside control-flow braced
+                // bodies) must produce a value whose inferred
+                // type matches the annotation.
+                validate_proc_returns(
+                    proc,
+                    source,
+                    table,
+                    proc_table,
+                    newtype_names,
+                    diags,
+                );
                 // Fresh scope per proc body. Seed with typed
                 // parameters so `-slot $arg` inside the body knows
                 // `arg`'s declared type without the caller having
@@ -530,6 +818,8 @@ fn validate_stmts(
                     &proc.body,
                     source,
                     table,
+                    proc_table,
+                    newtype_names,
                     &mut proc_scope,
                     diags,
                 );
@@ -545,7 +835,15 @@ fn validate_stmts(
                 // enclosing frame, matching Tcl's rule that
                 // `namespace eval` creates a namespace but not a
                 // fresh local-variable scope.
-                validate_stmts(&ns.body, source, table, var_table, diags);
+                validate_stmts(
+                    &ns.body,
+                    source,
+                    table,
+                    proc_table,
+                    newtype_names,
+                    var_table,
+                    diags,
+                );
             }
             _ => {}
         }
@@ -557,7 +855,15 @@ fn validate_stmts(
         for word in &cmd.words {
             for part in &word.parts {
                 if let WordPart::CmdSubst { body, .. } = part {
-                    validate_stmts(body, source, table, var_table, diags);
+                    validate_stmts(
+                        body,
+                        source,
+                        table,
+                        proc_table,
+                        newtype_names,
+                        var_table,
+                        diags,
+                    );
                 }
             }
         }
@@ -3108,6 +3414,13 @@ proc dcmac::T::to {v: dcmac::T} string { return $v }\n";
     /// Qualified) passes when the name resolves to a real newtype.
     #[test]
     fn namespaced_newtype_tail_arg_allowed() {
+        // `use` returns via `dcmac::T::to` so the return-type
+        // check sees a `string`-typed value matching the
+        // declared `string` return. A raw `return $slot` (leaking
+        // the newtype out as its underlying) is now correctly
+        // flagged as a type mismatch — the analyzer wants
+        // callers to cross the newtype boundary through the
+        // explicit `T::to` conversion.
         let src = "\
 namespace eval dcmac {}\n\
 namespace eval dcmac::T {}\n\
@@ -3115,7 +3428,7 @@ type dcmac::T = string\n\
 proc dcmac::T::repr {v: dcmac::T} string { return $v }\n\
 proc dcmac::T::from {v: string} dcmac::T { return $v }\n\
 proc dcmac::T::to {v: dcmac::T} string { return $v }\n\
-proc use {name slot: dcmac::T} string { return $slot }\n";
+proc use {name slot: dcmac::T} string { return [dcmac::T::to -v $slot] }\n";
         let d = diags(src);
         let errs: Vec<_> =
             d.iter().filter(|d| d.severity == Severity::Error).collect();
@@ -3408,6 +3721,128 @@ proc Properties::to {v} { return $v }\n";
             type_errs[0].message.contains("potato"),
             "message names offending literal: {}",
             type_errs[0].message,
+        );
+    }
+
+    // ------ return-type check ------------------------------------
+    //
+    // Annotated procs must produce a value whose type matches the
+    // declared return type on every `return X` in the body —
+    // including returns buried inside `if`/`while`/etc bodies.
+
+    #[test]
+    fn return_type_matching_annotation_no_diag() {
+        let src = "\
+type ns::TypeA = Properties
+proc make_a {} ns::TypeA { return {} }
+proc use_a {} ns::TypeA {
+  set x [make_a]
+  return $x
+}
+";
+        let d = diags(src);
+        assert!(
+            d.iter()
+                .all(|x| !x.message.contains("return type mismatch")),
+            "unexpected diags: {d:?}",
+        );
+    }
+
+    #[test]
+    fn return_type_mismatch_errors() {
+        // Body returns `ns::TypeA` but annotation says `ns::TypeB`.
+        // This is the shape the user hit with `configure_gtm`
+        // wrongly annotated `cpm5::Config`.
+        let src = "\
+type ns::TypeA = Properties
+type ns::TypeB = Properties
+proc make_a {} ns::TypeA { return {} }
+proc mismatched {} ns::TypeB {
+  set x [make_a]
+  return $x
+}
+";
+        let d = diags(src);
+        let errs: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("return type mismatch"))
+            .collect();
+        assert_eq!(errs.len(), 1, "expected 1 diag, got {d:?}");
+        let msg = &errs[0].message;
+        assert!(
+            msg.contains("ns::TypeA") && msg.contains("ns::TypeB"),
+            "message names both types: {msg}",
+        );
+    }
+
+    #[test]
+    fn return_type_check_descends_into_if_body() {
+        // Wrong-typed return buried inside an `if` body — the
+        // walker parses the braced body and finds the return.
+        let src = "\
+type ns::TypeA = Properties
+type ns::TypeB = Properties
+proc make_a {} ns::TypeA { return {} }
+proc branchy {} ns::TypeB {
+  if 1 {
+    set x [make_a]
+    return $x
+  }
+  return {}
+}
+";
+        let d = diags(src);
+        let errs: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("return type mismatch"))
+            .collect();
+        assert!(!errs.is_empty(), "expected mismatch inside if, got {d:?}");
+    }
+
+    #[test]
+    fn bare_return_in_annotated_proc_errors() {
+        let src = "\
+type ns::TypeA = Properties
+proc bad {} ns::TypeA {
+  return
+}
+";
+        let d = diags(src);
+        let errs: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("bare `return`"))
+            .collect();
+        assert_eq!(errs.len(), 1, "expected bare-return diag, got {d:?}");
+    }
+
+    #[test]
+    fn bare_return_in_unit_proc_is_ok() {
+        // `unit` return type = "no meaningful value"; bare
+        // `return` is idiomatic for side-effecting procs that
+        // early-out on a condition.
+        let src = "\
+proc side_effect {x} unit {
+  if $x { return }
+  return
+}
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("bare `return`")),
+            "unexpected bare-return diag: {d:?}",
+        );
+    }
+
+    #[test]
+    fn unannotated_proc_no_return_check() {
+        // No return annotation → no check fires, no diagnostic.
+        let src = "\
+proc anything {} { return 42 }
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("return type")),
+            "unexpected diags: {d:?}",
         );
     }
 }

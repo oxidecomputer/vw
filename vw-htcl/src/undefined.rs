@@ -110,9 +110,15 @@ pub fn top_level_var_types(
         if !matches!(cmd.kind, CommandKind::Set) {
             continue;
         }
-        let Some(name_word) = cmd.words.get(1) else { continue };
-        let Some(value_word) = cmd.words.get(2) else { continue };
-        let Some(name) = name_word.as_text() else { continue };
+        let Some(name_word) = cmd.words.get(1) else {
+            continue;
+        };
+        let Some(value_word) = cmd.words.get(2) else {
+            continue;
+        };
+        let Some(name) = name_word.as_text() else {
+            continue;
+        };
         if let Some(ty) = crate::validate::value_type_with_procs(
             value_word,
             sig_table,

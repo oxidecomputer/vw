@@ -189,11 +189,7 @@ fn walk_stmts(
             }
             CommandKind::NamespaceEval(ns) => {
                 walk_stmts(
-                    source,
-                    &ns.body,
-                    sig_table,
-                    proc_table,
-                    var_table,
+                    source, &ns.body, sig_table, proc_table, var_table,
                     rewrites,
                 );
             }
@@ -206,11 +202,7 @@ fn walk_stmts(
             for part in &word.parts {
                 if let WordPart::CmdSubst { body, .. } = part {
                     walk_stmts(
-                        source,
-                        body,
-                        sig_table,
-                        proc_table,
-                        var_table,
+                        source, body, sig_table, proc_table, var_table,
                         rewrites,
                     );
                 }
