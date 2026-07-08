@@ -1938,21 +1938,52 @@ fn validate_command(
         return;
     }
     let Some(sig) = table.get(call_name) else {
-        // Unknown call. If it uses `-flag` keyword arguments, the
-        // user probably meant an htcl wrapper that isn't loaded —
-        // shipping it to the EDA backend would either error
-        // cryptically or do something nonsensical with the
-        // arguments. Force the user to be explicit: either `src` a
-        // wrapper module, or use `extern::<name>` for the raw
-        // Tcl/EDA proc.
+        // Unknown call. Two paths fire an error:
+        //
+        // 1. The call uses `-flag` keyword arguments. Almost
+        //    always the user meant an htcl wrapper that isn't
+        //    loaded — shipping it raw to the EDA backend either
+        //    errors cryptically or misinterprets the args.
+        //
+        // 2. The unqualified name has a matching namespaced
+        //    proc in scope (e.g., `get_bd_addr_spaces` when
+        //    `vivado_cmd::get_bd_addr_spaces` exists). That's a
+        //    missed namespace prefix on the same wrapper the
+        //    user is calling elsewhere with the qualified name.
+        //    Catching this even for positional-only calls is
+        //    what makes the analyzer's behavior consistent —
+        //    otherwise `assign_bd_address` errors (has `-flag`
+        //    args) but `[get_bd_addr_spaces X]` inside its arg
+        //    silently passes, which reads as an analyzer gap.
+        //
+        // A positional-only call to a bare Tcl builtin (`llength`,
+        // `dict`, etc.) still passes cleanly: `is_known_tcl_builtin`
+        // filters those, and there's no namespaced homonym.
         let uses_keyword = cmd.words.iter().skip(1).any(|w| {
             w.as_text()
                 .is_some_and(|t| t.starts_with('-') && t.len() > 1)
         });
-        if uses_keyword && !is_known_tcl_builtin(call_name) {
-            let hint = match suggest_name(call_name, table.keys()) {
-                Some(s) => format!(" — did you mean `{s}`?"),
-                None => String::new(),
+        let namespaced_match = if !call_name.contains("::") {
+            let suffix = format!("::{call_name}");
+            table.keys().find(|k| k.ends_with(&suffix)).cloned()
+        } else {
+            None
+        };
+        let should_flag = !is_known_tcl_builtin(call_name)
+            && (uses_keyword || namespaced_match.is_some());
+        if should_flag {
+            // Prefer the exact namespaced match as the "did you
+            // mean" — it's a stronger signal than the fuzzy
+            // Levenshtein suggestion, which for the bare-name
+            // case would surface the same or a nearby name
+            // anyway.
+            let hint = if let Some(qualified) = &namespaced_match {
+                format!(" — did you mean `{qualified}`?")
+            } else {
+                match suggest_name(call_name, table.keys()) {
+                    Some(s) => format!(" — did you mean `{s}`?"),
+                    None => String::new(),
+                }
             };
             diags.push(Diagnostic {
                 severity: Severity::Error,
@@ -2815,6 +2846,50 @@ port::plum_if_pin -name p -pin q
         // call (puts, set, etc.). Pass through silently.
         let src = "puts hello\n";
         assert!(diags(src).is_empty());
+    }
+
+    #[test]
+    fn positional_call_with_namespaced_match_is_flagged() {
+        // `get_thing X` positional-only would normally pass (raw
+        // Tcl assumption), but here a `foo::get_thing` is in
+        // scope — the unqualified form is almost certainly a
+        // missed namespace prefix, worth flagging with a
+        // "did you mean" that names the exact match.
+        let src = "\
+namespace eval foo {
+  proc get_thing {name} { return $name }
+}
+puts [get_thing X]
+";
+        let d = diags(src);
+        let errs: Vec<_> = d
+            .iter()
+            .filter(|e| e.message.contains("undefined proc `get_thing`"))
+            .collect();
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected one undefined-proc diag, got {d:?}"
+        );
+        assert!(
+            errs[0].message.contains("foo::get_thing"),
+            "expected `foo::get_thing` suggestion, got: {}",
+            errs[0].message,
+        );
+    }
+
+    #[test]
+    fn positional_call_with_no_namespaced_match_still_passes() {
+        // No matching namespaced proc → keep the "raw Tcl
+        // builtin assumption" semantics for positional calls.
+        // A bare `some_native X` with nothing named `*::some_native`
+        // in scope stays silent.
+        let src = "puts [some_native X]\n";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|e| !e.message.contains("undefined proc")),
+            "unexpected diag: {d:?}",
+        );
     }
 
     #[test]

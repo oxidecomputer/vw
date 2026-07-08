@@ -1949,15 +1949,36 @@ impl App {
         // `handle_worker_event` picks up `WorkerEvent::PrepareDone`
         // when the background thread finishes, and continues the
         // dispatch pipeline from there.
-        // Tell the user we're chewing on it. Auto-load of a big
-        // htcl tree can burn tens of seconds in parse+validate;
-        // without a visible sentinel, the REPL looks frozen even
-        // though the event loop is happily redrawing (there's
-        // just nothing new to show yet).
-        self.push(
-            ScrollbackKind::Notice,
-            "preparing… (parsing + validating imports)".into(),
-        );
+        // Show a "preparing…" sentinel only when the input will
+        // actually pull new files through the loader — i.e., the
+        // top-level parse of `text` contains a `src` command.
+        // A one-liner like `bd::clobber -name txr0` doesn't touch
+        // disk and prepare finishes in low double-digit ms; a
+        // notice per submit for that case is just noise.
+        //
+        // The parse itself is cheap (input is usually a single
+        // line); prepare will re-parse the flat post-load source
+        // internally either way. False negatives are impossible
+        // — `src` is the only mechanism that adds files — and
+        // false positives are bounded to "user typed `src`
+        // without triggering big work" (already-preloaded
+        // target), where a brief notice does no harm.
+        let will_load = {
+            let parsed = vw_htcl::parse(&text);
+            parsed.document.stmts.iter().any(|s| {
+                matches!(
+                    s,
+                    vw_htcl::Stmt::Command(c)
+                        if matches!(c.kind, vw_htcl::CommandKind::Src(_))
+                )
+            })
+        };
+        if will_load {
+            self.push(
+                ScrollbackKind::Notice,
+                "preparing… (parsing + validating imports)".into(),
+            );
+        }
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let session = std::sync::Arc::clone(&self.session);

@@ -110,6 +110,15 @@ pub struct LoadedFile {
     /// ←  entry.htcl:1 (src ip/cips)` — which is the htcl-level
     /// equivalent of a stack trace.
     pub imported_via: Option<ImportEdge>,
+    /// Modification time of the file at read time. Populated when
+    /// the fs metadata call succeeds; `None` when it doesn't
+    /// (unlikely on a file we just read, but the API allows it).
+    /// Used by the REPL's cross-batch loader cache: if the
+    /// current mtime differs from this stored one, the file
+    /// gets re-read on the next `src` — this is what makes
+    /// live-editing an already-sourced `.htcl` file work
+    /// interactively without a full restart.
+    pub mtime: Option<std::time::SystemTime>,
 }
 
 /// An edge in the import graph: this file was loaded because the
@@ -213,11 +222,16 @@ pub fn load_with_observer(
     resolver: &Resolver,
     observer: &mut dyn LoadObserver,
 ) -> Result<LoadedProgram, LoadError> {
-    load_with_preloaded(entry, resolver, observer, &HashSet::new())
+    load_with_preloaded(
+        entry,
+        resolver,
+        observer,
+        &std::collections::HashMap::new(),
+    )
 }
 
 /// Same as [`load_with_observer`] but seeds the "already loaded"
-/// set with an externally-supplied path list.
+/// map with paths → mtime-at-load-time.
 ///
 /// The REPL uses this to skip re-parsing files a prior batch has
 /// already sourced. Without it, `src ip/gtm` in a REPL session
@@ -226,27 +240,39 @@ pub fn load_with_observer(
 /// `self.loaded` cache is per-load-call, so cross-batch
 /// redundancy explodes into O(minutes) for a large tree.
 ///
-/// A preloaded path returns `Ok(())` from `load_file` immediately
-/// — no read, no parse. The caller's document still records the
-/// `src` command as a syntactic marker; downstream analysis
-/// pulls the file's parsed content from prior-batch state.
+/// A preloaded path short-circuits ONLY when the file's current
+/// on-disk mtime matches the stored one. That's what lets a user
+/// edit `ip/gtm.htcl`, then re-run `src ip/gtm` at the REPL and
+/// actually see the change — the loader stats the target, sees
+/// the mtime bump, and re-reads + re-parses instead of taking
+/// the cached-empty path. A stat per hit is negligible next to
+/// what the re-parse would cost.
+///
+/// A missing mtime (`None`) on either side downgrades to
+/// "unknown → always reload" — safer than silently reusing
+/// possibly-stale content.
 pub fn load_with_preloaded(
     entry: &Path,
     resolver: &Resolver,
     observer: &mut dyn LoadObserver,
-    preloaded: &HashSet<PathBuf>,
+    preloaded: &std::collections::HashMap<PathBuf, std::time::SystemTime>,
 ) -> Result<LoadedProgram, LoadError> {
     let entry = entry.canonicalize().unwrap_or_else(|_| entry.to_path_buf());
     let mut state = State {
         program: LoadedProgram::default(),
-        // Seed `loaded` from the preloaded set — same semantics
-        // as "we already loaded this in a prior call": the
-        // `load_file` guard at the top short-circuits. The
-        // entry path itself is intentionally NOT auto-added
-        // even if it's in `preloaded`; the caller passed `entry`
-        // because they want its content walked (it's the batch's
-        // own scratch or the user's typed input).
-        loaded: preloaded.iter().filter(|p| *p != &entry).cloned().collect(),
+        // Seed `preloaded_mtimes` — the actual short-circuit
+        // check is inside `load_file` and gates on the mtime
+        // being unchanged since the prior batch stored it. The
+        // entry path itself is intentionally omitted even if the
+        // caller included it; that path is the batch's own
+        // scratch or the user's typed input, which the caller
+        // wants walked regardless.
+        preloaded_mtimes: preloaded
+            .iter()
+            .filter(|(p, _)| *p != &entry)
+            .map(|(p, t)| (p.clone(), *t))
+            .collect(),
+        loaded: HashSet::new(),
         in_progress: HashSet::new(),
         resolver,
         observer,
@@ -257,7 +283,14 @@ pub fn load_with_preloaded(
 
 struct State<'r, 'o> {
     program: LoadedProgram,
+    /// Files the loader has already read this call (its own dedup
+    /// tracking). Grows as `load_file` recurses.
     loaded: HashSet<PathBuf>,
+    /// Cross-call preloaded set: path → mtime-when-prior-batch-
+    /// loaded-it. `load_file` short-circuits only when the entry
+    /// is here AND the current mtime matches. Never mutated
+    /// during a load call.
+    preloaded_mtimes: std::collections::HashMap<PathBuf, std::time::SystemTime>,
     in_progress: HashSet<PathBuf>,
     resolver: &'r Resolver,
     observer: &'o mut dyn LoadObserver,
@@ -273,12 +306,30 @@ impl State<'_, '_> {
         if self.loaded.contains(path) || self.in_progress.contains(path) {
             return Ok(());
         }
+        // Cross-batch cache: skip re-parse only when this file
+        // was preloaded by a prior batch AND its on-disk mtime
+        // hasn't budged. Any mismatch (unknown current mtime,
+        // different mtime, no stored mtime) forces a fresh
+        // read so live edits show up on the next `src`.
+        if let Some(stored_mtime) = self.preloaded_mtimes.get(path) {
+            let current_mtime =
+                fs::metadata(path).ok().and_then(|m| m.modified().ok());
+            if current_mtime == Some(*stored_mtime) {
+                return Ok(());
+            }
+        }
         self.in_progress.insert(path.to_path_buf());
 
         let source = fs::read_to_string(path).map_err(|e| LoadError::Io {
             path: path.to_path_buf(),
             source: e,
         })?;
+        // Stat right after the read so the recorded mtime matches
+        // the source we just captured. Failing to stat (fs
+        // permissions, deleted between read and stat, etc.)
+        // downgrades to `None`, which the preloaded-cache path
+        // treats as "unknown → always reload".
+        let mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
         let parsed = parse(&source);
         if !parsed.errors.is_empty() {
             return Err(LoadError::Parse {
@@ -294,6 +345,7 @@ impl State<'_, '_> {
             path: path.to_path_buf(),
             source: source.clone(),
             imported_via,
+            mtime,
         });
 
         // Walk the parsed document, copying text in span order. Any
