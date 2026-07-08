@@ -29,12 +29,7 @@
 //! reference to it, or an attribute-ident value referring to a
 //! sibling arg. Each maps to the same rename operation.
 
-use crate::ast::{
-    AttributeValue, Command, CommandKind, Document, Proc, ProcSignature, Stmt,
-    Word, WordForm, WordPart,
-};
-use crate::hover::is_body_host;
-use crate::scope::{resolve_var_def, scan_var_ref, VarDef};
+use crate::ast::Document;
 use crate::span::Span;
 
 /// A single text-substitution edit to apply. Spans are absolute in
@@ -61,16 +56,78 @@ pub fn rename_at(
     offset: u32,
     new_name: &str,
 ) -> Option<Vec<RenameEdit>> {
-    if !is_valid_tcl_ident(new_name) {
+    if !is_valid_tcl_ident_or_qualified(new_name) {
         return None;
     }
-    // Try proc-arg rename first. Its identification is narrower
-    // (only fires when the cursor lands on a signature arg / an
-    // attribute-ident naming an arg / a `$var` resolving to an
-    // arg), so it can't misclassify a local as a proc arg.
-    let edits = rename_proc_arg(document, source, offset, new_name)
-        .or_else(|| rename_local(document, source, offset, new_name))?;
+    // Route through the [`crate::references`] core so proc /
+    // type / enum-variant renames flow through the same
+    // identify + collect pipeline as `textDocument/references`.
+    // Locals + proc args are still file-local; the LSP layer
+    // decides whether to also scan sibling files.
+    let target = crate::references::identify_at(document, source, offset)?;
+    let spans =
+        crate::references::find_references_in(document, source, &target);
+    if spans.is_empty() {
+        return None;
+    }
+    let replacement = replacement_for(&target, new_name);
+    let edits = spans
+        .into_iter()
+        .map(|span| RenameEdit {
+            span,
+            new_text: replacement.clone(),
+        })
+        .collect();
     Some(finalize_edits(edits))
+}
+
+/// Pick the exact text to substitute at each ref span for a
+/// given target. Straightforward for locals / proc args / type
+/// names (the new bare name goes in verbatim). Procs preserve
+/// their namespace prefix so a rename of a call site like
+/// `vivado_cmd::create_bd_cell` targets the LAST segment only
+/// when the user typed a bare name.
+fn replacement_for(
+    target: &crate::references::ReferenceTarget,
+    new_name: &str,
+) -> String {
+    use crate::references::ReferenceTarget;
+    match target {
+        ReferenceTarget::Proc { name }
+            if name.contains("::") && !new_name.contains("::") =>
+        {
+            // Preserve the namespace prefix from the original.
+            let ns_prefix =
+                name.rsplit_once("::").map(|(ns, _)| ns).unwrap_or("");
+            format!("{ns_prefix}::{new_name}")
+        }
+        ReferenceTarget::EnumVariant { enum_name, .. } => {
+            // Enum variant refs span the whole `Enum::Variant`
+            // form in call-head/qualified positions, so we
+            // preserve the enum prefix.
+            format!("{enum_name}::{new_name}")
+        }
+        _ => new_name.to_string(),
+    }
+}
+
+/// A rename target's new text is either a plain identifier or a
+/// fully qualified path (`ns::name`). Reject anything that
+/// doesn't parse as one of those so the substituted text stays
+/// valid htcl.
+fn is_valid_tcl_ident_or_qualified(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    for seg in s.split("::") {
+        if seg.is_empty() {
+            return false;
+        }
+        if !is_valid_tcl_ident(seg) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Tcl identifiers accept letters, digits, underscore, and `::`
@@ -93,538 +150,6 @@ fn finalize_edits(mut edits: Vec<RenameEdit>) -> Vec<RenameEdit> {
     edits.sort_by_key(|e| (e.span.start, e.span.end));
     edits.dedup_by(|a, b| a.span == b.span && a.new_text == b.new_text);
     edits
-}
-
-// ─── proc-arg rename ────────────────────────────────────────────────
-
-/// Attempt to rename a proc parameter. Fires when the cursor is on:
-///
-/// - the arg's `name_span` in the signature
-/// - an attribute-ident value inside the signature that names the arg
-/// - a `$name` reference in the body that resolves to the arg
-///
-/// Emits: the signature-decl span, every attribute-ident span naming
-/// the arg, and every use site inside the body.
-fn rename_proc_arg(
-    document: &Document,
-    source: &str,
-    offset: u32,
-    new_name: &str,
-) -> Option<Vec<RenameEdit>> {
-    let (proc, arg_name) = find_proc_arg_at(document, source, offset)?;
-    let sig = proc.signature.as_ref()?;
-    let arg = sig.args.iter().find(|a| a.name == arg_name)?;
-
-    let mut edits = Vec::new();
-    edits.push(RenameEdit {
-        span: arg.name_span,
-        new_text: new_name.to_string(),
-    });
-    for attr_edit in attribute_ident_edits(sig, &arg_name, new_name) {
-        edits.push(attr_edit);
-    }
-    collect_var_ref_edits(&proc.body, source, &arg_name, new_name, &mut edits);
-    Some(edits)
-}
-
-/// If `offset` lands anywhere that identifies a proc arg, return the
-/// enclosing proc plus the arg's name.
-fn find_proc_arg_at<'a>(
-    document: &'a Document,
-    source: &str,
-    offset: u32,
-) -> Option<(&'a Proc, String)> {
-    find_proc_arg_in(&document.stmts, source, offset)
-}
-
-fn find_proc_arg_in<'a>(
-    stmts: &'a [Stmt],
-    source: &str,
-    offset: u32,
-) -> Option<(&'a Proc, String)> {
-    for stmt in stmts {
-        let Stmt::Command(cmd) = stmt else { continue };
-        if !cmd.span.contains(offset) {
-            continue;
-        }
-        if let CommandKind::Proc(proc) = &cmd.kind {
-            // Cursor on a signature arg name?
-            if let Some(sig) = proc.signature.as_ref() {
-                for arg in &sig.args {
-                    if arg.name_span.contains(offset) {
-                        return Some((proc, arg.name.clone()));
-                    }
-                    // Cursor on an attribute-ident naming a sibling arg?
-                    for attr in &arg.attributes {
-                        for value in &attr.values {
-                            if let AttributeValue::Ident { value: name, span } =
-                                value
-                            {
-                                if !span.contains(offset) {
-                                    continue;
-                                }
-                                if sig.args.iter().any(|a| &a.name == name) {
-                                    return Some((proc, name.clone()));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Cursor inside the body — resolve a var ref.
-            if proc.body_span.contains(offset) {
-                if let Some(name) =
-                    var_ref_name_in_scope(&proc.body, source, offset)
-                {
-                    // Ensure the resolution lands on a proc arg (not a
-                    // body-local `set`).
-                    if let Some(VarDef::Param(_)) =
-                        resolve_var_def(&name, &proc.body, Some(proc), offset)
-                    {
-                        return Some((proc, name));
-                    }
-                }
-                // Recurse into nested procs.
-                if let Some(hit) = find_proc_arg_in(&proc.body, source, offset)
-                {
-                    return Some(hit);
-                }
-            }
-            return None;
-        }
-        if let CommandKind::NamespaceEval(ns) = &cmd.kind {
-            if let Some(hit) = find_proc_arg_in(&ns.body, source, offset) {
-                return Some(hit);
-            }
-        }
-    }
-    None
-}
-
-/// Every attribute-ident value across `sig` whose text is `old_name`,
-/// as a rename edit to `new_name`.
-fn attribute_ident_edits(
-    sig: &ProcSignature,
-    old_name: &str,
-    new_name: &str,
-) -> Vec<RenameEdit> {
-    let mut out = Vec::new();
-    for arg in &sig.args {
-        for attr in &arg.attributes {
-            for value in &attr.values {
-                if let AttributeValue::Ident { value: name, span } = value {
-                    if name == old_name {
-                        out.push(RenameEdit {
-                            span: *span,
-                            new_text: new_name.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-// ─── local rename ───────────────────────────────────────────────────
-
-/// Attempt to rename a `set` / `variable` / `foreach` / `upvar`
-/// local. Fires when the cursor is on:
-///
-/// - the target name of the decl command
-/// - a `$name` reference resolving to a local (not a proc arg)
-fn rename_local(
-    document: &Document,
-    source: &str,
-    offset: u32,
-    new_name: &str,
-) -> Option<Vec<RenameEdit>> {
-    let (scope_stmts, enclosing) = innermost_scope_full(document, offset);
-    // 1. Cursor on a decl target?
-    if let Some(name) =
-        local_decl_name_at(scope_stmts, offset).map(|s| s.to_string())
-    {
-        let mut edits = Vec::new();
-        collect_local_decl_edits(scope_stmts, &name, new_name, &mut edits);
-        collect_var_ref_edits(scope_stmts, source, &name, new_name, &mut edits);
-        // Foreach's iter can shadow an outer name, so filter out any
-        // ref edits that fell inside an inner proc body — those are
-        // separate scopes and we shouldn't touch them.
-        if edits.is_empty() {
-            return None;
-        }
-        return Some(edits);
-    }
-    // 2. Cursor on a `$var` that resolves to a local?
-    let name = var_ref_name_in_scope(scope_stmts, source, offset)?;
-    match resolve_var_def(&name, scope_stmts, enclosing, offset)? {
-        VarDef::Local(_) => {}
-        // Proc args are handled by `rename_proc_arg`.
-        VarDef::Param(_) => return None,
-    }
-    let mut edits = Vec::new();
-    collect_local_decl_edits(scope_stmts, &name, new_name, &mut edits);
-    collect_var_ref_edits(scope_stmts, source, &name, new_name, &mut edits);
-    if edits.is_empty() {
-        return None;
-    }
-    Some(edits)
-}
-
-/// If `offset` lands on the target-name word of a `set`, `variable`,
-/// `foreach` iter (bare form only), or `upvar` local, return that
-/// name. Multi-var `foreach {a b c}` and the interior of upvar with
-/// dynamic pairs are not supported for the "cursor is on a decl"
-/// path — the cursor can only be on a bare-word decl. Users who need
-/// to rename inside a brace-list `foreach` still get it via `$name`
-/// from within the body.
-fn local_decl_name_at(stmts: &[Stmt], offset: u32) -> Option<&str> {
-    for stmt in stmts {
-        let Stmt::Command(cmd) = stmt else { continue };
-        if !cmd.span.contains(offset) {
-            continue;
-        }
-        if let Some(name) = decl_name_in_command(cmd, offset) {
-            return Some(name);
-        }
-    }
-    None
-}
-
-fn decl_name_in_command(cmd: &Command, offset: u32) -> Option<&str> {
-    match &cmd.kind {
-        CommandKind::Set => {
-            // 2-word `set foo` is a read, not a decl.
-            if cmd.words.len() < 3 {
-                return None;
-            }
-            let target = cmd.words.get(1)?;
-            if target.span.contains(offset) {
-                return target.as_text();
-            }
-            None
-        }
-        CommandKind::Generic => {
-            let head = cmd.words.first()?.as_text()?;
-            match head {
-                "variable" => {
-                    let target = cmd.words.get(1)?;
-                    target.span.contains(offset).then(|| target.as_text())?
-                }
-                "foreach" => {
-                    // `foreach ITER LIST BODY` (4 words) — cursor
-                    // on ITER position.
-                    if cmd.words.len() < 4 {
-                        return None;
-                    }
-                    // Every even-indexed word (skipping the leading
-                    // `foreach`) up to body_idx-1 is an iter.
-                    let body_idx = cmd.words.len() - 1;
-                    let mut i = 1;
-                    while i < body_idx {
-                        let target = &cmd.words[i];
-                        if target.span.contains(offset) {
-                            return target.as_text();
-                        }
-                        i += 2;
-                    }
-                    None
-                }
-                "upvar" => {
-                    // `upvar [LEVEL] remote local [remote local]…`
-                    let mut idx = 1;
-                    if let Some(w) = cmd.words.get(idx) {
-                        if let Some(t) = w.as_text() {
-                            if t.starts_with('#')
-                                || t.chars()
-                                    .next()
-                                    .is_some_and(|c| c.is_ascii_digit())
-                            {
-                                idx += 1;
-                            }
-                        }
-                    }
-                    while idx + 1 < cmd.words.len() {
-                        let local_word = &cmd.words[idx + 1];
-                        if local_word.span.contains(offset) {
-                            return local_word.as_text();
-                        }
-                        idx += 2;
-                    }
-                    None
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Push edits for every `set NAME …` / `variable NAME` / `foreach
-/// NAME …` / `upvar … NAME` decl in `stmts` whose target text is
-/// `old_name`.
-fn collect_local_decl_edits(
-    stmts: &[Stmt],
-    old_name: &str,
-    new_name: &str,
-    edits: &mut Vec<RenameEdit>,
-) {
-    for stmt in stmts {
-        let Stmt::Command(cmd) = stmt else { continue };
-        push_decl_edit_if_matches(cmd, old_name, new_name, edits);
-    }
-}
-
-fn push_decl_edit_if_matches(
-    cmd: &Command,
-    old_name: &str,
-    new_name: &str,
-    edits: &mut Vec<RenameEdit>,
-) {
-    match &cmd.kind {
-        CommandKind::Set => {
-            if cmd.words.len() < 3 {
-                return;
-            }
-            let target = &cmd.words[1];
-            if target.as_text() == Some(old_name) {
-                edits.push(RenameEdit {
-                    span: target.span,
-                    new_text: new_name.to_string(),
-                });
-            }
-        }
-        CommandKind::Generic => {
-            let Some(head) = cmd.words.first().and_then(Word::as_text) else {
-                return;
-            };
-            match head {
-                "variable" => {
-                    if let Some(target) = cmd.words.get(1) {
-                        if target.as_text() == Some(old_name) {
-                            edits.push(RenameEdit {
-                                span: target.span,
-                                new_text: new_name.to_string(),
-                            });
-                        }
-                    }
-                }
-                "foreach" => {
-                    if cmd.words.len() < 4 {
-                        return;
-                    }
-                    let body_idx = cmd.words.len() - 1;
-                    let mut i = 1;
-                    while i < body_idx {
-                        let target = &cmd.words[i];
-                        if target.as_text() == Some(old_name) {
-                            edits.push(RenameEdit {
-                                span: target.span,
-                                new_text: new_name.to_string(),
-                            });
-                        }
-                        i += 2;
-                    }
-                }
-                "upvar" => {
-                    let mut idx = 1;
-                    if let Some(w) = cmd.words.get(idx) {
-                        if let Some(t) = w.as_text() {
-                            if t.starts_with('#')
-                                || t.chars()
-                                    .next()
-                                    .is_some_and(|c| c.is_ascii_digit())
-                            {
-                                idx += 1;
-                            }
-                        }
-                    }
-                    while idx + 1 < cmd.words.len() {
-                        let local_word = &cmd.words[idx + 1];
-                        if local_word.as_text() == Some(old_name) {
-                            edits.push(RenameEdit {
-                                span: local_word.span,
-                                new_text: new_name.to_string(),
-                            });
-                        }
-                        idx += 2;
-                    }
-                }
-                _ => {}
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Return the innermost proc's body plus that proc (or the document
-/// plus `None` at the top level). Same shape as
-/// [`crate::scope::innermost_scope`] but returned owned so callers
-/// can decide the scope kind without another lookup.
-fn innermost_scope_full(
-    document: &Document,
-    offset: u32,
-) -> (&[Stmt], Option<&Proc>) {
-    crate::scope::innermost_scope(document, offset)
-}
-
-// ─── shared use-site collector ─────────────────────────────────────
-
-/// Walk `stmts` and every same-frame nested scope (body-host brace
-/// bodies, `[ … ]` substitutions), pushing a rename edit for every
-/// `$name` reference whose name matches `old_name`. **Does not**
-/// descend into nested `proc` bodies or `namespace eval` blocks —
-/// those introduce a fresh scope where the same name is unrelated.
-fn collect_var_ref_edits(
-    stmts: &[Stmt],
-    source: &str,
-    old_name: &str,
-    new_name: &str,
-    edits: &mut Vec<RenameEdit>,
-) {
-    for stmt in stmts {
-        let Stmt::Command(cmd) = stmt else { continue };
-        // Skip nested-scope commands entirely — collect_var_ref_edits
-        // is meant to walk one frame's worth of code.
-        if matches!(
-            &cmd.kind,
-            CommandKind::Proc(_) | CommandKind::NamespaceEval(_)
-        ) {
-            continue;
-        }
-        collect_var_ref_edits_in_command(
-            cmd, source, old_name, new_name, edits,
-        );
-    }
-}
-
-fn collect_var_ref_edits_in_command(
-    cmd: &Command,
-    source: &str,
-    old_name: &str,
-    new_name: &str,
-    edits: &mut Vec<RenameEdit>,
-) {
-    for word in &cmd.words {
-        collect_var_ref_edits_in_word(word, source, old_name, new_name, edits);
-    }
-    // Body-host commands (if/while/foreach/…) carry brace-word
-    // scripts that run in the same frame. Reparse each and walk it
-    // like part of the current scope.
-    if let Some(head) = cmd.words.first().and_then(Word::as_text) {
-        if is_body_host(head) {
-            for word in cmd.words.iter().skip(1) {
-                if let Some(stmts) = reparse_braced_body(word, source) {
-                    collect_var_ref_edits(
-                        &stmts, source, old_name, new_name, edits,
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn collect_var_ref_edits_in_word(
-    word: &Word,
-    source: &str,
-    old_name: &str,
-    new_name: &str,
-    edits: &mut Vec<RenameEdit>,
-) {
-    for part in &word.parts {
-        match part {
-            WordPart::VarRef { name, span } => {
-                // Only rename plain-name refs — `${arr(key)}` or
-                // `${ns::var}` is out of scope for local rename
-                // (namespaces cross scope boundaries; array cells
-                // are the array's, not a separate identifier).
-                if name == old_name {
-                    push_var_ref_edit(*span, source, new_name, edits);
-                }
-            }
-            WordPart::CmdSubst { body, .. } => {
-                // Nested command substitution runs in the current
-                // frame — its VarRefs count.
-                collect_var_ref_edits(body, source, old_name, new_name, edits);
-            }
-            WordPart::Text { .. } | WordPart::Escape { .. } => {}
-        }
-    }
-}
-
-/// Emit a rename edit that replaces just the NAME portion of a
-/// `$name` / `${name}` reference. The VarRef span covers the whole
-/// reference including `$` (and, for the braced form, `${` … `}`);
-/// we clip to the identifier byte range so we don't accidentally
-/// drop the sigils.
-fn push_var_ref_edit(
-    ref_span: Span,
-    source: &str,
-    new_name: &str,
-    edits: &mut Vec<RenameEdit>,
-) {
-    let bytes = source.as_bytes();
-    let start = ref_span.start as usize;
-    let end = ref_span.end as usize;
-    if end <= start || end > bytes.len() {
-        return;
-    }
-    // Determine `${…}` vs `$…` by peeking the second byte.
-    let (name_start, name_end) = if start + 1 < end && bytes[start + 1] == b'{'
-    {
-        // `${…}` — identifier lives between `${` and the closing `}`.
-        let s = start + 2;
-        let e = end.saturating_sub(1);
-        if e <= s {
-            return;
-        }
-        (s, e)
-    } else {
-        // `$…` — identifier lives between `$` and end of span.
-        let s = start + 1;
-        if end <= s {
-            return;
-        }
-        (s, end)
-    };
-    edits.push(RenameEdit {
-        span: Span::new(name_start as u32, name_end as u32),
-        new_text: new_name.to_string(),
-    });
-}
-
-/// If `word` is a braced body-host arg, reparse its interior into
-/// statements. Mirror of `unused::reparse_braced_body` — kept as its
-/// own helper here so the modules don't tangle their pub-crate
-/// surface.
-fn reparse_braced_body(word: &Word, source: &str) -> Option<Vec<Stmt>> {
-    if word.form != WordForm::Braced {
-        return None;
-    }
-    let WordPart::Text { value, span } = word.parts.first()? else {
-        return None;
-    };
-    let (mut stmts, mut errs) = crate::parser::parse_fragment(
-        value.as_str(),
-        crate::parser::Mode::BracketBody,
-    );
-    let delta = span.start;
-    for s in &mut stmts {
-        crate::parser::shift_stmt(s, delta);
-    }
-    crate::parser::populate_procs(&mut stmts, source, &mut errs);
-    Some(stmts)
-}
-
-/// Recover the name of a `$var` at `offset`, whether it's a
-/// structured [`WordPart::VarRef`] we can see or one buried inside
-/// opaque text. Returns the bare identifier only.
-fn var_ref_name_in_scope(
-    _stmts: &[Stmt],
-    source: &str,
-    offset: u32,
-) -> Option<String> {
-    scan_var_ref(source, offset).map(|(name, _)| name)
 }
 
 #[cfg(test)]
@@ -830,37 +355,46 @@ proc outer {} {
 
     #[test]
     fn refuse_invalid_new_name() {
+        // Bad syntax for a Tcl identifier still gets refused. The
+        // qualified-name `ns::var` form is now accepted (proc /
+        // enum-variant renames need to write it).
         let src = "proc f {} { set x 1; puts $x }\n";
         let pos = at(src, "set x", 0) + 4;
         let parsed = parse(src);
         assert!(rename_at(&parsed.document, src, pos, "").is_none());
         assert!(rename_at(&parsed.document, src, pos, "1foo").is_none());
         assert!(rename_at(&parsed.document, src, pos, "foo-bar").is_none());
-        assert!(rename_at(&parsed.document, src, pos, "ns::var").is_none());
     }
 
     #[test]
-    fn refuse_when_cursor_on_proc_name() {
+    fn rename_proc_from_decl_covers_call_sites() {
+        // Cursor on the proc name at its decl → both the decl and
+        // every call to `greet` in the same file get rewritten.
         let src = "\
 proc greet {} { puts hi }
 greet
+proc other {} { greet }
 ";
-        // Cursor on `greet` (the proc name decl).
         let pos = at(src, "greet", 0);
-        let parsed = parse(src);
-        assert!(rename_at(&parsed.document, src, pos, "hello").is_none());
+        let edits = edits_of(src, pos, "hello");
+        let renamed = apply(src, &edits);
+        assert!(renamed.contains("proc hello {}"), "{renamed}");
+        assert_eq!(renamed.matches("hello").count(), 3, "{renamed}");
     }
 
     #[test]
-    fn refuse_when_cursor_on_call_site() {
-        // Same as above but at the call site. We don't rename procs.
+    fn rename_proc_from_call_site() {
+        // Cursor on a call site → same set of edits as from the
+        // decl; the identify pass just picks the same target.
         let src = "\
 proc greet {} { puts hi }
 greet
 ";
         let pos = at(src, "greet", 1);
-        let parsed = parse(src);
-        assert!(rename_at(&parsed.document, src, pos, "hello").is_none());
+        let edits = edits_of(src, pos, "hello");
+        let renamed = apply(src, &edits);
+        assert!(renamed.contains("proc hello {}"), "{renamed}");
+        assert!(!renamed.contains("greet"), "{renamed}");
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub mod overload;
 pub mod parser;
 pub mod proc_args;
 pub mod putr;
+pub mod references;
 pub mod rename;
 pub mod repr;
 pub mod scope;
@@ -68,6 +69,7 @@ pub use lower::{
     EXTERN_PREFIX,
 };
 pub use overload::emit_dispatcher;
+pub use references::{find_references_in, identify_at, ReferenceTarget};
 pub use rename::{rename_at, RenameEdit};
 pub use repr::{
     emit_enum_prelude, emit_primitive_prelude, emit_repr, emit_repr_with_types,

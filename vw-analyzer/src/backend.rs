@@ -114,6 +114,23 @@ pub trait LanguageBackend: Send + Sync {
     ) -> Option<WorkspaceEdit> {
         None
     }
+
+    /// All locations that reference the symbol at `position`,
+    /// including `position`'s own location. `include_declaration`
+    /// mirrors the LSP `ReferenceContext` flag — when `false` the
+    /// backend should omit the decl span from the response.
+    ///
+    /// Returns an empty vec when the cursor isn't on a known
+    /// symbol. Default impl returns empty so backends without a
+    /// references implementation don't have to stub it out.
+    async fn references(
+        &self,
+        _uri: &Url,
+        _position: Position,
+        _include_declaration: bool,
+    ) -> Vec<Location> {
+        Vec::new()
+    }
 }
 
 /// A symbol surfaced from a backend, language-neutral. Backends that

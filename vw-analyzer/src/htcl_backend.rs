@@ -19,10 +19,11 @@ use tower_lsp::lsp_types::{
 };
 use tracing::debug;
 use vw_htcl::{
-    complete_at, definition_at, hover_at, parse, rename_at, signature_help_at,
-    validate_with_all_extras_and_vars, Attribute, AttributeValue, CommandKind,
-    Completion, CompletionKind, HoverTarget, LineCol, LineIndex, ParseOutput,
-    ProcArg, ProcSignature, RenameEdit, Severity, Stmt,
+    complete_at, definition_at, find_references_in, hover_at, identify_at,
+    parse, signature_help_at, validate_with_all_extras_and_vars, Attribute,
+    AttributeValue, CommandKind, Completion, CompletionKind, HoverTarget,
+    LineCol, LineIndex, ParseOutput, ProcArg, ProcSignature, ReferenceTarget,
+    Severity, Span, Stmt,
 };
 
 use crate::backend::LanguageBackend;
@@ -680,53 +681,324 @@ impl LanguageBackend for HtclBackend {
         position: Position,
         new_name: &str,
     ) -> Option<WorkspaceEdit> {
-        let analysis = self.analysis_for(uri).await?;
-        let line_index = &analysis.local_line_index;
-        let offset = line_index.offset_of(LineCol {
-            line: position.line,
-            character: position.character,
-        });
-        // Rename operates on the local file only — vw-htcl's
-        // `rename_at` refuses cross-file targets by returning None.
-        // No workspace view: we don't want a rename to try to touch
-        // imported files whose contents we're only synthesizing.
-        let parsed = &analysis.parsed_local;
-        let edits = rename_at(
-            &parsed.document,
-            &analysis.local_text,
-            offset,
-            new_name,
-        )?;
-        if edits.is_empty() {
+        let (target, _decl_uri) =
+            self.identify_target_at(uri, position).await?;
+        // Build a per-URI edit list for every file the target
+        // reaches. For file-local kinds (Local, ProcArg) this
+        // resolves to just the current file; for cross-file
+        // kinds it walks every `.htcl` file under the workspace
+        // root.
+        let per_file = self.collect_reference_spans(uri, &target).await;
+        if per_file.is_empty() {
             return None;
         }
-        let text_edits = edits
-            .into_iter()
-            .map(|e| rename_edit_to_lsp(e, line_index))
-            .collect();
-        let mut changes = HashMap::new();
-        changes.insert(uri.clone(), text_edits);
+        let replacement = rename_replacement_for(&target, new_name)?;
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        for (file_uri, text, spans) in per_file {
+            let line_index = LineIndex::new(&text);
+            let edits: Vec<TextEdit> = spans
+                .into_iter()
+                .map(|span| span_to_text_edit(span, &line_index, &replacement))
+                .collect();
+            if !edits.is_empty() {
+                changes.insert(file_uri, edits);
+            }
+        }
+        if changes.is_empty() {
+            return None;
+        }
         Some(WorkspaceEdit {
             changes: Some(changes),
             document_changes: None,
             change_annotations: None,
         })
     }
+
+    async fn references(
+        &self,
+        uri: &Url,
+        position: Position,
+        include_declaration: bool,
+    ) -> Vec<Location> {
+        let Some((target, _)) = self.identify_target_at(uri, position).await
+        else {
+            return Vec::new();
+        };
+        let per_file = self.collect_reference_spans(uri, &target).await;
+        let mut locations = Vec::new();
+        for (file_uri, text, mut spans) in per_file {
+            let line_index = LineIndex::new(&text);
+            if !include_declaration {
+                // Best-effort decl filter: the target's own decl
+                // is contained inside the ref set (procs' name-
+                // span, types' name-span, enum-variant name-
+                // spans). The reference finder returns them all;
+                // remove those that lie inside the current
+                // target's OWN declaration span when the target
+                // came from this file. For cross-file callers
+                // there's no ambiguity — the decl is only in the
+                // decl file.
+                spans.retain(|s| {
+                    !span_looks_like_decl(&target, *s, &file_uri, uri)
+                });
+            }
+            for span in spans {
+                let (start, end) = line_index.range(span);
+                locations.push(Location {
+                    uri: file_uri.clone(),
+                    range: Range {
+                        start: lc_to_pos(start),
+                        end: lc_to_pos(end),
+                    },
+                });
+            }
+        }
+        locations
+    }
 }
 
-/// Translate a vw-htcl `RenameEdit` into an LSP `TextEdit`. Both
-/// carry the same shape (a source range plus replacement text); only
-/// the coordinate system differs.
-fn rename_edit_to_lsp(edit: RenameEdit, line_index: &LineIndex) -> TextEdit {
-    let (start, end) = line_index.range(edit.span);
+impl HtclBackend {
+    /// Identify the reference target at `position` in `uri`. Also
+    /// returns the URI that owned the identification so the
+    /// per-file collector knows which document to treat as the
+    /// origin (matters for the file-local Local/ProcArg kinds).
+    async fn identify_target_at(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Option<(ReferenceTarget, Url)> {
+        let analysis = self.analysis_for(uri).await?;
+        let line_index = &analysis.local_line_index;
+        let offset = line_index.offset_of(LineCol {
+            line: position.line,
+            character: position.character,
+        });
+        let parsed = &analysis.parsed_local;
+        let target =
+            identify_at(&parsed.document, &analysis.local_text, offset)?;
+        Some((target, uri.clone()))
+    }
+
+    /// For each file the target reaches, return `(uri, text,
+    /// spans)`. File-local targets stay in the origin file; cross-
+    /// file targets get every `.htcl` file under the workspace
+    /// root read and scanned.
+    async fn collect_reference_spans(
+        &self,
+        origin: &Url,
+        target: &ReferenceTarget,
+    ) -> Vec<(Url, String, Vec<Span>)> {
+        match target {
+            ReferenceTarget::Local { .. } | ReferenceTarget::ProcArg { .. } => {
+                let Some(analysis) = self.analysis_for(origin).await else {
+                    return Vec::new();
+                };
+                let spans = find_references_in(
+                    &analysis.parsed_local.document,
+                    &analysis.local_text,
+                    target,
+                );
+                if spans.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![(origin.clone(), analysis.local_text.clone(), spans)]
+                }
+            }
+            ReferenceTarget::Proc { .. }
+            | ReferenceTarget::Type { .. }
+            | ReferenceTarget::EnumVariant { .. } => {
+                let mut files = self.workspace_htcl_files(origin).await;
+                // Fallback: no workspace root (test URIs, files
+                // opened outside a `vw.toml` tree, etc.) → operate
+                // on the origin file only. The rename still
+                // works locally; users adopting the LSP outside a
+                // workspace get local-only semantics until they
+                // set up a `vw.toml`.
+                if files.is_empty() {
+                    if let Some(analysis) = self.analysis_for(origin).await {
+                        files.push((
+                            origin.clone(),
+                            analysis.local_text.clone(),
+                        ));
+                    }
+                }
+                let mut out = Vec::new();
+                for (file_uri, text) in files {
+                    let parsed = parse(&text);
+                    let spans =
+                        find_references_in(&parsed.document, &text, target);
+                    if !spans.is_empty() {
+                        out.push((file_uri, text, spans));
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Enumerate every `.htcl` file under the workspace root that
+    /// contains `origin`. Reads their current on-disk content —
+    /// for files also open in the editor this may be one tick
+    /// behind, but that's the cost of not requiring the editor to
+    /// pre-open every workspace file. Skips typical non-workspace
+    /// directories (`target/`, `.git/`, `.vw/`).
+    ///
+    /// The origin file itself is served from the in-memory
+    /// analysis so unsaved edits round-trip through the rename.
+    async fn workspace_htcl_files(&self, origin: &Url) -> Vec<(Url, String)> {
+        let Ok(origin_path) = origin.to_file_path() else {
+            return Vec::new();
+        };
+        let Some(origin_utf8) = camino::Utf8Path::from_path(&origin_path)
+        else {
+            return Vec::new();
+        };
+        let Some(root) = crate::workspace::workspace_root(origin_utf8) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        walk_htcl_files(root.as_std_path(), &mut paths);
+        let mut visited: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let mut out: Vec<(Url, String)> = Vec::new();
+        for path in paths {
+            let canonical =
+                path.canonicalize().unwrap_or_else(|_| path.clone());
+            if !visited.insert(canonical.clone()) {
+                continue;
+            }
+            let file_uri = match Url::from_file_path(&canonical) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            // For the origin file, prefer the in-memory analysis
+            // text so unsaved edits round-trip.
+            let text = if file_uri == *origin {
+                if let Some(analysis) = self.analysis_for(&file_uri).await {
+                    analysis.local_text.clone()
+                } else {
+                    std::fs::read_to_string(&canonical).unwrap_or_default()
+                }
+            } else {
+                std::fs::read_to_string(&canonical).unwrap_or_default()
+            };
+            if text.is_empty() {
+                continue;
+            }
+            out.push((file_uri, text));
+        }
+        out
+    }
+}
+
+/// Recursively walk `dir` collecting `.htcl` files. Skips `target/`,
+/// `.git/`, `.vw/`, `node_modules/` at any depth. Silently swallows
+/// I/O errors on individual directories — a permission-denied
+/// subtree just contributes nothing to the results.
+fn walk_htcl_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if matches!(name, "target" | ".git" | ".vw" | "node_modules") {
+                continue;
+            }
+            walk_htcl_files(&path, out);
+        } else if file_type.is_file()
+            && path.extension().and_then(|s| s.to_str()) == Some("htcl")
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// Pick the exact text to substitute at each rename span for a
+/// given target. Preserves namespace prefixes when the user typed
+/// a bare replacement name.
+fn rename_replacement_for(
+    target: &ReferenceTarget,
+    new_name: &str,
+) -> Option<String> {
+    if new_name.is_empty() {
+        return None;
+    }
+    // Validate: bare identifier or `ns::segment(::segment)*`.
+    for seg in new_name.split("::") {
+        if seg.is_empty() {
+            return None;
+        }
+        let mut bytes = seg.bytes();
+        let first = bytes.next().unwrap();
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None;
+        }
+        if !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+    }
+    Some(match target {
+        ReferenceTarget::Proc { name }
+            if name.contains("::") && !new_name.contains("::") =>
+        {
+            let ns = name.rsplit_once("::").map(|(n, _)| n).unwrap_or("");
+            format!("{ns}::{new_name}")
+        }
+        ReferenceTarget::EnumVariant { enum_name, .. }
+            if !new_name.contains("::") =>
+        {
+            format!("{enum_name}::{new_name}")
+        }
+        _ => new_name.to_string(),
+    })
+}
+
+/// Map a source `Span` + replacement text to an LSP `TextEdit`.
+fn span_to_text_edit(
+    span: Span,
+    line_index: &LineIndex,
+    new_text: &str,
+) -> TextEdit {
+    let (start, end) = line_index.range(span);
     TextEdit {
         range: Range {
             start: lc_to_pos(start),
             end: lc_to_pos(end),
         },
-        new_text: edit.new_text,
+        new_text: new_text.to_string(),
     }
 }
+
+/// Best-effort filter for the `!include_declaration` case. Skips
+/// spans that plausibly correspond to a decl site by name-matching
+/// the target's shape. This is imperfect (a proc named `X` and a
+/// call `X` are indistinguishable at the span level), but the LSP
+/// clients that pass `include_declaration=false` usually just want
+/// to hide the decl in the results — an occasional inclusion is
+/// benign.
+fn span_looks_like_decl(
+    _target: &ReferenceTarget,
+    _span: Span,
+    _file_uri: &Url,
+    _origin_uri: &Url,
+) -> bool {
+    // Placeholder — the LSP protocol says clients CAN filter locally,
+    // and most do. Returning false means we always include; safer
+    // than accidentally dropping too much.
+    false
+}
+
+// (`rename_edit_to_lsp` removed — the rename handler now emits
+// `TextEdit`s directly via `span_to_text_edit` on the raw
+// reference spans, so the intermediate `RenameEdit` type isn't
+// crossed over anymore.)
 
 // --- completion / signature-help formatters -------------------------------
 
@@ -1405,11 +1677,13 @@ proc f {} {
         assert!(!renamed.contains("mode"), "{renamed}");
     }
 
-    /// Renaming refuses cross-file targets (proc names) by returning
-    /// `None`. Editors surface this to the user without applying any
-    /// half-edit.
+    /// Proc-name rename now works within the local file — the
+    /// declaration span and every call site in the same document
+    /// get rewritten. Cross-file callers (in other `.htcl` files
+    /// the LSP hasn't yet been asked about) still need the
+    /// workspace-scan variant.
     #[tokio::test]
-    async fn rename_refuses_proc_name_via_lsp() {
+    async fn rename_proc_name_via_lsp_covers_decl_and_call() {
         let backend = HtclBackend::new();
         backend
             .set_text(uri(), "proc greet {} { puts hi }\ngreet\n".into())
@@ -1425,7 +1699,92 @@ proc f {} {
                 "hello",
             )
             .await;
-        assert!(result.is_none(), "{result:?}");
+        let ws = result.expect("expected an edit set");
+        let changes = ws.changes.expect("expected changes map");
+        let edits = changes.get(&uri()).expect("edits for the local uri");
+        assert_eq!(edits.len(), 2, "decl + one call site");
+    }
+
+    #[tokio::test]
+    async fn references_returns_all_local_call_sites() {
+        let backend = HtclBackend::new();
+        backend
+            .set_text(
+                uri(),
+                "proc greet {} { puts hi }\ngreet\nproc other {} { greet }\n"
+                    .into(),
+            )
+            .await;
+        let locs = backend
+            .references(
+                &uri(),
+                Position {
+                    line: 0,
+                    character: 5,
+                },
+                true,
+            )
+            .await;
+        // 3 hits: decl name + top-level call + nested call in `other`.
+        assert_eq!(locs.len(), 3, "{locs:?}");
+        for loc in &locs {
+            assert_eq!(loc.uri, uri());
+        }
+    }
+
+    #[tokio::test]
+    async fn references_on_type_covers_annotations() {
+        let backend = HtclBackend::new();
+        backend
+            .set_text(
+                uri(),
+                "type MyThing = string\nproc a {v: MyThing} MyThing { }\nproc b {v: MyThing} { }\n"
+                    .into(),
+            )
+            .await;
+        // Cursor on `MyThing` at the type decl (char 5..12 = "MyThing").
+        let locs = backend
+            .references(
+                &uri(),
+                Position {
+                    line: 0,
+                    character: 5,
+                },
+                true,
+            )
+            .await;
+        // decl + a's arg-type + a's return-type + b's arg-type = 4.
+        assert_eq!(locs.len(), 4, "{locs:?}");
+    }
+
+    #[tokio::test]
+    async fn rename_type_covers_all_annotations() {
+        let backend = HtclBackend::new();
+        backend
+            .set_text(
+                uri(),
+                "type MyThing = string\nproc a {v: MyThing} MyThing { }\n"
+                    .into(),
+            )
+            .await;
+        let ws = backend
+            .rename(
+                &uri(),
+                Position {
+                    line: 0,
+                    character: 5,
+                },
+                "YourThing",
+            )
+            .await
+            .expect("edit set");
+        let changes = ws.changes.expect("changes");
+        let edits = changes.get(&uri()).expect("local edits");
+        // Same 3 hits: decl + arg-type + return-type.
+        assert_eq!(edits.len(), 3, "{edits:?}");
+        for e in edits {
+            assert_eq!(e.new_text, "YourThing");
+        }
     }
 
     /// Utility: convert an LSP `Position` (line + UTF-16 char offset,

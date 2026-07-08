@@ -201,6 +201,7 @@ impl LanguageServer for Analyzer {
                     work_done_progress_options: Default::default(),
                 }),
                 rename_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -389,6 +390,26 @@ impl LanguageServer for Analyzer {
             return Ok(None);
         };
         Ok(backend.rename(&uri, position, &new_name).await)
+    }
+
+    async fn references(
+        &self,
+        params: ReferenceParams,
+    ) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri.clone();
+        let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+        let Some(backend) = self.backend_for(&uri) else {
+            return Ok(None);
+        };
+        let locs = backend
+            .references(&uri, position, include_declaration)
+            .await;
+        if locs.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(locs))
+        }
     }
 }
 
