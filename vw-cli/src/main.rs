@@ -18,6 +18,8 @@ use vw_lib::{
     VersionInfo, VhdlStandard,
 };
 
+mod parallel_load;
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CliVhdlStandard {
     #[value(name = "2008")]
@@ -899,10 +901,10 @@ fn discover_sibling_vivado_cmd(start: &Utf8Path) -> Option<Utf8PathBuf> {
 ///
 /// A [`CliObserver`] is attached so the loader's progress prints in
 /// real time as `Sourcing …` / `Checking …` lines.
-fn load_htcl_program(
+async fn load_htcl_program(
     entry: &Utf8Path,
 ) -> Result<vw_htcl::LoadedProgram, Box<dyn std::error::Error>> {
-    let entry_path = std::path::Path::new(entry.as_str());
+    let entry_path = std::path::Path::new(entry.as_str()).to_path_buf();
     let workspace_dir = find_workspace_dir(entry);
     let mut resolver = vw_htcl::Resolver::new();
     if let Some(ws) = workspace_dir.as_deref() {
@@ -915,225 +917,27 @@ fn load_htcl_program(
             }
         }
     }
-    // Snapshot dep-name → cache-path so the CLI observer can
-    // rewrite `./foo` src imports inside a dep as `@depname/foo`
-    // in the `Sourcing` / `Checking` lines. Without this the log
-    // says `Sourcing ./cpm_pcie1_axibar2pcie` and looks like a
-    // local file when it actually lives in the cpm dep.
     let dep_paths: Vec<(String, std::path::PathBuf)> = workspace_dir
         .as_deref()
         .and_then(|ws| vw_lib::transitive_dep_cache_paths(ws).ok())
         .map(|paths| paths.into_iter().collect())
         .unwrap_or_default();
-    let mut observer = CliObserver::new(dep_paths);
-    let result = vw_htcl::load_program_with_observer(
-        entry_path,
-        &resolver,
-        &mut observer,
+    let observer = std::sync::Arc::new(
+        parallel_load::MultiProgressObserver::new(dep_paths),
     );
-    // Commit the last live-updated status line + drop back to a
-    // fresh row so any subsequent output starts cleanly. Runs
-    // whether the load succeeded or errored (an error still
-    // leaves half of a `Sourcing …` line on screen otherwise).
+    let obs_for_load: std::sync::Arc<dyn parallel_load::ParallelObserver> =
+        observer.clone();
+    let result = parallel_load::load_parallel(
+        &entry_path,
+        std::sync::Arc::new(resolver),
+        obs_for_load,
+        std::collections::HashMap::new(),
+    )
+    .await;
     observer.finish();
     Ok(result?)
 }
 
-/// Prints Cargo-style `Sourcing …` and `Checking …` lines as the
-/// loader walks the dependency tree.
-struct CliObserver {
-    /// `(depname, cache-directory-abs-path)` pairs. When the
-    /// resolved import path lies inside one of these directories,
-    /// the emit path renders as `@<depname>/<relative>` instead
-    /// of the raw `src` operand — so the user can see at a
-    /// glance which files came from which dep. Empty when the
-    /// entry isn't inside a workspace.
-    dep_paths: Vec<(String, std::path::PathBuf)>,
-    /// Cached at construction: whether stdout is a real terminal.
-    /// TTYs get carriage-return-based in-place updates so a large
-    /// dep tree with hundreds of files scrolls under a single
-    /// live status line instead of flooding the scrollback.
-    /// Piped / redirected stdout falls back to
-    /// one-line-per-event so `vw run > log.txt` keeps sensible
-    /// content.
-    stdout_is_tty: bool,
-    /// True when the most recent emit wrote a non-newline-
-    /// terminated status line to a TTY. Tells [`finish`] to
-    /// close out the row with a `\n` on load exit.
-    live: bool,
-    /// Dep names (`@vivado-cmd`, `@cpm5`, …) seen in first-
-    /// encounter order. On TTY-mode `finish` we replace the
-    /// live status row with one `Checking <dep>` line per entry,
-    /// so the user retains a compact scrollback record of what
-    /// actually got loaded — the per-file chatter flies by
-    /// during the load but doesn't stay behind.
-    seen_deps: Vec<String>,
-    /// Fast-membership guard for [`seen_deps`] so we only push
-    /// each dep once even when a hundred of its sub-files stream
-    /// through `on_source`/`on_parsed`.
-    seen_deps_set: std::collections::HashSet<String>,
-    /// Label emitted for the entry file (via `on_parsed` with
-    /// `raw = None`). Included in the summary row so the user
-    /// sees the top-level `Checking prime` as the last committed
-    /// line.
-    entry_label: Option<String>,
-}
-
-impl CliObserver {
-    fn new(dep_paths: Vec<(String, std::path::PathBuf)>) -> Self {
-        use std::io::IsTerminal;
-        Self {
-            dep_paths,
-            stdout_is_tty: std::io::stdout().is_terminal(),
-            live: false,
-            seen_deps: Vec::new(),
-            seen_deps_set: std::collections::HashSet::new(),
-            entry_label: None,
-        }
-    }
-
-    /// If `label` names a file inside a dep (`@name/...`),
-    /// record `@name` in [`seen_deps`] on first sight. Local
-    /// workspace files (no `@` prefix) are recorded as the
-    /// entry label instead when they come from the entry-file
-    /// hook.
-    fn track(&mut self, label: &str) {
-        if let Some(rest) = label.strip_prefix('@') {
-            let name = match rest.split_once('/') {
-                Some((n, _)) => n,
-                None => rest,
-            };
-            let key = format!("@{name}");
-            if self.seen_deps_set.insert(key.clone()) {
-                self.seen_deps.push(key);
-            }
-        }
-    }
-
-    /// Emit a `Verb Label` status line. On a TTY, overwrites the
-    /// previous status in place using `\r` + ANSI erase-to-end
-    /// (`\x1b[K`) — the whole load's Sourcing / Checking chatter
-    /// stays confined to a single visual row. On a non-TTY,
-    /// writes a full newline-terminated line as before.
-    fn emit_status(&mut self, verb: &str, label: &str) {
-        use std::io::Write;
-        let styled_verb = verb.bright_green().bold();
-        let mut stdout = std::io::stdout().lock();
-        if self.stdout_is_tty {
-            // `\r` moves the cursor to column 0; `\x1b[K` clears
-            // from cursor to end of line so a shorter label
-            // doesn't leave tail bytes from the previous longer
-            // one. Then write the new status without a trailing
-            // newline. Flush so the terminal renders the update
-            // immediately — Sourcing/Checking events fire faster
-            // than a line-buffered flush would.
-            let _ = write!(stdout, "\r\x1b[K{:>12} {}", styled_verb, label);
-            let _ = stdout.flush();
-            self.live = true;
-        } else {
-            let _ = writeln!(stdout, "{:>12} {}", styled_verb, label);
-        }
-    }
-
-    /// Terminate the live status row (TTY mode only) and replace
-    /// it with a compact `Checking <dep>` summary — one line per
-    /// dep encountered, ending with `Checking <entry>`. This is
-    /// what the user actually keeps in scrollback: the per-file
-    /// events flew by during the load, but they retain a record
-    /// of which top-level deps and which entry file were loaded.
-    ///
-    /// No-op in non-TTY (piped) mode — every event was already
-    /// committed on its own line, so the log has full detail.
-    fn finish(&mut self) {
-        use std::io::Write;
-        if !self.live {
-            return;
-        }
-        let mut stdout = std::io::stdout().lock();
-        // Clear the live status row before printing the summary.
-        let _ = write!(stdout, "\r\x1b[K");
-        let checking = "Checking".bright_green().bold();
-        for dep in &self.seen_deps {
-            let _ = writeln!(stdout, "{:>12} {}", checking, dep);
-        }
-        if let Some(entry) = &self.entry_label {
-            let _ = writeln!(stdout, "{:>12} {}", checking, entry);
-        }
-        self.live = false;
-    }
-}
-
-impl vw_htcl::LoadObserver for CliObserver {
-    fn on_source(&mut self, raw: &str, resolved: &std::path::Path) {
-        let label = self.friendly_import(raw, Some(resolved));
-        self.track(&label);
-        self.emit_status("Sourcing", &label);
-    }
-    fn on_parsed(&mut self, file: &std::path::Path, raw: Option<&str>) {
-        let label = self.friendly_import(raw.unwrap_or(""), Some(file));
-        self.track(&label);
-        if raw.is_none() {
-            // Entry file — captured for the summary emitted by
-            // [`finish`]. Rare-but-legal case: the entry itself
-            // lives inside a dep (opening a file from a dep-cache
-            // directory in the editor); we still want to show it.
-            self.entry_label = Some(label.clone());
-        }
-        self.emit_status("Checking", &label);
-    }
-}
-
-impl CliObserver {
-    /// Format a `src` operand for the CLI's `Sourcing / Checking`
-    /// output. Preference order:
-    ///
-    /// 1. If `resolved` lies inside a known dep's cache dir,
-    ///    render as `@<depname>/<relative-to-dep>` — the form
-    ///    that survives copy-paste into an `src` directive and
-    ///    tells the user which dep the file lives in.
-    /// 2. Otherwise if `raw` is present, strip its `@` sigil and
-    ///    `.htcl` suffix (the user wrote this operand).
-    /// 3. Otherwise (entry file, empty `raw`), the resolved
-    ///    file's stem.
-    fn friendly_import(
-        &self,
-        raw: &str,
-        resolved: Option<&std::path::Path>,
-    ) -> String {
-        if let Some(resolved) = resolved {
-            let canonical = resolved
-                .canonicalize()
-                .unwrap_or_else(|_| resolved.to_path_buf());
-            for (name, dep_path) in &self.dep_paths {
-                let dep_canonical = dep_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| dep_path.clone());
-                if let Ok(rel) = canonical.strip_prefix(&dep_canonical) {
-                    let rel_str = rel.display().to_string();
-                    let rel_str = rel_str.trim_end_matches(".htcl");
-                    return if rel_str.is_empty() {
-                        format!("@{name}")
-                    } else {
-                        format!("@{name}/{rel_str}")
-                    };
-                }
-            }
-        }
-        if !raw.is_empty() {
-            return raw
-                .trim_start_matches('@')
-                .trim_end_matches(".htcl")
-                .to_string();
-        }
-        resolved
-            .and_then(|p| p.file_stem())
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string()
-    }
-}
-
-/// Names of every dep the workspace (via `vw.toml`) resolves for
 /// `entry`. Used by `check_htcl` to pre-flight `src @<name>`
 /// imports and produce spanned diagnostics before the loader's
 /// hard-abort path fires. Returns an empty set when `entry` isn't
@@ -1227,7 +1031,7 @@ async fn check_htcl(
         }
     }
 
-    let program = load_htcl_program(file)?;
+    let program = load_htcl_program(file).await?;
     let parsed = vw_htcl::parse(&program.source);
     let validator_diags = vw_htcl::validate(&parsed.document, &program.source);
 
@@ -1533,7 +1337,7 @@ async fn run_htcl(
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let program = load_htcl_program(file)?;
+    let program = load_htcl_program(file).await?;
     // Keep `program` alive — the stack-frame rewriting needs the
     // LoadedProgram for body-span resolution. We borrow `source`
     // from it instead of moving.

@@ -26,3 +26,6 @@ colored = "2.0"
 tokio.workspace = true
 camino.workspace = true
 tracing-subscriber.workspace = true
+indicatif.workspace = true
+petgraph.workspace = true
+futures.workspace = true
