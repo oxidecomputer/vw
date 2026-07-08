@@ -922,8 +922,17 @@ async fn load_htcl_program(
         .and_then(|ws| vw_lib::transitive_dep_cache_paths(ws).ok())
         .map(|paths| paths.into_iter().collect())
         .unwrap_or_default();
+    // Pick up the workspace name from `vw.toml` so the local
+    // (non-@dep) files' bar shows `Checking metroid` instead of
+    // `Checking workspace`. Falls back to the literal `workspace`
+    // when there's no vw.toml or no `name = "…"` field.
+    let workspace_label = workspace_dir
+        .as_deref()
+        .and_then(|ws| vw_lib::load_workspace_config(ws).ok())
+        .map(|cfg| cfg.workspace.name)
+        .unwrap_or_else(|| "workspace".to_string());
     let observer = std::sync::Arc::new(
-        parallel_load::MultiProgressObserver::new(dep_paths),
+        parallel_load::MultiProgressObserver::new(dep_paths, workspace_label),
     );
     let obs_for_load: std::sync::Arc<dyn parallel_load::ParallelObserver> =
         observer.clone();
@@ -1600,13 +1609,23 @@ async fn run_htcl(
         // `stmt_origin` — see [`vw_repl::wrap_tcl_with_origin_marker`]
         // for the race this fixes.
         let tcl = vw_repl::wrap_tcl_with_origin_marker(&tcl, &stmt_origin);
+        // `set VAR <expr>` is a binding — the user asked to name a
+        // value, not to display it. Vivado's Tcl returns the
+        // bound value as the eval result, and echoing that would
+        // leak the raw internal form (e.g. `metroid` from
+        // `set proj [create_project … -name metroid]` in
+        // `project.htcl`). Suppress the result echo for set
+        // bindings so the batch path matches the REPL's
+        // `is_set_binding` policy (`vw-repl/src/app.rs:2437`).
+        let is_set_binding = matches!(cmd.kind, vw_htcl::CommandKind::Set);
         match backend.eval(&tcl).await {
             Ok(out) => {
                 // Puts output already streamed to stdout via the
                 // sink; `out.stdout` is empty here by contract. The
                 // eval's return value gets a newline only when it's
-                // not already empty.
-                if !out.value.is_empty() {
+                // not already empty AND the source command wasn't a
+                // set binding.
+                if !out.value.is_empty() && !is_set_binding {
                     println!("{}", out.value);
                 }
             }

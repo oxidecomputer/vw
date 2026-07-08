@@ -555,10 +555,19 @@ pub struct MultiProgressObserver {
     /// True when stdout is a real terminal. Bars only render
     /// when true; non-TTY falls back to plain `println!`.
     stdout_is_tty: bool,
+    /// Human-friendly label for the local workspace's bar. Picked
+    /// up from `vw.toml`'s `name = "…"` field when available, so
+    /// `Checking workspace` becomes `Checking metroid` for the
+    /// metroid workspace. Falls back to the literal `workspace`
+    /// when no name is configured.
+    workspace_label: String,
 }
 
 impl MultiProgressObserver {
-    pub fn new(dep_paths: Vec<(String, PathBuf)>) -> Self {
+    pub fn new(
+        dep_paths: Vec<(String, PathBuf)>,
+        workspace_label: String,
+    ) -> Self {
         use std::io::IsTerminal;
         let multi = MultiProgress::new();
         Self {
@@ -566,6 +575,7 @@ impl MultiProgressObserver {
             bars: Mutex::new(Vec::new()),
             dep_paths,
             stdout_is_tty: std::io::stdout().is_terminal(),
+            workspace_label,
         }
     }
 
@@ -608,8 +618,9 @@ impl MultiProgressObserver {
     }
 
     /// Bucket a `label` into a top-level dep name for bar routing.
-    /// `@foo/bar` → `@foo`; `foo/bar` or `foo` → `workspace`.
-    fn bucket_of(label: &str) -> String {
+    /// `@foo/bar` → `@foo`; `foo/bar` or `foo` → the workspace
+    /// label (typically the `vw.toml` name).
+    fn bucket_of(&self, label: &str) -> String {
         if let Some(rest) = label.strip_prefix('@') {
             let name = match rest.split_once('/') {
                 Some((n, _)) => n,
@@ -617,7 +628,7 @@ impl MultiProgressObserver {
             };
             format!("@{name}")
         } else {
-            "workspace".to_string()
+            self.workspace_label.clone()
         }
     }
 
@@ -647,7 +658,7 @@ impl MultiProgressObserver {
 impl ParallelObserver for MultiProgressObserver {
     fn on_source(&self, raw: &str, resolved: &Path) {
         let label = self.friendly_label(raw, Some(resolved));
-        let bucket = Self::bucket_of(&label);
+        let bucket = self.bucket_of(&label);
         if !self.stdout_is_tty {
             println!("{:>12} {label}", "Sourcing");
             return;
@@ -659,7 +670,7 @@ impl ParallelObserver for MultiProgressObserver {
 
     fn on_parsed(&self, file: &Path, raw: Option<&str>) {
         let label = self.friendly_label(raw.unwrap_or(""), Some(file));
-        let bucket = Self::bucket_of(&label);
+        let bucket = self.bucket_of(&label);
         if !self.stdout_is_tty {
             println!("{:>12} {label}", "Checking");
             return;
@@ -690,12 +701,20 @@ impl MultiProgressObserver {
         if !self.stdout_is_tty {
             return;
         }
-        let guard = self.bars.lock().unwrap();
-        for (name, bar) in guard.iter() {
-            if !bar.is_finished() {
-                bar.set_prefix("Checking");
-                bar.finish_with_message(name.clone());
+        {
+            let guard = self.bars.lock().unwrap();
+            for (name, bar) in guard.iter() {
+                if !bar.is_finished() {
+                    bar.set_prefix("Checking");
+                    bar.finish_with_message(name.clone());
+                }
             }
         }
+        // Force a fresh row for any subsequent stdout output. Without
+        // this, `indicatif` leaves the cursor at the end of the last
+        // rendered bar row and downstream stdout writes (e.g. the
+        // vw-run Vivado stream's first `puts` result) land on the
+        // same line as `Checking @<last-dep>`.
+        println!();
     }
 }
