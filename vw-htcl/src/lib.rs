@@ -57,13 +57,15 @@ pub use goto::definition_at;
 pub use hover::{hover_at, HoverTarget};
 pub use loader::{
     load as load_program, load_with_observer as load_program_with_observer,
-    ImportEdge, LoadError, LoadObserver, LoadedFile, LoadedProgram,
-    SourceRegion,
+    load_with_preloaded as load_program_with_preloaded, ImportEdge, LoadError,
+    LoadObserver, LoadedFile, LoadedProgram, SourceRegion,
 };
 pub use lower::{
     extern_rename_prelude, is_extern_call, lower_command,
-    lower_command_with_putr, lower_proc_decl_with_name, rewrite_externs,
-    signature_table, ExternRewrite, SignatureTable, EXTERN_PREFIX,
+    lower_command_with_putr, lower_command_with_putr_and_index,
+    lower_proc_decl_with_name, lower_proc_decl_with_name_and_index,
+    rewrite_externs, signature_table, ExternRewrite, SignatureTable,
+    EXTERN_PREFIX,
 };
 pub use overload::emit_dispatcher;
 pub use rename::{rename_at, RenameEdit};

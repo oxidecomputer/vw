@@ -26,6 +26,7 @@ use crate::ast::{
     Command, CommandKind, Document, NamespaceEval, Proc, ProcSignature, Stmt,
     Word, WordForm, WordPart,
 };
+use crate::line_index::LineIndex;
 
 pub type SignatureTable<'a> = HashMap<String, &'a ProcSignature>;
 
@@ -91,12 +92,27 @@ fn collect_into<'a>(
 /// backend. See [`lower_command_with_putr`] for the variant that
 /// takes a `putr` rewrite map; callers with no putr calls (or who
 /// don't care) can invoke this simpler form.
+///
+/// Builds a fresh [`LineIndex`] every call — fine for one-off
+/// uses (tests, single-statement lowering) but pathological when
+/// looped over a document with thousands of top-level procs. Bulk
+/// callers should build the index once and use
+/// [`lower_command_with_putr_and_index`] to skip the per-call
+/// rebuild — a 19MB flat document has 1000× the newline-scan
+/// cost of a single-statement fragment.
 pub fn lower_command(
     cmd: &Command,
     source: &str,
     table: &SignatureTable<'_>,
 ) -> String {
-    lower_command_with_putr(cmd, source, table, empty_putr_map())
+    let line_index = LineIndex::new(source);
+    lower_command_with_putr_and_index(
+        cmd,
+        source,
+        table,
+        empty_putr_map(),
+        &line_index,
+    )
 }
 
 /// Lower one top-level command, consulting `putr_map` first: when
@@ -114,6 +130,25 @@ pub fn lower_command_with_putr(
     table: &SignatureTable<'_>,
     putr_map: &crate::putr::RewriteMap,
 ) -> String {
+    let line_index = LineIndex::new(source);
+    lower_command_with_putr_and_index(cmd, source, table, putr_map, &line_index)
+}
+
+/// Bulk-friendly variant of [`lower_command_with_putr`] that
+/// accepts a pre-built [`LineIndex`] instead of constructing one
+/// per call. Callers looping over thousands of top-level
+/// statements MUST use this form — every `lower_proc_decl`
+/// consult needs line-of-offset lookups, and rebuilding the
+/// index over a 19MB flat source per proc was the O(procs ×
+/// source_len) accidental quadratic that made auto-loading a
+/// large `.htcl` take minutes.
+pub fn lower_command_with_putr_and_index(
+    cmd: &Command,
+    source: &str,
+    table: &SignatureTable<'_>,
+    putr_map: &crate::putr::RewriteMap,
+    line_index: &LineIndex,
+) -> String {
     // Fast path: if this command IS a putr rewrite target, emit
     // the replacement verbatim. No further descent needed — the
     // replacement is a complete Tcl expression.
@@ -122,10 +157,10 @@ pub fn lower_command_with_putr(
     }
     match &cmd.kind {
         CommandKind::Proc(proc) => {
-            lower_proc_decl(proc, source, table, putr_map)
+            lower_proc_decl(proc, source, table, putr_map, line_index)
         }
         CommandKind::NamespaceEval(ns) => {
-            lower_namespace_eval(ns, source, table, putr_map)
+            lower_namespace_eval(ns, source, table, putr_map, line_index)
         }
         // `src` is a module import; by the time we lower we expect the
         // [`crate::loader`] flatten pass to have already inlined every
@@ -160,7 +195,7 @@ pub fn lower_command_with_putr(
             // anywhere — top-level, inside a proc body, inside a
             // `[ ... ]`, inside an `eval` — work uniformly without
             // the lowerer needing to see every call site.
-            lower_words(&cmd.words, source, table, putr_map)
+            lower_words(&cmd.words, source, table, putr_map, line_index)
         }
     }
 }
@@ -175,12 +210,15 @@ fn lower_namespace_eval(
     source: &str,
     table: &SignatureTable<'_>,
     putr_map: &crate::putr::RewriteMap,
+    line_index: &LineIndex,
 ) -> String {
     let name = ns.name.as_deref().unwrap_or("");
     let mut body = String::new();
     for stmt in &ns.body {
         let Stmt::Command(cmd) = stmt else { continue };
-        let line = lower_command_with_putr(cmd, source, table, putr_map);
+        let line = lower_command_with_putr_and_index(
+            cmd, source, table, putr_map, line_index,
+        );
         if !line.is_empty() {
             body.push_str(&line);
             body.push('\n');
@@ -217,8 +255,11 @@ fn lower_proc_decl(
     source: &str,
     table: &SignatureTable<'_>,
     putr_map: &crate::putr::RewriteMap,
+    line_index: &LineIndex,
 ) -> String {
-    lower_proc_decl_with_name(proc, source, table, None, putr_map)
+    lower_proc_decl_with_name_and_index(
+        proc, source, table, None, putr_map, line_index,
+    )
 }
 
 /// Like [`lower_proc_decl`] but uses `name_override` as the emitted
@@ -234,6 +275,29 @@ pub fn lower_proc_decl_with_name(
     table: &SignatureTable<'_>,
     name_override: Option<&str>,
     putr_map: &crate::putr::RewriteMap,
+) -> String {
+    let line_index = LineIndex::new(source);
+    lower_proc_decl_with_name_and_index(
+        proc,
+        source,
+        table,
+        name_override,
+        putr_map,
+        &line_index,
+    )
+}
+
+/// Bulk-friendly variant: takes a pre-built [`LineIndex`] instead
+/// of constructing one over the entire source per call. The old
+/// unindexed form was the O(procs × source_len) hotspot that made
+/// `prepare` for a 19MB flat document take ~85s.
+pub fn lower_proc_decl_with_name_and_index(
+    proc: &Proc,
+    source: &str,
+    table: &SignatureTable<'_>,
+    name_override: Option<&str>,
+    putr_map: &crate::putr::RewriteMap,
+    line_index: &LineIndex,
 ) -> String {
     let name = name_override.or(proc.name.as_deref()).unwrap_or("");
     // Re-emit the body by walking its parsed statements rather
@@ -255,8 +319,7 @@ pub fn lower_proc_decl_with_name(
     // line N == `body_start_file_line + N - 1`, which is what
     // the REPL's `ProcLocation::resolve_body_line` already
     // assumes.
-    let line_idx = crate::line_index::LineIndex::new(source);
-    let body_open_line = line_idx.position(proc.body_span.start).line; // 0-based
+    let body_open_line = line_index.position(proc.body_span.start).line; // 0-based
     let body = if proc.body.is_empty() {
         proc.body_span.slice(source).to_string()
     } else {
@@ -267,12 +330,14 @@ pub fn lower_proc_decl_with_name(
         let mut cur_line = body_open_line + 1;
         for stmt in &proc.body {
             let Stmt::Command(cmd) = stmt else { continue };
-            let stmt_line = line_idx.position(cmd.span.start).line;
+            let stmt_line = line_index.position(cmd.span.start).line;
             while cur_line < stmt_line {
                 out.push('\n');
                 cur_line += 1;
             }
-            let line = lower_command_with_putr(cmd, source, table, putr_map);
+            let line = lower_command_with_putr_and_index(
+                cmd, source, table, putr_map, line_index,
+            );
             if line.is_empty() {
                 continue;
             }
@@ -466,6 +531,7 @@ fn lower_words(
     source: &str,
     table: &SignatureTable<'_>,
     putr_map: &crate::putr::RewriteMap,
+    line_index: &LineIndex,
 ) -> String {
     // Preserve source-level adjacency between consecutive words.
     // The parser splits `{*}$var` into two AST words ({*} as a
@@ -483,7 +549,7 @@ fn lower_words(
                 out.push(' ');
             }
         }
-        out.push_str(&lower_word(w, source, table, putr_map));
+        out.push_str(&lower_word(w, source, table, putr_map, line_index));
     }
     out
 }
@@ -493,13 +559,20 @@ fn lower_word(
     source: &str,
     table: &SignatureTable<'_>,
     putr_map: &crate::putr::RewriteMap,
+    line_index: &LineIndex,
 ) -> String {
     match word.form {
         WordForm::Bare => {
-            lower_word_parts(&word.parts, source, table, putr_map)
+            lower_word_parts(&word.parts, source, table, putr_map, line_index)
         }
         WordForm::Quoted => {
-            let inner = lower_word_parts(&word.parts, source, table, putr_map);
+            let inner = lower_word_parts(
+                &word.parts,
+                source,
+                table,
+                putr_map,
+                line_index,
+            );
             format!("\"{inner}\"")
         }
         WordForm::Braced => word.span.slice(source).to_string(),
@@ -511,6 +584,7 @@ fn lower_word_parts(
     source: &str,
     table: &SignatureTable<'_>,
     putr_map: &crate::putr::RewriteMap,
+    line_index: &LineIndex,
 ) -> String {
     let mut out = String::new();
     for part in parts {
@@ -528,9 +602,11 @@ fn lower_word_parts(
                 let lowered: Vec<String> = body
                     .iter()
                     .filter_map(|s| match s {
-                        Stmt::Command(c) => Some(lower_command_with_putr(
-                            c, source, table, putr_map,
-                        )),
+                        Stmt::Command(c) => {
+                            Some(lower_command_with_putr_and_index(
+                                c, source, table, putr_map, line_index,
+                            ))
+                        }
                         _ => None,
                     })
                     .filter(|s| !s.trim().is_empty())

@@ -183,7 +183,21 @@ pub struct App {
     /// history with Ctrl-P. Restored on Ctrl-N past the newest
     /// entry, so the draft they were typing isn't lost.
     history_draft: String,
-    session: Session,
+    /// Session state, shareable across threads so background
+    /// prepare tasks (`dispatch_eval_with_echo`) can hold a read
+    /// guard for the ~seconds-to-minutes of a large `src` import
+    /// while the main event loop's frequent lookups (Ctrl-P
+    /// history walk, tab-completion, signature-help refresh,
+    /// input-completeness check) grab their own concurrent read
+    /// guards without contention.
+    ///
+    /// `RwLock` — not `Mutex` — because the main thread's typing-
+    /// time reads MUST run in parallel with a long-running
+    /// background prepare's read. A single writer (`commit` on a
+    /// successful prepare) briefly acquires the write lock; that
+    /// happens on the main task after the prepare returns, so
+    /// there's no active reader to wait for.
+    session: std::sync::Arc<std::sync::RwLock<Session>>,
     scrollback: Vec<ScrollbackEntry>,
     scrollback_scroll: u16,
     /// Whether the terminal is currently capturing mouse events.
@@ -226,6 +240,12 @@ pub struct App {
     worker_state: WorkerState,
     worker_tx: mpsc::Sender<WorkerCmd>,
     eval_rx: mpsc::UnboundedReceiver<WorkerEvent>,
+    /// Sender-side of the worker-event channel, kept on App so
+    /// spawned background tasks (currently: `prepare` on a
+    /// blocking thread) can post their completion back to the
+    /// event loop without a separate channel. The receiver
+    /// (`eval_rx`) is drained inside the main select loop.
+    event_tx: mpsc::UnboundedSender<WorkerEvent>,
     /// Origins of every command we shipped to the worker in the
     /// current batch, in eval order, paired with an index for the
     /// next not-yet-acknowledged command. Lets the stream handler
@@ -311,6 +331,21 @@ enum WorkerEvent {
         last_in_batch: bool,
     },
     StartFailed(vw_eda::BackendError),
+    /// The background `prepare` (parse + validate + lower)
+    /// finished. `dispatch_eval_with_echo` spawns prepare on a
+    /// blocking thread so the event loop can render the input
+    /// echo + tick the timer while the (potentially minute-scale)
+    /// work runs. When this arrives, `handle_prepare_done` takes
+    /// over: surfaces warnings, commits or ships to the worker.
+    ///
+    /// `text` and `echo` are threaded through so the completion
+    /// handler has everything it needs without re-consulting the
+    /// input state (which may have moved on).
+    PrepareDone {
+        text: String,
+        echo: bool,
+        result: Result<crate::lower::Prepared, crate::lower::LowerError>,
+    },
 }
 
 pub async fn run(opts: ReplOptions) -> Result<(), ReplError> {
@@ -377,6 +412,10 @@ async fn run_inner(
     } else {
         None
     };
+    // Clone before moving into worker_task — App keeps its own
+    // handle so background prepare tasks can post PrepareDone
+    // events back onto the same channel the worker uses.
+    let event_tx_for_app = event_tx.clone();
     tokio::spawn(worker_task(
         worker_rx,
         event_tx,
@@ -385,7 +424,7 @@ async fn run_inner(
         info_with_stack,
     ));
 
-    let mut app = App::new(opts, worker_tx, eval_rx);
+    let mut app = App::new(opts, worker_tx, eval_rx, event_tx_for_app);
     if let Some(p) = verbose_log_path {
         app.push(
             ScrollbackKind::Notice,
@@ -482,6 +521,7 @@ impl App {
         opts: ReplOptions,
         worker_tx: mpsc::Sender<WorkerCmd>,
         eval_rx: mpsc::UnboundedReceiver<WorkerEvent>,
+        event_tx: mpsc::UnboundedSender<WorkerEvent>,
     ) -> Self {
         let mut input = TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
@@ -491,7 +531,9 @@ impl App {
             history: History::load_default(),
             history_cursor: None,
             history_draft: String::new(),
-            session: Session::new(),
+            session: std::sync::Arc::new(
+                std::sync::RwLock::new(Session::new()),
+            ),
             scrollback: Vec::new(),
             scrollback_scroll: 0,
             mouse_capture: true,
@@ -504,6 +546,7 @@ impl App {
             worker_state: WorkerState::Starting,
             worker_tx,
             eval_rx,
+            event_tx,
             pending_batch: None,
             pending_origins: Vec::new(),
             pending_return_types: Vec::new(),
@@ -585,7 +628,8 @@ impl App {
     /// to ship. Drives the input-area title and Enter behavior.
     pub fn input_is_complete(&self) -> bool {
         let buf = self.current_input_text();
-        is_buffer_complete(&buf, &self.session.signature_table())
+        let session = self.session.read().unwrap();
+        is_buffer_complete(&buf, &session.signature_table())
     }
 
     fn current_input_text(&self) -> String {
@@ -665,7 +709,8 @@ impl App {
         // existing data instead of an MB-scale reparse + walk.
         let parsed = vw_htcl::parser::parse(&input);
         let cmd_line = vw_htcl::cmdline::analyze(&input, offset);
-        let session_sigs = self.session.signature_table();
+        let session_guard = self.session.read().unwrap();
+        let session_sigs = session_guard.signature_table();
         let input_sigs = vw_htcl::signature_table(&parsed.document);
         // The currently-shipping batch hasn't committed yet — session
         // commit only happens on EvalDone(last_in_batch=true). During
@@ -1045,7 +1090,13 @@ impl App {
         // comments require walking the source document (kept on the
         // Command, not the ProcSignature).
         let parsed = vw_htcl::parser::parse(&input);
-        let session_sigs = self.session.signature_table();
+        // Arc-clone the session handle first — this drops the
+        // borrow on `self` immediately, so we can call `self.push` /
+        // `self.dismiss_signature_help` etc. later without the
+        // read guard blocking the mutable borrow of self.
+        let session = std::sync::Arc::clone(&self.session);
+        let session_guard = session.read().unwrap();
+        let session_sigs = session_guard.signature_table();
         let input_sigs = vw_htcl::signature_table(&parsed.document);
         let pending_doc = self.pending_batch.as_ref().map(|b| &b.document);
         let pending_sigs = pending_doc
@@ -1073,7 +1124,7 @@ impl App {
             }
         } else {
             // Walk session batches in reverse (newest first).
-            for batch in self.session.batches_for_doc_search() {
+            for batch in session_guard.batches_for_doc_search() {
                 if let Some(d) = lookup_proc_doc_comments(&batch.document, name)
                 {
                     doc_comments = d;
@@ -1135,9 +1186,10 @@ impl App {
     fn trigger_symbol_search(&mut self) {
         let input = self.current_input_text();
         let parsed = vw_htcl::parser::parse(&input);
+        let session_guard = self.session.read().unwrap();
         let index =
             std::sync::Arc::new(crate::symbol_index::SymbolIndex::build(
-                &self.session,
+                &session_guard,
                 self.pending_batch.as_ref(),
                 Some(&parsed.document),
             ));
@@ -1212,7 +1264,9 @@ impl App {
         let Some(name) = ident_under_cursor(&input, offset) else {
             return;
         };
-        let session_sigs = self.session.signature_table();
+        let session = std::sync::Arc::clone(&self.session);
+        let session_guard = session.read().unwrap();
+        let session_sigs = session_guard.signature_table();
         let pending_doc = self.pending_batch.as_ref().map(|b| &b.document);
         let pending_sigs = pending_doc
             .map(|d| vw_htcl::signature_table(d))
@@ -1234,7 +1288,7 @@ impl App {
                 doc_comments = d;
             }
         } else {
-            for batch in self.session.batches_for_doc_search() {
+            for batch in session_guard.batches_for_doc_search() {
                 if let Some(d) = lookup_proc_doc_comments(&batch.document, name)
                 {
                     doc_comments = d;
@@ -1774,7 +1828,10 @@ impl App {
         if trimmed.is_empty() {
             return;
         }
-        if !is_buffer_complete(&text, &self.session.signature_table()) {
+        if !is_buffer_complete(
+            &text,
+            &self.session.read().unwrap().signature_table(),
+        ) {
             self.input.insert_newline();
             return;
         }
@@ -1802,9 +1859,10 @@ impl App {
     }
 
     fn resolve_stack_frames(&self, msg: &str) -> String {
+        let session_guard = self.session.read().unwrap();
         resolve_stack_frames(
             msg,
-            &self.session,
+            &session_guard,
             self.pending_batch.as_ref(),
             self.input_file_for_resolve(),
         )
@@ -1881,19 +1939,86 @@ impl App {
             );
         }
 
-        // Lower htcl → Tcl through the same loader / signature-
-        // table / call-site-rewrite pipeline `vw run` uses, against
-        // the workspace whose `vw.toml` lives at or above the cwd.
-        // A lowering failure (unknown dep, parse error in an
-        // imported file, etc.) never reaches Vivado.
+        // Lower htcl → Tcl on a blocking thread so the event
+        // loop can render the input echo + tick the per-input
+        // timer during the (potentially minute-scale) parse +
+        // validate + lower work. `prepare` is fully synchronous
+        // CPU + I/O; spawn_blocking is the right primitive.
+        //
+        // The main task returns immediately after spawning —
+        // `handle_worker_event` picks up `WorkerEvent::PrepareDone`
+        // when the background thread finishes, and continues the
+        // dispatch pipeline from there.
+        // Tell the user we're chewing on it. Auto-load of a big
+        // htcl tree can burn tens of seconds in parse+validate;
+        // without a visible sentinel, the REPL looks frozen even
+        // though the event loop is happily redrawing (there's
+        // just nothing new to show yet).
+        self.push(
+            ScrollbackKind::Notice,
+            "preparing… (parsing + validating imports)".into(),
+        );
+
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let lowered = match crate::lower::prepare(&text, &cwd, &self.session) {
+        let session = std::sync::Arc::clone(&self.session);
+        let event_tx = self.event_tx.clone();
+        let text_moved = text;
+        tokio::task::spawn_blocking(move || {
+            // Catch panics on the blocking thread so a bug in
+            // prepare surfaces as an ERROR row rather than a
+            // silent stall. Without this the JoinHandle we drop
+            // absorbs the panic and the UI sits waiting forever
+            // for a PrepareDone that will never come.
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let session_guard = session.read().unwrap();
+                    crate::lower::prepare(&text_moved, &cwd, &session_guard)
+                }));
+            match result {
+                Ok(r) => {
+                    let _ = event_tx.send(WorkerEvent::PrepareDone {
+                        text: text_moved,
+                        echo,
+                        result: r,
+                    });
+                }
+                Err(payload) => {
+                    // Turn the panic message into a LowerError so
+                    // the existing PrepareDone/handle_prepare_done
+                    // path renders it as an ERROR row.
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic in prepare".to_string()
+                    };
+                    let _ = event_tx.send(WorkerEvent::PrepareDone {
+                        text: text_moved,
+                        echo,
+                        result: Err(crate::lower::LowerError::Parse(format!(
+                            "prepare panicked: {msg}",
+                        ))),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Continuation of `dispatch_eval_with_echo` — receives the
+    /// completed `Prepared` (or error) from the background prepare
+    /// task and finishes the dispatch pipeline: surfaces warnings,
+    /// commits pure-`src` imports directly, otherwise builds the
+    /// per-input timer boundaries and ships commands to the worker.
+    async fn handle_prepare_done(
+        &mut self,
+        _text: String,
+        echo: bool,
+        result: Result<crate::lower::Prepared, crate::lower::LowerError>,
+    ) {
+        let lowered = match result {
             Ok(l) => l,
             Err(e) => {
-                // The user cares "did my input run or not" — the
-                // fact that this came back from the lowering
-                // pipeline (vs. the Vivado worker) is internal
-                // accounting. Just say ERROR.
                 self.push(ScrollbackKind::Error, format!("ERROR: {e}"));
                 return;
             }
@@ -1914,8 +2039,11 @@ impl App {
             // Pure `src` import or comments-only input. Commit the
             // parsed batch to the session anyway so future
             // analyzer queries see the imported procs.
-            self.session.commit(lowered.batch);
+            self.session.write().unwrap().commit(lowered.batch);
             self.push(ScrollbackKind::Notice, "(no Tcl to evaluate)".into());
+            // The per-input timer was ticking through prepare;
+            // freeze it now — this batch has nothing to eval.
+            self.mark_inputs_completed();
             return;
         }
 
@@ -2026,8 +2154,10 @@ impl App {
                 // so the totals stay consistent across surfaces.
                 let parsed_input =
                     vw_htcl::parser::parse(&self.current_input_text());
+                let session = std::sync::Arc::clone(&self.session);
+                let session_guard = session.read().unwrap();
                 let index = crate::symbol_index::SymbolIndex::build(
-                    &self.session,
+                    &session_guard,
                     self.pending_batch.as_ref(),
                     Some(&parsed_input.document),
                 );
@@ -2141,6 +2271,9 @@ impl App {
                     ScrollbackKind::Error,
                     format!("vivado failed to start: {e}"),
                 );
+            }
+            WorkerEvent::PrepareDone { text, echo, result } => {
+                self.handle_prepare_done(text, echo, result).await;
             }
             WorkerEvent::Stream { kind, data } => {
                 let scrollback_kind = match kind {
@@ -2294,7 +2427,7 @@ impl App {
                                 self.push(ScrollbackKind::Result, text);
                             }
                             if let Some(batch) = self.pending_batch.take() {
-                                self.session.commit(batch);
+                                self.session.write().unwrap().commit(batch);
                             }
                             self.worker_state = WorkerState::Ready;
                             // Freeze per-input timers at their
@@ -2324,7 +2457,7 @@ impl App {
                         // partial or wrong; that's a separate
                         // concern from what the analyzer sees.
                         if let Some(batch) = self.pending_batch.take() {
-                            self.session.commit(batch);
+                            self.session.write().unwrap().commit(batch);
                         }
                         // Failed evals also freeze their per-input
                         // timer — otherwise the live counter would
@@ -2690,6 +2823,7 @@ fn render_eval_error(
         }
     };
     if let Some(info) = info.as_deref() {
+        let session_guard = app.session.read().unwrap();
         for tcl_frame in parse_tcl_proc_frames(info) {
             // Check the in-flight batch first (the lowering that
             // just ran), then fall back to prior session batches.
@@ -2700,7 +2834,7 @@ fn render_eval_error(
                 .pending_batch
                 .as_ref()
                 .and_then(|b| b.procs.get(&tcl_frame.proc))
-                .or_else(|| app.session.lookup_proc(&tcl_frame.proc));
+                .or_else(|| session_guard.lookup_proc(&tcl_frame.proc));
             let Some(loc) = loc else { continue };
             let Some((abs_line, content)) =
                 loc.resolve_body_line(tcl_frame.line)
@@ -3418,9 +3552,10 @@ WARNING: [port::plumb_if_pin-1] skipping foo
     async fn failed_eval_does_not_activate_next_boundary_before_error() {
         let (worker_tx, _worker_rx) =
             tokio::sync::mpsc::channel::<WorkerCmd>(8);
-        let (_event_tx, event_rx) =
+        let (event_tx, event_rx) =
             tokio::sync::mpsc::unbounded_channel::<WorkerEvent>();
-        let mut app = App::new(ReplOptions::default(), worker_tx, event_rx);
+        let mut app =
+            App::new(ReplOptions::default(), worker_tx, event_rx, event_tx);
 
         // Two-boundary batch. Only boundary 0's echo lives in
         // scrollback (deferred push means boundary 1 stays lazy

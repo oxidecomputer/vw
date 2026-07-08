@@ -213,10 +213,40 @@ pub fn load_with_observer(
     resolver: &Resolver,
     observer: &mut dyn LoadObserver,
 ) -> Result<LoadedProgram, LoadError> {
+    load_with_preloaded(entry, resolver, observer, &HashSet::new())
+}
+
+/// Same as [`load_with_observer`] but seeds the "already loaded"
+/// set with an externally-supplied path list.
+///
+/// The REPL uses this to skip re-parsing files a prior batch has
+/// already sourced. Without it, `src ip/gtm` in a REPL session
+/// that just `--load prime.htcl`-ed the same file re-parses
+/// **every** transitive import from scratch — the loader's own
+/// `self.loaded` cache is per-load-call, so cross-batch
+/// redundancy explodes into O(minutes) for a large tree.
+///
+/// A preloaded path returns `Ok(())` from `load_file` immediately
+/// — no read, no parse. The caller's document still records the
+/// `src` command as a syntactic marker; downstream analysis
+/// pulls the file's parsed content from prior-batch state.
+pub fn load_with_preloaded(
+    entry: &Path,
+    resolver: &Resolver,
+    observer: &mut dyn LoadObserver,
+    preloaded: &HashSet<PathBuf>,
+) -> Result<LoadedProgram, LoadError> {
     let entry = entry.canonicalize().unwrap_or_else(|_| entry.to_path_buf());
     let mut state = State {
         program: LoadedProgram::default(),
-        loaded: HashSet::new(),
+        // Seed `loaded` from the preloaded set — same semantics
+        // as "we already loaded this in a prior call": the
+        // `load_file` guard at the top short-circuits. The
+        // entry path itself is intentionally NOT auto-added
+        // even if it's in `preloaded`; the caller passed `entry`
+        // because they want its content walked (it's the batch's
+        // own scratch or the user's typed input).
+        loaded: preloaded.iter().filter(|p| *p != &entry).cloned().collect(),
         in_progress: HashSet::new(),
         resolver,
         observer,

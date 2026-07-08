@@ -188,10 +188,20 @@ pub fn prepare_with_observer(
     // up hundreds of thousands of lines of wrapper declarations.
     let scratch = ScratchFile::new(scratch_dir, input)?;
 
-    let program = vw_htcl::load_program_with_observer(
+    // Seed the loader's already-loaded set from prior batches so
+    // an incoming `src ip/gtm` (already sourced by an earlier
+    // batch) short-circuits at each preloaded file instead of
+    // re-parsing thousands of transitive imports. Every REPL
+    // submit prior to this change re-parsed the full transitive
+    // tree from scratch — 879 vivado-cmd files can dominate
+    // wall-clock for tens of seconds even though the analyzer
+    // already has all of it in prior session batches.
+    let preloaded = session.loaded_paths();
+    let program = vw_htcl::load_program_with_preloaded(
         &scratch.path,
         &resolver,
         observer,
+        &preloaded,
     )?;
     let parsed = vw_htcl::parse(&program.source);
 
@@ -461,19 +471,21 @@ pub fn prepare_with_observer(
                     let vw_htcl::CommandKind::Proc(proc) = &cmd.kind else {
                         unreachable!()
                     };
-                    vw_htcl::lower_proc_decl_with_name(
+                    vw_htcl::lower_proc_decl_with_name_and_index(
                         proc,
                         &program.source,
                         &table,
                         Some(&mangled),
                         &putr_map,
+                        &line_index,
                     )
                 }
-                None => vw_htcl::lower_command_with_putr(
+                None => vw_htcl::lower_command_with_putr_and_index(
                     cmd,
                     &program.source,
                     &table,
                     &putr_map,
+                    &line_index,
                 ),
             };
         let rewritten = vw_htcl::rewrite_externs(&lowered_raw);

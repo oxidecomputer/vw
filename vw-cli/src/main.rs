@@ -1570,16 +1570,21 @@ async fn run_htcl(
                 let vw_htcl::CommandKind::Proc(proc) = &cmd.kind else {
                     unreachable!()
                 };
-                vw_htcl::lower_proc_decl_with_name(
+                vw_htcl::lower_proc_decl_with_name_and_index(
                     proc,
                     &source,
                     &table,
                     Some(&mangled),
                     &putr_map,
+                    &merged_line_index,
                 )
             }
-            None => vw_htcl::lower_command_with_putr(
-                cmd, &source, &table, &putr_map,
+            None => vw_htcl::lower_command_with_putr_and_index(
+                cmd,
+                &source,
+                &table,
+                &putr_map,
+                &merged_line_index,
             ),
         };
         // Rewrite `extern::name` → `::name` (the textual pass the

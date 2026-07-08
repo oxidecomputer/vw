@@ -156,6 +156,28 @@ impl Session {
         types
     }
 
+    /// Union of file paths every committed batch has already
+    /// loaded. Passed to the next batch's loader as the
+    /// `preloaded` set so a `src` command that re-imports an
+    /// already-known file short-circuits instead of re-parsing
+    /// the whole transitive tree. Cross-batch this is a huge
+    /// win — a user typing `src ip/gtm` after
+    /// `--load prime.htcl` used to re-parse every transitive
+    /// dep (879 vivado-cmd files) from scratch; with this
+    /// threaded in, the loader recognizes them and returns
+    /// `Ok(())` immediately per file.
+    pub fn loaded_paths(
+        &self,
+    ) -> std::collections::HashSet<std::path::PathBuf> {
+        let mut out = std::collections::HashSet::new();
+        for batch in &self.batches {
+            for f in &batch.program.files {
+                out.insert(f.path.clone());
+            }
+        }
+        out
+    }
+
     /// Look up the most-recent proc location across every batch.
     /// Returns `None` when no batch has declared that proc — the
     /// error renderer's drill-down path silently skips such frames
