@@ -68,7 +68,11 @@ pub enum LoadError {
 /// file. The entry file's `on_parsed` fires last.
 pub trait LoadObserver {
     /// A `src <raw>` statement is about to be resolved and loaded.
-    fn on_source(&mut self, _raw: &str) {}
+    /// `resolved` is the on-disk path the loader is about to read,
+    /// so the observer can render dep-relative labels like
+    /// `@cpm/cpm_pcie1_axibar2pcie` even when `raw` itself is a
+    /// relative path (`./cpm_pcie1_axibar2pcie`) inside a dep.
+    fn on_source(&mut self, _raw: &str, _resolved: &Path) {}
     /// `file` finished parsing. `raw` is the original `src` text when
     /// this file was reached through an import (so callers can render
     /// `amd-htcl/cpm5` rather than the full filesystem path); `None`
@@ -391,7 +395,7 @@ impl State<'_, '_> {
             if !self.loaded.contains(&resolved)
                 && !self.in_progress.contains(&resolved)
             {
-                self.observer.on_source(raw);
+                self.observer.on_source(raw, &resolved);
             }
             self.load_file(
                 &resolved,
@@ -543,7 +547,7 @@ mod tests {
             events: Vec<String>,
         }
         impl LoadObserver for Recorder {
-            fn on_source(&mut self, raw: &str) {
+            fn on_source(&mut self, raw: &str, _resolved: &Path) {
                 self.events.push(format!("source {raw}"));
             }
             fn on_parsed(&mut self, file: &Path, raw: Option<&str>) {
@@ -593,7 +597,7 @@ mod tests {
             parse_c: usize,
         }
         impl LoadObserver for Counter {
-            fn on_source(&mut self, raw: &str) {
+            fn on_source(&mut self, raw: &str, _resolved: &Path) {
                 if raw == "c" {
                     self.source_c += 1;
                 }
