@@ -3,6 +3,7 @@
 Why HTCL
 
 1. Structured, documented discoverable interface.
+2. Catch common programming errors at analysis time.
 
 
 ## Notes
@@ -51,3 +52,21 @@ Why HTCL
       - This means analyzers can catch invalid issues, not the runtime after an
         hour of running.
       - It provides a natural surface for documenting the input alternatives.
+
+3. Catch common programming errors at analysis time
+  - Design build scripts can take an enormous amount of time to run.
+  - There are many things that can be caught by basic analysis and not having
+    to run them at all.
+    - Functions that declare a return type but:
+      - Return nothing
+      - Return the wrong type
+      - Don't _always_ return the right type
+    - Passing incorrect arguments types to procs
+    - Passing the wrong arguments to procs
+    - Calling undefined procs
+    - Refrencing undefined variables
+    - Sourcing dependencies that don't exist
+    - Supplying enumeration values as strings with typos
+  - Catching these hours into a built is a punch in the face that is completely
+    unnecessary and avoidable.
+  - HTCL catches all of these at analysis time in seconds.

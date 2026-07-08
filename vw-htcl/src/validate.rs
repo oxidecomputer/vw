@@ -466,6 +466,50 @@ pub(crate) fn validate_proc_returns(
         declared,
         diags,
     );
+
+    // Must-return: an annotated proc that isn't `unit` must
+    // reach a `return` on every path (or end with a
+    // last-expression whose type matches the annotation, per
+    // Tcl's implicit-return rule). Runs AFTER walk_returns so
+    // the per-return type errors surface first if both fire.
+    let is_unit = matches!(
+        declared,
+        crate::ast::TypeExpr::Named { name, .. } if name == "unit"
+    );
+    if !is_unit {
+        // walk_returns mutated local_vars — snapshot a fresh
+        // seed for the must-return pass so we start from the
+        // proc's typed parameters, matching the walker's own
+        // starting state.
+        let mut fresh_vars = VarTypeTable::new();
+        if let Some(sig) = &proc.signature {
+            for arg in &sig.args {
+                if let Some(ty) = &arg.type_annotation {
+                    fresh_vars.insert(arg.name.clone(), ty.clone());
+                }
+            }
+        }
+        if !paths_always_return(
+            &proc.body,
+            source,
+            declared,
+            sig_table,
+            proc_table,
+            &mut fresh_vars,
+        ) {
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!(
+                    "proc annotated `{}` may fall through without \
+                     returning a value of the right type; every code \
+                     path must end with `return $X` (or a final \
+                     expression whose type matches)",
+                    render_type_inline(declared),
+                ),
+                span: proc.name_span,
+            });
+        }
+    }
 }
 
 /// True when `proc_name` matches the newtype-triplet pattern
@@ -648,6 +692,431 @@ fn check_return(
             span: cmd.span,
         });
     }
+}
+
+/// Whether every code path through `stmts` reaches an explicit
+/// `return`, OR ends with a final statement whose result type
+/// matches `declared` (Tcl's implicit-last-expression return).
+///
+/// Empty `stmts` → false. This is the primary failure case for
+/// the must-return check: a proc annotated with a non-`unit`
+/// return type whose body is completely empty (or ends with a
+/// side-effecting `puts`) has no path that produces a value.
+///
+/// Descends into control-flow braced bodies via
+/// `parser::parse_fragment` + `shift_stmt` — the same reparse
+/// dance `walk_returns` already uses (see the identical pattern
+/// at line ~570).
+///
+/// Coverage of control commands:
+///
+/// - `return` (any form) → this path terminates.
+/// - `set VAR X` → records VAR's inferred type in `local_vars`
+///   so a downstream implicit-last-expression `$VAR` gets typed.
+/// - `if COND BODY [elseif COND BODY]* [else BODY]` → terminates
+///   iff there IS an `else` AND every branch body terminates.
+/// - `while` / `for` / `foreach` → conservative false (body may
+///   not execute at runtime).
+/// - `switch X { pat body pat body … [default body] }` →
+///   terminates iff a `default` arm exists AND every arm's body
+///   terminates. Fallthrough arms (`pat -`) inherit the next
+///   arm's body.
+/// - `catch` → conservative false (body may error out).
+/// - Anything else → non-terminating individually; keep scanning.
+fn paths_always_return(
+    stmts: &[Stmt],
+    source: &str,
+    declared: &crate::ast::TypeExpr,
+    sig_table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+    local_vars: &mut VarTypeTable,
+) -> bool {
+    if stmts.is_empty() {
+        return false;
+    }
+    let mut last_cmd_index: Option<usize> = None;
+    for (i, stmt) in stmts.iter().enumerate() {
+        let Stmt::Command(cmd) = stmt else { continue };
+        let head_text = cmd.words.first().and_then(|w| w.as_text());
+
+        // Track `set VAR <value>` bindings so a trailing `$VAR`
+        // (implicit last-expression) sees the right type.
+        if matches!(cmd.kind, CommandKind::Set) {
+            if let (Some(name_word), Some(value_word)) =
+                (cmd.words.get(1), cmd.words.get(2))
+            {
+                if let Some(name) = name_word.as_text() {
+                    if let Some(ty) = value_type_with_procs(
+                        value_word,
+                        sig_table,
+                        local_vars,
+                        Some(proc_table),
+                    ) {
+                        local_vars.insert(name.to_string(), ty);
+                    }
+                }
+            }
+        }
+        last_cmd_index = Some(i);
+
+        // Explicit `return` — the path terminates here.
+        if head_text == Some("return") {
+            return true;
+        }
+        // `error` — unwinds the stack, so control never falls
+        // through. Counts as terminating for the must-return
+        // analysis (the proc can't reach its end after this).
+        if head_text == Some("error") {
+            return true;
+        }
+        // `if` — check if all branches terminate AND an `else` exists.
+        if head_text == Some("if")
+            && if_command_terminates(
+                cmd, source, declared, sig_table, proc_table, local_vars,
+            )
+        {
+            return true;
+        }
+        // `switch` — check for `default` arm and all-arm termination.
+        if head_text == Some("switch")
+            && switch_command_terminates(
+                cmd, source, declared, sig_table, proc_table, local_vars,
+            )
+        {
+            return true;
+        }
+        // `try { body } [on ... handler]* [finally script]` —
+        // terminates iff the body AND every handler
+        // path-terminate. This is what the generator's
+        // wrap-body pattern emits (`try { return X } on error
+        // { error "prefix.$msg" }`).
+        if head_text == Some("try")
+            && try_command_terminates(
+                cmd, source, declared, sig_table, proc_table, local_vars,
+            )
+        {
+            return true;
+        }
+        // `while` / `for` / `foreach` / `catch` — never
+        // guaranteed to run their body, so they can't be sole
+        // terminators. Keep scanning.
+    }
+
+    // Implicit-last-expression rule: if we've made it here
+    // without hitting a `return`, look at the last command's
+    // last word. If that word's type matches `declared`, this
+    // path counts as terminating.
+    let Some(last_idx) = last_cmd_index else {
+        return false;
+    };
+    let Stmt::Command(last_cmd) = &stmts[last_idx] else {
+        return false;
+    };
+    let expr_word = if last_cmd.words.len() == 1 {
+        last_cmd.words.first()
+    } else {
+        // A multi-word command (e.g. `set _ [...]; $_`) parses
+        // as a single `$_` command with one word — but a
+        // multi-word command like `puts $x` has 2 words. Use
+        // the FIRST word only when there's a single word (a
+        // pure `$var` or `[proc-call]` expression); otherwise
+        // treat the last statement as an expression via its
+        // *head* word only when that head IS a proc-call —
+        // handled below.
+        last_cmd.words.first()
+    };
+    let Some(expr_word) = expr_word else {
+        return false;
+    };
+    // For a bare command like `some_typed_proc arg1 arg2`, we
+    // want to check the CALL's return type. `value_type_with_procs`
+    // won't help directly on the head word (it's a bare-text
+    // word, not a CmdSubst). But we CAN look up the head in the
+    // sig_table. If the head is a known proc AND its return
+    // type matches `declared`, treat as implicit return.
+    if let Some(head) = last_cmd.words.first().and_then(|w| w.as_text()) {
+        // `extern::name` is the caller's opt-out: "this is a raw
+        // Tcl proc; I'm not declaring its type, trust me." Same
+        // policy as `validate_command`'s check at line 1946.
+        // Trailing extern call = trust for the must-return check.
+        if crate::lower::is_extern_call(head) {
+            return true;
+        }
+        if let Some(sig) = sig_table.get(head) {
+            if let Some(ret_ty) = &sig.return_type {
+                if types_match(declared, ret_ty) {
+                    return true;
+                }
+            }
+        }
+    }
+    // Otherwise: try value_type_with_procs on the expression
+    // word itself (handles `$var` and `[proc-call]` shapes).
+    if let Some(ty) = value_type_with_procs(
+        expr_word,
+        sig_table,
+        local_vars,
+        Some(proc_table),
+    ) {
+        if types_match(declared, &ty) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does a single `if COND BODY [elseif COND BODY]* [else BODY]`
+/// command terminate? Yes iff every branch body terminates AND
+/// there IS an `else` (a chain with no `else` may fall through).
+///
+/// Word layout, positions counted from 0:
+/// - [0] = "if"
+/// - [1] = condition
+/// - [2] = body
+/// - [3] = "elseif" | "else" (or end)
+/// - [4] = condition (after elseif) | body (after else)
+/// - …
+fn if_command_terminates(
+    cmd: &crate::ast::Command,
+    source: &str,
+    declared: &crate::ast::TypeExpr,
+    sig_table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+    local_vars: &VarTypeTable,
+) -> bool {
+    let mut i = 1;
+    let mut has_else = false;
+    let mut branch_bodies: Vec<&crate::ast::Word> = Vec::new();
+    while i < cmd.words.len() {
+        // Skip the condition word.
+        if i + 1 >= cmd.words.len() {
+            return false;
+        }
+        branch_bodies.push(&cmd.words[i + 1]);
+        i += 2;
+        if i >= cmd.words.len() {
+            break;
+        }
+        match cmd.words[i].as_text() {
+            Some("elseif") => {
+                i += 1;
+                // Loop continues with i at condition position.
+            }
+            Some("else") => {
+                has_else = true;
+                i += 1;
+                if i >= cmd.words.len() {
+                    return false;
+                }
+                branch_bodies.push(&cmd.words[i]);
+                break;
+            }
+            _ => {
+                // Something unexpected — conservative: don't
+                // treat as terminating.
+                return false;
+            }
+        }
+    }
+    if !has_else {
+        return false;
+    }
+    for body_word in branch_bodies {
+        if !branch_body_terminates(
+            body_word, source, declared, sig_table, proc_table, local_vars,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Does a `switch X { pat body … [default body] }` terminate?
+/// Yes iff there's a `default` arm AND every arm's body
+/// terminates. Fallthrough arms (`pat -` where the body word is
+/// literally `-`) inherit the next arm's body.
+fn switch_command_terminates(
+    cmd: &crate::ast::Command,
+    source: &str,
+    declared: &crate::ast::TypeExpr,
+    sig_table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+    local_vars: &VarTypeTable,
+) -> bool {
+    // Find the switch body — the LAST braced word in the command
+    // (the argument list before it is `[options] value`, which
+    // we don't parse).
+    let body_word = cmd
+        .words
+        .iter()
+        .rev()
+        .find(|w| w.form == crate::ast::WordForm::Braced);
+    let Some(body_word) = body_word else {
+        return false;
+    };
+    let word_start = body_word.span.start as usize;
+    let word_end = body_word.span.end as usize;
+    if word_end <= word_start + 2 {
+        return false;
+    }
+    let interior_start = word_start + 1;
+    let interior_end = word_end - 1;
+    let body_text = &source[interior_start..interior_end];
+    let (mut arm_stmts, _errs) =
+        crate::parser::parse_fragment(body_text, crate::parser::Mode::Toplevel);
+    for s in &mut arm_stmts {
+        crate::parser::shift_stmt(s, interior_start as u32);
+    }
+    // Each arm parses as one command with words = [pat, body].
+    // Collect them as pairs, resolving fallthrough (`pat -`)
+    // arms to the next arm's body.
+    let mut pairs: Vec<(String, &crate::ast::Word)> = Vec::new();
+    let mut pending_pats: Vec<String> = Vec::new();
+    for stmt in &arm_stmts {
+        let Stmt::Command(arm_cmd) = stmt else {
+            continue;
+        };
+        if arm_cmd.words.len() < 2 {
+            return false;
+        }
+        let pat = match arm_cmd.words[0].as_text() {
+            Some(p) => p.to_string(),
+            None => return false,
+        };
+        let body_arg = &arm_cmd.words[1];
+        if body_arg.as_text() == Some("-") {
+            // Fallthrough: this pattern inherits the next
+            // resolved arm's body.
+            pending_pats.push(pat);
+            continue;
+        }
+        // Resolve pending fallthroughs to this arm's body too.
+        for pending in pending_pats.drain(..) {
+            pairs.push((pending, body_arg));
+        }
+        pairs.push((pat, body_arg));
+    }
+    if !pending_pats.is_empty() {
+        // Trailing `pat -` without a resolving arm — malformed.
+        return false;
+    }
+    // Must have a `default` arm.
+    let has_default = pairs.iter().any(|(p, _)| p == "default");
+    if !has_default {
+        return false;
+    }
+    for (_pat, body_word) in &pairs {
+        if !branch_body_terminates(
+            body_word, source, declared, sig_table, proc_table, local_vars,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Does a `try BODY [on CODE VAR HANDLER]* [trap PATS VAR HANDLER]*
+/// [finally SCRIPT]` terminate? Yes iff BODY terminates AND every
+/// handler body terminates. `finally` doesn't participate in
+/// termination (it runs REGARDLESS of what the body/handlers did,
+/// so it can't turn a non-terminating structure into a terminating
+/// one — but it also doesn't invalidate one).
+fn try_command_terminates(
+    cmd: &crate::ast::Command,
+    source: &str,
+    declared: &crate::ast::TypeExpr,
+    sig_table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+    local_vars: &VarTypeTable,
+) -> bool {
+    // Body is the first argument (word[1]).
+    let Some(body_word) = cmd.words.get(1) else {
+        return false;
+    };
+    if !branch_body_terminates(
+        body_word, source, declared, sig_table, proc_table, local_vars,
+    ) {
+        return false;
+    }
+    // Walk the remaining words looking for handler bodies. Each
+    // `on CODE VAR HANDLER` or `trap PATS VAR HANDLER` clause
+    // occupies 4 words; each `finally SCRIPT` occupies 2.
+    let mut i = 2;
+    while i < cmd.words.len() {
+        let head = cmd.words[i].as_text();
+        match head {
+            Some("on") | Some("trap") => {
+                // handler body is at position i+3.
+                let Some(handler_body) = cmd.words.get(i + 3) else {
+                    return false;
+                };
+                if !branch_body_terminates(
+                    handler_body,
+                    source,
+                    declared,
+                    sig_table,
+                    proc_table,
+                    local_vars,
+                ) {
+                    return false;
+                }
+                i += 4;
+            }
+            Some("finally") => {
+                // Finally script doesn't affect the terminator
+                // analysis — skip past its word.
+                i += 2;
+            }
+            _ => {
+                // Malformed / something we don't recognize;
+                // conservative false.
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Does the branch body word (a `WordForm::Braced` script)
+/// terminate? Reparses the interior as a fragment and delegates
+/// to `paths_always_return`. Non-braced body words (unusual —
+/// only shows up when the parser hits malformed input) → false.
+fn branch_body_terminates(
+    body_word: &crate::ast::Word,
+    source: &str,
+    declared: &crate::ast::TypeExpr,
+    sig_table: &HashMap<String, &ProcSignature>,
+    proc_table: &HashMap<String, &crate::ast::Proc>,
+    local_vars: &VarTypeTable,
+) -> bool {
+    if body_word.form != crate::ast::WordForm::Braced {
+        return false;
+    }
+    let word_start = body_word.span.start as usize;
+    let word_end = body_word.span.end as usize;
+    if word_end <= word_start + 2 {
+        return false;
+    }
+    let interior_start = word_start + 1;
+    let interior_end = word_end - 1;
+    let body_text = &source[interior_start..interior_end];
+    let (mut body_stmts, _errs) =
+        crate::parser::parse_fragment(body_text, crate::parser::Mode::Toplevel);
+    for s in &mut body_stmts {
+        crate::parser::shift_stmt(s, interior_start as u32);
+    }
+    crate::parser::populate_procs(&mut body_stmts, source, &mut Vec::new());
+    // Branch bodies share the outer scope's var table (Tcl
+    // control-flow doesn't create a new frame).
+    let mut branch_vars = local_vars.clone();
+    paths_always_return(
+        &body_stmts,
+        source,
+        declared,
+        sig_table,
+        proc_table,
+        &mut branch_vars,
+    )
 }
 
 /// Walk `proc`'s body left-to-right, tracking `set VAR <value>`
@@ -3919,5 +4388,231 @@ proc anything {} { return 42 }
             d.iter().all(|x| !x.message.contains("return type")),
             "unexpected diags: {d:?}",
         );
+    }
+
+    // ─── must-return / fallthrough analysis ─────────────────────
+
+    fn has_fallthrough_diag(d: &[Diagnostic]) -> bool {
+        d.iter().any(|x| x.message.contains("may fall through"))
+    }
+
+    #[test]
+    fn empty_body_annotated_proc_errors() {
+        // The user's `configure_txr1` case: annotated with a
+        // real type but the body is empty. Must-return should
+        // flag it.
+        let src = "\
+type MyType = string
+proc configure_txr1 {} MyType { }
+";
+        let d = diags(src);
+        assert!(has_fallthrough_diag(&d), "diags: {d:?}");
+    }
+
+    #[test]
+    fn single_puts_body_annotated_proc_errors() {
+        // Body has a side-effecting `puts` and no return; the
+        // last statement's result isn't a MyType.
+        let src = "\
+type MyType = string
+proc foo {} MyType {
+  puts hello
+}
+";
+        let d = diags(src);
+        assert!(has_fallthrough_diag(&d), "diags: {d:?}");
+    }
+
+    #[test]
+    fn if_no_else_annotated_proc_errors() {
+        let src = "\
+type MyType = string
+proc bad {} MyType {
+  if 1 {
+    return {}
+  }
+}
+";
+        let d = diags(src);
+        assert!(has_fallthrough_diag(&d), "diags: {d:?}");
+    }
+
+    #[test]
+    fn while_body_return_annotated_proc_errors() {
+        // Even with a `return` inside the loop body, the loop
+        // may not execute — must-return still fires.
+        let src = "\
+type MyType = string
+proc bad {} MyType {
+  while 1 {
+    return {}
+  }
+}
+";
+        let d = diags(src);
+        assert!(has_fallthrough_diag(&d), "diags: {d:?}");
+    }
+
+    #[test]
+    fn if_else_both_return_no_error() {
+        let src = "\
+type MyType = string
+proc ok {} MyType {
+  if 1 {
+    return {}
+  } else {
+    return {}
+  }
+}
+";
+        let d = diags(src);
+        assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn if_elseif_else_all_return_no_error() {
+        let src = "\
+type MyType = string
+proc ok {} MyType {
+  if 1 {
+    return {}
+  } elseif 2 {
+    return {}
+  } else {
+    return {}
+  }
+}
+";
+        let d = diags(src);
+        assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn implicit_last_expression_typed_proc_call_no_error() {
+        // Trailing typed proc-call is an implicit return in Tcl.
+        let src = "\
+type MyType = string
+proc make_it {} MyType { return {} }
+proc user {} MyType {
+  make_it
+}
+";
+        let d = diags(src);
+        assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn implicit_last_expression_extern_call_no_error() {
+        // Trailing extern call is the user's opt-out for raw
+        // Tcl. Trust it as a valid implicit return.
+        let src = "\
+type MyType = string
+proc user {} MyType {
+  extern::some_raw_tcl_proc -foo bar
+}
+";
+        let d = diags(src);
+        assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn switch_with_default_all_return_no_error() {
+        let src = "\
+type MyType = string
+proc ok {} MyType {
+  switch $x {
+    a { return {} }
+    default { return {} }
+  }
+}
+";
+        let d = diags(src);
+        assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn switch_no_default_errors() {
+        let src = "\
+type MyType = string
+proc bad {} MyType {
+  switch $x {
+    a { return {} }
+    b { return {} }
+  }
+}
+";
+        let d = diags(src);
+        assert!(has_fallthrough_diag(&d), "diags: {d:?}");
+    }
+
+    #[test]
+    fn switch_default_falls_through_errors() {
+        let src = "\
+type MyType = string
+proc bad {} MyType {
+  switch $x {
+    a { return {} }
+    default { puts hi }
+  }
+}
+";
+        let d = diags(src);
+        assert!(has_fallthrough_diag(&d), "diags: {d:?}");
+    }
+
+    #[test]
+    fn try_body_and_handler_terminate_no_error() {
+        // Matches the vw-ip generator's wrap pattern:
+        // `try { return X } on error { error "…" }`.
+        let src = "\
+type MyType = string
+proc gen {} MyType {
+  try {
+    return {}
+  } on error {msg} {
+    error \"foo.$msg\"
+  }
+}
+";
+        let d = diags(src);
+        assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn unit_annotated_empty_body_no_error() {
+        // `unit` return type doesn't require a value.
+        let src = "\
+proc side_effect {} unit { }
+";
+        let d = diags(src);
+        assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn newtype_triplet_empty_body_no_error() {
+        // T::from and friends are exempted before the must-return
+        // check fires.
+        let src = "\
+type ns::T = string
+proc ns::T::from {v: string} ns::T { return $v }
+proc ns::T::empty {} ns::T { }
+";
+        let d = diags(src);
+        assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    #[test]
+    fn enum_overload_arm_empty_body_no_error() {
+        // First-arg-Qualified shape (overload arm) is exempted
+        // before the must-return check fires.
+        let src = "\
+enum E = {
+  A: string
+  B: string
+}
+proc handle {v: E::A} string { }
+";
+        let d = diags(src);
+        assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
     }
 }
