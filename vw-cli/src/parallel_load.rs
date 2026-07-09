@@ -542,15 +542,27 @@ fn join_err_to_load_err(e: JoinError) -> LoadError {
 /// bar creation (first-sight-per-dep) needs synchronized
 /// access. Bar updates otherwise happen from many blocking-
 /// thread contexts concurrently.
+///
+/// **Terminal-side note.** Committed rows are emitted via
+/// [`MultiProgress::println`] which uses cursor manipulation to
+/// insert content above the bar area rather than a natural scroll.
+/// On terminals whose Ctrl-L handler pushes visible content into
+/// scrollback before clearing (iTerm2, most xterm-family
+/// emulators, tmux), this behaves correctly. On terminals whose
+/// Ctrl-L just erases the visible display without preserving
+/// unscrolled content (some recent ghostty builds), the committed
+/// rows can vanish. That's a terminal behavior, not something the
+/// loader can fix at emission time — the tradeoff of the multi-
+/// row UI.
 pub struct MultiProgressObserver {
     multi: MultiProgress,
     /// `(name, ProgressBar)` — one per top-level dep. `name` is
-    /// the `@dep` prefix or "workspace" for local files. Insertion
-    /// order preserved so scrollback matches source order.
+    /// the `@dep` prefix or the workspace label for local files.
+    /// Insertion order preserved so scrollback matches source
+    /// order.
     bars: Mutex<Vec<(String, ProgressBar)>>,
     /// `(depname, cache-directory-abs-path)` pairs used to rewrite
-    /// resolved paths back into `@dep/relative` labels — same as
-    /// the previous CliObserver.
+    /// resolved paths back into `@dep/relative` labels.
     dep_paths: Vec<(String, PathBuf)>,
     /// True when stdout is a real terminal. Bars only render
     /// when true; non-TTY falls back to plain `println!`.
@@ -579,11 +591,9 @@ impl MultiProgressObserver {
         }
     }
 
-    /// Format a `src` label the same way the previous
-    /// `CliObserver::friendly_import` did: resolve to
-    /// `@<depname>/<relative>` when the path is inside a known
-    /// dep-cache directory; otherwise strip `@` sigil and
-    /// `.htcl` suffix.
+    /// Format a `src` label. `@<depname>/<relative>` when the
+    /// path is inside a known dep-cache directory; otherwise
+    /// strip `@` sigil and `.htcl` suffix.
     fn friendly_label(&self, raw: &str, resolved: Option<&Path>) -> String {
         if let Some(resolved) = resolved {
             let canonical = resolved
@@ -681,40 +691,50 @@ impl ParallelObserver for MultiProgressObserver {
     }
 
     fn on_dep_completed(&self, dep_name: &str) {
+        use colored::Colorize;
         if !self.stdout_is_tty {
             return;
         }
-        let guard = self.bars.lock().unwrap();
-        if let Some((_, bar)) = guard.iter().find(|(n, _)| n == dep_name) {
-            bar.set_prefix("Checking");
-            bar.finish_with_message(dep_name.to_string());
+        // Print the committed row THROUGH the MultiProgress. Using
+        // `multi.println` inserts the text ABOVE the bar area so
+        // the row settles into normal scrollback flow.
+        let prefix = "Checking".bright_green().bold();
+        let _ = self.multi.println(format!("{:>12} {}", prefix, dep_name));
+        // Now remove the bar from the display so it doesn't double-
+        // render on the next tick.
+        let mut guard = self.bars.lock().unwrap();
+        if let Some(pos) = guard.iter().position(|(n, _)| n == dep_name) {
+            let (_, bar) = guard.remove(pos);
+            self.multi.remove(&bar);
         }
     }
 }
 
 impl MultiProgressObserver {
     /// Finalize any bar that wasn't committed by an
-    /// [`on_dep_completed`] — happens for the "workspace" bar
-    /// covering local files and for the entry file's own bar.
-    /// Call this after `load_parallel` returns.
+    /// [`on_dep_completed`] — the local-workspace bar covering
+    /// non-`@dep` files, and the entry file's own bar — by
+    /// routing each row through [`MultiProgress::println`] so it
+    /// enters the normal output stream ABOVE the (now-cleared)
+    /// bar area.
     pub fn finish(&self) {
+        use colored::Colorize;
         if !self.stdout_is_tty {
             return;
         }
-        {
-            let guard = self.bars.lock().unwrap();
-            for (name, bar) in guard.iter() {
-                if !bar.is_finished() {
-                    bar.set_prefix("Checking");
-                    bar.finish_with_message(name.clone());
-                }
+        let mut guard = self.bars.lock().unwrap();
+        let prefix = "Checking".bright_green().bold();
+        // Snapshot the remaining bar names in the current order so
+        // we can commit + remove without mutating the vec mid-scan.
+        let remaining: Vec<String> =
+            guard.iter().map(|(n, _)| n.clone()).collect();
+        for name in remaining {
+            let _ = self.multi.println(format!("{:>12} {}", prefix, name));
+            if let Some(pos) = guard.iter().position(|(n, _)| n == &name) {
+                let (_, bar) = guard.remove(pos);
+                self.multi.remove(&bar);
             }
         }
-        // Force a fresh row for any subsequent stdout output. Without
-        // this, `indicatif` leaves the cursor at the end of the last
-        // rendered bar row and downstream stdout writes (e.g. the
-        // vw-run Vivado stream's first `puts` result) land on the
-        // same line as `Checking @<last-dep>`.
-        println!();
+        let _ = self.multi.clear();
     }
 }
