@@ -621,6 +621,7 @@ pub fn draw_completion_popup(
                 CompletionKind::Proc => "·",
                 CompletionKind::Flag => "-",
                 CompletionKind::EnumValue => "=",
+                CompletionKind::Constructor => "+",
             };
             let kind_style = match item.kind {
                 CompletionKind::Proc => {
@@ -631,6 +632,9 @@ pub fn draw_completion_popup(
                 }
                 CompletionKind::EnumValue => {
                     Style::default().fg(Color::Rgb(100, 200, 200))
+                }
+                CompletionKind::Constructor => {
+                    Style::default().fg(Color::Rgb(120, 200, 140))
                 }
             };
             let detail = item
@@ -691,6 +695,8 @@ mod tests {
             detail: None,
             documentation: None,
             replace: HtclSpan { start: 0, end: 0 },
+            insert_text: None,
+            snippet: false,
         }
     }
 

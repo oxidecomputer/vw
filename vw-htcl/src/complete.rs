@@ -33,11 +33,18 @@ pub enum CompletionKind {
     Flag,
     /// A value from a flag's `@enum(...)` constraint.
     EnumValue,
+    /// A constructor call inferred from a `Construct with [path]` doc
+    /// hint on the target arg — inserts a multi-line command-
+    /// substitution block with the cursor positioned to start typing
+    /// the constructor's own flags.
+    Constructor,
 }
 
 #[derive(Clone, Debug)]
 pub struct Completion {
-    /// Text shown in the list and inserted (`greet`, `-name`).
+    /// Text shown in the list (`greet`, `-name`, or the constructor
+    /// path for `Constructor` kind). Also used as the inserted text
+    /// unless `insert_text` overrides it.
     pub label: String,
     pub kind: CompletionKind,
     /// Short, single-line annotation shown inline next to the label.
@@ -47,6 +54,14 @@ pub struct Completion {
     /// Source range the inserted text replaces (the partial word, or a
     /// zero-width insertion point between words).
     pub replace: Span,
+    /// Text to insert instead of `label` — used by snippet-shaped
+    /// completions (`Constructor`) whose visible label is a plain
+    /// name but whose insertion is a multi-line block. When `None`
+    /// the LSP layer inserts `label` verbatim.
+    pub insert_text: Option<String>,
+    /// If true, `insert_text` uses LSP snippet syntax (`$0`, `${1:foo}`,
+    /// etc.) and the LSP layer sets `InsertTextFormat::SNIPPET`.
+    pub snippet: bool,
 }
 
 struct ProcInfo<'a> {
@@ -64,6 +79,34 @@ pub fn complete_at(
     source: &str,
     offset: u32,
 ) -> Vec<Completion> {
+    complete_at_with_extras(document, source, offset, &[])
+}
+
+/// Same as [`complete_at`] but also considers a workspace-side
+/// document as an extra source of proc definitions.
+///
+/// The LSP calls this way so it can:
+/// - use the **current** local text (`document` + `source`) for
+///   cmdline-scan context — so what the user *just typed* is what
+///   drives `in_command_position` / `partial` / `-flag` detection;
+/// - AND still pick up cross-file proc names (`gtwiz_versal::configure`,
+///   etc.) from a stale but recently-committed workspace parse
+///   (`workspace_document`).
+///
+/// Local procs shadow workspace ones on name collision. `workspace_
+/// document` should be a document parsed from the merged workspace
+/// view (local + all transitive imports); the local prefix will
+/// duplicate the local file's procs, so the shadowing rule dedupes
+/// them without extra bookkeeping.
+///
+/// Passing `None` is exactly equivalent to `complete_at` — no
+/// workspace symbols get added.
+pub fn complete_at_with_extras(
+    document: &Document,
+    source: &str,
+    offset: u32,
+    workspace_documents: &[&Document],
+) -> Vec<Completion> {
     // Inside a proc's argument-declaration braces, command/flag
     // completion is meaningless (attribute completion will live here
     // later). Stay quiet rather than offer nonsense.
@@ -72,7 +115,18 @@ pub fn complete_at(
     }
 
     let line = cmdline::analyze(source, offset);
-    let procs = collect_procs(document);
+    let mut procs = collect_procs(document);
+    // Merge in workspace-provided procs. Local procs already in
+    // `procs` shadow workspace ones — we only append a workspace
+    // proc when no local proc with the same qualified name exists.
+    for ws in workspace_documents {
+        let ws_procs = collect_procs(ws);
+        for wp in ws_procs {
+            if !procs.iter().any(|p| p.name == wp.name) {
+                procs.push(wp);
+            }
+        }
+    }
 
     if line.in_command_position() {
         return complete_proc_names(&procs, &line);
@@ -90,10 +144,107 @@ pub fn complete_at(
     let last_word_is_flag = line.words.len() >= 2
         && line.words.last().is_some_and(|w| w.starts_with('-'));
     if last_word_is_flag && !line.partial.starts_with('-') {
-        return complete_enum_values(&procs, &line);
+        // In value position, offer only value-shaped completions —
+        // enum choices and `Construct with [...]` snippets. Never
+        // fall through to flag completion: a free-form value slot
+        // has no reason to pop a flag list in front of what the user
+        // is typing.
+        let mut items = complete_enum_values(&procs, &line);
+        items.extend(complete_constructor(&procs, &line));
+        return items;
     }
 
     complete_flags(&procs, &line)
+}
+
+/// If the flag currently in value position has a `Construct with
+/// [path]` hint in its doc comment, emit a single snippet completion
+/// that inserts a multi-line command-substitution block calling that
+/// constructor. The cursor lands after the constructor name so the
+/// user can immediately start typing its own `-flag value` pairs.
+///
+/// Empty when the flag has no such hint (so the caller can fall
+/// through to normal flag/value handling).
+fn complete_constructor(
+    procs: &[ProcInfo<'_>],
+    line: &CmdLine<'_>,
+) -> Vec<Completion> {
+    let Some(name) = line.command_name() else {
+        return Vec::new();
+    };
+    let Some(proc) = procs.iter().find(|p| p.name == name) else {
+        return Vec::new();
+    };
+    let Some(sig) = proc.signature else {
+        return Vec::new();
+    };
+    let Some(last) = line.words.last() else {
+        return Vec::new();
+    };
+    let Some(flag) = last.strip_prefix('-') else {
+        return Vec::new();
+    };
+    let Some(arg) = sig.find(flag) else {
+        return Vec::new();
+    };
+    let Some(path) = extract_constructor_hint(&arg.doc_comments) else {
+        return Vec::new();
+    };
+    // Only offer when the partial (what the user has typed after the
+    // flag) is either empty or a prefix of the constructor path — a
+    // free-form value like `$my_var` shouldn't fight the constructor
+    // suggestion.
+    if !line.partial.is_empty() && !path.starts_with(line.partial) {
+        return Vec::new();
+    }
+    // Constructor invocation, multi-line for readability, `$0` sets
+    // the LSP cursor after the constructor name so `-flag` completion
+    // picks up next.
+    let insert = format!("[\n    {path} $0\n]");
+    vec![Completion {
+        label: path.clone(),
+        kind: CompletionKind::Constructor,
+        detail: Some(format!("constructor for -{}", arg.name)),
+        documentation: Some(format!(
+            "Insert a `\\[{path} ...\\]` command-substitution block \
+             for the `-{}` slot.",
+            arg.name
+        )),
+        replace: line.partial_span,
+        insert_text: Some(insert),
+        snippet: true,
+    }]
+}
+
+/// Scan doc comments for the `Construct with [path::name]` idiom and
+/// return the bracketed path if found. Matches on any line the doc
+/// author put it on; case-insensitive on the `construct with` phrase
+/// so `Construct` / `construct` / `CONSTRUCT` all work.
+fn extract_constructor_hint(doc_comments: &[String]) -> Option<String> {
+    for line in doc_comments {
+        let lower = line.to_ascii_lowercase();
+        let mut cursor = 0;
+        while let Some(rel) = lower[cursor..].find("construct with [") {
+            let start = cursor + rel + "construct with [".len();
+            if let Some(end_rel) = line[start..].find(']') {
+                let path = &line[start..start + end_rel];
+                if is_valid_path(path) {
+                    return Some(path.to_string());
+                }
+                cursor = start + end_rel + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn is_valid_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        && s.chars().next().is_some_and(|c| !c.is_ascii_digit())
 }
 
 /// `@enum(…)` value completions when the cursor sits in value
@@ -149,6 +300,8 @@ fn complete_enum_values(
                 detail: Some(format!("value for -{}", arg.name)),
                 documentation: crate::doc::brief(&arg.doc_comments),
                 replace: line.partial_span,
+                insert_text: None,
+                snippet: false,
             })
         })
         .collect()
@@ -195,6 +348,8 @@ fn complete_proc_names(
             detail: first_doc_line(p.doc_comments),
             documentation: proc_documentation(p),
             replace: line.partial_span,
+            insert_text: None,
+            snippet: false,
         })
         .collect()
 }
@@ -238,6 +393,8 @@ fn complete_flags(
                 detail: flag_detail(arg),
                 documentation: Some(arg_documentation(arg)),
                 replace: line.partial_span,
+                insert_text: None,
+                snippet: false,
             })
         })
         .collect()
@@ -611,6 +768,66 @@ cfg |
         let doc = item.documentation.as_deref().unwrap();
         assert!(doc.contains("@enum(LOW, HIGH, OPTIMIZED)"), "{doc}");
         assert!(doc.contains("@default(OPTIMIZED)"), "{doc}");
+    }
+
+    #[test]
+    fn constructor_hint_offers_snippet_in_value_position() {
+        // A doc line of the form `Construct with [namespaced::path]`
+        // on the target arg turns into a snippet completion in value
+        // position — the label is the constructor path, the insert
+        // text is a `[\n    path $0\n]` block with cursor placed
+        // after the constructor name.
+        let src = "\
+namespace eval demo {}\n\
+proc demo::child { -x: int } {}\n\
+proc parent {\n  ## Construct with [demo::child].\n  child: any\n} { }\n\
+parent -child |\n";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        let item = items
+            .iter()
+            .find(|c| c.kind == CompletionKind::Constructor)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no constructor completion; got {:?}",
+                    items
+                        .iter()
+                        .map(|c| (&c.label, c.kind))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(item.label, "demo::child");
+        assert!(item.snippet);
+        let insert = item.insert_text.as_deref().unwrap();
+        assert!(insert.contains("demo::child"), "insert={insert:?}");
+        assert!(insert.contains("$0"), "insert={insert:?}");
+        assert!(insert.starts_with('['), "insert={insert:?}");
+        assert!(insert.trim_end().ends_with(']'), "insert={insert:?}");
+    }
+
+    #[test]
+    fn constructor_hint_absent_produces_no_extra_completion() {
+        // No `Construct with ...` doc → no constructor completion.
+        // Value position on a non-enum, non-hinted flag returns empty.
+        let src = "\
+proc parent {\n  ## An arbitrary slot.\n  child: any\n} { }\n\
+parent -child |\n";
+        assert!(labels(src).is_empty());
+    }
+
+    #[test]
+    fn constructor_hint_case_insensitive() {
+        let src = "\
+proc parent {\n  ## construct with [foo::bar]\n  slot: any\n} { }\n\
+parent -slot |\n";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        assert!(items
+            .iter()
+            .any(|c| c.kind == CompletionKind::Constructor
+                && c.label == "foo::bar"));
     }
 
     #[test]

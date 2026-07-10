@@ -19,8 +19,8 @@ use tower_lsp::lsp_types::{
 };
 use tracing::debug;
 use vw_htcl::{
-    complete_at, definition_at, find_references_in, hover_at, identify_at,
-    parse, signature_help_at, validate_with_all_extras_and_vars, Attribute,
+    definition_at, find_references_in, hover_at, identify_at, parse,
+    signature_help_at, validate_with_all_extras_and_vars, Attribute,
     AttributeValue, CommandKind, Completion, CompletionKind, HoverTarget,
     LineCol, LineIndex, ParseOutput, ProcArg, ProcSignature, ReferenceTarget,
     Severity, Span, Stmt,
@@ -95,6 +95,18 @@ impl HtclBackend {
         Self::default()
     }
 
+    /// Test-only convenience: update text and wait for the indexer
+    /// to commit. Production `set_text` is deliberately fire-and-
+    /// forget so keystrokes never block; tests want synchronous
+    /// behavior so their assertions run against a committed
+    /// analysis.
+    #[cfg(test)]
+    pub(crate) async fn set_text_sync(&self, uri: Url, text: String) {
+        use crate::backend::LanguageBackend as _;
+        self.set_text(uri.clone(), text).await;
+        self.wait_for_reindex(&uri).await;
+    }
+
     /// Snapshot of the editor-supplied workspace roots. Callers
     /// pass this into [`crate::workspace::build_view`] etc. as
     /// fallback dep-lookup roots — see `workspace_roots`
@@ -102,6 +114,16 @@ impl HtclBackend {
     /// held across the (potentially I/O-heavy) view build.
     async fn workspace_roots_snapshot(&self) -> Vec<std::path::PathBuf> {
         self.workspace_roots.read().await.clone()
+    }
+
+    /// Snapshot the current in-memory text for `uri`. Used by
+    /// completion / hover / signature-help handlers that need the
+    /// CURRENT text (what the user just typed) rather than the
+    /// analysis snapshot's stale copy. Cheap: one hashmap read + a
+    /// String clone.
+    pub(crate) async fn current_text(&self, uri: &Url) -> Option<String> {
+        let docs = self.docs.read().await;
+        docs.get(uri).map(|s| s.text.clone())
     }
 
     /// Resolve a `src` import path from `entry_file`'s directory,
@@ -131,34 +153,25 @@ impl HtclBackend {
         &self,
         uri: &Url,
     ) -> Option<Arc<DocAnalysis>> {
-        // Subscribe FIRST, then check the current value. Reversing
-        // this creates a race: if the indexer sends `Some(...)`
-        // between the fast-path `borrow()` and `subscribe()`, the
-        // Receiver would be marked as seen at the fresh value and
-        // its `changed().await` would hang waiting for a
-        // never-coming next update. `subscribe()` seeds at the
-        // current value AND records the sequence position, so the
-        // subsequent `borrow_and_update()` correctly returns the
-        // current value regardless of who won the race.
-        let mut rx = {
-            let docs = self.docs.read().await;
-            docs.get(uri)?.tx.subscribe()
-        };
-        loop {
-            {
-                let borrowed = rx.borrow_and_update();
-                if let Some(a) = borrowed.clone() {
-                    return Some(a);
-                }
-            }
-            // `None` is the "indexing in progress" state; wait for
-            // the indexer's next send. `changed()` returns Err only
-            // when the sender is dropped — i.e. the doc was
-            // closed — in which case we bail with `None`.
-            if rx.changed().await.is_err() {
-                return None;
-            }
-        }
+        // Non-blocking snapshot: return whatever's currently in the
+        // watch channel — `Some(previous_analysis)` while a rebuild
+        // is in flight (serve-stale), `None` before the very first
+        // indexer has committed. Callers that CAN work with a stale
+        // snapshot (completion, hover, goto-def, references) use
+        // this directly; callers that need a fresh commit
+        // (diagnostics publish + progress indicator) use
+        // `wait_for_reindex` explicitly.
+        //
+        // We intentionally do NOT `await` a `changed()` here: rapid
+        // typing plus a 7s workspace-validate means every keystroke
+        // aborts the in-flight indexer, and if we haven't yet had a
+        // first commit, waiting would block indefinitely. Returning
+        // `None` immediately lets handlers degrade gracefully to a
+        // local-only analysis or empty results.
+        let docs = self.docs.read().await;
+        let state = docs.get(uri)?;
+        let out = state.tx.borrow().clone();
+        out
     }
 
     /// Build a fresh `DocAnalysis` for `text` synchronously
@@ -255,18 +268,19 @@ impl LanguageBackend for HtclBackend {
                 Some(state) => {
                     state.generation += 1;
                     state.text = text.clone();
-                    // Invalidate any waiters on the previous
-                    // analysis. `send_replace` (unlike `send`)
-                    // updates the stored value even when the
-                    // channel currently has no receivers —
-                    // critical here because the previous publish
-                    // task has usually finished and dropped its
-                    // receiver by the time the user types the
-                    // next keystroke. With plain `send()` the
-                    // send fails silently and the next analysis_for
-                    // reads the STALE analysis, so publishes fire
-                    // instantly with pre-typing diagnostics.
-                    let _ = state.tx.send_replace(None);
+                    // Serve-stale-while-rebuild: do NOT clear the
+                    // previous analysis. Reads (`analysis_for`,
+                    // via completion/hover/goto-def/references)
+                    // will see the pre-keystroke snapshot
+                    // immediately instead of waiting the ~7s a
+                    // fresh `build_analysis` takes on a large
+                    // workspace (the metroid tree hits ~7s in
+                    // the validator alone). Diagnostics update
+                    // one commit behind — an acceptable tradeoff
+                    // for interactive latency. When the freshly
+                    // spawned indexer commits, `send_replace(Some
+                    // (new))` swaps the snapshot in-place with
+                    // no observable gap.
                     let prev = state.index_task.take();
                     (state.tx.clone(), state.generation, prev)
                 }
@@ -296,6 +310,21 @@ impl LanguageBackend for HtclBackend {
         let roots_arc = self.workspace_roots.clone();
         let uri_task = uri.clone();
         let handle = tokio::spawn(async move {
+            // Debounce: wait for a quiet window before starting the
+            // ~7s workspace validate. Every new `set_text` aborts
+            // this task before the sleep completes, so a burst of
+            // keystrokes collapses into a single indexer run at the
+            // end. Without this, rapid typing kept aborting each
+            // partially-started build and NO analysis ever
+            // committed — the stale-serve fast path had nothing to
+            // return, so completion / hover blocked indefinitely
+            // on `analysis_for`.
+            //
+            // 250ms is a compromise: short enough not to be felt as
+            // "sluggish" after the last keystroke, long enough that
+            // Helix's typical inter-key gap during real typing
+            // (~30-80ms) sits comfortably inside the window.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             let roots = roots_arc.read().await.clone();
             // parse + validate are sync + potentially long
             // (hundreds of ms on gtwiz-versal). Run on a
@@ -356,6 +385,38 @@ impl LanguageBackend for HtclBackend {
 
     async fn set_workspace_roots(&self, roots: Vec<std::path::PathBuf>) {
         *self.workspace_roots.write().await = roots;
+    }
+
+    async fn wait_for_reindex(&self, uri: &Url) {
+        // Subscribe to the doc's analysis-watch channel, then wait
+        // for the NEXT commit — i.e. the indexer task's
+        // `send_replace(Some(new))` at the end of `set_text`'s
+        // spawned future. Used by the server to wrap the wait in
+        // an LSP `workDoneProgress` notification so the editor's
+        // "indexing…" spinner reflects the actual rebuild
+        // duration, not just a fire-and-forget millisecond.
+        //
+        // `mark_unchanged` is the key call: `subscribe()` seeds the
+        // receiver at the current sender value (which may be the
+        // stale-serve analysis we've KEPT alive across `set_text`
+        // — see the serve-stale comment there). Without
+        // `mark_unchanged` the immediate `changed().await` would
+        // return instantly on that already-seen value and the
+        // spinner would flash for a millisecond instead of
+        // spanning the whole rebuild.
+        //
+        // If the sender is dropped (doc closed), or the current
+        // watch has never held a value (uri unknown), we return
+        // immediately — no rebuild to wait on.
+        let mut rx = {
+            let docs = self.docs.read().await;
+            match docs.get(uri) {
+                Some(state) => state.tx.subscribe(),
+                None => return,
+            }
+        };
+        rx.mark_unchanged();
+        let _ = rx.changed().await;
     }
 
     async fn close(&self, uri: &Url) {
@@ -568,32 +629,65 @@ impl LanguageBackend for HtclBackend {
     }
 
     async fn hover(&self, uri: &Url, position: Position) -> Option<Hover> {
-        let analysis = self.analysis_for(uri).await?;
-        let offset = analysis.local_line_index.offset_of(LineCol {
+        // Same strategy as completion: serve hover off the CURRENT
+        // in-memory text so what the user's cursor is on maps to
+        // real content. When a workspace analysis is available
+        // (usually — 99% of hover requests fire between typing
+        // bursts, when there IS a committed snapshot), we consult
+        // it for cross-file lookups; when there isn't (fresh file,
+        // still-building initial index), we degrade to local-only
+        // — still useful for hovering over locally-defined procs.
+        let current_text = self.current_text(uri).await.unwrap_or_default();
+        let current_line_index = LineIndex::new(&current_text);
+        let offset = current_line_index.offset_of(LineCol {
             line: position.line,
             character: position.character,
         });
-        // Use the workspace view so a hover on a call to an imported
-        // proc shows that proc's signature, not nothing.
-        let parsed = &analysis.parsed_view;
-        let view = &analysis.view;
-        let target = hover_at(&parsed.document, &view.view_source, offset)?;
-        // The hover span is in view-source coordinates; only translate
-        // back to line/col when it lands in the local file (which is
-        // always true for a cursor hover from this editor).
-        if target.span().start >= view.local_len {
-            return None;
-        }
-        let (start, end) = analysis.local_line_index.range(target.span());
+        let current_parsed = vw_htcl::parse(&current_text);
+
+        // Prefer the workspace snapshot's parsed_view (it contains
+        // the imported proc definitions we want to hover through).
+        // Fall back to the CURRENT local parse when nothing's
+        // committed yet.
+        let stale = self.analysis_for(uri).await;
+        let (hover_doc, hover_source, hover_offset, doc_for_comments) =
+            if let Some(a) = stale.as_ref() {
+                // The offset was computed against CURRENT text. It
+                // maps 1:1 into the workspace view AS LONG AS the
+                // stale view's local prefix is a prefix of the
+                // current text (typical: adds/dels midway through
+                // the line only shift bytes past that point, but
+                // the workspace view is only ~correct in the local
+                // prefix anyway). For hover, the miscarriage is
+                // harmless — worst case we hover on the wrong
+                // token and return None.
+                (
+                    &a.parsed_view.document,
+                    a.view.view_source.as_str(),
+                    offset,
+                    &a.parsed_view.document,
+                )
+            } else {
+                (
+                    &current_parsed.document,
+                    current_text.as_str(),
+                    offset,
+                    &current_parsed.document,
+                )
+            };
+        let target = hover_at(hover_doc, hover_source, hover_offset)?;
+        // Prefer LOCAL line index for translating spans → line/col:
+        // that's what Helix expects.
+        let (start, end) = current_line_index.range(target.span());
         // The proc's own doc comments live on the surrounding Command,
         // not on its `Proc` payload — fetch them up here so the
         // formatters can stay focused on shape, not lookup plumbing.
         let proc_doc_comments = match &target {
             HoverTarget::ProcDef { proc, .. } => {
-                proc_doc_comments_for(&parsed.document, proc)
+                proc_doc_comments_for(doc_for_comments, proc)
             }
             HoverTarget::CallSite { proc_name, .. } => {
-                proc_doc_comments_by_name(&parsed.document, proc_name)
+                proc_doc_comments_by_name(doc_for_comments, proc_name)
             }
             _ => Vec::new(),
         };
@@ -615,43 +709,59 @@ impl LanguageBackend for HtclBackend {
         uri: &Url,
         position: Position,
     ) -> Vec<CompletionItem> {
-        let Some(analysis) = self.analysis_for(uri).await else {
-            return Vec::new();
-        };
-        let line_index = &analysis.local_line_index;
-        let offset = line_index.offset_of(LineCol {
+        // Serve completion off the CURRENT in-memory text (what the
+        // user just typed), not the stale-cached workspace analysis's
+        // local_text. Otherwise cmdline::analyze scans backward from
+        // an offset in TEXT THAT DOESN'T CONTAIN WHAT WAS JUST TYPED
+        // — the `partial` comes out blank or wrong, and completion
+        // silently returns nothing. This is the "typed `-preset` and
+        // got no enum values" symptom.
+        //
+        // Cross-file proc lookups (`gtwiz_versal::configure`, etc.)
+        // still come from the stale workspace analysis via
+        // `parsed_view` — those signatures don't change while the
+        // user types locally, so stale is fine.
+        let current_text = self.current_text(uri).await.unwrap_or_default();
+        let current_line_index = LineIndex::new(&current_text);
+        let offset = current_line_index.offset_of(LineCol {
             line: position.line,
             character: position.character,
         });
+        let current_parsed = vw_htcl::parse(&current_text);
 
         // `src <partial>` is filesystem-aware, so it takes its own
         // path before we fall back to the htcl-level analyzer.
-        let line = vw_htcl::cmdline::analyze(&analysis.local_text, offset);
+        let line = vw_htcl::cmdline::analyze(&current_text, offset);
         if crate::src_complete::is_src_path_context(&line) {
             if let Ok(entry_file) = uri.to_file_path() {
                 let resolver = crate::workspace::build_resolver(&entry_file);
                 return crate::src_complete::src_path_completions(
                     &entry_file,
                     &line,
-                    line_index,
+                    &current_line_index,
                     &resolver,
                 );
             }
         }
 
-        // Workspace view here too: command-position completion picks
-        // up imported proc names.
-        let view = &analysis.view;
-        let parsed = &analysis.parsed_view;
-        complete_at(&parsed.document, &view.view_source, offset)
-            .into_iter()
-            // The completion result's `replace` span is in view
-            // coordinates; if it slipped past the local region we
-            // drop it (shouldn't happen for in-file cursors, but
-            // defensive).
-            .filter(|c| c.replace.start < view.local_len)
-            .map(|c| completion_item(c, line_index))
-            .collect()
+        // Grab the workspace analysis if it exists (stale or fresh).
+        // If we've never had one commit, we complete against just
+        // the local file — better than blocking indefinitely.
+        let analysis = self.analysis_for(uri).await;
+        let workspace_docs: Vec<&vw_htcl::Document> = analysis
+            .as_ref()
+            .map(|a| vec![&a.parsed_view.document])
+            .unwrap_or_default();
+
+        vw_htcl::complete_at_with_extras(
+            &current_parsed.document,
+            &current_text,
+            offset,
+            &workspace_docs,
+        )
+        .into_iter()
+        .map(|c| completion_item(c, &current_line_index))
+        .collect()
     }
 
     async fn signature_help(
@@ -1007,14 +1117,21 @@ fn completion_item(c: Completion, line_index: &LineIndex) -> CompletionItem {
         CompletionKind::Proc => CompletionItemKind::FUNCTION,
         CompletionKind::Flag => CompletionItemKind::FIELD,
         CompletionKind::EnumValue => CompletionItemKind::ENUM_MEMBER,
+        CompletionKind::Constructor => CompletionItemKind::CONSTRUCTOR,
     };
     let (start, end) = line_index.range(c.replace);
+    let insert = c.insert_text.clone().unwrap_or_else(|| c.label.clone());
     let text_edit = TextEdit {
         range: Range {
             start: lc_to_pos(start),
             end: lc_to_pos(end),
         },
-        new_text: c.label.clone(),
+        new_text: insert,
+    };
+    let insert_text_format = if c.snippet {
+        InsertTextFormat::SNIPPET
+    } else {
+        InsertTextFormat::PLAIN_TEXT
     };
     CompletionItem {
         label: c.label,
@@ -1026,7 +1143,7 @@ fn completion_item(c: Completion, line_index: &LineIndex) -> CompletionItem {
                 value,
             })
         }),
-        insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+        insert_text_format: Some(insert_text_format),
         text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(
             text_edit,
         )),
@@ -1520,7 +1637,7 @@ mod tests {
     async fn diagnostics_for_unterminated_string() {
         let backend = HtclBackend::new();
         backend
-            .set_text(uri(), "puts \"oops\nputs ok\n".into())
+            .set_text_sync(uri(), "puts \"oops\nputs ok\n".into())
             .await;
         let diags = backend.diagnostics(&uri()).await;
         assert!(!diags.is_empty(), "expected at least one diagnostic");
@@ -1532,7 +1649,7 @@ mod tests {
     async fn document_symbols_include_proc() {
         let backend = HtclBackend::new();
         backend
-            .set_text(
+            .set_text_sync(
                 uri(),
                 "## greet someone\nproc greet {name} { puts hi }\n".into(),
             )
@@ -1548,7 +1665,7 @@ mod tests {
     async fn workspace_symbols_surface_procs_types_and_enum_variants() {
         let backend = HtclBackend::new();
         backend
-            .set_text(
+            .set_text_sync(
                 uri(),
                 "proc greet {name} { puts hi }\n\
                  type Foo = int\n\
@@ -1577,7 +1694,7 @@ mod tests {
     async fn validator_diagnostics_surface_in_lsp() {
         let backend = HtclBackend::new();
         backend
-            .set_text(
+            .set_text_sync(
                 uri(),
                 "proc axis {\n  @enum(1, 2, 4) width\n} { puts $width }\n\
                  axis -width 3\n"
@@ -1600,7 +1717,7 @@ mod tests {
     async fn unused_var_warning_surfaces_in_lsp() {
         let backend = HtclBackend::new();
         backend
-            .set_text(uri(), "proc f {unused_arg} { return 1 }\n".into())
+            .set_text_sync(uri(), "proc f {unused_arg} { return 1 }\n".into())
             .await;
         let diags = backend.diagnostics(&uri()).await;
         let warnings: Vec<_> = diags
@@ -1620,7 +1737,7 @@ mod tests {
     async fn unused_var_underscore_prefix_suppresses_lsp_warning() {
         let backend = HtclBackend::new();
         backend
-            .set_text(uri(), "proc f {_ignored} { return 1 }\n".into())
+            .set_text_sync(uri(), "proc f {_ignored} { return 1 }\n".into())
             .await;
         let diags = backend.diagnostics(&uri()).await;
         assert!(
@@ -1646,7 +1763,7 @@ proc f {} {
   return $mode
 }
 ";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Cursor on the `m` of `set mode` (line 1, column 6). 0-indexed.
         let workspace_edit = backend
             .rename(
@@ -1686,7 +1803,7 @@ proc f {} {
     async fn rename_proc_name_via_lsp_covers_decl_and_call() {
         let backend = HtclBackend::new();
         backend
-            .set_text(uri(), "proc greet {} { puts hi }\ngreet\n".into())
+            .set_text_sync(uri(), "proc greet {} { puts hi }\ngreet\n".into())
             .await;
         // Cursor on the `g` of the proc's own name.
         let result = backend
@@ -1709,7 +1826,7 @@ proc f {} {
     async fn references_returns_all_local_call_sites() {
         let backend = HtclBackend::new();
         backend
-            .set_text(
+            .set_text_sync(
                 uri(),
                 "proc greet {} { puts hi }\ngreet\nproc other {} { greet }\n"
                     .into(),
@@ -1736,7 +1853,7 @@ proc f {} {
     async fn references_on_type_covers_annotations() {
         let backend = HtclBackend::new();
         backend
-            .set_text(
+            .set_text_sync(
                 uri(),
                 "type MyThing = string\nproc a {v: MyThing} MyThing { }\nproc b {v: MyThing} { }\n"
                     .into(),
@@ -1761,7 +1878,7 @@ proc f {} {
     async fn rename_type_covers_all_annotations() {
         let backend = HtclBackend::new();
         backend
-            .set_text(
+            .set_text_sync(
                 uri(),
                 "type MyThing = string\nproc a {v: MyThing} MyThing { }\n"
                     .into(),
@@ -1817,7 +1934,7 @@ proc greet {\n\
   @default(\"world\") name\n\
 } { puts \"hi $name\" }\n\
 greet -name there\n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Cursor on the `g` of the call-site `greet`. Line indices
         // are 0-based.
         let hover = backend
@@ -1851,7 +1968,7 @@ proc greet {\n\
   @default(\"world\") name\n\
 } { puts hi }\n\
 greet -name there\n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Position cursor on `-name` of the call site (line 4 in the
         // 0-indexed scheme).
         let hover = backend
@@ -1878,7 +1995,9 @@ greet -name there\n";
     #[tokio::test]
     async fn hover_outside_known_construct_returns_none() {
         let backend = HtclBackend::new();
-        backend.set_text(uri(), "puts hello world\n".into()).await;
+        backend
+            .set_text_sync(uri(), "puts hello world\n".into())
+            .await;
         let hover = backend
             .hover(
                 &uri(),
@@ -1897,7 +2016,7 @@ greet -name there\n";
         let src = "\
 proc greet {\n  name\n} { puts hi }\n\
 greet -name there\n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Cursor on the `g` of the call-site `greet` (line 3).
         let locs = backend
             .goto_definition(
@@ -1919,7 +2038,7 @@ greet -name there\n";
         let backend = HtclBackend::new();
         let src = "\
 proc f {\n  has_a\n  @requires(has_a) has_b\n} { }\n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Cursor on `has_a` inside `@requires(has_a)`.
         let locs = backend
             .goto_definition(
@@ -1943,7 +2062,7 @@ proc f {\n  has_a\n  @requires(has_a) has_b\n} { }\n";
 proc greet {} { }\n\
 proc grumble {} { }\n\
 gr\n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Cursor at end of `gr` on line 2.
         let items = backend
             .completion(
@@ -1967,7 +2086,7 @@ gr\n";
         let src = "\
 proc cfg {\n  width\n  depth\n} { }\n\
 cfg \n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Line 4, just after `cfg ` (character 4).
         let items = backend
             .completion(
@@ -1992,7 +2111,7 @@ cfg \n";
 ## Configure the bus.\n\
 proc cfg {\n  width\n  depth\n} { }\n\
 cfg -depth \n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Line 5, after `cfg -depth ` (character 11).
         let help = backend
             .signature_help(
@@ -2022,7 +2141,7 @@ cfg -depth \n";
         let src = "\
 proc make_widget {} bd_cell { return foo }\n\
 make_widget \n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         let help = backend
             .signature_help(
                 &uri(),
@@ -2043,7 +2162,7 @@ make_widget \n";
         let backend = HtclBackend::new();
         let src = "\
 enum Property = {\n  Scalar: string\n  Nested: int\n}\n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Cursor on the enum name (line 0, col 5: 'Property').
         let hover = backend
             .hover(
@@ -2072,7 +2191,7 @@ enum Property = {\n  Scalar: string\n  Nested: int\n}\n";
         let src = "\
 ## Builds a widget.\n\
 proc make_widget {} dict<string,bd_cell> { return {} }\n";
-        backend.set_text(uri(), src.into()).await;
+        backend.set_text_sync(uri(), src.into()).await;
         // Hover on the proc name `make_widget` at line 1.
         let hover = backend
             .hover(
@@ -2099,7 +2218,7 @@ proc make_widget {} dict<string,bd_cell> { return {} }\n";
     #[tokio::test]
     async fn signature_help_none_outside_call() {
         let backend = HtclBackend::new();
-        backend.set_text(uri(), "puts hi\n".into()).await;
+        backend.set_text_sync(uri(), "puts hi\n".into()).await;
         let help = backend
             .signature_help(
                 &uri(),
@@ -2115,7 +2234,7 @@ proc make_widget {} dict<string,bd_cell> { return {} }\n";
     #[tokio::test]
     async fn goto_definition_unknown_returns_empty() {
         let backend = HtclBackend::new();
-        backend.set_text(uri(), "puts hello\n".into()).await;
+        backend.set_text_sync(uri(), "puts hello\n".into()).await;
         let locs = backend
             .goto_definition(
                 &uri(),
@@ -2154,7 +2273,9 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let backend = HtclBackend::new();
         let main_uri = Url::from_file_path(&main_path).unwrap();
         let lib_uri = Url::from_file_path(&lib_path).unwrap();
-        backend.set_text(main_uri.clone(), main_src.into()).await;
+        backend
+            .set_text_sync(main_uri.clone(), main_src.into())
+            .await;
         (dir, backend, main_uri, lib_uri)
     }
 
@@ -2215,7 +2336,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         std::fs::write(&path, src).unwrap();
         let backend = HtclBackend::new();
         let uri = Url::from_file_path(&path).unwrap();
-        backend.set_text(uri.clone(), src.into()).await;
+        backend.set_text_sync(uri.clone(), src.into()).await;
         let locs = backend
             .goto_definition(
                 &uri,
@@ -2250,7 +2371,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         std::fs::write(&path, src).unwrap();
         let backend = HtclBackend::new();
         let uri = Url::from_file_path(&path).unwrap();
-        backend.set_text(uri.clone(), src.into()).await;
+        backend.set_text_sync(uri.clone(), src.into()).await;
         // Cursor on `target` inside `[target -x 1]` on line 3.
         // Line 3 is `    set cell [target -x 1]`; `target` starts
         // at col 17.
@@ -2284,7 +2405,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         std::fs::write(&path, src).unwrap();
         let backend = HtclBackend::new();
         let uri = Url::from_file_path(&path).unwrap();
-        backend.set_text(uri.clone(), src.into()).await;
+        backend.set_text_sync(uri.clone(), src.into()).await;
         // Cursor on `target` inside `[target -x 1]` on line 4.
         let hover = backend
             .hover(
@@ -2318,7 +2439,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         std::fs::write(&path, src).unwrap();
         let backend = HtclBackend::new();
         let uri = Url::from_file_path(&path).unwrap();
-        backend.set_text(uri.clone(), src.into()).await;
+        backend.set_text_sync(uri.clone(), src.into()).await;
         let hover = backend
             .hover(
                 &uri,
@@ -2348,7 +2469,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let backend = HtclBackend::new();
         let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
         let text = std::fs::read_to_string(&cpm5_module).unwrap();
-        backend.set_text(cpm5_uri.clone(), text.clone()).await;
+        backend.set_text_sync(cpm5_uri.clone(), text.clone()).await;
 
         // Find the line + column of `vivado_cmd::set_property` —
         // avoids hard-coding a line number that will drift as the
@@ -2397,7 +2518,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let backend = HtclBackend::new();
         let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
         let text = std::fs::read_to_string(&cpm5_module).unwrap();
-        backend.set_text(cpm5_uri.clone(), text.clone()).await;
+        backend.set_text_sync(cpm5_uri.clone(), text.clone()).await;
         for needle in &["vivado_cmd::create_bd_cell", "vivado_cmd::create_ip"] {
             let (line, character) = text
                 .lines()
@@ -2436,7 +2557,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let backend = HtclBackend::new();
         let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
         let text = std::fs::read_to_string(&cpm5_module).unwrap();
-        backend.set_text(cpm5_uri.clone(), text.clone()).await;
+        backend.set_text_sync(cpm5_uri.clone(), text.clone()).await;
         let target = text.lines().enumerate().find_map(|(i, line)| {
             line.find("vivado_cmd::set_property")
                 .map(|col| (i as u32, (col + 12) as u32))
@@ -2468,7 +2589,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let backend = HtclBackend::new();
         let dcmac_uri = Url::from_file_path(&dcmac_module).unwrap();
         let text = std::fs::read_to_string(&dcmac_module).unwrap();
-        backend.set_text(dcmac_uri.clone(), text.clone()).await;
+        backend.set_text_sync(dcmac_uri.clone(), text.clone()).await;
         // Find a real type-annotation site (arg-type slot on
         // `MacPortProps::from` etc.) — not the `namespace eval
         // dcmac::MacPortProps {}` word, which passes the string as
@@ -2551,7 +2672,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let backend = HtclBackend::new();
         let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
         backend
-            .set_text(
+            .set_text_sync(
                 cpm5_uri.clone(),
                 std::fs::read_to_string(&cpm5_module).unwrap(),
             )
@@ -2627,7 +2748,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let backend = HtclBackend::new();
         let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
         backend
-            .set_text(
+            .set_text_sync(
                 cpm5_uri.clone(),
                 std::fs::read_to_string(&cpm5_module).unwrap(),
             )
@@ -2657,7 +2778,9 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         // Append a partial proc name at end of file so cursor lands in
         // command position.
         let new_text = "src lib\ngreet -who world\ngre\n";
-        backend.set_text(main_uri.clone(), new_text.into()).await;
+        backend
+            .set_text_sync(main_uri.clone(), new_text.into())
+            .await;
         let items = backend
             .completion(
                 &main_uri,
@@ -2716,7 +2839,9 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let (_dir, backend, main_uri, _lib_uri) =
             temp_workspace_with_import().await;
         let new_text = "src lib\nset cell [greet -who x]\n";
-        backend.set_text(main_uri.clone(), new_text.into()).await;
+        backend
+            .set_text_sync(main_uri.clone(), new_text.into())
+            .await;
         // Cursor on `greet` inside the `[ … ]` on line 1.
         let hover = backend
             .hover(
@@ -2741,7 +2866,9 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
             temp_workspace_with_import().await;
         // Cursor right after `greet ` inside `[ … ]`.
         let new_text = "src lib\nset cell [greet ]\n";
-        backend.set_text(main_uri.clone(), new_text.into()).await;
+        backend
+            .set_text_sync(main_uri.clone(), new_text.into())
+            .await;
         let help = backend
             .signature_help(
                 &main_uri,
@@ -2764,7 +2891,10 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let (_dir, backend, main_uri, _lib_uri) =
             temp_workspace_with_import().await;
         backend
-            .set_text(main_uri.clone(), "src lib\ngreet -whoz world\n".into())
+            .set_text_sync(
+                main_uri.clone(),
+                "src lib\ngreet -whoz world\n".into(),
+            )
             .await;
         let diags = backend.diagnostics(&main_uri).await;
         assert!(

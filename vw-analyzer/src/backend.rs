@@ -34,6 +34,20 @@ pub trait LanguageBackend: Send + Sync {
     /// (and cache) analysis results.
     async fn set_text(&self, uri: Url, text: String);
 
+    /// Block until the next full re-index / re-analysis of `uri`
+    /// commits. Called by the server AFTER `set_text` from a
+    /// detached task so it can wrap the wait in an LSP
+    /// `window/workDoneProgress` notification — that's how the
+    /// editor's "indexing…" spinner comes back on.
+    ///
+    /// Default implementation returns immediately (backends without
+    /// a background reindex signal don't have anything to wait on;
+    /// the progress spinner just flashes briefly and disappears).
+    /// Backends that do have a background rebuild (like
+    /// [`crate::HtclBackend`]) override this to await their
+    /// indexer's commit notification.
+    async fn wait_for_reindex(&self, _uri: &Url) {}
+
     /// Editor-supplied workspace roots (from LSP `rootUri` /
     /// `workspaceFolders`, plus updates via
     /// `didChangeWorkspaceFolders`). Backends may use them as

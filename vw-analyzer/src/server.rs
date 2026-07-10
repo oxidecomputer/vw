@@ -69,32 +69,36 @@ impl Analyzer {
         };
         let client = self.client.clone();
         let progress_seq = self.progress_seq.clone();
-        let uri_progress = uri.clone();
-        // Fire a progress token in a detached task. It races the
-        // publish; whichever finishes first is fine. If the
-        // client stalls on the create request we don't care —
-        // publish still ships.
+        let uri_task = uri.clone();
+        // Detached task: wait for the next indexer commit while an
+        // LSP progress spinner is active, then publish the diagnostics
+        // from THAT fresh analysis. Wrapping the wait in
+        // `with_progress` is what makes Helix's pulsing "indexing…"
+        // indicator show up during the rebuild — the previous version
+        // wrapped an empty `async {}` future so Begin+End fired in
+        // the same millisecond, effectively no-op.
+        //
+        // Reads (completion, hover, goto-def) DO NOT go through this
+        // task — they use `backend.diagnostics` / `analysis_for`
+        // directly and are served instantly from the stale-cache. So
+        // typing latency stays great; only the diagnostics-refresh +
+        // progress spinner are gated on the actual rebuild.
         tokio::spawn(async move {
-            let _ = with_progress(
+            with_progress(
                 &client,
                 &progress_seq,
                 "Indexing",
-                uri_progress.as_ref(),
-                async {},
+                uri_task.as_ref(),
+                backend.wait_for_reindex(&uri_task),
             )
             .await;
-        });
-        // Foreground: await the analysis, publish. No progress
-        // dependencies here.
-        let client = self.client.clone();
-        tokio::spawn(async move {
-            let diags = backend.diagnostics(&uri).await;
+            let diags = backend.diagnostics(&uri_task).await;
             debug!(
-                uri = %uri,
+                uri = %uri_task,
                 count = diags.len(),
                 "publishing diagnostics"
             );
-            client.publish_diagnostics(uri, diags, version).await;
+            client.publish_diagnostics(uri_task, diags, version).await;
         });
     }
 }

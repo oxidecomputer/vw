@@ -742,6 +742,8 @@ impl App {
                         detail: Some(hint.to_string()),
                         documentation: None,
                         replace: cmd_line.partial_span,
+                        insert_text: None,
+                        snippet: false,
                     });
                 }
             }
@@ -767,6 +769,8 @@ impl App {
                         detail: None,
                         documentation: None,
                         replace: cmd_line.partial_span,
+                        insert_text: None,
+                        snippet: false,
                     });
                 }
             }
@@ -809,6 +813,8 @@ impl App {
                             detail,
                             documentation: None,
                             replace: cmd_line.partial_span,
+                            insert_text: None,
+                            snippet: false,
                         });
                     }
                 }

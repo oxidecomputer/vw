@@ -53,7 +53,9 @@ pub use undefined::{top_level_var_names, top_level_var_types};
 pub mod unused;
 pub mod validate;
 
-pub use complete::{complete_at, Completion, CompletionKind};
+pub use complete::{
+    complete_at, complete_at_with_extras, Completion, CompletionKind,
+};
 pub use goto::definition_at;
 pub use hover::{hover_at, HoverTarget};
 pub use loader::{
