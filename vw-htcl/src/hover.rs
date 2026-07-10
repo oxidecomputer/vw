@@ -51,8 +51,15 @@ pub enum HoverTarget<'a> {
     },
     /// Cursor is on a `$var` reference that resolves to a local
     /// (`set`/`variable`) rather than a parameter. The span is the
-    /// reference itself.
-    LocalVar { name: String, span: Span },
+    /// reference itself. `ty` carries the type inferred from the
+    /// binding's RHS when the shape is knowable (a `[typed_proc ...]`
+    /// call substitution, a `$other_typed_var` copy, or a
+    /// `true`/`false` literal); `None` when the RHS is opaque.
+    LocalVar {
+        name: String,
+        span: Span,
+        ty: Option<crate::ast::TypeExpr>,
+    },
     /// Cursor is on the name of an `enum` declaration. Shows the
     /// variants block as a hover popup.
     EnumDef {
@@ -96,13 +103,75 @@ pub fn hover_at<'a>(
     if let Some(t) = hover_in_doc_comment(document, source, offset, &table) {
         return Some(t);
     }
+    // Cursor on the name-word of a `set VAR X` binding → treat it
+    // as the local's definition site, showing the same
+    // name-and-inferred-type hover that a `$VAR` reference would.
+    // Runs before the general stmt walker because that walker
+    // resolves `set` as a generic call and returns nothing useful
+    // for the name-word position.
+    if let Some(t) = hover_in_set_binding(document, source, offset, &table) {
+        return Some(t);
+    }
     hover_in_stmts(&document.stmts, &table, source, offset)
         // Fallback: a `$var` reference — including one buried in opaque
         // text (a command substitution or `if`/`while` condition).
-        .or_else(|| hover_scanned_var(document, source, offset))
+        .or_else(|| hover_scanned_var(document, source, offset, &table))
         // Fallback: cursor on a type-name annotation (arg type,
         // return type, `type … = TYPE` underlying, generic arg).
         .or_else(|| hover_of_type(document, offset))
+}
+
+/// Cursor on the name-word of a `set NAME VALUE` command (the
+/// binding site, no `$` prefix). Reuses the same `infer_local_type`
+/// walker as the `$var` fallback so the hover shows `$NAME: T` in
+/// both places consistently.
+fn hover_in_set_binding<'a>(
+    document: &'a Document,
+    _source: &'a str,
+    offset: u32,
+    sig_table: &crate::lower::SignatureTable<'a>,
+) -> Option<HoverTarget<'a>> {
+    use crate::ast::CommandKind;
+    let (stmts, enclosing) = innermost_scope(document, offset);
+    let cmd = find_set_command_at(stmts, offset)?;
+    // Skip the containing proc when scanning nested control-flow —
+    // for now `find_set_command_at` only looks at top-level stmts of
+    // the innermost scope, which covers the common case.
+    let CommandKind::Set = cmd.kind else {
+        return None;
+    };
+    let name_word = cmd.words.get(1)?;
+    if !name_word.span.contains(offset) {
+        return None;
+    }
+    let name = name_word.as_text()?.to_string();
+    let ty = infer_local_type(
+        stmts,
+        enclosing,
+        sig_table,
+        document,
+        &name,
+        name_word.span,
+    );
+    Some(HoverTarget::LocalVar {
+        name,
+        span: name_word.span,
+        ty,
+    })
+}
+
+fn find_set_command_at(stmts: &[Stmt], offset: u32) -> Option<&Command> {
+    use crate::ast::{CommandKind, Stmt};
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        if !cmd.span.contains(offset) {
+            continue;
+        }
+        if matches!(cmd.kind, CommandKind::Set) {
+            return Some(cmd);
+        }
+    }
+    None
 }
 
 /// Cursor on a type name → return a `TypeDef` hover target for the
@@ -244,6 +313,7 @@ fn hover_scanned_var<'a>(
     document: &'a Document,
     source: &str,
     offset: u32,
+    sig_table: &crate::lower::SignatureTable<'a>,
 ) -> Option<HoverTarget<'a>> {
     let (name, span) = scan_var_ref(source, offset)?;
     let (stmts, enclosing) = innermost_scope(document, offset);
@@ -256,8 +326,79 @@ fn hover_scanned_var<'a>(
             // Anchor the hover on the reference, not the declaration.
             span,
         }),
-        VarDef::Local(_) => Some(HoverTarget::LocalVar { name, span }),
+        VarDef::Local(def_span) => {
+            let ty = infer_local_type(
+                stmts, enclosing, sig_table, document, &name, def_span,
+            );
+            Some(HoverTarget::LocalVar { name, span, ty })
+        }
     }
+}
+
+/// Infer the type of the local variable `name` whose defining `set`
+/// command's name-word lives at `def_span`. Walks `scope_stmts` in
+/// order to seed `VarTypeTable` with any typed `set`s that come
+/// before the target — so a chain like `set a [typed]; set b $a`
+/// still types `b`. Seeds parameter types too, in case `set b $arg`
+/// forwards a parameter through a local. Returns `None` when the
+/// RHS is opaque (the same policy the validator uses).
+fn infer_local_type<'a>(
+    scope_stmts: &'a [Stmt],
+    enclosing: Option<&'a crate::ast::Proc>,
+    sig_table: &crate::lower::SignatureTable<'a>,
+    document: &'a Document,
+    name: &str,
+    def_span: Span,
+) -> Option<crate::ast::TypeExpr> {
+    use crate::ast::{CommandKind, Stmt};
+    let mut var_table = crate::validate::VarTypeTable::new();
+    // Parameter types are visible to `set` RHS inference — a forward
+    // like `set out $arg` propagates the arg's type through.
+    if let Some(proc) = enclosing {
+        if let Some(sig) = &proc.signature {
+            for arg in &sig.args {
+                if let Some(ty) = &arg.type_annotation {
+                    var_table.insert(arg.name.clone(), ty.clone());
+                }
+            }
+        }
+    }
+    // Full document-wide proc table so `[user_proc]` return-type
+    // inference kicks in for user procs without an annotated
+    // return type — same walker the REPL / putr chain uses.
+    let proc_table = crate::validate::build_proc_table(document);
+    for stmt in scope_stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        if !matches!(cmd.kind, CommandKind::Set) {
+            continue;
+        }
+        let Some(name_word) = cmd.words.get(1) else {
+            continue;
+        };
+        let Some(value_word) = cmd.words.get(2) else {
+            continue;
+        };
+        let Some(binding_name) = name_word.as_text() else {
+            continue;
+        };
+        // Type the RHS in the pre-target var-table (chain support).
+        let ty = crate::validate::value_type_with_procs(
+            value_word,
+            sig_table,
+            &var_table,
+            Some(&proc_table),
+        );
+        if let Some(ref t) = ty {
+            var_table.insert(binding_name.to_string(), t.clone());
+        }
+        // Return the type of the specific binding the hover is on —
+        // matched by name-word span so shadowed bindings before it
+        // don't overwrite the answer.
+        if name_word.span == def_span && binding_name == name {
+            return ty;
+        }
+    }
+    None
 }
 
 /// Find the hover target at `offset` within `stmts`, descending into
@@ -776,6 +917,89 @@ proc p {} {\n  set count 0\n  use $count\n}\n";
         let target = hover_at(&parsed.document, src, pos).unwrap();
         match target {
             HoverTarget::LocalVar { name, .. } => assert_eq!(name, "count"),
+            other => panic!("expected LocalVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_set_binding_name_infers_type() {
+        // Cursor on the LHS of `set x [typed]` (no `$`) — should
+        // resolve as a LocalVar with the RHS's type, same as
+        // hovering `$x` later would.
+        let src = "\
+proc make_it {} string { return hi }
+proc p {} {
+  set x [make_it]
+}
+";
+        let parsed = parse(src);
+        // Cursor lands on the `x` of `set x` (not `$x`).
+        let pos = first(src, "set x ") + "set ".len() as u32;
+        let target = hover_at(&parsed.document, src, pos).unwrap();
+        match target {
+            HoverTarget::LocalVar { name, ty, .. } => {
+                assert_eq!(name, "x");
+                let ty = ty.expect("expected inferred type");
+                assert!(
+                    matches!(
+                        ty,
+                        crate::ast::TypeExpr::Named { ref name, .. }
+                            if name == "string"
+                    ),
+                    "got {ty:?}",
+                );
+            }
+            other => panic!("expected LocalVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_local_var_infers_type_from_typed_call() {
+        // `set x [typed_proc ...]` where `typed_proc` has an
+        // annotated return type → hovering `$x` should carry that
+        // type.
+        let src = "\
+proc make_it {} string { return hi }
+proc p {} {
+  set x [make_it]
+  use $x
+}
+";
+        let parsed = parse(src);
+        let pos = first(src, "$x") + 1;
+        let target = hover_at(&parsed.document, src, pos).unwrap();
+        match target {
+            HoverTarget::LocalVar { name, ty, .. } => {
+                assert_eq!(name, "x");
+                let ty = ty.expect("expected inferred type");
+                assert!(
+                    matches!(
+                        ty,
+                        crate::ast::TypeExpr::Named { ref name, .. }
+                            if name == "string"
+                    ),
+                    "got {ty:?}",
+                );
+            }
+            other => panic!("expected LocalVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_local_var_untyped_rhs_reports_no_type() {
+        let src = "\
+proc p {} {
+  set x [some_untyped]
+  use $x
+}
+";
+        let parsed = parse(src);
+        let pos = first(src, "$x") + 1;
+        let target = hover_at(&parsed.document, src, pos).unwrap();
+        match target {
+            HoverTarget::LocalVar { ty, .. } => {
+                assert!(ty.is_none(), "expected no type, got {ty:?}");
+            }
             other => panic!("expected LocalVar, got {other:?}"),
         }
     }

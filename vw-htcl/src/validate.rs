@@ -410,9 +410,6 @@ pub(crate) fn validate_proc_returns(
     newtype_names: &std::collections::HashSet<String>,
     diags: &mut Vec<Diagnostic>,
 ) {
-    let Some(declared) = &proc.return_type else {
-        return;
-    };
     // Newtype-triplet exemption: `T::from`, `T::to`, `T::repr`,
     // `T::empty` are compiler-emitted (or generator-emitted)
     // identity conversions between a newtype and its underlying.
@@ -421,12 +418,23 @@ pub(crate) fn validate_proc_returns(
     // that's the WHOLE POINT of the from/to/repr layer: cross
     // the newtype boundary via `return $v` (Tcl-level identity).
     // Skip the check when the proc name is `T::<suffix>` for a
-    // declared newtype `T` and a triplet suffix.
+    // declared newtype `T` and a triplet suffix. Applies to both
+    // annotated and unannotated forms — hand-written triplets
+    // often omit the annotation and rely on the identity-shape.
     if let Some(name) = proc.name.as_deref() {
         if is_newtype_triplet_name(name, newtype_names) {
             return;
         }
     }
+    let Some(declared) = &proc.return_type else {
+        // No return-type annotation → the proc is implicitly a
+        // side-effect-only op. `return X` in a side-effect proc is
+        // a structural mismatch: the caller has nothing to receive
+        // it, and the missing annotation tells readers the same. Flag
+        // every `return X` with a value. Bare `return` is fine.
+        walk_returns_without_annotation(&proc.body, source, diags);
+        return;
+    };
     // Enum-overload-arm exemption: `proc f {v: E::A} string { … }`
     // is the specialization shape for the overload dispatcher —
     // `v` is the enum variant's payload, which at Tcl runtime is
@@ -636,6 +644,76 @@ fn walk_returns(
                     declared,
                     diags,
                 );
+            }
+        }
+    }
+}
+
+/// Walk `stmts` looking for `return X` statements with a value in a
+/// proc that has NO declared return type. Every such `return X` is
+/// an error — the proc's shape declares "side effects only," and a
+/// value-carrying return contradicts that.
+///
+/// Descends into control-flow braced bodies the same way
+/// [`walk_returns`] does — a value-return buried in an `if`/`else`
+/// branch is caught. Bare `return` is fine (side-effect procs
+/// naturally use it for early exits).
+fn walk_returns_without_annotation(
+    stmts: &[crate::ast::Stmt],
+    source: &str,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::ast::{Stmt, WordForm};
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        let head_text = cmd.words.first().and_then(|w| w.as_text());
+        if head_text == Some("return") && cmd.words.len() >= 2 {
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: "`return` with a value in a proc that has no \
+                          declared return type — add a return-type \
+                          annotation (`proc NAME { args } TYPE { ... }`) \
+                          or drop the returned value"
+                    .to_string(),
+                span: cmd.span,
+            });
+        }
+        if matches!(
+            head_text,
+            Some(
+                "if" | "elseif"
+                    | "else"
+                    | "while"
+                    | "for"
+                    | "foreach"
+                    | "catch"
+            )
+        ) {
+            for word in cmd.words.iter().skip(1) {
+                if word.form != WordForm::Braced {
+                    continue;
+                }
+                let word_start = word.span.start as usize;
+                let word_end = word.span.end as usize;
+                if word_end <= word_start + 2 {
+                    continue;
+                }
+                let interior_start = word_start + 1;
+                let interior_end = word_end - 1;
+                let body_text = &source[interior_start..interior_end];
+                let (mut body_stmts, _errs) = crate::parser::parse_fragment(
+                    body_text,
+                    crate::parser::Mode::Toplevel,
+                );
+                for s in &mut body_stmts {
+                    crate::parser::shift_stmt(s, interior_start as u32);
+                }
+                crate::parser::populate_procs(
+                    &mut body_stmts,
+                    source,
+                    &mut Vec::new(),
+                );
+                walk_returns_without_annotation(&body_stmts, source, diags);
             }
         }
     }
@@ -4378,15 +4456,47 @@ proc side_effect {x} unit {
     }
 
     #[test]
-    fn unannotated_proc_no_return_check() {
-        // No return annotation → no check fires, no diagnostic.
+    fn unannotated_proc_return_with_value_errors() {
+        // No return annotation + `return X` → an error. The proc's
+        // shape declares "side effects only," and a value-carrying
+        // return contradicts that.
         let src = "\
 proc anything {} { return 42 }
 ";
         let d = diags(src);
         assert!(
-            d.iter().all(|x| !x.message.contains("return type")),
-            "unexpected diags: {d:?}",
+            d.iter()
+                .any(|x| x.message.contains("no declared return type")),
+            "expected diag, got: {d:?}",
+        );
+    }
+
+    #[test]
+    fn unannotated_proc_bare_return_ok() {
+        // Bare `return` is fine in a side-effect proc — common
+        // early-exit pattern.
+        let src = "\
+proc anything {} { puts hi; return }
+";
+        let d = diags(src);
+        assert!(
+            d.iter()
+                .all(|x| !x.message.contains("no declared return type")),
+            "unexpected diag, got: {d:?}",
+        );
+    }
+
+    #[test]
+    fn unannotated_proc_return_value_inside_if_errors() {
+        // A value-return buried in a control-flow branch still fires.
+        let src = "\
+proc anything { x: int } { if {$x > 0} { return 42 } }
+";
+        let d = diags(src);
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("no declared return type")),
+            "expected diag, got: {d:?}",
         );
     }
 

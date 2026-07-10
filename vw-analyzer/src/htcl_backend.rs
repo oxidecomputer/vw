@@ -1343,7 +1343,9 @@ fn format_hover(target: &HoverTarget, proc_doc_comments: &[String]) -> String {
         } => format_proc(proc_name, Some(signature), proc_doc_comments),
         HoverTarget::ProcArgDef { arg, .. }
         | HoverTarget::CallArg { arg, .. } => format_arg(arg),
-        HoverTarget::LocalVar { name, .. } => format_local_var(name),
+        HoverTarget::LocalVar { name, ty, .. } => {
+            format_local_var(name, ty.as_ref())
+        }
         HoverTarget::EnumDef { decl, .. } => format_enum(decl),
         HoverTarget::TypeDef { decl, .. } => format_type_def(decl),
     }
@@ -1383,10 +1385,13 @@ fn format_enum(decl: &vw_htcl::EnumDecl) -> String {
     out
 }
 
-fn format_local_var(name: &str) -> String {
+fn format_local_var(name: &str, ty: Option<&vw_htcl::TypeExpr>) -> String {
     let mut out = String::new();
     writeln!(out, "```htcl").unwrap();
-    writeln!(out, "${name}").unwrap();
+    match ty {
+        Some(t) => writeln!(out, "${name}: {}", render_type(t)).unwrap(),
+        None => writeln!(out, "${name}").unwrap(),
+    }
     writeln!(out, "```").unwrap();
     out.push_str("\nLocal variable.\n");
     out

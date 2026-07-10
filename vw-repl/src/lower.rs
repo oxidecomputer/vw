@@ -989,7 +989,7 @@ mod tests {
                   @enum(0, 1) @default(0) quiet\n    \
                   @enum(0, 1) @default(0) verbose\n    \
                   @default(\"\") project\n  \
-                } {\n    \
+                } string {\n    \
                   set cmd [list ::current_project]\n    \
                   return [{*}$cmd]\n  \
                 }\n\
@@ -1219,7 +1219,7 @@ mod tests {
         std::fs::write(
             dep.join("module.htcl"),
             "namespace eval lib {\n  \
-              proc f { @default(0) x } { return $x }\n\
+              proc f { @default(0) x } int { return $x }\n\
             }\n",
         )
         .unwrap();
@@ -1308,7 +1308,7 @@ mod tests {
             "namespace eval vivado {\n  \
               proc create_bd_design {\n    \
                 @default(\"\") name\n  \
-              } {\n    \
+              } string {\n    \
                 set cmd [list ::create_bd_design]\n    \
                 return [{*}$cmd]\n  \
               }\n\
@@ -1472,7 +1472,7 @@ mod tests {
         // and `expected_return_type` is None.
         let dir = tempfile::tempdir().unwrap();
         let prep = prepare(
-            "proc plain {} { return whatever }\n\
+            "proc plain {} { puts whatever }\n\
              plain\n",
             dir.path(),
             &empty_session(),
