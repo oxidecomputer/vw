@@ -195,8 +195,23 @@ impl LanguageServer for Analyzer {
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             }),
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                // Advertise open/close/change AND save so Helix
+                // sends `textDocument/didSave` — that lets us
+                // force an immediate re-index on `Ctrl-s` even
+                // if the user's edit was smaller than the
+                // `set_text` debounce would react to on its own.
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        will_save: None,
+                        will_save_wait_until: None,
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(
+                            SaveOptions {
+                                include_text: Some(false),
+                            },
+                        )),
+                    },
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
@@ -310,6 +325,20 @@ impl LanguageServer for Analyzer {
         if let Some(backend) = self.backend_for(&uri) {
             backend.close(&uri).await;
         }
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        debug!(%uri, "did_save");
+        if let Some(backend) = self.backend_for(&uri) {
+            // Zero-debounce reindex — the whole point of
+            // handling save is that `Ctrl-s` should force a
+            // fresh check now, not 250ms from now.
+            backend.save(&uri).await;
+        }
+        // Same publish path as did_change so the fresh index's
+        // diagnostics land in the editor.
+        self.spawn_publish_diagnostics(uri, None);
     }
 
     async fn document_symbol(

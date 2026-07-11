@@ -299,6 +299,56 @@ impl HtclBackend {
             cross_file_diagnostics,
         })
     }
+
+    /// Spawn a fresh indexer task for `uri` + `text`. Returns the
+    /// `JoinHandle` so the caller can install it into `DocState`
+    /// (and abort it on a subsequent update). `debounce` gates how
+    /// long the task waits before starting the ~7s build — used
+    /// by `set_text` (250ms, to coalesce rapid typing) and by
+    /// `save` (0ms, so `Ctrl-s` re-checks immediately).
+    ///
+    /// The `spawn_blocking` inner run to completion even if the
+    /// outer task is aborted; the generation guard at commit time
+    /// discards any superseded result.
+    fn spawn_indexer(
+        &self,
+        uri: Url,
+        text: String,
+        generation: u64,
+        debounce: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let docs_arc = self.docs.clone();
+        let roots_arc = self.workspace_roots.clone();
+        tokio::spawn(async move {
+            if !debounce.is_zero() {
+                tokio::time::sleep(debounce).await;
+            }
+            let roots = roots_arc.read().await.clone();
+            let uri_inner = uri.clone();
+            let analysis = match tokio::task::spawn_blocking(move || {
+                HtclBackend::build_analysis(&uri_inner, text, &roots)
+            })
+            .await
+            {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let docs = docs_arc.read().await;
+            if let Some(state) = docs.get(&uri) {
+                if state.generation == generation {
+                    debug!(uri = %uri, generation, "index committed");
+                    let _ = state.tx.send_replace(Some(analysis));
+                } else {
+                    debug!(
+                        uri = %uri,
+                        generation,
+                        current = state.generation,
+                        "index superseded, discarded",
+                    );
+                }
+            }
+        })
+    }
 }
 
 #[async_trait]
@@ -358,67 +408,12 @@ impl LanguageBackend for HtclBackend {
             handle.abort();
         }
 
-        // Spawn the fresh indexer. Cloned Arcs so the async task
-        // owns 'static state — HtclBackend itself isn't cloneable,
-        // but its RwLocks are.
-        let docs_arc = self.docs.clone();
-        let roots_arc = self.workspace_roots.clone();
-        let uri_task = uri.clone();
-        let handle = tokio::spawn(async move {
-            // Debounce: wait for a quiet window before starting the
-            // ~7s workspace validate. Every new `set_text` aborts
-            // this task before the sleep completes, so a burst of
-            // keystrokes collapses into a single indexer run at the
-            // end. Without this, rapid typing kept aborting each
-            // partially-started build and NO analysis ever
-            // committed — the stale-serve fast path had nothing to
-            // return, so completion / hover blocked indefinitely
-            // on `analysis_for`.
-            //
-            // 250ms is a compromise: short enough not to be felt as
-            // "sluggish" after the last keystroke, long enough that
-            // Helix's typical inter-key gap during real typing
-            // (~30-80ms) sits comfortably inside the window.
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            let roots = roots_arc.read().await.clone();
-            // parse + validate are sync + potentially long
-            // (hundreds of ms on gtwiz-versal). Run on a
-            // spawn_blocking so the async worker isn't tied up.
-            // The spawn_blocking work runs to completion even
-            // after abort(); the generation guard below ensures a
-            // superseded result gets discarded.
-            let uri_inner = uri_task.clone();
-            let analysis = match tokio::task::spawn_blocking(move || {
-                HtclBackend::build_analysis(&uri_inner, text, &roots)
-            })
-            .await
-            {
-                Ok(a) => a,
-                Err(_) => return,
-            };
-            // Guard: only commit if this task is still the current
-            // generation for this URI. Otherwise the newer set_text
-            // has already superseded us.
-            let docs = docs_arc.read().await;
-            if let Some(state) = docs.get(&uri_task) {
-                if state.generation == generation {
-                    debug!(uri = %uri_task, generation, "index committed");
-                    // `send_replace` for the same reason as in
-                    // `set_text`'s invalidation: the receiver
-                    // count could have dropped to zero between
-                    // spawn and commit, and a plain `send()`
-                    // would silently swallow the write.
-                    let _ = state.tx.send_replace(Some(analysis));
-                } else {
-                    debug!(
-                        uri = %uri_task,
-                        generation,
-                        current = state.generation,
-                        "index superseded, discarded",
-                    );
-                }
-            }
-        });
+        let handle = self.spawn_indexer(
+            uri.clone(),
+            text,
+            generation,
+            std::time::Duration::from_millis(250),
+        );
 
         // Store the handle so a subsequent set_text can abort us.
         let mut docs = self.docs.write().await;
@@ -440,6 +435,45 @@ impl LanguageBackend for HtclBackend {
 
     async fn set_workspace_roots(&self, roots: Vec<std::path::PathBuf>) {
         *self.workspace_roots.write().await = roots;
+    }
+
+    async fn save(&self, uri: &Url) {
+        // Save is the user's explicit "I'm done for now" signal —
+        // skip the debounce entirely so their edit is checked
+        // immediately. Bump the generation so any in-flight
+        // debounced indexer from the last `set_text` gets
+        // superseded when this one commits. Text is whatever's
+        // currently stored; Helix sends `did_change` before
+        // `did_save` on save operations so the buffer's already
+        // in sync.
+        let (text, generation, prev_task) = {
+            let mut docs = self.docs.write().await;
+            let Some(state) = docs.get_mut(uri) else {
+                return;
+            };
+            state.generation += 1;
+            let prev = state.index_task.take();
+            (state.text.clone(), state.generation, prev)
+        };
+        if let Some(handle) = prev_task {
+            handle.abort();
+        }
+        let handle = self.spawn_indexer(
+            uri.clone(),
+            text,
+            generation,
+            std::time::Duration::ZERO,
+        );
+        let mut docs = self.docs.write().await;
+        if let Some(state) = docs.get_mut(uri) {
+            if state.generation == generation {
+                state.index_task = Some(handle);
+            } else {
+                handle.abort();
+            }
+        } else {
+            handle.abort();
+        }
     }
 
     async fn wait_for_reindex(&self, uri: &Url) {
@@ -3172,5 +3206,44 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
             !ws.contains_key(&dep_uri),
             "dep diagnostics should be filtered out: {ws:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn save_skips_debounce_and_commits_immediately() {
+        // Simulates the "small edit + Ctrl-s" flow: the user made
+        // a tiny change (so set_text just fired a 250ms-debounced
+        // indexer that hasn't started yet), then saved. `save`
+        // must abort the pending debounced task and commit its
+        // OWN indexer without waiting.
+        //
+        // We verify by racing `save` against a bounded timeout:
+        // if `save` still went through the debounce, this would
+        // time out because the sleep would still be pending.
+        let backend = HtclBackend::new();
+        let uri = Url::parse("file:///tmp/save-test.htcl").unwrap();
+        // `set_text` puts a debounced indexer in flight — it
+        // won't commit for 250ms even though the analysis itself
+        // is fast for this trivial input.
+        backend
+            .set_text(uri.clone(), "proc f {} unit { puts hi }\n".into())
+            .await;
+        // `save` bumps the generation and spawns a fresh
+        // zero-debounce indexer, which should commit essentially
+        // right away. If we're wrong and save honors the
+        // debounce, the `changed()` await would block ~250ms;
+        // set a 100ms timeout to catch that regression.
+        let saved = backend.save(&uri);
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            async {
+                saved.await;
+                backend.wait_for_reindex(&uri).await;
+            },
+        )
+        .await;
+        assert!(waited.is_ok(), "save didn't commit within timeout");
+        // And the committed analysis must actually exist.
+        let a = backend.analysis_for(&uri).await;
+        assert!(a.is_some(), "save didn't leave a committed analysis");
     }
 }

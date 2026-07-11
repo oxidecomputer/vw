@@ -34,6 +34,14 @@ pub trait LanguageBackend: Send + Sync {
     /// (and cache) analysis results.
     async fn set_text(&self, uri: Url, text: String);
 
+    /// Trigger an immediate re-index of `uri` — no debounce, no
+    /// wait. Called from `did_save` so `Ctrl-s` in the editor
+    /// forces a fresh diagnostic sweep even after a small edit
+    /// that hadn't yet reached the `set_text` debounce window.
+    /// Backends without a debounce can leave this as the no-op
+    /// default: their `set_text` already committed synchronously.
+    async fn save(&self, _uri: &Url) {}
+
     /// Block until the next full re-index / re-analysis of `uri`
     /// commits. Called by the server AFTER `set_text` from a
     /// detached task so it can wrap the wait in an LSP

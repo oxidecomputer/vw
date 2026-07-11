@@ -1380,6 +1380,63 @@ async fn run_htcl(
         .into());
     }
 
+    // Validator gate. `vw check prime.htcl` runs `vw_htcl::validate`
+    // and returns non-zero on any error; `vw run prime.htcl` used
+    // to skip the validator entirely and hand the (possibly
+    // type-broken) program to Vivado, letting silent runtime
+    // divergence hide real bugs the checker had already found. Run
+    // the same validator here and abort on any error before
+    // spawning Vivado — same behavior `check` shows, same exit
+    // path. Warnings still emit but don't gate execution.
+    let validator_diags = vw_htcl::validate(&parsed.document, &source);
+    let mut error_count = 0usize;
+    let mut warning_count = 0usize;
+    let cwd_owned = std::env::current_dir().ok();
+    let cwd = cwd_owned.as_deref();
+    let mut indices: std::collections::HashMap<usize, vw_htcl::LineIndex> =
+        std::collections::HashMap::new();
+    for d in &validator_diags {
+        let (display_path, line, col) = match program.locate_span(d.span) {
+            Some((idx, file_span)) => {
+                let loaded = &program.files[idx];
+                let index = indices
+                    .entry(idx)
+                    .or_insert_with(|| vw_htcl::LineIndex::new(&loaded.source));
+                let (start, _) = index.range(file_span);
+                (
+                    render_path(&loaded.path, cwd),
+                    start.line + 1,
+                    start.character + 1,
+                )
+            }
+            None => (file.to_string(), 0, 0),
+        };
+        match d.severity {
+            vw_htcl::Severity::Error => {
+                error_count += 1;
+                eprintln!(
+                    "{} {display_path}:{line}:{col}: {}",
+                    "error:".bright_red(),
+                    d.message
+                );
+            }
+            vw_htcl::Severity::Warning => {
+                warning_count += 1;
+                eprintln!(
+                    "{} {display_path}:{line}:{col}: {}",
+                    "warning:".bright_yellow(),
+                    d.message
+                );
+            }
+        }
+    }
+    if error_count > 0 {
+        eprintln!("{file}: {error_count} error(s), {warning_count} warning(s)");
+        return Err(
+            format!("{error_count} validation error(s); aborting",).into()
+        );
+    }
+
     if check_only {
         let cmd_count = parsed
             .document
