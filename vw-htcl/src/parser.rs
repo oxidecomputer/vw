@@ -852,6 +852,7 @@ fn parse_var_ref(
                 return Ok(WordPart::VarRef {
                     name,
                     span: Span::new(start as u32, input.location() as u32),
+                    braced: true,
                 });
             }
             name.push(c);
@@ -874,6 +875,7 @@ fn parse_var_ref(
     Ok(WordPart::VarRef {
         name,
         span: Span::new(start as u32, input.location() as u32),
+        braced: false,
     })
 }
 

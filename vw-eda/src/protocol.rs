@@ -73,14 +73,48 @@ pub struct StreamMessage {
 }
 
 /// One wire-level message read from the worker. Either a streaming
-/// chunk for an in-flight request, or the request's final response.
-/// Discriminated by structural inspection: stream messages have a
-/// `stream` field, responses have `ok`.
+/// chunk for an in-flight request, the request's final response, or
+/// an unsolicited RPC call FROM the worker asking `vw` (Rust side) to
+/// compute a value. Discriminated by structural inspection:
+/// - stream chunks have a `stream` field,
+/// - responses have `ok`,
+/// - RPC calls have `rpc` set to `true` plus a `method` field.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum WireMessage {
     Stream(StreamMessage),
     Response(Response),
+    Rpc(RpcCall),
+}
+
+/// An RPC call FROM the worker (shim) TO `vw`. The shim's htcl
+/// library uses this to reach Rust-implemented externs like
+/// `vw::workspace_root` and `vw::design_sources` — anything whose
+/// answer lives on the tool side, not in Vivado.
+///
+/// Wire shape: `{"id": M, "rpc": true, "method": "...", "args": ...}`
+/// The `rpc: true` marker keeps the untagged `WireMessage` union
+/// unambiguous — plain responses have `ok`, streams have `stream`,
+/// RPC calls have `rpc`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RpcCall {
+    pub id: u64,
+    /// Always `true` — used as an untagged-enum discriminator. See
+    /// [`RpcMarker`] for the deserializer.
+    pub rpc: RpcMarker,
+    pub method: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+/// Marker that always serializes to the literal `true`. Same
+/// pattern as [`OkMarker`] — distinguishes RPC calls from Responses
+/// in the untagged `WireMessage` union.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct RpcMarker(#[serde(deserialize_with = "deserialize_true")] pub bool);
+
+impl RpcMarker {
+    pub const TRUE: RpcMarker = RpcMarker(true);
 }
 
 /// Marker that always serializes to the literal `true`. Lets us use

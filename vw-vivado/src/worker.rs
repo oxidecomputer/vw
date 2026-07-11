@@ -135,7 +135,7 @@ pub enum StreamKind {
 pub type StdoutSink = Box<dyn FnMut(StreamKind, &str) + Send>;
 
 /// Spawn-time configuration for [`VivadoBackend`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct VivadoConfig {
     /// Override the `vivado` executable path. If `None`, resolution
     /// order is `$VW_VIVADO`, then a `vivado` lookup on `$PATH`.
@@ -174,6 +174,13 @@ pub struct VivadoConfig {
     /// truncated) at spawn time and flushed per-line so it's safe
     /// to `tail -f` from another terminal.
     pub verbose_log: Option<PathBuf>,
+    /// Optional RPC handler for shim-initiated calls (`vw::…`
+    /// procs that reach back into Rust for values Vivado can't
+    /// provide). Dispatched from the proto-read task per inbound
+    /// [`vw_eda::protocol::RpcCall`]. When `None`, any RPC call
+    /// from the shim is answered with "no RPC handler
+    /// configured".
+    pub rpc_handler: Option<std::sync::Arc<dyn crate::RpcHandler>>,
 }
 
 /// Vivado [`EdaBackend`] implementation.
@@ -203,6 +210,11 @@ pub struct VivadoBackend {
         tokio::sync::mpsc::UnboundedReceiver<Result<String, std::io::Error>>,
     _proto_read_task: Option<tokio::task::JoinHandle<()>>,
     proto_write: OwnedWriteHalf,
+    /// Shim-initiated RPC handler (see [`crate::RpcHandler`]).
+    /// Consulted by [`Self::dispatch_rpc_call`] for every inbound
+    /// [`WireMessage::Rpc`]. `None` (the default) → RPCs return
+    /// "no RPC handler configured" error.
+    rpc_handler: Option<std::sync::Arc<dyn crate::RpcHandler>>,
     next_id: AtomicU64,
     stdout_pump: Option<std::thread::JoinHandle<()>>,
     stdout_sink: Option<StdoutSink>,
@@ -411,6 +423,7 @@ impl VivadoBackend {
             proto_read: proto_rx,
             _proto_read_task: Some(_proto_read_task),
             proto_write: write_half,
+            rpc_handler: config.rpc_handler.clone(),
             next_id: AtomicU64::new(1),
             stdout_pump: Some(stdout_pump),
             stdout_sink: None,
@@ -602,8 +615,58 @@ impl VivadoBackend {
                         "response id mismatch; discarding"
                     );
                 }
+                WireMessage::Rpc(call) => {
+                    // Shim-initiated RPC (a `vw::…` proc reaching
+                    // back into Rust). Dispatch synchronously here
+                    // — we're the only reader of `proto_read`
+                    // during an eval, and we're the writer of
+                    // `proto_write` too, so replying inline keeps
+                    // ownership simple and avoids a second writer
+                    // task. The htcl caller is blocked on
+                    // `gets $sock` waiting for exactly this
+                    // response; other in-flight RPCs on other
+                    // evals aren't a concern (only one eval runs
+                    // at a time on the shim).
+                    self.dispatch_rpc_call(call).await?;
+                }
             }
         }
+    }
+
+    /// Handle one inbound [`RpcCall`], write the response back to
+    /// the shim.
+    async fn dispatch_rpc_call(
+        &mut self,
+        call: vw_eda::protocol::RpcCall,
+    ) -> Result<(), BackendError> {
+        let result = match &self.rpc_handler {
+            Some(handler) => handler.call(&call.method, call.args).await,
+            None => Err(format!(
+                "no RPC handler configured; can't answer '{}'",
+                call.method
+            )),
+        };
+        let resp = match result {
+            Ok(value) => Response::ok(call.id, value),
+            Err(msg) => Response::err(
+                call.id,
+                vw_eda::protocol::ErrorPayload {
+                    message: msg,
+                    code: None,
+                    info: None,
+                },
+            ),
+        };
+        // Reuse the same write path Rust's own Requests take.
+        // Writing to `proto_write` while `proto_read` is being
+        // consumed here (we own both, we're inside `read_
+        // response_for`) is safe: TCP is full-duplex and no other
+        // task holds `proto_write` while `eval` is in progress.
+        let mut line = serde_json::to_string(&resp)?;
+        line.push('\n');
+        self.proto_write.write_all(line.as_bytes()).await?;
+        self.proto_write.flush().await?;
+        Ok(())
     }
 
     /// Filter a PTY line received during an in-flight eval. Lines

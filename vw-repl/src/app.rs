@@ -416,12 +416,28 @@ async fn run_inner(
     // handle so background prepare tasks can post PrepareDone
     // events back onto the same channel the worker uses.
     let event_tx_for_app = event_tx.clone();
+    // Workspace-root discovery mirrors `vw run` / `vw check`:
+    // walk up from the initial-load file if provided, else from
+    // the current cwd, looking for the nearest `vw.toml`. Used
+    // to answer the htcl `vw::workspace_root` RPC — served
+    // through the Vivado shim's rpc_call primitive at eval time.
+    let rpc_workspace_root: Option<std::path::PathBuf> = {
+        let start_dir = opts
+            .initial_load
+            .as_ref()
+            .and_then(|p| {
+                p.as_std_path().parent().map(std::path::Path::to_path_buf)
+            })
+            .or_else(|| std::env::current_dir().ok());
+        start_dir.and_then(|d| find_vw_toml_ancestor(&d))
+    };
     tokio::spawn(worker_task(
         worker_rx,
         event_tx,
         verbose,
         verbose_log_path.clone(),
         info_with_stack,
+        rpc_workspace_root,
     ));
 
     let mut app = App::new(opts, worker_tx, eval_rx, event_tx_for_app);
@@ -2706,17 +2722,59 @@ impl App {
 // Worker task: owns the Vivado backend, serializes evals.
 // ---------------------------------------------------------------------
 
+/// Walk up from `start` looking for a `vw.toml`. Mirrors
+/// `vw-cli::find_workspace_dir` — the REPL needs the same
+/// discovery for RPC-served answers like `vw::workspace_root`.
+fn find_vw_toml_ancestor(
+    start: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let mut cur: &std::path::Path = start;
+    loop {
+        if cur.join("vw.toml").is_file() {
+            return Some(cur.to_path_buf());
+        }
+        cur = cur.parent()?;
+    }
+}
+
 async fn worker_task(
     mut rx: mpsc::Receiver<WorkerCmd>,
     tx: mpsc::UnboundedSender<WorkerEvent>,
     verbose: bool,
     verbose_log: Option<std::path::PathBuf>,
     info_with_stack: bool,
+    rpc_workspace_root: Option<std::path::PathBuf>,
 ) {
+    // RPC handler — mirrors `vw run`'s. `vw::workspace_root`
+    // answers with the entry / cwd's nearest `vw.toml` parent;
+    // unknown methods fail loudly so future htcl calls surface
+    // a clear "unknown method" instead of hanging.
+    let rpc_handler = vw_vivado::FnHandler::new(
+        move |method: String, _args: serde_json::Value| {
+            let ws = rpc_workspace_root.clone();
+            async move {
+                match method.as_str() {
+                    "workspace_root" => match ws {
+                        Some(p) => Ok(serde_json::Value::String(
+                            p.to_string_lossy().to_string(),
+                        )),
+                        None => {
+                            Err("no workspace root: neither the initial-load \
+                             file nor the current cwd has a `vw.toml` \
+                             in its parent chain"
+                                .to_string())
+                        }
+                    },
+                    other => Err(format!("unknown RPC method: {other}")),
+                }
+            }
+        },
+    );
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
         verbose_log,
         info_with_stack,
+        rpc_handler: Some(rpc_handler),
         ..Default::default()
     })
     .await;

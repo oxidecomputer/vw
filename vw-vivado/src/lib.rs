@@ -10,6 +10,8 @@
 //! executable is: `VW_VIVADO` env var, then `PATH` lookup. v0 supports
 //! the `eval` op only; structured ops land in phase 4.
 
+mod rpc;
 mod worker;
 
+pub use rpc::{FnHandler, RpcHandler};
 pub use worker::{StreamKind, VivadoBackend, VivadoConfig};

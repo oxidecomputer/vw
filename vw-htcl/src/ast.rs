@@ -482,6 +482,13 @@ pub enum WordPart {
     VarRef {
         name: String,
         span: Span,
+        /// True when the source used the `${name}` bracketed form.
+        /// Preserved for lowering so `"${ip}_wrapper.vhd"` doesn't
+        /// re-emit as `"$ip_wrapper.vhd"` — Tcl's `$` reads a
+        /// greedy ident (`[A-Za-z0-9_:]+`) and would then try to
+        /// dereference the non-existent `ip_wrapper` variable. See
+        /// `lower_word_parts` for the emit side.
+        braced: bool,
     },
     /// `[ cmd ... ]` command substitution. `source` is the raw interior
     /// text (between the brackets) and `span` covers the whole

@@ -590,9 +590,23 @@ fn lower_word_parts(
     for part in parts {
         match part {
             WordPart::Text { value, .. } => out.push_str(value),
-            WordPart::VarRef { name, .. } => {
-                out.push('$');
-                out.push_str(name);
+            WordPart::VarRef { name, braced, .. } => {
+                // Preserve the source's braced form. Emitting a
+                // plain `$name` where the source had `${name}`
+                // breaks interpolations like `"${ip}_wrapper.vhd"`:
+                // Tcl reads `$ip_wrapper` as one greedy ident
+                // and errors with "no such variable ip_wrapper".
+                // Preserving the braces also happens to be a
+                // no-op for typical `$var` refs — we only wrap
+                // when the source did.
+                if *braced {
+                    out.push_str("${");
+                    out.push_str(name);
+                    out.push('}');
+                } else {
+                    out.push('$');
+                    out.push_str(name);
+                }
             }
             WordPart::Escape { value, .. } => {
                 out.push('\\');
@@ -865,6 +879,30 @@ set proj [
         assert!(is_extern_call("extern::common::send_msg_id"));
         assert!(!is_extern_call("set_property"));
         assert!(!is_extern_call("not_extern::foo"));
+    }
+
+    #[test]
+    fn braced_var_ref_preserves_braces_in_output() {
+        // Regression: `"${ip}_wrapper.vhd"` in htcl source used to
+        // lower to `"$ip_wrapper.vhd"`, which Tcl reads as
+        // `$ip_wrapper` (one greedy identifier) — dereferencing a
+        // non-existent variable. Preserving the braces is the fix.
+        let src = "puts \"${ip}_wrapper.vhd\"\n";
+        let out = lowered(src);
+        assert_eq!(
+            out[0], "puts \"${ip}_wrapper.vhd\"",
+            "braced form must round-trip",
+        );
+    }
+
+    #[test]
+    fn bare_var_ref_still_uses_bare_form() {
+        // The braces are a source-level distinction; unadorned
+        // `$var` should still emit as `$var`, not `${var}` (Tcl
+        // handles both but the bare form is the idiomatic one).
+        let src = "puts \"$ip.bd\"\n";
+        let out = lowered(src);
+        assert_eq!(out[0], "puts \"$ip.bd\"");
     }
 
     #[test]

@@ -24,6 +24,7 @@ arboard = "3"
 base64 = "0.22"
 winnow.workspace = true
 nucleo-matcher.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

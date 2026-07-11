@@ -1167,7 +1167,7 @@ fn walk_var_ref_spans_in_word(
 ) {
     for part in &word.parts {
         match part {
-            WordPart::VarRef { name: n, span } => {
+            WordPart::VarRef { name: n, span, .. } => {
                 if n == name {
                     // Span covers `$name`; the target is the
                     // identifier portion (skip the leading `$`).

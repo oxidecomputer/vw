@@ -1451,10 +1451,37 @@ async fn run_htcl(
         return Ok(());
     }
 
+    // RPC handler — serves htcl `vw::…` calls whose answers live
+    // on the tool side (workspace root, design source list, …).
+    // Constructed with whatever workspace state we can discover
+    // from the entry file; when no `vw.toml` is found the
+    // handler still exists but returns an error for `workspace_
+    // root`, matching how the same call behaves in the LSP.
+    let rpc_workspace_root: Option<std::path::PathBuf> =
+        find_workspace_dir(file).map(|p| p.into_std_path_buf());
+    let rpc_handler = vw_vivado::FnHandler::new(
+        move |method: String, _args: serde_json::Value| {
+            let ws = rpc_workspace_root.clone();
+            async move {
+                match method.as_str() {
+                    "workspace_root" => match ws {
+                        Some(p) => Ok(serde_json::Value::String(
+                            p.to_string_lossy().to_string(),
+                        )),
+                        None => Err("no workspace root: entry file has no \
+                             `vw.toml` in its parent chain"
+                            .to_string()),
+                    },
+                    other => Err(format!("unknown RPC method: {other}")),
+                }
+            }
+        },
+    );
     let mut backend =
         vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
             verbose,
             info_with_stack,
+            rpc_handler: Some(rpc_handler),
             ..Default::default()
         })
         .await

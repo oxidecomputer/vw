@@ -430,7 +430,7 @@ fn var_ref_at(cmd: &Command, offset: u32) -> Option<&str> {
             continue;
         }
         for part in &word.parts {
-            if let WordPart::VarRef { name, span } = part {
+            if let WordPart::VarRef { name, span, .. } = part {
                 if span.contains(offset) {
                     return Some(name.as_str());
                 }

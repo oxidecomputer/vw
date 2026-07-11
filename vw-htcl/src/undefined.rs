@@ -307,7 +307,7 @@ fn collect_use_sites_in_word(
     // skips them.
     for part in &word.parts {
         match part {
-            WordPart::VarRef { name, span } => {
+            WordPart::VarRef { name, span, .. } => {
                 use_sites.push((name.clone(), *span));
             }
             WordPart::CmdSubst { body, .. } => {

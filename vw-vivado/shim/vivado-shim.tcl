@@ -192,6 +192,76 @@ proc ::vw::send_err {id message {code ""} {info ""}} {
     flush $protocol_sock
 }
 
+# ---------- shim-initiated RPC ----------
+#
+# `vw::rpc_call METHOD [ARGS_JSON]` sends an RPC request to the
+# `vw` Rust process and blocks until the response arrives.
+# Returns the result value on success, throws with the vw-side
+# error message on failure.
+#
+# Direction is the MIRROR of the eval loop: normally vw sends
+# requests and this shim answers. Here the shim sends and vw
+# answers. The response uses the same `{id, ok, result}` /
+# `{id, ok:false, error}` shape as an eval response — no new
+# response type — so it round-trips through the normal
+# read/write machinery.
+#
+# ARGS_JSON is a JSON-encoded string (e.g. `[::json::dict2json
+# {name value}]` or a bare literal like `null` / `{}`), NOT a
+# Tcl dict. Callers that only need a bare call pass nothing;
+# the arg defaults to `null`.
+#
+# Usage is meant to be called ONLY from inside an eval — during
+# an eval we're the sole consumer of the protocol socket, so
+# reading the response synchronously via `gets $sock` doesn't
+# race the main dispatch loop. Calling from outside an eval
+# would race that loop and swallow a real request; the guard
+# below errors clearly rather than deadlocking.
+variable ::vw::rpc_next_id 1
+
+proc ::vw::rpc_call {method {args_json "null"}} {
+    variable protocol_sock
+    if {!$::vw::capturing} {
+        error "vw::rpc_call must be invoked from inside an eval"
+    }
+    set id $::vw::rpc_next_id
+    incr ::vw::rpc_next_id
+    set j_method [::vw::json_string $method]
+    ::vw::real_puts $protocol_sock \
+        "{\"id\":$id,\"rpc\":true,\"method\":$j_method,\"args\":$args_json}"
+    flush $protocol_sock
+    # Read exactly one response line. Repeat if vw sends anything
+    # else in the meantime (e.g. an unexpected stream chunk); we
+    # only stop when we see a response tagged with our id.
+    while {1} {
+        if {[gets $protocol_sock line] < 0} {
+            if {[eof $protocol_sock]} {
+                error "vw::rpc_call: protocol socket closed before response"
+            }
+            continue
+        }
+        set line [string trim $line]
+        if {$line eq ""} { continue }
+        if {[catch {::json::json2dict $line} resp]} {
+            error "vw::rpc_call: unparseable response from vw: $resp"
+        }
+        if {![dict exists $resp id]} { continue }
+        if {[dict get $resp id] != $id} { continue }
+        if {[dict exists $resp ok] && [dict get $resp ok]} {
+            return [expr {[dict exists $resp result] \
+                ? [dict get $resp result] : ""}]
+        }
+        set msg ""
+        if {[dict exists $resp error]} {
+            set err [dict get $resp error]
+            if {[dict exists $err message]} {
+                set msg [dict get $err message]
+            }
+        }
+        error "vw::rpc_call: $msg"
+    }
+}
+
 proc ::vw::log {msg} {
     puts stderr "\[vw-shim\] $msg"
     flush stderr
