@@ -582,7 +582,7 @@ fn generate_single(
         &mut procs,
         "create",
         &create_doc,
-        Some("bd_cell"),
+        Some("string"),
         &create_body,
     );
     write_namespace_block(&mut out, &ip_name, &procs);
@@ -608,31 +608,36 @@ fn write_namespace_block(out: &mut String, ip_name: &str, body: &str) {
 
 /// Emit the `-bd` switch as a proc-arg declaration.
 ///
-/// `-bd 0` (default) → `create_ip` (project-level IP module);
-/// `-bd 1` → `create_bd_cell` (block-design cell). Project IP is
-/// the default because it's the shape Vivado's own
+/// `-bd false` (default) → `create_ip` (project-level IP module);
+/// `-bd true` → `create_bd_cell` (block-design cell). Project IP
+/// is the default because it's the shape Vivado's own
 /// `write_ip_tcl`-generated scripts use, and most external tools
 /// (simulators, downstream regeneration flows) expect wrappers
 /// that create discoverable IP source objects. Wrappers going
-/// into a block design still work — the caller just passes
-/// `-bd 1`. The bool-as-int shape (`@enum(0, 1)`) matches every
-/// other yes/no flag the generator emits.
+/// into a block design still work — the caller passes
+/// `-bd true`. Both paths return a plain `string` handle at
+/// runtime (a bd_cell path or a project-IP module name); the
+/// wrapper's declared return type is `string` so both flows
+/// type-check under strict nominal identity, and callers that
+/// need `bd_cell` semantics can promote via `bd_cell::from` at
+/// their own use site.
 fn push_bd_switch_arg(doc: &mut Doc) {
     doc.push(Item::Blank);
     doc.push(Item::DocComment(
-        "Create the IP as a project-level module (`0`, default) via \
-         `create_ip`, or as a block-design cell (`1`) via \
-         `create_bd_cell`. The returned handle is compatible with the \
-         sub-procs either way — Vivado's `set_property -dict …` works \
-         on both IP objects and cell paths."
+        "Create the IP as a project-level module (`false`, \
+         default) via `create_ip`, or as a block-design cell \
+         (`true`) via `create_bd_cell`. Returns the underlying \
+         handle as a string in either case — a `/…` block-\
+         design cell path when `true`, a raw module name when \
+         `false`. Downstream `set_property -dict …` works on \
+         both shapes."
             .into(),
     ));
     doc.push(Item::Command(Command {
         doc_comments: Vec::new(),
         words: vec![
-            Word::Raw("@enum(0, 1)".into()),
-            Word::Raw("@default(0)".into()),
-            Word::Bare("bd".into()),
+            Word::Raw("@default(false)".into()),
+            Word::Bare("bd: bool".into()),
         ],
         body: None,
     }));
@@ -660,33 +665,35 @@ fn build_single_create_body(vlnv: &str, ip_name: &str) -> String {
     writeln!(out, "if {{$config eq \"\"}} {{").unwrap();
     writeln!(out, "  set config [{ip_name}::Config::empty]").unwrap();
     writeln!(out, "}}").unwrap();
-    // `-bd 0` (project-IP mode) is deprecated at the typed-wrapper
-    // level — `create_ip` yields a raw module-name string, not a
-    // `bd_cell`, so returning it violates the declared return type.
-    // Fail loudly with a pointer to the direct `vivado_cmd::create_ip`
-    // escape hatch instead of silently returning the wrong shape.
-    // We error UP FRONT (before any `set cell`) so the rest of the
-    // body has a single, statically type-consistent flow: `$cell`
-    // is always the `bd_cell` `create_bd_cell` returns. No user code
-    // currently passes `-bd 0`; add a separate typed proc returning
-    // `string` if project-IP wrapping is needed later.
-    writeln!(out, "if {{!$bd}} {{").unwrap();
+    // Two-mode create: `-bd true` produces a bd_cell path, `-bd
+    // false` (default) a project-IP module name. Both wind up in
+    // `$handle` as a plain string; the wrapper's declared return
+    // type is `string` so the strict-nominal-identity return-type
+    // check passes in either branch. Callers that need a
+    // `bd_cell` newtype at their use site promote with
+    // `bd_cell::from` (which validates the `/…` shape); callers
+    // that don't just carry the string through.
+    writeln!(out, "if {{$bd}} {{").unwrap();
     writeln!(
         out,
-        "  error \"{ip_name}::create -bd 0 is not currently supported by \
-             the typed wrapper — the project-IP return value is a raw \
-             module name (string), not a bd_cell. Call \
-             vivado_cmd::create_ip directly if you need project mode.\""
+        "  set handle [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
     )
     .unwrap();
+    writeln!(out, "}} else {{").unwrap();
+    writeln!(
+        out,
+        "  set handle [vivado_cmd::create_ip -vlnv {vlnv} -module_name $name]"
+    )
+    .unwrap();
+    // `create_ip` returns an XCI transcript, not the module
+    // name — but downstream `set_property` and callers want to
+    // reference the module by name. Overwrite `handle` with
+    // `$name` so both branches yield the "thing you address
+    // set_property against."
+    writeln!(out, "  set handle $name").unwrap();
     writeln!(out, "}}").unwrap();
-    writeln!(
-        out,
-        "set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
-    )
-    .unwrap();
     emit_config_finalize(&mut out, ip_name);
-    writeln!(out, "return $cell").unwrap();
+    writeln!(out, "return $handle").unwrap();
     out
 }
 
@@ -1165,7 +1172,7 @@ fn generate_split(
         &mut procs,
         "create",
         &create_doc,
-        Some("bd_cell"),
+        Some("string"),
         &create_body,
     );
 
@@ -2112,14 +2119,27 @@ fn emit_config_finalize(out: &mut String, ip_name: &str) {
         "set _dict [Properties::to_dotted_flat -v [{config_ty}::to -v $config]]"
     )
     .unwrap();
-    // `-bd 0` was rejected up top with an `error`; the finalize
-    // only needs the `bd_cell` path.
+    // Two-mode set_property target:
+    // - `-bd true`: `$handle` IS the `/…` bd_cell path,
+    //   `set_property -objects` takes it directly.
+    // - `-bd false`: `$handle` is a bare module name; the IP
+    //   object is fetched via `[get_ips $handle]`.
+    // Both branches are semantically identical up to the target
+    // resolution, matching the pre-collapse behavior.
     writeln!(out, "if {{[llength $_dict] > 0}} {{").unwrap();
+    writeln!(out, "  if {{$bd}} {{").unwrap();
     writeln!(
         out,
-        "  vivado_cmd::set_property -dict $_dict -objects $cell"
+        "    vivado_cmd::set_property -dict $_dict -objects $handle"
     )
     .unwrap();
+    writeln!(out, "  }} else {{").unwrap();
+    writeln!(
+        out,
+        "    vivado_cmd::set_property -dict $_dict -objects [get_ips $handle]"
+    )
+    .unwrap();
+    writeln!(out, "  }}").unwrap();
     writeln!(out, "}}").unwrap();
 }
 
@@ -3397,13 +3417,12 @@ mod tests {
 
     #[test]
     fn bd_switch_arg_toggles_construction() {
-        // Every generated wrapper carries the `-bd` arg for API
-        // stability. The `-bd 0` runtime path is now rejected with
-        // an `error` at the top of the body (project-IP mode
-        // returns a string, not a bd_cell — see
-        // `build_single_create_body` for the rationale), so the
-        // body only calls `create_bd_cell`. `create_ip` no longer
-        // appears in the generated wrapper.
+        // Every generated wrapper carries the typed `-bd` arg
+        // (real `bool`, defaulting to `false` = project-IP mode),
+        // and the body branches on it: `-bd true` calls
+        // `create_bd_cell`, `-bd false` calls `create_ip`. Both
+        // paths produce a plain-string handle so the wrapper's
+        // declared return type (`string`) covers either branch.
         for out in [
             generate(
                 &mk_component(),
@@ -3423,11 +3442,10 @@ mod tests {
             )
             .into_single(),
         ] {
-            assert!(out.contains("@enum(0, 1) @default(0) bd"), "{out}");
-            assert!(out.contains("if {!$bd} {"), "{out}");
-            assert!(out.contains("-bd 0 is not currently supported"), "{out}");
+            assert!(out.contains("@default(false) bd: bool"), "{out}");
+            assert!(out.contains("if {$bd} {"), "{out}");
             assert!(out.contains("create_bd_cell"), "{out}");
-            assert!(!out.contains("create_ip -vlnv"), "{out}");
+            assert!(out.contains("create_ip -vlnv"), "{out}");
             let parsed = vw_htcl::parse(&out);
             assert!(
                 parsed.errors.is_empty(),
@@ -3521,13 +3539,13 @@ mod tests {
         )
         .into_single();
         let create_start = out.find("proc create {").expect("no create");
-        // Argspec ends at `} bd_cell {`.
+        // Argspec ends at `} string {`.
         let create_body = &out[create_start..];
         let argspec_end = create_body
-            .find("} bd_cell {")
-            .expect("create should return bd_cell");
+            .find("} string {")
+            .expect("create should return string");
         let argspec = &create_body[..argspec_end];
-        for expected in ["name", "bd", "config: demo::Config"] {
+        for expected in ["name", "bd: bool", "config: demo::Config"] {
             assert!(
                 argspec.contains(expected),
                 "expected `{expected}` in create argspec:\n{argspec}"
@@ -3567,14 +3585,14 @@ mod tests {
             create_range.contains("demo::Config::empty"),
             "create should coerce empty-string default to Config::empty:\n{create_range}"
         );
-        // Only the bd-cell path — the `-bd 0` branch is rejected
-        // up top and no longer emits its own `set_property`
-        // variant against `[get_ips $name]`.
+        // Both bd branches: `-bd true` targets `$handle` (the
+        // bd_cell path directly); `-bd false` fetches the IP
+        // object via `[get_ips $handle]`.
         assert!(
-            create_range.contains("set_property -dict $_dict -objects $cell")
+            create_range.contains("set_property -dict $_dict -objects $handle")
         );
-        assert!(!create_range
-            .contains("set_property -dict $_dict -objects [get_ips $name]"));
+        assert!(create_range
+            .contains("set_property -dict $_dict -objects [get_ips $handle]"));
     }
 
     // ------------------------------------------------------------------

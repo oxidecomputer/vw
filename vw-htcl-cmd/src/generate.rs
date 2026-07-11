@@ -326,40 +326,67 @@ fn effective_args(
         .collect()
 }
 
+/// Translate legacy `"0"`/`"1"` boolean defaults into `"false"`/
+/// `"true"` when the arg is still typed as a bool (i.e., no
+/// `clear_enum` or explicit type override that would fall through
+/// to the value-taking path). Anything else passes through verbatim.
+fn bool_translate_if_needed(
+    raw: &str,
+    kind: &ArgKind,
+    over: &ArgOverride,
+) -> String {
+    let is_bool_arg = matches!(kind, ArgKind::Boolean)
+        && !over.clear_enum
+        && over.arg_type.is_none();
+    if !is_bool_arg {
+        return raw.to_string();
+    }
+    match raw {
+        "0" => "false".to_string(),
+        "1" => "true".to_string(),
+        _ => raw.to_string(),
+    }
+}
+
 fn effective_arg(arg: &Argument, over: Option<&ArgOverride>) -> EffectiveArg {
     let empty = ArgOverride::default();
     let over = over.unwrap_or(&empty);
 
     // Default value: explicit override wins; else man-page heuristic.
+    // Boolean args now emit as `@default(false) name: bool` instead
+    // of `@enum(0, 1) @default(0) name` — Vivado's man pages
+    // universally document them as toggles, and htcl already has a
+    // `bool` type. Callers write `-quiet true` instead of
+    // `-quiet 1`.
     let mut default: Option<String> = match &arg.kind {
-        ArgKind::Boolean => Some("0".to_string()),
+        ArgKind::Boolean => Some("false".to_string()),
         ArgKind::Value | ArgKind::Positional => {
             (!arg.required).then(|| "".to_string())
         }
     };
     if let Some(d) = over.default.as_deref() {
-        default = Some(d.to_string());
+        // Translate `"0"`/`"1"` in an override to `false`/`true` if
+        // the arg is still typed as a bool. Otherwise the override
+        // wins verbatim.
+        default = Some(bool_translate_if_needed(d, &arg.kind, over));
     }
 
-    // Enum: man-page-derived for booleans; constraints can clear or
-    // replace.
-    let mut enum_values: Option<Vec<String>> = match &arg.kind {
-        ArgKind::Boolean => Some(vec!["0".to_string(), "1".to_string()]),
-        _ => None,
-    };
-    if over.clear_enum {
-        enum_values = None;
-    }
+    // Enum: no `@enum` for booleans anymore — the `bool` type
+    // annotation carries the constraint. Non-boolean args still
+    // pick up whatever the override declares.
+    let mut enum_values: Option<Vec<String>> = None;
     if let Some(v) = &over.enum_ {
         enum_values = Some(v.clone());
     }
 
-    // Kind: an arg with no `@enum` (cleared) and a string-typed
-    // default acts like a value-taking flag — body-emit should
-    // forward `-flag $value`, not `if {$flag} { ... }`. This is the
-    // exact shape `set_property -dict` needs.
-    let kind = if matches!(arg.kind, ArgKind::Boolean) && enum_values.is_none()
-    {
+    // Kind: an override that clears the (former) `@enum(0, 1)` on a
+    // man-page-Boolean and gives a string-typed default is signaling
+    // "actually value-taking" — body-emit should forward
+    // `-flag $value`, not `if {$flag} { ... }`. This is the exact
+    // shape `set_property -dict` needs. The signal is `clear_enum`
+    // in the override; without it we keep the Boolean shape and
+    // emit as a bool toggle.
+    let kind = if matches!(arg.kind, ArgKind::Boolean) && over.clear_enum {
         if arg.flag.is_some() {
             ArgKind::Value
         } else {
@@ -373,7 +400,12 @@ fn effective_arg(arg: &Argument, over: Option<&ArgOverride>) -> EffectiveArg {
     let arg_type = over
         .arg_type
         .clone()
-        .or_else(|| typed_arg_type(&arg.ident).map(String::from));
+        .or_else(|| typed_arg_type(&arg.ident).map(String::from))
+        // Default booleans to `bool` when there's no override and
+        // no allowlist entry.
+        .or_else(|| {
+            matches!(kind, ArgKind::Boolean).then(|| "bool".to_string())
+        });
 
     EffectiveArg {
         ident: arg.ident.clone(),

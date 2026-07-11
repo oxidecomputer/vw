@@ -195,23 +195,20 @@ impl LanguageServer for Analyzer {
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             }),
             capabilities: ServerCapabilities {
-                // Advertise open/close/change AND save so Helix
-                // sends `textDocument/didSave` — that lets us
-                // force an immediate re-index on `Ctrl-s` even
-                // if the user's edit was smaller than the
-                // `set_text` debounce would react to on its own.
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
-                        will_save: None,
-                        will_save_wait_until: None,
-                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(
-                            SaveOptions {
-                                include_text: Some(false),
-                            },
-                        )),
-                    },
+                // FULL sync — the client sends the whole buffer
+                // on every change. Do NOT switch this to
+                // `TextDocumentSyncCapability::Options { ... }`
+                // to opt into `didSave`: Helix's LSP client
+                // stopped sending `didChange` altogether when we
+                // tried that (verified 2026-07 — no
+                // notifications reached the server after the
+                // switch, and diagnostics froze until reload).
+                // Keep this `Kind(FULL)` until we find a Helix-
+                // safe way to also receive save events (e.g.
+                // dynamic registration via
+                // `client/registerCapability`).
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
