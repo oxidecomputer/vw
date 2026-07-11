@@ -74,6 +74,18 @@ const TYPED_ARG_NAMES: &[&str] = &[
     "nets",
     "intf_net",
     "intf_nets",
+    // File-object handles: `get_files` returns a Tcl_Obj carrying
+    // Vivado's internal file representation. Passing that through
+    // `lappend flags {*}$files` shimmers the internal rep to a plain
+    // path string, which `make_wrapper -files` (and any downstream
+    // command taking a file-object list) then rejects with
+    // `[Common 17-161] Invalid option value`.
+    "file",
+    "files",
+    // Filesets: `get_filesets` returns fileset objects. Same
+    // shimmer pitfall as files/cells.
+    "fileset",
+    "filesets",
 ];
 
 fn is_typed_arg(name: &str, override_: Option<bool>) -> bool {
@@ -113,6 +125,12 @@ fn typed_arg_type(name: &str) -> Option<&'static str> {
         "intf_nets" => Some("list<bd_intf_net>"),
         // object / objects / of_objects: any handle class — no
         // precise type until we have unions.
+        //
+        // file / files / fileset / filesets: no concrete newtype
+        // in the current type-decl set — leave the annotation off
+        // (returned as `string` today from `get_files` /
+        // `get_filesets`); still routed through the typed-arg
+        // fast path so we don't shimmer the internal rep away.
         _ => None,
     }
 }
@@ -704,7 +722,19 @@ fn emit_typed_invocation_with(
         for (arg, flag) in included {
             match arg.kind {
                 ArgKind::Positional => {
-                    write!(line, " ${id}", id = arg.ident).unwrap();
+                    // Typed positional args carry Vivado object
+                    // handles (`get_files`, `get_filesets`,
+                    // `get_cells`, …). At the Tcl call level
+                    // Vivado's commands universally take these
+                    // via `-<flag> $value`, not positional — see
+                    // the `make_wrapper -files [get_files ...]`
+                    // example in the man page. Emit the flag
+                    // form so both shimmer avoidance AND flag
+                    // routing land at once; a bare positional
+                    // yields `[Common 17-161] Invalid option
+                    // value` because Vivado can't tell which
+                    // slot it was intended for.
+                    write!(line, " -{flag} ${id}", id = arg.ident).unwrap();
                 }
                 _ => {
                     write!(line, " -{flag} ${id}", id = arg.ident).unwrap();
