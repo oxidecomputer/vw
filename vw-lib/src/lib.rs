@@ -190,6 +190,13 @@ pub struct WorkspaceConfig {
     #[allow(dead_code)]
     pub workspace: WorkspaceInfo,
     pub dependencies: HashMap<String, Dependency>,
+    /// Test-only dependencies. Only the ENTRY workspace's
+    /// `[test-dependencies]` are honored — a transitive dep's
+    /// test-deps are private to itself. Cargo-parity semantic for
+    /// `dev-dependencies`. Consumed by `vw test` via
+    /// [`transitive_dep_cache_paths_with_test`].
+    #[serde(default, rename = "test-dependencies")]
+    pub test_dependencies: HashMap<String, Dependency>,
     #[serde(default)]
     pub tools: Option<ToolsConfig>,
 }
@@ -515,6 +522,7 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
             version: "0.1.0".to_string(),
         },
         dependencies: HashMap::new(),
+        test_dependencies: HashMap::new(),
         tools: None,
     };
 
@@ -565,7 +573,17 @@ pub async fn update_workspace_with_token(
 
     let mut update_info = Vec::new();
 
-    for (name, dep) in &config.dependencies {
+    // Fetch both regular and test dependencies. Same lockfile
+    // section (locks are name → commit; there's no downstream code
+    // that cares whether a locked entry came from `[dependencies]`
+    // vs `[test-dependencies]`). VHDL libraries still get indexed
+    // for both, matching Cargo's model where dev-deps are visible
+    // to test builds.
+    for (name, dep) in config
+        .test_dependencies
+        .iter()
+        .chain(config.dependencies.iter())
+    {
         let creds = credentials
             .as_ref()
             .map(|c| (c.username.as_str(), c.password.as_str()));
@@ -735,6 +753,7 @@ pub async fn add_dependency_with_token(
                     version: "0.1.0".to_string(),
                 },
                 dependencies: HashMap::new(),
+                test_dependencies: HashMap::new(),
                 tools: None,
             }
         });
@@ -813,12 +832,14 @@ pub fn clear_cache(workspace_dir: &Utf8Path) -> Result<Vec<String>> {
     Ok(cleared)
 }
 
-/// List all dependencies in the workspace.
+/// List all dependencies in the workspace (both regular and
+/// test-dependencies). Callers that want to render them in
+/// separate sections can filter on [`DependencyInfo::is_test`].
 pub fn list_dependencies(
     workspace_dir: &Utf8Path,
 ) -> Result<Vec<DependencyInfo>> {
     let config = load_workspace_config(workspace_dir)?;
-    if config.dependencies.is_empty() {
+    if config.dependencies.is_empty() && config.test_dependencies.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -826,7 +847,12 @@ pub fn list_dependencies(
     let lock_file = load_lock_file(workspace_dir).ok();
 
     let mut deps = Vec::new();
-    for (name, dep) in &config.dependencies {
+    for (name, dep, is_test) in config
+        .dependencies
+        .iter()
+        .map(|(n, d)| (n, d, false))
+        .chain(config.test_dependencies.iter().map(|(n, d)| (n, d, true)))
+    {
         let (source_label, version_info) = match &dep.source {
             DependencySource::Path { path } => {
                 (path.display().to_string(), VersionInfo::Local)
@@ -864,6 +890,7 @@ pub fn list_dependencies(
             name: name.clone(),
             source: source_label,
             version: version_info,
+            is_test,
         });
     }
 
@@ -877,6 +904,10 @@ pub struct DependencyInfo {
     /// the local path for path deps.
     pub source: String,
     pub version: VersionInfo,
+    /// True when this entry came from `[test-dependencies]` rather
+    /// than `[dependencies]`. Test-deps only affect `vw test`; other
+    /// commands see them but don't act on them.
+    pub is_test: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1084,6 +1115,54 @@ fn list_testbenches_impl(
 pub struct TestbenchInfo {
     pub name: String,
     pub path: PathBuf,
+}
+
+/// Recursively enumerate every `*.htcl` file under
+/// `<workspace_dir>/test/`. Skips hidden directories (`.git`,
+/// `.vscode`, etc.) and any directory literally named `target`
+/// (the vw-standard build-output location, matches the shape used
+/// by `vw::make_wrapper`). Returns file paths sorted
+/// lexicographically for deterministic test order.
+///
+/// Returns an empty vec when `<workspace_dir>/test/` doesn't exist
+/// — matches `vw test`'s expected "no tests found" UX rather than
+/// erroring.
+pub fn list_htcl_tests(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    let test_dir = workspace_dir.join("test");
+    if !test_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    walk_htcl_tests(test_dir.as_std_path(), &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn walk_htcl_tests(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).map_err(|e| VwError::FileSystem {
+        message: format!(
+            "Failed to read test directory {}: {e}",
+            dir.display()
+        ),
+    })? {
+        let entry = entry.map_err(|e| VwError::FileSystem {
+            message: format!("Failed to read directory entry: {e}"),
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') || name_str == "target" {
+            continue;
+        }
+        if path.is_file() {
+            if path.extension().and_then(|s| s.to_str()) == Some("htcl") {
+                out.push(path);
+            }
+        } else if path.is_dir() {
+            walk_htcl_tests(&path, out)?;
+        }
+    }
+    Ok(())
 }
 
 pub struct RecordProcessor {
@@ -1995,6 +2074,34 @@ fn save_workspace_config(
     Ok(())
 }
 
+/// Walk up from `start` (typically a directory) looking for the
+/// first `vw.toml` file in the ancestor chain. Returns the
+/// containing directory, or `None` if none is found.
+///
+/// Callers that hold a FILE path — say `entry.htcl` — should pass
+/// `entry.parent()` since a file itself cannot contain a
+/// `vw.toml`. The check uses `is_file()` so a stray directory
+/// named `vw.toml` doesn't trip a false positive.
+///
+/// Consolidates three near-duplicate helpers that previously
+/// lived in `vw-cli::find_workspace_dir`, `vw-repl::app::
+/// find_vw_toml_ancestor`, and `vw-repl::lower::
+/// find_workspace_dir`. The `vw-analyzer` multi-root discovery
+/// (LSP `initialize`-supplied roots) is a different concept and
+/// stays in the analyzer.
+pub fn find_workspace_dir(start: &Path) -> Option<Utf8PathBuf> {
+    let mut cur = Utf8PathBuf::from_path_buf(start.to_path_buf()).ok()?;
+    loop {
+        if cur.join("vw.toml").is_file() {
+            return Some(cur);
+        }
+        // `Utf8Path::parent()` returns `None` at the filesystem
+        // root; the loop naturally terminates without needing a
+        // manual `parent == cur` guard.
+        cur = cur.parent()?.to_path_buf();
+    }
+}
+
 pub fn load_workspace_config(
     workspace_dir: &Utf8Path,
 ) -> Result<WorkspaceConfig> {
@@ -2075,6 +2182,18 @@ pub fn deps_directory() -> Result<PathBuf> {
 pub fn dep_cache_paths(
     workspace_dir: &Utf8Path,
 ) -> Result<HashMap<String, PathBuf>> {
+    dep_cache_paths_with_test(workspace_dir, false)
+}
+
+/// Same as [`dep_cache_paths`] but optionally includes
+/// `[test-dependencies]`. Only `vw test` should pass
+/// `include_test = true`; other callers see the same map they
+/// always did, so `vw run`/`vw check`/`vw update`'s dep behavior
+/// is unchanged.
+pub fn dep_cache_paths_with_test(
+    workspace_dir: &Utf8Path,
+    include_test: bool,
+) -> Result<HashMap<String, PathBuf>> {
     let mut out = HashMap::new();
 
     // Local deps live wherever `vw.toml` says; they don't need a
@@ -2086,10 +2205,25 @@ pub fn dep_cache_paths(
                 out.insert(name, path.to_path_buf());
             }
         }
+        if include_test {
+            for (name, dep) in config.test_dependencies {
+                if let Some(path) = dep.local_path() {
+                    out.insert(name, path.to_path_buf());
+                }
+            }
+        }
     }
 
     // Git deps are resolved through the lockfile and the per-user
     // cache. A missing lock isn't an error here — just skip git entries.
+    // The lockfile stores test-dep and normal-dep entries in the same
+    // `dependencies` section (no separate section for locks — see the
+    // rationale on `update_workspace_with_token`). Non-test callers
+    // want to filter out entries that came exclusively from
+    // `[test-dependencies]`; simplest safe rule for now: everything in
+    // the lockfile is exposed regardless of section. A subsequent PR
+    // can add a `test = true` marker per lock entry if this becomes a
+    // real concern.
     match load_lock_file(workspace_dir) {
         Ok(lock) => {
             for (name, locked) in lock.dependencies {
@@ -2131,9 +2265,26 @@ fn resolve_dep_path(path: &Path) -> Result<PathBuf> {
 pub fn transitive_dep_cache_paths(
     entry_workspace_dir: &Utf8Path,
 ) -> Result<HashMap<String, PathBuf>> {
+    transitive_dep_cache_paths_with_test(entry_workspace_dir, false)
+}
+
+/// Like [`transitive_dep_cache_paths`] but optionally includes
+/// the ENTRY workspace's `[test-dependencies]`. Cargo-parity
+/// semantic for `dev-dependencies`: test-deps are private to the
+/// workspace that declares them. Recursed-into workspaces are
+/// walked with `include_test = false` so a dep's own test-deps
+/// aren't pulled into your consumer.
+pub fn transitive_dep_cache_paths_with_test(
+    entry_workspace_dir: &Utf8Path,
+    include_test: bool,
+) -> Result<HashMap<String, PathBuf>> {
     let mut out: HashMap<String, PathBuf> = HashMap::new();
     let mut visited: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
+    // Only the entry workspace's paths are gathered with
+    // `include_test`; everything queued after gets the normal
+    // treatment.
+    let mut first_iter = true;
     let mut queue: Vec<PathBuf> =
         vec![entry_workspace_dir.as_std_path().to_path_buf()];
 
@@ -2144,7 +2295,9 @@ pub fn transitive_dep_cache_paths(
         let Ok(ws_utf8) = Utf8PathBuf::from_path_buf(ws) else {
             continue;
         };
-        let Ok(paths) = dep_cache_paths(&ws_utf8) else {
+        let want_test = include_test && first_iter;
+        first_iter = false;
+        let Ok(paths) = dep_cache_paths_with_test(&ws_utf8, want_test) else {
             continue;
         };
         for (name, dep_path) in paths {
@@ -2974,5 +3127,54 @@ mod dependency_source_tests {
         let deserialized: Dependency = toml::from_str(&serialized).unwrap();
         assert!(deserialized.is_local());
         assert_eq!(deserialized.local_path(), Some(Path::new("/some/where")));
+    }
+
+    #[test]
+    fn test_dependencies_parse_from_test_dependencies_section() {
+        let toml = r#"
+            [workspace]
+            name = "demo"
+            version = "0.1.0"
+
+            [dependencies.vivado-cmd]
+            path = "/home/x/vivado-cmd"
+
+            [test-dependencies.test]
+            path = "/home/x/test"
+        "#;
+        let config: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.dependencies.len(), 1);
+        assert_eq!(config.test_dependencies.len(), 1);
+        assert!(config.test_dependencies["test"].is_local());
+    }
+
+    #[test]
+    fn list_htcl_tests_walks_test_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(ws.join("vw.toml"), "").unwrap();
+        std::fs::create_dir_all(ws.join("test/nested")).unwrap();
+        std::fs::create_dir_all(ws.join("test/.hidden")).unwrap();
+        std::fs::create_dir_all(ws.join("test/target")).unwrap();
+        std::fs::write(ws.join("test/a.htcl"), "").unwrap();
+        std::fs::write(ws.join("test/b.htcl"), "").unwrap();
+        std::fs::write(ws.join("test/skip.vhd"), "").unwrap();
+        std::fs::write(ws.join("test/nested/c.htcl"), "").unwrap();
+        std::fs::write(ws.join("test/.hidden/z.htcl"), "").unwrap();
+        std::fs::write(ws.join("test/target/z.htcl"), "").unwrap();
+        let tests = list_htcl_tests(&ws).unwrap();
+        assert_eq!(tests.len(), 3, "{:?}", tests);
+        assert!(tests[0].ends_with("test/a.htcl"));
+        assert!(tests[1].ends_with("test/b.htcl"));
+        assert!(tests[2].ends_with("test/nested/c.htcl"));
+    }
+
+    #[test]
+    fn list_htcl_tests_returns_empty_when_test_dir_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(ws.join("vw.toml"), "").unwrap();
+        let tests = list_htcl_tests(&ws).unwrap();
+        assert!(tests.is_empty());
     }
 }

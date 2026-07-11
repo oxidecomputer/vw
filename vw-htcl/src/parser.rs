@@ -320,6 +320,11 @@ fn parse_document(
     // the attached command's `doc_comments_span` so the analyzer
     // can answer "is the cursor inside this doc block?"
     let mut pending_docs_span: Option<Span> = None;
+    // Attributes at statement position (`@test`, `@test(dedicated-eda)`,
+    // etc.) attach to the next `proc` command, mirroring
+    // `pending_docs`. Cleared with a warning if the next command
+    // isn't a proc.
+    let mut pending_attrs: Vec<Attribute> = Vec::new();
 
     loop {
         skip_inline_ws(input, source, mode);
@@ -367,12 +372,55 @@ fn parse_document(
                 }
                 stmts.push(Stmt::Comment(comment));
             }
+            '@' => {
+                // Statement-position attribute — `@name` or
+                // `@name(v1, v2)`. Accumulates into
+                // `pending_attrs` and attaches to the next `proc`
+                // command via the drain in the `Ok(cmd)` arm below.
+                match parse_top_level_attribute(input, source, errors) {
+                    Some(attr) => pending_attrs.push(attr),
+                    None => {
+                        // Parser already recorded the error and
+                        // resynced. Drop any accumulated attrs so
+                        // a garbage line doesn't attach half a
+                        // block to the next proc.
+                        pending_attrs.clear();
+                    }
+                }
+            }
             _ => {
                 let cmd_start = input.location();
                 match parse_command(input, source, mode) {
                     Ok(mut cmd) => {
                         cmd.doc_comments = std::mem::take(&mut pending_docs);
                         cmd.doc_comments_span = pending_docs_span.take();
+                        // Drain pending attributes into the command:
+                        // procs get them via `Proc.attributes`; any
+                        // other command shape drops them with a
+                        // warning.
+                        if !pending_attrs.is_empty() {
+                            match &mut cmd.kind {
+                                CommandKind::Proc(proc) => {
+                                    proc.attributes =
+                                        std::mem::take(&mut pending_attrs);
+                                }
+                                _ => {
+                                    let first =
+                                        pending_attrs.first().unwrap().span;
+                                    let last =
+                                        pending_attrs.last().unwrap().span;
+                                    errors.push(ParseError {
+                                        message: "attribute attached to \
+                                                  non-proc statement — \
+                                                  only `proc` declarations \
+                                                  accept attributes here"
+                                            .into(),
+                                        span: Span::new(first.start, last.end),
+                                    });
+                                    pending_attrs.clear();
+                                }
+                            }
+                        }
                         stmts.push(Stmt::Command(cmd));
                     }
                     Err(err) => {
@@ -413,6 +461,220 @@ fn parse_document(
     Document {
         stmts,
         span: Span::new(start as u32, input.location() as u32),
+    }
+}
+
+/// Parse a statement-position attribute — `@name` or
+/// `@name(v1, v2, …)`. Attribute values accept the same shapes
+/// [`crate::proc_args`]' parser does (int, string, ident), plus
+/// kebab-case idents (`dedicated-eda`) for readable multi-word
+/// tokens like `@test(dedicated-eda)`.
+///
+/// Returns `None` when the leading identifier is missing or the
+/// argument list is malformed — errors are appended to `errors`
+/// verbatim; the caller drops any accumulated attributes to avoid
+/// half-parsed items sticking to the next proc.
+fn parse_top_level_attribute(
+    input: &mut Input<'_>,
+    source: &str,
+    errors: &mut Vec<ParseError>,
+) -> Option<Attribute> {
+    let start = input.location() as u32;
+    advance_char(input); // '@'
+    let name_start = input.location() as u32;
+    let name = consume_ident(input, source);
+    let name_end = input.location() as u32;
+    if name.is_empty() {
+        errors.push(ParseError {
+            message: "expected attribute name after `@`".into(),
+            span: Span::new(start, input.location() as u32),
+        });
+        return None;
+    }
+    let name_span = Span::new(name_start, name_end);
+    let mut values: Vec<AttributeValue> = Vec::new();
+    if !at_eof(input, source) && current_char(input, source) == '(' {
+        advance_char(input);
+        loop {
+            skip_attr_ws(input, source);
+            if at_eof(input, source) {
+                errors.push(ParseError {
+                    message: "unterminated attribute argument list".into(),
+                    span: Span::new(start, input.location() as u32),
+                });
+                break;
+            }
+            if current_char(input, source) == ')' {
+                advance_char(input);
+                break;
+            }
+            match parse_attribute_value(input, source) {
+                Some(v) => values.push(v),
+                None => {
+                    errors.push(ParseError {
+                        message: "expected attribute value".into(),
+                        span: Span::new(
+                            input.location() as u32,
+                            input.location() as u32 + 1,
+                        ),
+                    });
+                    // Resync to `,`/`)` so the rest of the list
+                    // still parses.
+                    while !at_eof(input, source) {
+                        let c = current_char(input, source);
+                        if c == ',' || c == ')' || c == '\n' {
+                            break;
+                        }
+                        advance_char(input);
+                    }
+                }
+            }
+            skip_attr_ws(input, source);
+            if at_eof(input, source) {
+                continue;
+            }
+            if current_char(input, source) == ',' {
+                advance_char(input);
+            }
+        }
+    }
+    Some(Attribute {
+        name,
+        name_span,
+        values,
+        span: Span::new(start, input.location() as u32),
+    })
+}
+
+/// Consume `[A-Za-z_][A-Za-z0-9_]*` at the input cursor.
+fn consume_ident(input: &mut Input<'_>, source: &str) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    while !at_eof(input, source) {
+        let c = current_char(input, source);
+        let ok = if first {
+            c.is_alphabetic() || c == '_'
+        } else {
+            c.is_alphanumeric() || c == '_'
+        };
+        if !ok {
+            break;
+        }
+        out.push(c);
+        advance_char(input);
+        first = false;
+    }
+    out
+}
+
+/// Ident with support for internal hyphens (`dedicated-eda`).
+/// Consumes `[A-Za-z_]([A-Za-z0-9_-]*[A-Za-z0-9_])?` — a leading
+/// alphabetic/underscore, followed by any mix of alphanumeric,
+/// underscore, or hyphen, but disallowing a trailing hyphen. Used
+/// only for attribute value idents; keeps proc names and
+/// everything else on the stricter `consume_ident` rule.
+fn consume_kebab_ident(input: &mut Input<'_>, source: &str) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    while !at_eof(input, source) {
+        let c = current_char(input, source);
+        let ok = if first {
+            c.is_alphabetic() || c == '_'
+        } else {
+            c.is_alphanumeric() || c == '_' || c == '-'
+        };
+        if !ok {
+            break;
+        }
+        out.push(c);
+        advance_char(input);
+        first = false;
+    }
+    // Trim a trailing hyphen — `foo-` isn't a valid identifier and
+    // rolling it back lets the surrounding parser see the `-` as
+    // its own token if it wants to.
+    while out.ends_with('-') {
+        out.pop();
+        // We can't easily un-advance the winnow cursor here, so
+        // trailing hyphens are consumed but not part of the name.
+        // In attribute-value context the `-` would then be
+        // followed by `,` or `)`, and neither position accepts a
+        // dangling hyphen — the caller's resync handles it.
+    }
+    out
+}
+
+/// Skip horizontal whitespace + newlines inside an attribute
+/// argument list. Attribute lists can wrap across lines, so we
+/// consume `\n` as freely as space/tab.
+fn skip_attr_ws(input: &mut Input<'_>, source: &str) {
+    while !at_eof(input, source) {
+        let c = current_char(input, source);
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+            advance_char(input);
+        } else {
+            break;
+        }
+    }
+}
+
+fn parse_attribute_value(
+    input: &mut Input<'_>,
+    source: &str,
+) -> Option<AttributeValue> {
+    let start = input.location() as u32;
+    if at_eof(input, source) {
+        return None;
+    }
+    let c = current_char(input, source);
+    if c == '"' {
+        advance_char(input);
+        let mut buf = String::new();
+        while !at_eof(input, source) && current_char(input, source) != '"' {
+            if current_char(input, source) == '\\' {
+                advance_char(input);
+                if !at_eof(input, source) {
+                    buf.push(current_char(input, source));
+                    advance_char(input);
+                }
+            } else {
+                buf.push(current_char(input, source));
+                advance_char(input);
+            }
+        }
+        if !at_eof(input, source) {
+            advance_char(input); // closing "
+        }
+        Some(AttributeValue::String {
+            value: buf,
+            span: Span::new(start, input.location() as u32),
+        })
+    } else if c == '-' || c.is_ascii_digit() {
+        let mut buf = String::new();
+        if c == '-' {
+            buf.push('-');
+            advance_char(input);
+        }
+        while !at_eof(input, source)
+            && current_char(input, source).is_ascii_digit()
+        {
+            buf.push(current_char(input, source));
+            advance_char(input);
+        }
+        buf.parse::<i64>()
+            .ok()
+            .map(|value| AttributeValue::Integer {
+                value,
+                span: Span::new(start, input.location() as u32),
+            })
+    } else if c.is_alphabetic() || c == '_' {
+        let value = consume_kebab_ident(input, source);
+        Some(AttributeValue::Ident {
+            value,
+            span: Span::new(start, input.location() as u32),
+        })
+    } else {
+        None
     }
 }
 
@@ -564,6 +826,7 @@ fn classify_command(words: &[Word]) -> CommandKind {
                 return_type: None,
                 return_type_span,
                 body: Vec::new(),
+                attributes: Vec::new(),
             })
         }
         // `type NAME = UNDERLYING` newtype declaration. The `=` may
@@ -1843,5 +2106,82 @@ set cfg [
         let src = "[configure -a x #-b y]\n";
         let out = parse(src);
         assert!(out.errors.is_empty(), "parse errors: {:?}", out.errors);
+    }
+
+    #[test]
+    fn top_level_attribute_attaches_to_proc() {
+        // Regression: `@test` above `proc foo {} { ... }` should
+        // populate `proc.attributes` with a single attribute named
+        // `test`. Consumed by `vw test`.
+        let src = "@test\nproc foo {} { puts hi }\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!("expected command");
+        };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            panic!("expected proc");
+        };
+        assert_eq!(proc.attributes.len(), 1);
+        assert_eq!(proc.attributes[0].name, "test");
+        assert!(proc.attributes[0].values.is_empty());
+    }
+
+    #[test]
+    fn attribute_with_kebab_value_parses() {
+        // `@test(dedicated-eda)` — kebab-case ident allowed in
+        // attribute value position only. This shape drives the
+        // `vw test` runner's shared-vs-dedicated bucket choice.
+        let src = "@test(dedicated-eda)\nproc foo {} { }\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!();
+        };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            panic!();
+        };
+        assert_eq!(proc.attributes.len(), 1);
+        let attr = &proc.attributes[0];
+        assert_eq!(attr.name, "test");
+        assert_eq!(attr.values.len(), 1);
+        match &attr.values[0] {
+            AttributeValue::Ident { value, .. } => {
+                assert_eq!(value, "dedicated-eda")
+            }
+            other => panic!("expected Ident, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_attributes_stack_on_one_proc() {
+        let src = "@test\n@another\nproc foo {} { }\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!();
+        };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            panic!();
+        };
+        assert_eq!(proc.attributes.len(), 2);
+        assert_eq!(proc.attributes[0].name, "test");
+        assert_eq!(proc.attributes[1].name, "another");
+    }
+
+    #[test]
+    fn attribute_on_non_proc_command_reports_error() {
+        // `@test` above a `set` command doesn't make sense — the
+        // parser records a diagnostic and drops the attrs so they
+        // don't leak onto whatever the NEXT command is.
+        let src = "@test\nset x 1\n";
+        let out = parse(src);
+        assert!(
+            out.errors.iter().any(|e| e
+                .message
+                .contains("attribute attached to non-proc statement")),
+            "expected non-proc-attachment diagnostic, got {:?}",
+            out.errors,
+        );
     }
 }

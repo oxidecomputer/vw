@@ -16,7 +16,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8Path;
 use vw_htcl::{LineIndex, Resolver};
 
 use crate::session::{Session, SessionBatch};
@@ -172,7 +172,7 @@ pub fn prepare_with_observer(
     session: &Session,
     observer: &mut dyn vw_htcl::LoadObserver,
 ) -> Result<Prepared, LowerError> {
-    let workspace_dir = find_workspace_dir(cwd);
+    let workspace_dir = vw_lib::find_workspace_dir(cwd);
     let resolver = build_resolver(workspace_dir.as_deref());
 
     let scratch_dir = workspace_dir
@@ -859,20 +859,6 @@ fn render_location(
         }
     }
     format!("(input):{flat_line}")
-}
-
-fn find_workspace_dir(start: &Path) -> Option<Utf8PathBuf> {
-    let mut cur = Utf8PathBuf::from_path_buf(start.to_path_buf()).ok()?;
-    loop {
-        if cur.join("vw.toml").exists() {
-            return Some(cur);
-        }
-        let parent = cur.parent()?.to_path_buf();
-        if parent == cur {
-            return None;
-        }
-        cur = parent;
-    }
 }
 
 fn build_resolver(workspace_dir: Option<&Utf8Path>) -> Resolver {

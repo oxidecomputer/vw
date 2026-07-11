@@ -225,7 +225,102 @@ pub fn validate_with_all_extras_and_vars<'doc>(
     // path (no span). The check no-ops when `extra_dep_names` is
     // empty — unit tests and non-workspace callers skip it.
     validate_src_imports(document, extra_dep_names, &mut diags);
+    validate_test_attributes(document, &mut diags);
     diags
+}
+
+/// `@test` semantic checks. Fires warnings (not errors) so
+/// misused tags surface in the LSP + `vw check` without blocking
+/// execution. Rules:
+///
+/// - `@test(X)` where X isn't the literal ident `dedicated-eda`
+///   (the only recognized value today).
+/// - `@test` on a proc with a non-empty parameter list — tests
+///   are zero-arg for the MVP runner.
+/// - `@test` on a nested proc (declared inside another proc's
+///   body) — only top-level `@test` procs are discoverable by
+///   `vw test`.
+///
+/// Doesn't check for `@test` on non-proc statements — that's
+/// caught at parse time with a spanned error.
+fn validate_test_attributes(document: &Document, diags: &mut Vec<Diagnostic>) {
+    walk_procs_for_test_check(
+        &document.stmts,
+        /*inside_proc=*/ false,
+        diags,
+    );
+}
+
+fn walk_procs_for_test_check(
+    stmts: &[Stmt],
+    inside_proc: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        match &cmd.kind {
+            CommandKind::Proc(proc) => {
+                if let Some(attr) = proc.attribute("test") {
+                    if inside_proc {
+                        diags.push(Diagnostic {
+                            severity: Severity::Warning,
+                            message: "`@test` on a nested proc — only \
+                                      top-level `@test`-annotated procs \
+                                      are discoverable by `vw test`"
+                                .into(),
+                            span: attr.span,
+                        });
+                    }
+                    for value in &attr.values {
+                        let ok = matches!(
+                            value,
+                            crate::ast::AttributeValue::Ident { value: v, .. }
+                                if v == "dedicated-eda"
+                        );
+                        if !ok {
+                            diags.push(Diagnostic {
+                                severity: Severity::Warning,
+                                message: format!(
+                                    "`@test(…)` value must be \
+                                     `dedicated-eda` (the only \
+                                     recognized value); got `{}`",
+                                    render_attribute_value(value),
+                                ),
+                                span: attr.span,
+                            });
+                        }
+                    }
+                    if let Some(sig) = &proc.signature {
+                        if !sig.args.is_empty() {
+                            diags.push(Diagnostic {
+                                severity: Severity::Warning,
+                                message: "`@test` procs must take zero \
+                                          arguments — parameterized tests \
+                                          aren't supported yet"
+                                    .into(),
+                                span: attr.span,
+                            });
+                        }
+                    }
+                }
+                walk_procs_for_test_check(&proc.body, true, diags);
+            }
+            CommandKind::NamespaceEval(ns) => {
+                walk_procs_for_test_check(&ns.body, inside_proc, diags);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn render_attribute_value(v: &crate::ast::AttributeValue) -> String {
+    match v {
+        crate::ast::AttributeValue::Integer { value, .. } => value.to_string(),
+        crate::ast::AttributeValue::String { value, .. } => {
+            format!("\"{value}\"")
+        }
+        crate::ast::AttributeValue::Ident { value, .. } => value.clone(),
+    }
 }
 
 /// Walk every top-level `src @<name>` statement in `document` and
@@ -4724,5 +4819,57 @@ proc handle {v: E::A} string { }
 ";
         let d = diags(src);
         assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    // ─── @test attribute semantic checks ───────────────────────
+
+    #[test]
+    fn test_attribute_dedicated_eda_ok() {
+        let src = "@test(dedicated-eda)\nproc t {} { }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("dedicated-eda")),
+            "unexpected diag: {d:?}",
+        );
+    }
+
+    #[test]
+    fn test_attribute_wrong_value_warns() {
+        let src = "@test(bogus)\nproc t {} { }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning
+                && x.message.contains("dedicated-eda")),
+            "expected `dedicated-eda`-related warning: {d:?}",
+        );
+    }
+
+    #[test]
+    fn test_attribute_on_proc_with_args_warns() {
+        // Zero-arg only for MVP.
+        let src = "@test\nproc t {x: int} { }\n";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning
+                && x.message.contains("zero arguments")),
+            "expected zero-arg warning: {d:?}",
+        );
+    }
+
+    #[test]
+    fn test_attribute_on_nested_proc_warns() {
+        // Only top-level @test procs are runnable.
+        let src = "\
+proc outer {} {
+  @test
+  proc inner {} { puts hi }
+}
+";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning
+                && x.message.contains("nested proc")),
+            "expected nested-proc warning: {d:?}",
+        );
     }
 }

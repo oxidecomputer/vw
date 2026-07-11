@@ -429,7 +429,9 @@ async fn run_inner(
                 p.as_std_path().parent().map(std::path::Path::to_path_buf)
             })
             .or_else(|| std::env::current_dir().ok());
-        start_dir.and_then(|d| find_vw_toml_ancestor(&d))
+        start_dir
+            .and_then(|d| vw_lib::find_workspace_dir(&d))
+            .map(|p| p.into_std_path_buf())
     };
     tokio::spawn(worker_task(
         worker_rx,
@@ -2721,21 +2723,6 @@ impl App {
 // ---------------------------------------------------------------------
 // Worker task: owns the Vivado backend, serializes evals.
 // ---------------------------------------------------------------------
-
-/// Walk up from `start` looking for a `vw.toml`. Mirrors
-/// `vw-cli::find_workspace_dir` — the REPL needs the same
-/// discovery for RPC-served answers like `vw::workspace_root`.
-fn find_vw_toml_ancestor(
-    start: &std::path::Path,
-) -> Option<std::path::PathBuf> {
-    let mut cur: &std::path::Path = start;
-    loop {
-        if cur.join("vw.toml").is_file() {
-            return Some(cur.to_path_buf());
-        }
-        cur = cur.parent()?;
-    }
-}
 
 async fn worker_task(
     mut rx: mpsc::Receiver<WorkerCmd>,

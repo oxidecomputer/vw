@@ -18,6 +18,7 @@ use vw_lib::{
     VersionInfo, VhdlStandard,
 };
 
+mod htcl_test;
 mod parallel_load;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -94,8 +95,8 @@ enum Commands {
     List,
     #[command(about = "Generate deps.tcl file with all dependency VHDL files")]
     DepsToTcl,
-    #[command(about = "Run testbench using NVC")]
-    Test {
+    #[command(about = "Run VHDL testbench using NVC")]
+    Bench {
         #[arg(help = "Name of the testbench entity to run")]
         testbench: Option<String>,
         #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
@@ -180,12 +181,36 @@ enum Commands {
         )]
         info_with_stack: bool,
     },
-    #[command(
-        about = "Parse and run analysis on htcl files without executing them"
-    )]
+    #[command(about = "Parse and analyze htcl. With no args, discovers the \
+                 workspace's module.htcl AND test/*.htcl and checks both")]
     Check {
-        #[arg(required = true, help = "One or more .htcl source files")]
+        #[arg(help = "One or more .htcl source files. Empty → discover \
+                    from the workspace root.")]
         files: Vec<Utf8PathBuf>,
+    },
+    #[command(about = "Run htcl-level tests (@test procs under test/)")]
+    Test {
+        #[arg(help = "Substring filter — run only tests whose name matches")]
+        filter: Option<String>,
+        #[arg(long, help = "List discovered tests without running them")]
+        list: bool,
+        #[arg(
+            long,
+            help = "Max concurrent dedicated-eda Vivado processes",
+            default_value_t = 2
+        )]
+        test_threads: usize,
+        #[arg(
+            short,
+            long,
+            help = "Forward Vivado banner/info to stderr during test evals"
+        )]
+        verbose: bool,
+        #[arg(
+            long = "info-with-stack",
+            help = "Attach the Tcl call stack to INFO messages too"
+        )]
+        info_with_stack: bool,
     },
     #[command(subcommand, about = "IP-XACT tooling")]
     Ip(IpCommand),
@@ -440,9 +465,8 @@ async fn main() {
                 if deps.is_empty() {
                     println!("No dependencies found in workspace");
                 } else {
-                    println!("Dependencies:");
-                    for dep in deps {
-                        let version_info = match dep.version {
+                    let render = |dep: &vw_lib::DependencyInfo| {
+                        let version_info = match &dep.version {
                             VersionInfo::Branch { branch } => {
                                 format!(" (branch: {branch})")
                             }
@@ -455,13 +479,29 @@ async fn main() {
                             VersionInfo::Local => " (local)".to_string(),
                             VersionInfo::Unknown => String::new(),
                         };
-
                         println!(
                             "  {} - {}{}",
                             dep.name.cyan(),
                             dep.source,
                             version_info.bright_black()
                         );
+                    };
+                    let (test_deps, regular_deps): (Vec<_>, Vec<_>) =
+                        deps.into_iter().partition(|d| d.is_test);
+                    if !regular_deps.is_empty() {
+                        println!("Dependencies:");
+                        for dep in &regular_deps {
+                            render(dep);
+                        }
+                    }
+                    if !test_deps.is_empty() {
+                        if !regular_deps.is_empty() {
+                            println!();
+                        }
+                        println!("Test dependencies:");
+                        for dep in &test_deps {
+                            render(dep);
+                        }
                     }
                 }
             }
@@ -482,7 +522,7 @@ async fn main() {
                 process::exit(1);
             }
         },
-        Commands::Test {
+        Commands::Bench {
             testbench,
             std,
             list,
@@ -620,9 +660,47 @@ async fn main() {
             }
         }
         Commands::Check { files } => {
+            // Two shapes:
+            //   `vw check FILE [FILE...]` — check the explicit list.
+            //   `vw check`               — discover from workspace:
+            //     - `<ws>/module.htcl` in normal mode.
+            //     - Every `<ws>/test/**/*.htcl` in test-mode
+            //       (test-deps + self-injection visible so `src @<self>`
+            //       and `src @<test-dep>` both resolve).
+            let discovered = if files.is_empty() {
+                match discover_check_targets(&cwd) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("{} {e}", "error:".bright_red());
+                        process::exit(1);
+                    }
+                }
+            } else {
+                files
+                    .into_iter()
+                    .map(|f| CheckTarget {
+                        path: f,
+                        include_test_deps: false,
+                    })
+                    .collect()
+            };
+            if discovered.is_empty() {
+                eprintln!(
+                    "{} nothing to check — pass a file, or run from a \
+                     directory with a `vw.toml` that has a `module.htcl` \
+                     or `test/*.htcl`",
+                    "note:".bright_yellow(),
+                );
+                return;
+            }
             let mut had_errors = false;
-            for file in &files {
-                match check_htcl(file).await {
+            for target in &discovered {
+                let res = check_htcl_with_mode(
+                    &target.path,
+                    target.include_test_deps,
+                )
+                .await;
+                match res {
                     Ok(file_errs) => {
                         if file_errs {
                             had_errors = true;
@@ -630,11 +708,36 @@ async fn main() {
                     }
                     Err(e) => {
                         had_errors = true;
-                        eprintln!("{} {file}: {e}", "error:".bright_red());
+                        eprintln!(
+                            "{} {}: {e}",
+                            "error:".bright_red(),
+                            target.path,
+                        );
                     }
                 }
             }
             if had_errors {
+                process::exit(1);
+            }
+        }
+        Commands::Test {
+            filter,
+            list,
+            test_threads,
+            verbose,
+            info_with_stack,
+        } => {
+            if let Err(e) = htcl_test::run_htcl_tests(
+                &cwd,
+                filter,
+                list,
+                test_threads,
+                verbose,
+                info_with_stack,
+            )
+            .await
+            {
+                eprintln!("{} {e}", "error:".bright_red());
                 process::exit(1);
             }
         }
@@ -904,17 +1007,56 @@ fn discover_sibling_vivado_cmd(start: &Utf8Path) -> Option<Utf8PathBuf> {
 async fn load_htcl_program(
     entry: &Utf8Path,
 ) -> Result<vw_htcl::LoadedProgram, Box<dyn std::error::Error>> {
+    load_htcl_program_with_mode(entry, false).await
+}
+
+/// Same as [`load_htcl_program`] but resolves
+/// `[test-dependencies]` from the entry's workspace too. Used by
+/// `vw test`. Cargo-parity: only the ENTRY workspace's test-deps
+/// are pulled in — transitive workspaces don't leak their own
+/// test-deps into the resolver.
+#[allow(dead_code)] // wired via `crate::htcl_test`
+pub(crate) async fn load_htcl_program_for_test(
+    entry: &Utf8Path,
+) -> Result<vw_htcl::LoadedProgram, Box<dyn std::error::Error>> {
+    load_htcl_program_with_mode(entry, true).await
+}
+
+async fn load_htcl_program_with_mode(
+    entry: &Utf8Path,
+    include_test_deps: bool,
+) -> Result<vw_htcl::LoadedProgram, Box<dyn std::error::Error>> {
     let entry_path = std::path::Path::new(entry.as_str()).to_path_buf();
-    let workspace_dir = find_workspace_dir(entry);
+    let workspace_dir =
+        entry_path.parent().and_then(vw_lib::find_workspace_dir);
     let mut resolver = vw_htcl::Resolver::new();
+    // Load the workspace config once — its `name` field feeds both
+    // the progress bar's label AND the self-injection at the
+    // bottom of this block.
+    let workspace_cfg = workspace_dir
+        .as_deref()
+        .and_then(|ws| vw_lib::load_workspace_config(ws).ok());
     if let Some(ws) = workspace_dir.as_deref() {
         // Transitive resolution so a library's `src @other/...`
         // import works even when the consumer hasn't redeclared
         // `other` in their own `vw.toml`.
-        if let Ok(paths) = vw_lib::transitive_dep_cache_paths(ws) {
+        if let Ok(paths) =
+            vw_lib::transitive_dep_cache_paths_with_test(ws, include_test_deps)
+        {
             for (name, path) in paths {
                 resolver = resolver.with_dep(name, path);
             }
+        }
+        // Cargo-parity self-reference: a library named `foo` can
+        // `src @foo/bar` to reach its own siblings without the
+        // user having to declare `foo` as a dep of itself. Uses
+        // `with_dep_if_absent` so a legitimately-declared external
+        // `foo` still wins.
+        if let Some(cfg) = &workspace_cfg {
+            resolver = resolver.with_dep_if_absent(
+                cfg.workspace.name.clone(),
+                ws.as_std_path().to_path_buf(),
+            );
         }
     }
     let dep_paths: Vec<(String, std::path::PathBuf)> = workspace_dir
@@ -926,10 +1068,9 @@ async fn load_htcl_program(
     // (non-@dep) files' bar shows `Checking metroid` instead of
     // `Checking workspace`. Falls back to the literal `workspace`
     // when there's no vw.toml or no `name = "…"` field.
-    let workspace_label = workspace_dir
-        .as_deref()
-        .and_then(|ws| vw_lib::load_workspace_config(ws).ok())
-        .map(|cfg| cfg.workspace.name)
+    let workspace_label = workspace_cfg
+        .as_ref()
+        .map(|cfg| cfg.workspace.name.clone())
         .unwrap_or_else(|| "workspace".to_string());
     let observer = std::sync::Arc::new(
         parallel_load::MultiProgressObserver::new(dep_paths, workspace_label),
@@ -953,25 +1094,34 @@ async fn load_htcl_program(
 /// inside a workspace or the dep cache can't be read — the caller
 /// treats empty as "skip the check", matching the validator's own
 /// short-circuit.
+#[allow(dead_code)] // legacy entry — new callers use `_with_mode`
 fn collect_dep_names(entry: &Utf8Path) -> std::collections::HashSet<String> {
-    let Some(ws) = find_workspace_dir(entry) else {
-        return std::collections::HashSet::new();
-    };
-    let Ok(paths) = vw_lib::transitive_dep_cache_paths(&ws) else {
-        return std::collections::HashSet::new();
-    };
-    paths.into_keys().collect()
+    collect_dep_names_with_mode(entry, false)
 }
 
-/// Walk up from `start`'s parent directory looking for a `vw.toml`.
-fn find_workspace_dir(start: &Utf8Path) -> Option<Utf8PathBuf> {
-    let mut cur = start.parent()?.to_path_buf();
-    loop {
-        if cur.join("vw.toml").exists() {
-            return Some(cur);
-        }
-        cur = cur.parent()?.to_path_buf();
+fn collect_dep_names_with_mode(
+    entry: &Utf8Path,
+    include_test_deps: bool,
+) -> std::collections::HashSet<String> {
+    let entry_path = std::path::Path::new(entry.as_str());
+    let Some(ws) = entry_path.parent().and_then(vw_lib::find_workspace_dir)
+    else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(paths) =
+        vw_lib::transitive_dep_cache_paths_with_test(&ws, include_test_deps)
+    else {
+        return std::collections::HashSet::new();
+    };
+    let mut names: std::collections::HashSet<String> =
+        paths.into_keys().collect();
+    // Mirror `load_htcl_program`'s self-injection: a library named
+    // `foo` can `src @foo/bar` at check time even though `foo`
+    // isn't in its own [dependencies].
+    if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
+        names.insert(cfg.workspace.name);
     }
+    names
 }
 
 fn init_analyzer_logging() {
@@ -988,8 +1138,58 @@ fn init_analyzer_logging() {
 /// Run parse + signature validation on `file`. Returns `Ok(true)`
 /// if any error-severity diagnostics were reported, `Ok(false)` for
 /// clean. Warnings don't flip the return value but still print.
+#[allow(dead_code)] // legacy entry — new callers use `_with_mode`
 async fn check_htcl(
     file: &camino::Utf8Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    check_htcl_with_mode(file, false).await
+}
+
+/// One entry in the `vw check` (no-args) discovery result. Test
+/// files get `include_test_deps = true` so the validator can see
+/// `@<test-dep>` and `@<workspace_self>` imports without the user
+/// spelling them out in the vw.toml `[dependencies]` section.
+struct CheckTarget {
+    path: Utf8PathBuf,
+    include_test_deps: bool,
+}
+
+/// Discover files to check when the user runs `vw check` from a
+/// workspace directory with no explicit file list. Adds
+/// `<ws>/module.htcl` when present (checked in normal mode) plus
+/// every `<ws>/test/**/*.htcl` (checked in test-mode).
+///
+/// Errors when we can't find the enclosing workspace at all —
+/// otherwise returns an empty vec, letting the caller print
+/// "nothing to check" without treating it as a hard failure.
+fn discover_check_targets(
+    cwd: &Utf8Path,
+) -> Result<Vec<CheckTarget>, Box<dyn std::error::Error>> {
+    let ws = vw_lib::find_workspace_dir(cwd.as_std_path())
+        .ok_or("not in a vw workspace (no vw.toml in the parent chain)")?;
+    let mut targets = Vec::new();
+    let module = ws.join("module.htcl");
+    if module.is_file() {
+        targets.push(CheckTarget {
+            path: module,
+            include_test_deps: false,
+        });
+    }
+    for path in vw_lib::list_htcl_tests(&ws)? {
+        let Ok(path) = Utf8PathBuf::from_path_buf(path) else {
+            continue;
+        };
+        targets.push(CheckTarget {
+            path,
+            include_test_deps: true,
+        });
+    }
+    Ok(targets)
+}
+
+async fn check_htcl_with_mode(
+    file: &camino::Utf8Path,
+    include_test_deps: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // Pre-flight: run the validator's src-import check on the entry
     // file BEFORE handing to `load_htcl_program`, which would
@@ -999,7 +1199,7 @@ async fn check_htcl(
     // on where the missing dep is and how to fix it. Only kicks in
     // when the workspace has a `vw.toml` (otherwise dep-names is
     // empty and the check is a no-op).
-    let dep_names = collect_dep_names(file);
+    let dep_names = collect_dep_names_with_mode(file, include_test_deps);
     if !dep_names.is_empty() {
         let entry_text = std::fs::read_to_string(file.as_str())?;
         let entry_parsed = vw_htcl::parse(&entry_text);
@@ -1040,7 +1240,11 @@ async fn check_htcl(
         }
     }
 
-    let program = load_htcl_program(file).await?;
+    let program = if include_test_deps {
+        load_htcl_program_for_test(file).await?
+    } else {
+        load_htcl_program(file).await?
+    };
     let parsed = vw_htcl::parse(&program.source);
     let validator_diags = vw_htcl::validate(&parsed.document, &program.source);
 
@@ -1457,8 +1661,11 @@ async fn run_htcl(
     // from the entry file; when no `vw.toml` is found the
     // handler still exists but returns an error for `workspace_
     // root`, matching how the same call behaves in the LSP.
-    let rpc_workspace_root: Option<std::path::PathBuf> =
-        find_workspace_dir(file).map(|p| p.into_std_path_buf());
+    let file_path = std::path::Path::new(file.as_str());
+    let rpc_workspace_root: Option<std::path::PathBuf> = file_path
+        .parent()
+        .and_then(vw_lib::find_workspace_dir)
+        .map(|p| p.into_std_path_buf());
     let rpc_handler = vw_vivado::FnHandler::new(
         move |method: String, _args: serde_json::Value| {
             let ws = rpc_workspace_root.clone();

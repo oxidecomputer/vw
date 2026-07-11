@@ -171,6 +171,23 @@ pub struct Proc {
     /// proc body. Nested procs declared here have their own `body`
     /// populated recursively.
     pub body: Vec<Stmt>,
+    /// Attributes attached to this proc declaration itself (as
+    /// opposed to [`ProcArg::attributes`], which live on individual
+    /// args). Populated by the parser from `@name(…)` items that
+    /// appear at statement position immediately BEFORE the `proc`
+    /// keyword. Mirrors the doc-comment attachment pattern the
+    /// parser already uses. Currently used by `vw test` to
+    /// recognize `@test`- and `@test(dedicated-eda)`-marked procs.
+    pub attributes: Vec<Attribute>,
+}
+
+impl Proc {
+    /// Look up a proc-level attribute by name. Returns the first
+    /// match — attributes with duplicate names are unusual but not
+    /// rejected at the parse level.
+    pub fn attribute(&self, name: &str) -> Option<&Attribute> {
+        self.attributes.iter().find(|a| a.name == name)
+    }
 }
 
 /// A `type NAME = UNDERLYING` declaration.

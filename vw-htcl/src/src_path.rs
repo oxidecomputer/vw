@@ -103,6 +103,21 @@ impl Resolver {
         self
     }
 
+    /// Same as [`with_dep`], but only registers `name` when no
+    /// entry already exists. Cargo-parity semantic for
+    /// self-injecting the enclosing workspace as `@<workspace_name>`
+    /// — a user-declared dep with the same name (rare but
+    /// possible) still wins.
+    pub fn with_dep_if_absent(
+        mut self,
+        name: impl Into<String>,
+        root: PathBuf,
+    ) -> Self {
+        let name = name.into();
+        self.cached_deps.entry(name).or_insert(root);
+        self
+    }
+
     /// Iterate the registered dependencies as `(name, root)` pairs.
     /// Order is unspecified — callers that care should sort.
     pub fn deps(&self) -> impl Iterator<Item = (&str, &Path)> {
@@ -249,5 +264,42 @@ mod tests {
         let (dir, resolver) = fixture();
         let err = resolver.resolve(dir.path(), "does/not/exist").unwrap_err();
         assert!(matches!(err, ResolveError::NotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn with_dep_if_absent_leaves_existing_alone() {
+        // A user-declared dep of the same name must shadow the
+        // self-injection — same policy Cargo uses for the crate-
+        // self reference. Without this, a library that legitimately
+        // depends on an external `foo` couldn't also self-reference.
+        let existing = PathBuf::from("/tmp/existing");
+        let new_path = PathBuf::from("/tmp/new");
+        let resolver = Resolver::new()
+            .with_dep("foo", existing.clone())
+            .with_dep_if_absent("foo", new_path);
+        assert_eq!(resolver.dep_root("foo"), Some(existing.as_path()));
+    }
+
+    #[test]
+    fn with_dep_if_absent_registers_when_missing() {
+        let path = PathBuf::from("/tmp/self");
+        let resolver = Resolver::new().with_dep_if_absent("self", path.clone());
+        assert_eq!(resolver.dep_root("self"), Some(path.as_path()));
+    }
+
+    #[test]
+    fn self_referential_workspace_resolves() {
+        // Simulate a library named `foo` that sources one of its
+        // own sibling modules via `src @foo/bar`. The resolver has
+        // `foo` self-injected to the workspace root, so `@foo/bar`
+        // resolves to `<ws>/bar.htcl`.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("bar.htcl"), "## sib\n").unwrap();
+        fs::write(dir.path().join("vw.toml"), "[workspace]\nname = \"foo\"\n")
+            .unwrap();
+        let resolver =
+            Resolver::new().with_dep_if_absent("foo", dir.path().to_path_buf());
+        let resolved = resolver.resolve(dir.path(), "@foo/bar").unwrap();
+        assert!(resolved.ends_with("bar.htcl"), "{resolved:?}");
     }
 }

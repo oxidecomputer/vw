@@ -179,6 +179,20 @@ pub fn build_resolver(entry_file: &Path) -> Resolver {
 ///
 /// First-seen wins on name collisions in the order above, so the
 /// file's own workspace's choice never gets overridden.
+/// True when `entry_file` sits inside the workspace's `test/`
+/// directory subtree. Used to decide whether the analyzer's
+/// resolver includes `[test-dependencies]` for LSP goto-def /
+/// hover / diagnostics inside test files.
+fn is_test_file(entry_file: &Path, workspace_dir: &Utf8Path) -> bool {
+    let ws_std = workspace_dir.as_std_path();
+    let Ok(rel) = entry_file.strip_prefix(ws_std) else {
+        return false;
+    };
+    rel.components()
+        .next()
+        .is_some_and(|c| std::path::Component::Normal("test".as_ref()) == c)
+}
+
 pub fn build_resolver_with(
     entry_file: &Path,
     extra_roots: &[PathBuf],
@@ -186,15 +200,33 @@ pub fn build_resolver_with(
     let mut merged: std::collections::HashMap<String, PathBuf> =
         std::collections::HashMap::new();
     if let Some(workspace_dir) = find_workspace_dir(entry_file) {
+        // A file under `<ws>/test/**` is a test file — pull in
+        // `[test-dependencies]` too so `src @<test-dep>` resolves
+        // in the analyzer just like it does in `vw test`. Matches
+        // the CLI's `check_htcl_with_mode(_, include_test)`
+        // behavior.
+        let include_test = is_test_file(entry_file, &workspace_dir);
         // Transitive: a library that does `src @other-lib/...`
         // shouldn't force every consumer to redeclare `other-lib`
         // in their own `vw.toml`. The walker pulls in each dep's
         // own deps so the resolver sees the whole graph
         // (Cargo-style first-seen-wins on name conflicts).
-        if let Ok(paths) = vw_lib::transitive_dep_cache_paths(&workspace_dir) {
+        if let Ok(paths) = vw_lib::transitive_dep_cache_paths_with_test(
+            &workspace_dir,
+            include_test,
+        ) {
             for (name, path) in paths {
                 merged.entry(name).or_insert(path);
             }
+        }
+        // Cargo-parity self-reference: a workspace named `foo`
+        // resolves `src @foo/bar` to `<ws>/bar.htcl`. Uses
+        // `entry(...).or_insert(...)` so a legitimately-declared
+        // external `foo` (rare but possible) still wins.
+        if let Ok(cfg) = vw_lib::load_workspace_config(&workspace_dir) {
+            merged
+                .entry(cfg.workspace.name)
+                .or_insert_with(|| workspace_dir.as_std_path().to_path_buf());
         }
     }
     for root in extra_roots {
