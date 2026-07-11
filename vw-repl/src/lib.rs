@@ -109,6 +109,10 @@ pub struct ReplOptions {
     /// noisy enough without stack traces — but useful when diagnosing
     /// where a particular INFO is emitted from.
     pub info_with_stack: bool,
+    /// Optional `--part <id>` selector — picks a non-default
+    /// `[[target-parts]]` entry to drive the auto-project. `None`
+    /// uses the workspace default.
+    pub part: Option<String>,
 }
 
 /// Run the REPL until the user exits. Owns the terminal alternate

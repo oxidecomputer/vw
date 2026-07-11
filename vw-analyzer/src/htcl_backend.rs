@@ -209,8 +209,12 @@ impl HtclBackend {
                 file_path.parent().and_then(vw_lib::find_workspace_dir)
             {
                 if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
-                    if let Some(target_part) =
-                        cfg.workspace.target_part.as_deref()
+                    // LSP checks the DEFAULT part only — cheap and
+                    // reflects what `vw run` would boot with. The
+                    // CLI's `vw check --all-parts` covers the
+                    // wider matrix on demand.
+                    if let Ok(Some(target_part)) =
+                        cfg.workspace.default_target_part()
                     {
                         let dep_targets = vw_lib::collect_dep_targets(&ws);
                         let mismatches = vw_lib::check_target_compatibility(
@@ -243,32 +247,27 @@ impl HtclBackend {
                                 }
                                 let (start, end) =
                                     local_line_index.range(src.path_span);
-                                let families =
-                                    if m.supported_families.is_empty() {
-                                        "(none)".to_string()
-                                    } else {
-                                        m.supported_families.join(", ")
-                                    };
+                                let hint = target_mismatch_families_hint(m);
                                 let (severity, message) = match m.kind {
                                     vw_lib::TargetMismatchKind::NotSupported => (
                                         DiagnosticSeverity::ERROR,
                                         format!(
-                                            "target-part `{}` is on dep `{}`'s \
-                                             `not-supported` list — Xilinx has \
-                                             attested the IP is not usable on \
-                                             this part (declared families: {})",
-                                            m.target_part, m.dep, families,
+                                            "target-part `{}` matches dep \
+                                             `{}`'s `not-supported` list \
+                                             — Xilinx has attested the IP \
+                                             is not usable on this part \
+                                             ({})",
+                                            m.target_part, m.dep, hint,
                                         ),
                                     ),
                                     vw_lib::TargetMismatchKind::Unblessed => (
                                         DiagnosticSeverity::WARNING,
                                         format!(
-                                            "target-part `{}` isn't in dep \
-                                             `{}`'s support matrix (declared \
-                                             families: {}); the IP may still \
-                                             work but Xilinx hasn't blessed \
-                                             the combination",
-                                            m.target_part, m.dep, families,
+                                            "target-part `{}` isn't blessed \
+                                             by dep `{}` ({}); the IP may \
+                                             still work but Xilinx hasn't \
+                                             blessed the combination",
+                                            m.target_part, m.dep, hint,
                                         ),
                                     ),
                                 };
@@ -1255,6 +1254,39 @@ impl HtclBackend {
 /// starts_with` is purely lexical). Canonicalization failures
 /// (missing files, permission errors) fall back to the lexical
 /// compare, which still catches the common case.
+/// Same helper as vw-cli's — split blessed vs. banned family lists
+/// so a dep whose `[targets]` only carries a `not-supported` list
+/// doesn't get misreported as "declared families: versal" when
+/// the versal families there are BANNED, not blessed.
+fn target_mismatch_families_hint(m: &vw_lib::TargetMismatch) -> String {
+    match (
+        m.supported_families.is_empty(),
+        m.not_supported_families.is_empty(),
+    ) {
+        (true, true) => {
+            "no `[targets]` families declared — the dep has patterns \
+             but none carry family names"
+                .to_string()
+        }
+        (false, true) => {
+            format!("blessed families: {}", m.supported_families.join(", "))
+        }
+        (true, false) => {
+            format!(
+                "no blessed families — only `not-supported` entries for {}",
+                m.not_supported_families.join(", "),
+            )
+        }
+        (false, false) => {
+            format!(
+                "blessed families: {}; also `not-supported` entries for {}",
+                m.supported_families.join(", "),
+                m.not_supported_families.join(", "),
+            )
+        }
+    }
+}
+
 fn uri_under_roots(uri: &Url, roots: &[std::path::PathBuf]) -> bool {
     let Ok(path) = uri.to_file_path() else {
         return false;

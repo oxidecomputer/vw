@@ -144,6 +144,13 @@ enum Commands {
         )]
         check: bool,
         #[arg(
+            long,
+            value_name = "ID",
+            help = "Select a non-default `[[target-parts]]` entry by full \
+                    part ID or unique substring (e.g. `--part 3HP`)"
+        )]
+        part: Option<String>,
+        #[arg(
             short,
             long,
             help = "Forward Vivado's banner and info messages to stderr"
@@ -175,6 +182,13 @@ enum Commands {
         )]
         initial_load: Option<Utf8PathBuf>,
         #[arg(
+            long,
+            value_name = "ID",
+            help = "Select a non-default `[[target-parts]]` entry by full \
+                    part ID or unique substring"
+        )]
+        part: Option<String>,
+        #[arg(
             long = "info-with-stack",
             help = "Attach the Tcl call stack to INFO messages too \
                     (WARNING / ERROR / CRITICAL always include the stack)"
@@ -187,6 +201,22 @@ enum Commands {
         #[arg(help = "One or more .htcl source files. Empty → discover \
                     from the workspace root.")]
         files: Vec<Utf8PathBuf>,
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with = "all_parts",
+            help = "Check against a specific `[[target-parts]]` entry by \
+                    full part ID or unique substring. Default: the workspace's \
+                    default part."
+        )]
+        part: Option<String>,
+        #[arg(
+            long = "all-parts",
+            conflicts_with = "part",
+            help = "Check against every declared `[[target-parts]]` entry \
+                    instead of just the default"
+        )]
+        all_parts: bool,
     },
     #[command(about = "Run htcl-level tests (@test procs under test/)")]
     Test {
@@ -200,6 +230,14 @@ enum Commands {
             default_value_t = 2
         )]
         test_threads: usize,
+        #[arg(
+            long,
+            value_name = "ID",
+            help = "Select the workspace-default `[[target-parts]]` entry \
+                    for tests without their own `@test(target=…)`; matches \
+                    by full ID or unique substring"
+        )]
+        part: Option<String>,
         #[arg(
             short,
             long,
@@ -629,11 +667,18 @@ async fn main() {
         Commands::Run {
             file,
             check,
+            part,
             verbose,
             info_with_stack,
         } => {
-            if let Err(e) =
-                run_htcl(&file, check, verbose, info_with_stack).await
+            if let Err(e) = run_htcl(
+                &file,
+                check,
+                part.as_deref(),
+                verbose,
+                info_with_stack,
+            )
+            .await
             {
                 eprintln!("{} {e}", "error:".bright_red());
                 process::exit(1);
@@ -646,11 +691,13 @@ async fn main() {
         Commands::Repl {
             verbose,
             initial_load,
+            part,
             info_with_stack,
         } => {
             if let Err(e) = vw_repl::run(vw_repl::ReplOptions {
                 verbose,
                 initial_load,
+                part,
                 info_with_stack,
             })
             .await
@@ -659,7 +706,11 @@ async fn main() {
                 process::exit(1);
             }
         }
-        Commands::Check { files } => {
+        Commands::Check {
+            files,
+            part,
+            all_parts,
+        } => {
             // Two shapes:
             //   `vw check FILE [FILE...]` — check the explicit list.
             //   `vw check`               — discover from workspace:
@@ -694,10 +745,13 @@ async fn main() {
                 return;
             }
             let mut had_errors = false;
+            let part_selector =
+                PartSelector::from_flags(part.as_deref(), all_parts);
             for target in &discovered {
                 let res = check_htcl_with_mode(
                     &target.path,
                     target.include_test_deps,
+                    &part_selector,
                 )
                 .await;
                 match res {
@@ -724,6 +778,7 @@ async fn main() {
             filter,
             list,
             test_threads,
+            part,
             verbose,
             info_with_stack,
         } => {
@@ -732,6 +787,7 @@ async fn main() {
                 filter,
                 list,
                 test_threads,
+                part.as_deref(),
                 verbose,
                 info_with_stack,
             )
@@ -1229,7 +1285,7 @@ fn init_analyzer_logging() {
 async fn check_htcl(
     file: &camino::Utf8Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    check_htcl_with_mode(file, false).await
+    check_htcl_with_mode(file, false, &PartSelector::Default).await
 }
 
 /// One entry in the `vw check` (no-args) discovery result. Test
@@ -1274,9 +1330,61 @@ fn discover_check_targets(
     Ok(targets)
 }
 
+/// How `vw check` decides which `[[target-parts]]` entries to
+/// evaluate. Constructed from the CLI's `--part` / `--all-parts`
+/// flags; consumed by [`check_htcl_with_mode`] to iterate the
+/// selected parts through the compatibility check.
+#[derive(Debug, Clone)]
+enum PartSelector {
+    /// No flag → use the workspace's default part.
+    Default,
+    /// `--part <id>` → use the matching entry.
+    Explicit(String),
+    /// `--all-parts` → iterate every entry.
+    All,
+}
+
+impl PartSelector {
+    fn from_flags(part: Option<&str>, all_parts: bool) -> Self {
+        if all_parts {
+            Self::All
+        } else if let Some(p) = part {
+            Self::Explicit(p.to_string())
+        } else {
+            Self::Default
+        }
+    }
+
+    /// Resolve to a concrete list of part strings against `ws_info`.
+    /// Returns an empty vec for a library workspace (no target
+    /// parts declared) — caller treats that as "no compat check."
+    fn resolve<'a>(
+        &self,
+        ws_info: &'a vw_lib::WorkspaceInfo,
+    ) -> std::result::Result<Vec<&'a str>, vw_lib::TargetSelectError> {
+        if ws_info.target_parts.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self {
+            Self::Default => {
+                Ok(ws_info.default_target_part()?.into_iter().collect())
+            }
+            Self::Explicit(q) => {
+                Ok(ws_info.select_target_part(Some(q))?.into_iter().collect())
+            }
+            Self::All => Ok(ws_info
+                .target_parts
+                .iter()
+                .map(|p| p.part.as_str())
+                .collect()),
+        }
+    }
+}
+
 async fn check_htcl_with_mode(
     file: &camino::Utf8Path,
     include_test_deps: bool,
+    part_selector: &PartSelector,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // Pre-flight: run the validator's src-import check on the entry
     // file BEFORE handing to `load_htcl_program`, which would
@@ -1385,13 +1493,22 @@ async fn check_htcl_with_mode(
         emit(Some(d.severity), &d.message, d.span);
     }
 
-    // Target-compatibility check. Only fires when the entry
-    // workspace declares a `target-part` — library workspaces
-    // (no target) skip silently.
+    // Target-compatibility check. Iterates over the parts the
+    // selector picked (default, explicit `--part`, or every
+    // `[[target-parts]]` entry with `--all-parts`). Library
+    // workspaces (no target parts) skip silently.
     let entry_path = std::path::Path::new(file.as_str());
     if let Some(ws) = entry_path.parent().and_then(vw_lib::find_workspace_dir) {
         if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
-            if let Some(target_part) = cfg.workspace.target_part.as_deref() {
+            let parts = match part_selector.resolve(&cfg.workspace) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{} {e}", "error:".bright_red());
+                    error_count += 1;
+                    Vec::new()
+                }
+            };
+            if !parts.is_empty() {
                 let dep_targets = vw_lib::collect_dep_targets(&ws);
                 for (dep, err) in &dep_targets.errors {
                     eprintln!(
@@ -1400,42 +1517,39 @@ async fn check_htcl_with_mode(
                     );
                     warning_count += 1;
                 }
-                let mismatches = vw_lib::check_target_compatibility(
-                    Some(target_part),
-                    &dep_targets,
-                );
-                for m in &mismatches {
-                    let families = if m.supported_families.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        m.supported_families.join(", ")
-                    };
-                    match m.kind {
-                        vw_lib::TargetMismatchKind::NotSupported => {
-                            eprintln!(
-                                "{} target-part `{}` is on dep `{}`'s \
-                                 `not-supported` list — Xilinx has attested \
-                                 the IP is not usable on this part \
-                                 (declared families: {})",
-                                "error:".bright_red(),
-                                m.target_part,
-                                m.dep,
-                                families,
-                            );
-                            error_count += 1;
-                        }
-                        vw_lib::TargetMismatchKind::Unblessed => {
-                            eprintln!(
-                                "{} target-part `{}` isn't in dep `{}`'s \
-                                 support matrix (declared families: {}); the \
-                                 IP may still work but Xilinx hasn't blessed \
-                                 the combination",
-                                "warning:".bright_yellow(),
-                                m.target_part,
-                                m.dep,
-                                families,
-                            );
-                            warning_count += 1;
+                for target_part in &parts {
+                    let mismatches = vw_lib::check_target_compatibility(
+                        Some(target_part),
+                        &dep_targets,
+                    );
+                    for m in &mismatches {
+                        match m.kind {
+                            vw_lib::TargetMismatchKind::NotSupported => {
+                                eprintln!(
+                                    "{} target-part `{}` matches dep `{}`'s \
+                                     `not-supported` list — Xilinx has \
+                                     attested the IP is not usable on this \
+                                     part ({})",
+                                    "error:".bright_red(),
+                                    m.target_part,
+                                    m.dep,
+                                    target_mismatch_families_hint(m),
+                                );
+                                error_count += 1;
+                            }
+                            vw_lib::TargetMismatchKind::Unblessed => {
+                                eprintln!(
+                                    "{} target-part `{}` isn't blessed by \
+                                     dep `{}` ({}); the IP may still work \
+                                     but Xilinx hasn't blessed the \
+                                     combination",
+                                    "warning:".bright_yellow(),
+                                    m.target_part,
+                                    m.dep,
+                                    target_mismatch_families_hint(m),
+                                );
+                                warning_count += 1;
+                            }
                         }
                     }
                 }
@@ -1462,6 +1576,41 @@ fn render_path(
         }
     }
     path.display().to_string()
+}
+
+/// Human-readable summary of what a dep declared in its
+/// `[targets]` block. Splits blessed vs. banned families so a dep
+/// with only a `not-supported` list (e.g. clk-wizard v1.0, where
+/// every entry is `Not-Supported`) doesn't get misreported as
+/// "declared families: versal" — the versal families are BANNED
+/// there, not blessed.
+fn target_mismatch_families_hint(m: &vw_lib::TargetMismatch) -> String {
+    match (
+        m.supported_families.is_empty(),
+        m.not_supported_families.is_empty(),
+    ) {
+        (true, true) => {
+            "no `[targets]` families declared — the dep has patterns \
+             but none carry family names"
+                .to_string()
+        }
+        (false, true) => {
+            format!("blessed families: {}", m.supported_families.join(", "),)
+        }
+        (true, false) => {
+            format!(
+                "no blessed families — only `not-supported` entries for {}",
+                m.not_supported_families.join(", "),
+            )
+        }
+        (false, false) => {
+            format!(
+                "blessed families: {}; also `not-supported` entries for {}",
+                m.supported_families.join(", "),
+                m.not_supported_families.join(", "),
+            )
+        }
+    }
 }
 
 /// For every monomorphized generic encountered while walking `ty`
@@ -1692,6 +1841,7 @@ fn overload_specialization_mangle(
 async fn run_htcl(
     file: &camino::Utf8Path,
     check_only: bool,
+    part: Option<&str>,
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1812,20 +1962,29 @@ async fn run_htcl(
         .and_then(vw_lib::find_workspace_dir)
         .map(|p| p.into_std_path_buf());
     // Auto-project bootstrap: if the enclosing workspace declares
-    // `target-part`, ship a `create_project -in_memory` down the
-    // wire before user code runs. Eliminates the "no open project"
-    // failure mode for `ip::check` / `get_ipdefs` / etc., and gives
-    // the whole session a stable part context for downstream
-    // implementation/timing steps.
-    let auto_project = rpc_workspace_root.as_deref().and_then(|ws| {
-        let ws_utf8 = camino::Utf8Path::from_path(ws)?;
-        let cfg = vw_lib::load_workspace_config(ws_utf8).ok()?;
-        let part = cfg.workspace.target_part?;
-        Some(vw_vivado::AutoProject {
-            name: cfg.workspace.name,
-            part,
+    // `[[target-parts]]`, ship a `create_project -in_memory` down
+    // the wire before user code runs. `--part <id>` picks a
+    // non-default entry; otherwise we use the workspace default.
+    // Eliminates the "no open project" failure mode for
+    // `ip::check` / `get_ipdefs` / etc., and gives the whole
+    // session a stable part context for downstream
+    // implementation/timing steps. `select_target_part` errors
+    // out on bad selectors — surface those before booting Vivado.
+    let auto_project = rpc_workspace_root
+        .as_deref()
+        .and_then(camino::Utf8Path::from_path)
+        .and_then(|ws| vw_lib::load_workspace_config(ws).ok())
+        .map(|cfg| {
+            cfg.workspace.select_target_part(part).map(|maybe_part| {
+                maybe_part.map(|p| vw_vivado::AutoProject {
+                    name: cfg.workspace.name.clone(),
+                    part: p.to_string(),
+                })
+            })
         })
-    });
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .flatten();
     let rpc_handler = vw_vivado::make_handler(rpc_workspace_root);
     let mut backend =
         vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {

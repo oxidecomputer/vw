@@ -35,6 +35,7 @@ pub async fn run_htcl_tests(
     filter: Option<String>,
     list: bool,
     test_threads: usize,
+    part: Option<&str>,
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -87,8 +88,15 @@ pub async fn run_htcl_tests(
     );
 
     if !shared.is_empty() {
-        run_shared_bucket(&ws, shared, &mut summary, verbose, info_with_stack)
-            .await?;
+        run_shared_bucket(
+            &ws,
+            shared,
+            &mut summary,
+            part,
+            verbose,
+            info_with_stack,
+        )
+        .await?;
     }
     if !dedicated.is_empty() {
         run_dedicated_bucket(
@@ -96,6 +104,7 @@ pub async fn run_htcl_tests(
             dedicated,
             test_threads,
             &mut summary,
+            part,
             verbose,
             info_with_stack,
         )
@@ -290,6 +299,7 @@ async fn run_shared_bucket(
     ws: &Utf8Path,
     tests: Vec<TestCase>,
     summary: &mut RunSummary,
+    part: Option<&str>,
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -297,8 +307,9 @@ async fn run_shared_bucket(
     // so per-test `@target(part=…)` cannot apply — that override
     // only makes sense in dedicated-eda tests where each run gets
     // a fresh session. The validator flags this at check time; here
-    // we silently fall back to the workspace default.
-    let auto_project = workspace_auto_project(ws);
+    // we silently fall back to the workspace default (or the CLI's
+    // `--part` selector if the user passed one).
+    let auto_project = workspace_auto_project(ws, part)?;
     // Show the first test's name up front with a "starting vivado"
     // status so the run doesn't look hung during the ~10-30s
     // Vivado boot. `run_one_test` overwrites this line as soon as
@@ -338,6 +349,7 @@ async fn run_dedicated_bucket(
     tests: Vec<TestCase>,
     test_threads: usize,
     summary: &mut RunSummary,
+    part: Option<&str>,
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -347,7 +359,7 @@ async fn run_dedicated_bucket(
     // ~1-2 GB of RAM so caution around parallelism is warranted;
     // parallel exec is a follow-up.
     let _ = threads;
-    let ws_default = workspace_auto_project(ws);
+    let ws_default = workspace_auto_project(ws, part)?;
     for test in tests {
         // Per-test `@target(part=…)` swaps the auto-project's
         // `-part` for this test only; falls back to workspace
@@ -529,16 +541,28 @@ async fn spawn_backend(
     Ok(backend)
 }
 
-/// Derive the default auto-project from a workspace's `[workspace]
-/// target-part` — same rule vw run uses. Returns `None` for library
-/// workspaces (no target-part).
-fn workspace_auto_project(ws: &Utf8Path) -> Option<vw_vivado::AutoProject> {
-    let cfg = vw_lib::load_workspace_config(ws).ok()?;
-    let part = cfg.workspace.target_part?;
-    Some(vw_vivado::AutoProject {
-        name: cfg.workspace.name,
-        part,
-    })
+/// Derive the auto-project from a workspace's `[[target-parts]]`
+/// block — same rule `vw run` uses. `part` is the CLI's `--part`
+/// selector (`None` picks the workspace default). Returns:
+/// - `Ok(None)` for library workspaces (no target parts declared)
+/// - `Ok(Some(_))` when a part resolves cleanly
+/// - `Err(_)` when the CLI selector is bogus or the multi-entry
+///   list has no default marked.
+fn workspace_auto_project(
+    ws: &Utf8Path,
+    part: Option<&str>,
+) -> Result<Option<vw_vivado::AutoProject>, Box<dyn std::error::Error>> {
+    let Ok(cfg) = vw_lib::load_workspace_config(ws) else {
+        return Ok(None);
+    };
+    let selected = cfg
+        .workspace
+        .select_target_part(part)
+        .map_err(|e| e.to_string())?;
+    Ok(selected.map(|p| vw_vivado::AutoProject {
+        name: cfg.workspace.name.clone(),
+        part: p.to_string(),
+    }))
 }
 
 #[derive(Default)]

@@ -219,18 +219,126 @@ pub struct WorkspaceInfo {
     pub name: String,
     #[allow(dead_code)]
     pub version: String,
-    /// Project-scope: the specific Vivado part this workspace
-    /// targets. Full Vivado part specifier (e.g.
-    /// `xcvm3358-vsvh1747-2M-e-S`) — package and speed grade
+    /// Project-scope: every Vivado device part this workspace can
+    /// target. Each entry is a full Vivado specifier (e.g.
+    /// `xcvp1202-vsva2785-2MHP-e-S`) — package and speed grade
     /// matter for downstream implementation / timing analysis
     /// even if the family alone is enough for IP-availability
-    /// checks. Absent for library workspaces.
+    /// checks.
     ///
-    /// Also drives the auto-`create_project -in_memory -part`
-    /// that runs when a Vivado session boots against this
-    /// workspace.
-    #[serde(default, rename = "target-part")]
-    pub target_part: Option<String>,
+    /// One entry must be marked `default = true` when the list
+    /// has more than one; the default drives the auto-project
+    /// on `vw run` / `vw repl` / `vw test`. The CLI's
+    /// `--part <id-or-substring>` flag selects a non-default
+    /// entry.
+    ///
+    /// Empty for library workspaces (they publish `[targets]`
+    /// instead — see [`TargetsConfig`]).
+    #[serde(default, rename = "target-parts")]
+    pub target_parts: Vec<TargetPart>,
+}
+
+/// One entry in a workspace's `[[target-parts]]` list.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TargetPart {
+    /// Full Vivado part identifier, e.g.
+    /// `xcvp1202-vsva2785-2MHP-e-S`.
+    pub part: String,
+    /// `true` marks this entry as the default target part. Exactly
+    /// one entry must set this when the list has more than one
+    /// entry. A single-entry list may omit the flag — the sole
+    /// entry is implicitly the default.
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// Errors surfaced when validating or selecting a target part
+/// from a workspace's `[[target-parts]]` list. Wrapped by the
+/// `WorkspaceInfo` accessors so callers can render precise
+/// diagnostics.
+#[derive(Debug, thiserror::Error)]
+pub enum TargetSelectError {
+    #[error(
+        "workspace has {count} `[[target-parts]]` entries but none are marked \
+         `default = true`; add `default = true` to exactly one entry"
+    )]
+    NoDefault { count: usize },
+    #[error(
+        "workspace has multiple `[[target-parts]]` entries marked \
+         `default = true` ({defaults:?}); only one may be default"
+    )]
+    MultipleDefaults { defaults: Vec<String> },
+    #[error("no `[[target-parts]]` entry matches `{query}`")]
+    NoMatch { query: String },
+    #[error(
+        "`{query}` matches multiple `[[target-parts]]` entries ({matches:?}); \
+         disambiguate with a longer substring or the full part ID"
+    )]
+    Ambiguous { query: String, matches: Vec<String> },
+}
+
+impl WorkspaceInfo {
+    /// Return the default target part, if any. Empty list yields
+    /// `Ok(None)`. Single-entry list yields that entry as the
+    /// implicit default (regardless of the `default` flag).
+    /// Multi-entry list requires exactly one `default = true`.
+    pub fn default_target_part(
+        &self,
+    ) -> std::result::Result<Option<&str>, TargetSelectError> {
+        match self.target_parts.len() {
+            0 => Ok(None),
+            1 => Ok(Some(self.target_parts[0].part.as_str())),
+            _ => {
+                let defaults: Vec<&TargetPart> =
+                    self.target_parts.iter().filter(|p| p.default).collect();
+                match defaults.len() {
+                    1 => Ok(Some(defaults[0].part.as_str())),
+                    0 => Err(TargetSelectError::NoDefault {
+                        count: self.target_parts.len(),
+                    }),
+                    _ => Err(TargetSelectError::MultipleDefaults {
+                        defaults: defaults
+                            .iter()
+                            .map(|p| p.part.clone())
+                            .collect(),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Resolve a CLI `--part <query>` selector against the
+    /// workspace's target parts. `None` returns the default (via
+    /// [`default_target_part`](Self::default_target_part)). `Some`
+    /// matches by exact part ID first; failing that, by unique
+    /// substring. Multiple substring matches, or zero matches,
+    /// error out.
+    pub fn select_target_part(
+        &self,
+        query: Option<&str>,
+    ) -> std::result::Result<Option<&str>, TargetSelectError> {
+        let Some(q) = query else {
+            return self.default_target_part();
+        };
+        if let Some(exact) = self.target_parts.iter().find(|p| p.part == q) {
+            return Ok(Some(exact.part.as_str()));
+        }
+        let matches: Vec<&TargetPart> = self
+            .target_parts
+            .iter()
+            .filter(|p| p.part.contains(q))
+            .collect();
+        match matches.len() {
+            1 => Ok(Some(matches[0].part.as_str())),
+            0 => Err(TargetSelectError::NoMatch {
+                query: q.to_string(),
+            }),
+            _ => Err(TargetSelectError::Ambiguous {
+                query: q.to_string(),
+                matches: matches.iter().map(|p| p.part.clone()).collect(),
+            }),
+        }
+    }
 }
 
 /// Library-scope target metadata. Populated by `vw ip generate`
@@ -398,10 +506,22 @@ pub struct TargetMismatch {
     pub dep: String,
     /// The target part string that was checked.
     pub target_part: String,
-    /// Family cues gathered from the dep's declared patterns —
-    /// e.g. `["versal"]`. Used in the diagnostic message so the
-    /// user knows what families the dep DOES bless.
+    /// Family cues gathered from the dep's BLESSED patterns —
+    /// its `[targets] supported` list. Empty when the dep has no
+    /// blessed patterns (e.g. clk-wizard v1.0, which has only
+    /// `not-supported` entries). The diagnostic message uses this
+    /// to say "clk-wizard blesses parts in the following families;
+    /// yours isn't among them."
     pub supported_families: Vec<String>,
+    /// Family cues gathered from the dep's BAN LIST — its
+    /// `[targets] not-supported` list. Reported separately from
+    /// `supported_families` because the semantics differ:
+    /// families named in `supported` are blessed for use, families
+    /// named ONLY in `not-supported` are ones Xilinx has attested
+    /// don't work (at least for specific parts). Reporting them
+    /// as "declared families" without qualification is misleading
+    /// (see #vw-check clarity).
+    pub not_supported_families: Vec<String>,
     /// Whether Xilinx explicitly forbids this combination or
     /// simply hasn't blessed it.
     pub kind: TargetMismatchKind,
@@ -436,17 +556,16 @@ pub fn check_target_compatibility(
         if supported.is_empty() && not_supported.is_empty() {
             continue;
         }
+        let sup_families = dedup_families(supported);
+        let ns_families = dedup_families(not_supported);
         let hit_not_supported =
             not_supported.iter().any(|p| p.regex.is_match(part));
         if hit_not_supported {
-            let mut families: Vec<String> =
-                not_supported.iter().map(|p| p.family.clone()).collect();
-            families.sort();
-            families.dedup();
             out.push(TargetMismatch {
                 dep: dep.clone(),
                 target_part: part.to_string(),
-                supported_families: families,
+                supported_families: sup_families,
+                not_supported_families: ns_families,
                 kind: TargetMismatchKind::NotSupported,
             });
             continue;
@@ -455,21 +574,23 @@ pub fn check_target_compatibility(
         if hit_supported {
             continue;
         }
-        let mut families: Vec<String> = supported
-            .iter()
-            .chain(not_supported.iter())
-            .map(|p| p.family.clone())
-            .collect();
-        families.sort();
-        families.dedup();
         out.push(TargetMismatch {
             dep: dep.clone(),
             target_part: part.to_string(),
-            supported_families: families,
+            supported_families: sup_families,
+            not_supported_families: ns_families,
             kind: TargetMismatchKind::Unblessed,
         });
     }
     out
+}
+
+fn dedup_families(patterns: &[TargetPattern]) -> Vec<String> {
+    let mut families: Vec<String> =
+        patterns.iter().map(|p| p.family.clone()).collect();
+    families.sort();
+    families.dedup();
+    families
 }
 
 pub fn parse_target_pattern(
@@ -814,7 +935,7 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
         workspace: WorkspaceInfo {
             name,
             version: "0.1.0".to_string(),
-            target_part: None,
+            target_parts: Vec::new(),
         },
         dependencies: HashMap::new(),
         test_dependencies: HashMap::new(),
@@ -1047,7 +1168,7 @@ pub async fn add_dependency_with_token(
                 workspace: WorkspaceInfo {
                     name: "workspace".to_string(),
                     version: "0.1.0".to_string(),
-                    target_part: None,
+                    target_parts: Vec::new(),
                 },
                 dependencies: HashMap::new(),
                 test_dependencies: HashMap::new(),
@@ -2388,7 +2509,31 @@ fn save_workspace_config(
 /// (LSP `initialize`-supplied roots) is a different concept and
 /// stays in the analyzer.
 pub fn find_workspace_dir(start: &Path) -> Option<Utf8PathBuf> {
-    let mut cur = Utf8PathBuf::from_path_buf(start.to_path_buf()).ok()?;
+    // Canonicalize UP FRONT so the walk-up starts from an
+    // absolute path. Callers hand us relative or empty paths in
+    // real workflows: `vw run prime.htcl` derives
+    // `Path("prime.htcl").parent() == ""`, which used to yield an
+    // empty-string workspace root — served over RPC to htcl,
+    // that caused `[file join $root target ip $ip]` to compute a
+    // RELATIVE path (`target/ip/cips`), which Vivado created
+    // inside its auto-cleaned tempdir cwd. The wrapper was
+    // silently written and immediately deleted on process exit.
+    // Canonicalizing here fixes every downstream consumer
+    // (workspace_root RPC, LSP compat check, htcl-test) in one
+    // place. Fallback to the raw start when canonicalize fails
+    // (e.g. path doesn't exist yet) so we don't regress the "no
+    // workspace" branch for freshly-created files.
+    // Empty path is a special case — `Path("").canonicalize()`
+    // errors with ENOENT, and `parent()` on it yields None
+    // immediately, so we'd terminate the walk before ever
+    // checking the cwd. Fold empty → cwd first, then canonicalize.
+    let start_pb = if start.as_os_str().is_empty() {
+        std::env::current_dir().ok()?
+    } else {
+        start.to_path_buf()
+    };
+    let canon = start_pb.canonicalize().unwrap_or(start_pb);
+    let mut cur = Utf8PathBuf::from_path_buf(canon).ok()?;
     loop {
         if cur.join("vw.toml").is_file() {
             return Some(cur);
@@ -3517,9 +3662,95 @@ mod dependency_source_tests {
         "#;
         let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.workspace.name, "clk-wizard");
-        assert_eq!(cfg.workspace.target_part, None);
+        assert!(cfg.workspace.target_parts.is_empty());
         let t = cfg.targets.expect("expected [targets]");
         assert_eq!(t.supported.len(), 2);
+    }
+
+    #[test]
+    fn workspace_config_parses_multi_target_parts() {
+        let toml = r#"
+            [workspace]
+            name = "metroid"
+            version = "0.1.0"
+
+            [[workspace.target-parts]]
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+            default = true
+
+            [[workspace.target-parts]]
+            part = "xcvp1202-vsva2785-3HP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.workspace.target_parts.len(), 2);
+        assert_eq!(
+            cfg.workspace.default_target_part().unwrap(),
+            Some("xcvp1202-vsva2785-2MHP-e-S"),
+        );
+        // Substring selector picks the non-default.
+        assert_eq!(
+            cfg.workspace.select_target_part(Some("3HP")).unwrap(),
+            Some("xcvp1202-vsva2785-3HP-e-S"),
+        );
+    }
+
+    #[test]
+    fn multi_parts_without_default_flag_errors() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+
+            [[workspace.target-parts]]
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+
+            [[workspace.target-parts]]
+            part = "xcvp1202-vsva2785-3HP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert!(matches!(
+            cfg.workspace.default_target_part(),
+            Err(TargetSelectError::NoDefault { count: 2 }),
+        ));
+    }
+
+    #[test]
+    fn ambiguous_substring_errors() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+
+            [[workspace.target-parts]]
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+            default = true
+
+            [[workspace.target-parts]]
+            part = "xcvp1202-vsva2785-3HP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        // "xcvp1202" matches both entries.
+        assert!(matches!(
+            cfg.workspace.select_target_part(Some("xcvp1202")),
+            Err(TargetSelectError::Ambiguous { .. }),
+        ));
+    }
+
+    #[test]
+    fn single_part_is_implicit_default() {
+        let toml = r#"
+            [workspace]
+            name = "vw"
+            version = "0.1.0"
+
+            [[workspace.target-parts]]
+            part = "xcvp1202-vsva2785-3HP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.workspace.default_target_part().unwrap(),
+            Some("xcvp1202-vsva2785-3HP-e-S"),
+        );
     }
 
     fn make_dep(name: &str, patterns: &[&str]) -> (String, Vec<TargetPattern>) {
@@ -3598,21 +3829,5 @@ mod dependency_source_tests {
         dt.per_dep.insert(name, patterns);
         let mismatches = check_target_compatibility(None, &dt);
         assert!(mismatches.is_empty());
-    }
-
-    #[test]
-    fn workspace_config_parses_project_target_part() {
-        let toml = r#"
-            [workspace]
-            name = "metroid"
-            version = "0.1.0"
-            target-part = "xcvm3358-vsvh1747-2M-e-S"
-        "#;
-        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
-        assert_eq!(
-            cfg.workspace.target_part.as_deref(),
-            Some("xcvm3358-vsvh1747-2M-e-S"),
-        );
-        assert!(cfg.targets.is_none());
     }
 }

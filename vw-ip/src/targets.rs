@@ -105,6 +105,56 @@ pub fn extract_targets_from_xml(xml: &str) -> ExtractedTargets {
             out.supported.push(normalized);
         }
     }
+    // Lift `ARCHITECTURE=<name>` clauses out of the IP's
+    // `<xilinx:autoDevicePropertiesFilter>` and add a family-wide
+    // `<architecture>{.+}` pattern per unique architecture. This
+    // captures the intent of IPs like `clk_wizard_v1_0` whose
+    // filter is `((ARCHITECTURE=versal)&&(MMCM>0))` — the IP is
+    // blessed for the entire versal architecture; the `MMCM > 0`
+    // and per-family `not-supported` entries then prune specific
+    // parts out. Without this lift, an IP whose supportedFamilies
+    // list is empty (or entirely Not-Supported) looks like it has
+    // no blessed patterns at all, which fires spurious "not
+    // blessed" warnings on parts Vivado will happily instantiate.
+    //
+    // We don't try to evaluate the boolean expression as a whole
+    // (capability clauses like `MMCM > 0` need per-part device
+    // properties we don't have statically). Extracting the pure
+    // architecture predicates is enough for the "blessed vs. not"
+    // question — capabilities and per-part bans still narrow at
+    // check time.
+    for arch in extract_architectures_from_filter(xml) {
+        let pat = format!("{arch}{{.+}}");
+        if !out.supported.contains(&pat) {
+            out.supported.push(pat);
+        }
+    }
+    out
+}
+
+/// Pull every `ARCHITECTURE=<name>` clause out of any
+/// `<xilinx:autoDevicePropertiesFilter>` block in `xml`. The
+/// filter is a boolean expression written in a Xilinx-specific
+/// mini-language, with entity-encoded operators (`&amp;&amp;`,
+/// `&gt;`). We only care about the architecture predicates;
+/// capability clauses (`MMCM > 0`, `CPM5 > 0`, …) are ignored.
+fn extract_architectures_from_filter(xml: &str) -> Vec<String> {
+    let block_re = regex::Regex::new(
+        r#"(?s)<xilinx:autoDevicePropertiesFilter>\s*([^<]*?)\s*</xilinx:autoDevicePropertiesFilter>"#,
+    )
+    .expect("autoDevicePropertiesFilter block regex must compile");
+    let arch_re =
+        regex::Regex::new(r#"(?i)ARCHITECTURE\s*=\s*([A-Za-z0-9_]+)"#)
+            .expect("architecture predicate regex must compile");
+    let mut out = Vec::new();
+    for cap in block_re.captures_iter(xml) {
+        for a in arch_re.captures_iter(&cap[1]) {
+            let name = a[1].to_string();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
     out
 }
 
@@ -189,5 +239,74 @@ mod tests {
             extract_targets_from_xml("<component>no families here</component>");
         assert!(out.supported.is_empty());
         assert!(out.not_supported.is_empty());
+    }
+
+    #[test]
+    fn architecture_filter_widens_blessed_list() {
+        // clk_wizard_v1_0's exact shape: every family entry is
+        // Not-Supported, but the filter blesses the whole versal
+        // architecture. Result: `versal{.+}` in supported;
+        // specific parts still in not_supported.
+        let out = extract_targets_from_xml(
+            r#"
+            <xilinx:supportedFamilies>
+              <xilinx:family xilinx:lifeCycle="Not-Supported">versal{xa2ve3288(.*)}</xilinx:family>
+              <xilinx:family xilinx:lifeCycle="Not-Supported">versal{xc2ve3(.*)}</xilinx:family>
+            </xilinx:supportedFamilies>
+            <xilinx:autoDevicePropertiesFilter>((ARCHITECTURE=versal)&amp;&amp;(MMCM&gt;0))</xilinx:autoDevicePropertiesFilter>
+            "#,
+        );
+        assert_eq!(out.supported, vec!["versal{.+}"]);
+        assert_eq!(
+            out.not_supported,
+            vec!["versal{xa2ve3288(.*)}", "versal{xc2ve3(.*)}"],
+        );
+    }
+
+    #[test]
+    fn architecture_filter_dedupes_against_existing_supported() {
+        // If the supported list already carries a versal entry,
+        // adding another family-wide one would be redundant. But
+        // `versal{.+}` and `versal{xcvm3(.*)}` are DIFFERENT
+        // patterns; both belong. We only dedupe on exact-string
+        // equality so the same regex isn't repeated.
+        let out = extract_targets_from_xml(
+            r#"
+            <xilinx:supportedFamilies>
+              <xilinx:family xilinx:lifeCycle="Production">versal{xcvm3(.*)}</xilinx:family>
+            </xilinx:supportedFamilies>
+            <xilinx:autoDevicePropertiesFilter>(ARCHITECTURE=versal)</xilinx:autoDevicePropertiesFilter>
+            "#,
+        );
+        assert_eq!(out.supported, vec!["versal{xcvm3(.*)}", "versal{.+}"]);
+    }
+
+    #[test]
+    fn capability_only_filter_adds_nothing_to_supported() {
+        // dcmac_v3_0 / cpm5_v1_0 have capability-only filters —
+        // no ARCHITECTURE clause. Nothing to lift; the family
+        // list alone drives the blessed set.
+        let out = extract_targets_from_xml(
+            r#"
+            <xilinx:supportedFamilies>
+              <xilinx:family xilinx:lifeCycle="Production">versal{xcvp1202(.*)}</xilinx:family>
+            </xilinx:supportedFamilies>
+            <xilinx:autoDevicePropertiesFilter>(CPM5 &gt; 0)</xilinx:autoDevicePropertiesFilter>
+            "#,
+        );
+        assert_eq!(out.supported, vec!["versal{xcvp1202(.*)}"]);
+    }
+
+    #[test]
+    fn multiple_architecture_clauses_each_lift() {
+        // Rare but possible: an IP that supports several
+        // architectures. Each named `ARCHITECTURE=<x>` clause
+        // becomes its own family-wide pattern.
+        let out = extract_targets_from_xml(
+            r#"
+            <xilinx:autoDevicePropertiesFilter>((ARCHITECTURE=versal) || (ARCHITECTURE=zynquplus))</xilinx:autoDevicePropertiesFilter>
+            "#,
+        );
+        assert_eq!(out.supported, vec!["versal{.+}", "zynquplus{.+}"]);
     }
 }

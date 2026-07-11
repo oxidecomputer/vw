@@ -439,6 +439,7 @@ async fn run_inner(
         verbose,
         verbose_log_path.clone(),
         info_with_stack,
+        opts.part.clone(),
         rpc_workspace_root,
     ));
 
@@ -2730,22 +2731,39 @@ async fn worker_task(
     verbose: bool,
     verbose_log: Option<std::path::PathBuf>,
     info_with_stack: bool,
+    part: Option<String>,
     rpc_workspace_root: Option<std::path::PathBuf>,
 ) {
     // Auto-project bootstrap: same rule as `vw run` — if the
-    // enclosing workspace declares a `target-part`, create an
+    // enclosing workspace declares `[[target-parts]]`, create an
     // in-memory project up front so `ip::check`, `get_ipdefs`,
     // and every other project-scoped call have a project to
-    // read at the first user eval.
-    let auto_project = rpc_workspace_root.as_deref().and_then(|ws| {
-        let ws_utf8 = camino::Utf8Path::from_path(ws)?;
-        let cfg = vw_lib::load_workspace_config(ws_utf8).ok()?;
-        let part = cfg.workspace.target_part?;
-        Some(vw_vivado::AutoProject {
-            name: cfg.workspace.name,
-            part,
-        })
-    });
+    // read at the first user eval. `part` is the CLI's `--part`
+    // selector; `None` uses the workspace default.
+    let auto_project_result = rpc_workspace_root
+        .as_deref()
+        .and_then(camino::Utf8Path::from_path)
+        .and_then(|ws| vw_lib::load_workspace_config(ws).ok())
+        .map(|cfg| {
+            cfg.workspace.select_target_part(part.as_deref()).map(
+                |maybe_part| {
+                    maybe_part.map(|p| vw_vivado::AutoProject {
+                        name: cfg.workspace.name.clone(),
+                        part: p.to_string(),
+                    })
+                },
+            )
+        });
+    let auto_project = match auto_project_result {
+        Some(Ok(ap)) => ap,
+        Some(Err(e)) => {
+            let _ = tx.send(WorkerEvent::StartFailed(
+                vw_eda::BackendError::Worker(e.to_string()),
+            ));
+            return;
+        }
+        None => None,
+    };
     // RPC handler — mirrors `vw run`'s. `vw::workspace_root`
     // answers with the entry / cwd's nearest `vw.toml` parent;
     // unknown methods fail loudly so future htcl calls surface
