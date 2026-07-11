@@ -189,6 +189,7 @@ impl fmt::Display for VhdlStandard {
 pub struct WorkspaceConfig {
     #[allow(dead_code)]
     pub workspace: WorkspaceInfo,
+    #[serde(default)]
     pub dependencies: HashMap<String, Dependency>,
     /// Test-only dependencies. Only the ENTRY workspace's
     /// `[test-dependencies]` are honored — a transitive dep's
@@ -197,6 +198,17 @@ pub struct WorkspaceConfig {
     /// [`transitive_dep_cache_paths_with_test`].
     #[serde(default, rename = "test-dependencies")]
     pub test_dependencies: HashMap<String, Dependency>,
+    /// Library-scope: the set of Vivado device families/parts the
+    /// files in this workspace support. Populated by `vw ip
+    /// generate` from the underlying IP's `<xilinx:supported
+    /// Families>`, normalized so every entry has a brace-form
+    /// regex against the raw part name.
+    ///
+    /// Project workspaces (those that declare `[workspace]
+    /// target-part`) omit this — projects consume libraries, they
+    /// don't publish their own supported-parts list.
+    #[serde(default)]
+    pub targets: Option<TargetsConfig>,
     #[serde(default)]
     pub tools: Option<ToolsConfig>,
 }
@@ -207,6 +219,288 @@ pub struct WorkspaceInfo {
     pub name: String,
     #[allow(dead_code)]
     pub version: String,
+    /// Project-scope: the specific Vivado part this workspace
+    /// targets. Full Vivado part specifier (e.g.
+    /// `xcvm3358-vsvh1747-2M-e-S`) — package and speed grade
+    /// matter for downstream implementation / timing analysis
+    /// even if the family alone is enough for IP-availability
+    /// checks. Absent for library workspaces.
+    ///
+    /// Also drives the auto-`create_project -in_memory -part`
+    /// that runs when a Vivado session boots against this
+    /// workspace.
+    #[serde(default, rename = "target-part")]
+    pub target_part: Option<String>,
+}
+
+/// Library-scope target metadata. Populated by `vw ip generate`
+/// so downstream `vw check` can verify a consumer's target-part
+/// is supported by every transitive dep without ever touching
+/// Vivado at check time.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TargetsConfig {
+    /// Blessed patterns — `<xilinx:family>` entries whose
+    /// `lifeCycle` is `Production`, `Beta`, or `Pre-Production`.
+    /// A target-part that matches any of these is a clean pass;
+    /// the check emits no diagnostic for that dep.
+    ///
+    /// Every string is in the form `<family-name>{<part-name-regex>}`
+    /// — see [`parse_target_pattern`] for the parse rules. Bare
+    /// family names are rejected; `vw ip generate` normalizes them
+    /// before writing.
+    #[serde(default)]
+    pub supported: Vec<String>,
+    /// Explicitly-unsupported patterns — `<xilinx:family>` entries
+    /// with `lifeCycle="Not-Supported"`. Xilinx has attested that
+    /// the IP is NOT usable on parts matching these patterns; if
+    /// the target-part matches one, `vw check` fires an ERROR.
+    ///
+    /// Note: an entire component.xml with only Not-Supported
+    /// entries (e.g. an experimental IP still in incubation)
+    /// leaves `supported = []` and populates only this list. In
+    /// that case the check treats a NON-match here as "unblessed
+    /// but not forbidden" — a warning, not an error.
+    #[serde(default, rename = "not-supported")]
+    pub not_supported: Vec<String>,
+}
+
+/// A parsed `family{regex}` target pattern. The regex is
+/// pre-compiled at parse time so hot paths (validator, LSP
+/// diagnostics) don't re-compile per-check.
+#[derive(Debug, Clone)]
+pub struct TargetPattern {
+    /// The family word out front — `versal`, `artix7`, etc. Kept
+    /// verbatim for diagnostics: "clk-wizard supports the versal
+    /// family; your target `xcvm3358…` isn't in that family."
+    pub family: String,
+    /// The compiled regex from inside the braces. Applied against
+    /// the consumer's target-part string; a match means the
+    /// library supports the target.
+    pub regex: regex::Regex,
+    /// Original source text (`versal{xcvm3(.*)}`) — used to
+    /// point diagnostics back at the exact vw.toml line.
+    pub raw: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TargetParseError {
+    #[error("target pattern `{raw}` is missing the `{{regex}}` part")]
+    MissingBraces { raw: String },
+    #[error("target pattern `{raw}`: {source}")]
+    BadRegex {
+        raw: String,
+        #[source]
+        source: regex::Error,
+    },
+}
+
+/// Parse one entry of `[targets].supported` — the form
+/// `<family>{<regex>}`. Bare-family entries (no braces) are
+/// rejected with [`TargetParseError::MissingBraces`]; the
+/// generator's job is to normalize them into brace form before
+/// they reach downstream consumers.
+/// Snapshot of per-dep target-support metadata used by the
+/// project-vs-dep compatibility check. Populated from each dep's
+/// `[targets] supported` list at the entry workspace's transitive
+/// walk time; used later by [`check_target_compatibility`] to
+/// verify a given target-part is supported.
+///
+/// Deps with no `[targets]` at all are `Vec::new()` — the check
+/// treats an empty list as "universal / no constraint," so
+/// non-IP libraries (@vw, @test) don't need to declare anything.
+///
+/// Parse errors during pattern compile are turned into
+/// `(dep_name, error)` entries in the second field so callers
+/// can surface them as diagnostics without dropping the whole
+/// dep's info.
+#[derive(Debug, Default)]
+pub struct DepTargets {
+    /// Blessed (`Production`/`Beta`/`Pre-Production`) patterns
+    /// per dep. A target-part matching any of these clears the
+    /// check clean.
+    pub per_dep: HashMap<String, Vec<TargetPattern>>,
+    /// Explicitly `Not-Supported` patterns per dep. A target-part
+    /// matching any of these is an ERROR — Xilinx has attested
+    /// the IP is not usable there.
+    pub per_dep_not_supported: HashMap<String, Vec<TargetPattern>>,
+    pub errors: Vec<(String, TargetParseError)>,
+}
+
+/// Walk the entry workspace's transitive deps and collect each
+/// dep's `[targets].supported` patterns. Returns a
+/// [`DepTargets`] snapshot ready to feed into
+/// [`check_target_compatibility`].
+///
+/// Skips deps whose `vw.toml` doesn't load — they contribute
+/// nothing (treated as universal). This matches the "empty =
+/// universal" policy the compat check applies.
+pub fn collect_dep_targets(entry_workspace_dir: &Utf8Path) -> DepTargets {
+    let mut out = DepTargets::default();
+    let Ok(paths) = transitive_dep_cache_paths(entry_workspace_dir) else {
+        return out;
+    };
+    for (name, path) in paths {
+        let Ok(path_utf8) = Utf8PathBuf::from_path_buf(path) else {
+            continue;
+        };
+        let Ok(cfg) = load_workspace_config(&path_utf8) else {
+            continue;
+        };
+        let Some(targets) = cfg.targets else {
+            out.per_dep.insert(name.clone(), Vec::new());
+            out.per_dep_not_supported.insert(name, Vec::new());
+            continue;
+        };
+        let mut compiled: Vec<TargetPattern> = Vec::new();
+        for raw in &targets.supported {
+            match parse_target_pattern(raw) {
+                Ok(p) => compiled.push(p),
+                Err(e) => out.errors.push((name.clone(), e)),
+            }
+        }
+        let mut compiled_not_supported: Vec<TargetPattern> = Vec::new();
+        for raw in &targets.not_supported {
+            match parse_target_pattern(raw) {
+                Ok(p) => compiled_not_supported.push(p),
+                Err(e) => out.errors.push((name.clone(), e)),
+            }
+        }
+        out.per_dep.insert(name.clone(), compiled);
+        out.per_dep_not_supported
+            .insert(name, compiled_not_supported);
+    }
+    out
+}
+
+/// Severity of a target-compatibility mismatch. The two-tier
+/// treatment reflects what `<xilinx:supportedFamilies>` actually
+/// means in Vivado's IP catalog: the family list is a lifeCycle-
+/// tagged compatibility MATRIX, not a hard availability filter.
+/// Vivado exposes IPs even for families that aren't listed. So:
+///
+/// - `NotSupported` — target-part matched a Not-Supported entry.
+///   Xilinx explicitly attests the IP won't work here. Error.
+/// - `Unblessed` — target-part matched no entry at all (neither
+///   supported nor not-supported). Warning: the IP MAY work but
+///   Xilinx hasn't blessed the combination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetMismatchKind {
+    NotSupported,
+    Unblessed,
+}
+
+/// One target-compatibility observation. Emitted by
+/// [`check_target_compatibility`]; the caller uses `kind` to
+/// choose diagnostic severity (error vs warning).
+#[derive(Debug, Clone)]
+pub struct TargetMismatch {
+    /// Dep name (e.g. `clk-wizard`).
+    pub dep: String,
+    /// The target part string that was checked.
+    pub target_part: String,
+    /// Family cues gathered from the dep's declared patterns —
+    /// e.g. `["versal"]`. Used in the diagnostic message so the
+    /// user knows what families the dep DOES bless.
+    pub supported_families: Vec<String>,
+    /// Whether Xilinx explicitly forbids this combination or
+    /// simply hasn't blessed it.
+    pub kind: TargetMismatchKind,
+}
+
+/// Return each dep's target-compatibility observation against
+/// `target_part`. Deps with no `[targets]` at all (`supported`
+/// AND `not_supported` both empty) contribute nothing — treated
+/// as universal. When `target_part` is `None` (library workspace,
+/// no project target) the check is a no-op.
+///
+/// Decision matrix per dep:
+/// - matches a Not-Supported pattern → `NotSupported` (error).
+///   Trumps a supported match — an explicit ban wins.
+/// - matches a Supported pattern → clean pass, no observation.
+/// - matches neither, but the dep has SOME patterns declared →
+///   `Unblessed` (warning).
+pub fn check_target_compatibility(
+    target_part: Option<&str>,
+    dep_targets: &DepTargets,
+) -> Vec<TargetMismatch> {
+    let Some(part) = target_part else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (dep, supported) in &dep_targets.per_dep {
+        let not_supported = dep_targets
+            .per_dep_not_supported
+            .get(dep)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        if supported.is_empty() && not_supported.is_empty() {
+            continue;
+        }
+        let hit_not_supported =
+            not_supported.iter().any(|p| p.regex.is_match(part));
+        if hit_not_supported {
+            let mut families: Vec<String> =
+                not_supported.iter().map(|p| p.family.clone()).collect();
+            families.sort();
+            families.dedup();
+            out.push(TargetMismatch {
+                dep: dep.clone(),
+                target_part: part.to_string(),
+                supported_families: families,
+                kind: TargetMismatchKind::NotSupported,
+            });
+            continue;
+        }
+        let hit_supported = supported.iter().any(|p| p.regex.is_match(part));
+        if hit_supported {
+            continue;
+        }
+        let mut families: Vec<String> = supported
+            .iter()
+            .chain(not_supported.iter())
+            .map(|p| p.family.clone())
+            .collect();
+        families.sort();
+        families.dedup();
+        out.push(TargetMismatch {
+            dep: dep.clone(),
+            target_part: part.to_string(),
+            supported_families: families,
+            kind: TargetMismatchKind::Unblessed,
+        });
+    }
+    out
+}
+
+pub fn parse_target_pattern(
+    raw: &str,
+) -> std::result::Result<TargetPattern, TargetParseError> {
+    let Some((family, rest)) = raw.split_once('{') else {
+        return Err(TargetParseError::MissingBraces {
+            raw: raw.to_string(),
+        });
+    };
+    let Some(regex_src) = rest.strip_suffix('}') else {
+        return Err(TargetParseError::MissingBraces {
+            raw: raw.to_string(),
+        });
+    };
+    // Anchor at start: `xcvm3(.*)` should match ONLY parts that
+    // begin with `xcvm3`, not any string containing `xcvm3` mid-
+    // way. End anchor is optional because the source patterns
+    // themselves use `(.*)` to slop up the suffix.
+    let anchored = format!("^{regex_src}");
+    let regex = regex::Regex::new(&anchored).map_err(|e| {
+        TargetParseError::BadRegex {
+            raw: raw.to_string(),
+            source: e,
+        }
+    })?;
+    Ok(TargetPattern {
+        family: family.to_string(),
+        regex,
+        raw: raw.to_string(),
+    })
 }
 
 /// How a workspace dependency identifies its source. Currently a git
@@ -520,9 +814,11 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
         workspace: WorkspaceInfo {
             name,
             version: "0.1.0".to_string(),
+            target_part: None,
         },
         dependencies: HashMap::new(),
         test_dependencies: HashMap::new(),
+        targets: None,
         tools: None,
     };
 
@@ -751,9 +1047,11 @@ pub async fn add_dependency_with_token(
                 workspace: WorkspaceInfo {
                     name: "workspace".to_string(),
                     version: "0.1.0".to_string(),
+                    target_part: None,
                 },
                 dependencies: HashMap::new(),
                 test_dependencies: HashMap::new(),
+                targets: None,
                 tools: None,
             }
         });
@@ -3176,5 +3474,145 @@ mod dependency_source_tests {
         std::fs::write(ws.join("vw.toml"), "").unwrap();
         let tests = list_htcl_tests(&ws).unwrap();
         assert!(tests.is_empty());
+    }
+
+    #[test]
+    fn target_pattern_parses_brace_form() {
+        let p = parse_target_pattern("versal{xcvm3(.*)}").unwrap();
+        assert_eq!(p.family, "versal");
+        assert!(p.regex.is_match("xcvm3358-vsvh1747-2M-e-S"));
+        assert!(!p.regex.is_match("xc7z020clg484-1"));
+    }
+
+    #[test]
+    fn target_pattern_rejects_bare_family() {
+        // Bare `artix7` (no braces) shouldn't reach downstream vw.
+        // toml; `vw ip generate` normalizes into brace form.
+        let e = parse_target_pattern("artix7").unwrap_err();
+        assert!(matches!(e, TargetParseError::MissingBraces { .. }));
+    }
+
+    #[test]
+    fn target_pattern_anchors_at_start() {
+        // `xcvm3(.*)` should NOT match "xxx-xcvm3358" (regex would
+        // otherwise be "contains xcvm3"). Anchoring at start
+        // prevents that.
+        let p = parse_target_pattern("versal{xcvm3(.*)}").unwrap();
+        assert!(p.regex.is_match("xcvm3358"));
+        assert!(!p.regex.is_match("blah-xcvm3358"));
+    }
+
+    #[test]
+    fn workspace_config_parses_target_part_and_targets() {
+        let toml = r#"
+            [workspace]
+            name = "clk-wizard"
+            version = "0.1.0"
+
+            [targets]
+            supported = [
+                "versal{xcvm3(.*)}",
+                "versal{xc2ve3(.*)}",
+            ]
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.workspace.name, "clk-wizard");
+        assert_eq!(cfg.workspace.target_part, None);
+        let t = cfg.targets.expect("expected [targets]");
+        assert_eq!(t.supported.len(), 2);
+    }
+
+    fn make_dep(name: &str, patterns: &[&str]) -> (String, Vec<TargetPattern>) {
+        let compiled: Vec<TargetPattern> = patterns
+            .iter()
+            .map(|s| parse_target_pattern(s).unwrap())
+            .collect();
+        (name.to_string(), compiled)
+    }
+
+    #[test]
+    fn target_compat_matches_when_pattern_covers_part() {
+        let mut dt = DepTargets::default();
+        let (name, patterns) = make_dep("clk-wizard", &["versal{xcvm3(.*)}"]);
+        dt.per_dep.insert(name, patterns);
+        let mismatches =
+            check_target_compatibility(Some("xcvm3358-vsvh1747-2M-e-S"), &dt);
+        assert!(mismatches.is_empty(), "{mismatches:?}");
+    }
+
+    #[test]
+    fn target_compat_reports_unblessed_when_no_pattern_matches() {
+        let mut dt = DepTargets::default();
+        let (name, patterns) = make_dep("clk-wizard", &["versal{xcvm3(.*)}"]);
+        dt.per_dep.insert(name, patterns);
+        let mismatches =
+            check_target_compatibility(Some("xc7z020clg484-1"), &dt);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].dep, "clk-wizard");
+        assert_eq!(mismatches[0].supported_families, vec!["versal"]);
+        assert_eq!(mismatches[0].kind, TargetMismatchKind::Unblessed);
+    }
+
+    #[test]
+    fn target_compat_reports_not_supported_wins_over_supported() {
+        // If a target matches both a supported and a not-supported
+        // pattern, the explicit ban must win — Xilinx has attested
+        // the combination doesn't work.
+        let mut dt = DepTargets::default();
+        let (name, sup) = make_dep("gadget", &["versal{xcv(.*)}"]);
+        dt.per_dep.insert(name.clone(), sup);
+        let (_, ns) = make_dep("gadget", &["versal{xcvp1202.*}"]);
+        dt.per_dep_not_supported.insert(name, ns);
+        let mismatches =
+            check_target_compatibility(Some("xcvp1202-vsva2785-3HP-e-S"), &dt);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].kind, TargetMismatchKind::NotSupported);
+    }
+
+    #[test]
+    fn target_compat_supported_match_clears_when_no_ban() {
+        let mut dt = DepTargets::default();
+        let (name, sup) = make_dep("gadget", &["versal{xcvp1202.*}"]);
+        dt.per_dep.insert(name, sup);
+        let mismatches =
+            check_target_compatibility(Some("xcvp1202-vsva2785-3HP-e-S"), &dt);
+        assert!(mismatches.is_empty(), "{mismatches:?}");
+    }
+
+    #[test]
+    fn target_compat_treats_empty_patterns_as_universal() {
+        // @vw / @test — no [targets] means "we support anything."
+        let mut dt = DepTargets::default();
+        dt.per_dep.insert("vw".into(), Vec::new());
+        let mismatches =
+            check_target_compatibility(Some("xc7z020clg484-1"), &dt);
+        assert!(mismatches.is_empty());
+    }
+
+    #[test]
+    fn target_compat_no_op_when_no_target_declared() {
+        // Library workspaces have no target-part — check should
+        // silently accept.
+        let mut dt = DepTargets::default();
+        let (name, patterns) = make_dep("clk-wizard", &["versal{xcvm3(.*)}"]);
+        dt.per_dep.insert(name, patterns);
+        let mismatches = check_target_compatibility(None, &dt);
+        assert!(mismatches.is_empty());
+    }
+
+    #[test]
+    fn workspace_config_parses_project_target_part() {
+        let toml = r#"
+            [workspace]
+            name = "metroid"
+            version = "0.1.0"
+            target-part = "xcvm3358-vsvh1747-2M-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.workspace.target_part.as_deref(),
+            Some("xcvm3358-vsvh1747-2M-e-S"),
+        );
+        assert!(cfg.targets.is_none());
     }
 }

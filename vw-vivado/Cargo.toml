@@ -16,3 +16,5 @@ async-trait.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 portable-pty.workspace = true
+similar.workspace = true
+colored = "2.0"

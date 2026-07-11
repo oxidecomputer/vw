@@ -47,5 +47,6 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tui-textarea = { version = "0.7", default-features = false, features = ["crossterm", "ratatui"] }
 nucleo-matcher = "0.3"
 indicatif = "0.17"
+similar = { version = "2.6", features = ["inline"] }
 ipxact = { path = "/home/ry/src/ipe/crates/ipxact" }
 #ipxact = { git = "https://github.com/oxidecomputer/ipe", branch = "ry/init" }

@@ -411,9 +411,30 @@ pub struct Attribute {
 
 #[derive(Clone, Debug)]
 pub enum AttributeValue {
-    Integer { value: i64, span: Span },
-    String { value: String, span: Span },
-    Ident { value: String, span: Span },
+    Integer {
+        value: i64,
+        span: Span,
+    },
+    String {
+        value: String,
+        span: Span,
+    },
+    Ident {
+        value: String,
+        span: Span,
+    },
+    /// A `key=value` item in an attribute value list, e.g.
+    /// `@test(dedicated-eda part=xcvm3358-vsvh1747-2M-e-S)` where
+    /// `part=xcvm3358…` produces a `Keyed { key: "part", value:
+    /// Ident(…) }`. Positional items in the same list continue to
+    /// use the plain [`Integer`]/[`String`]/[`Ident`] variants,
+    /// so old consumers keep working.
+    Keyed {
+        key: String,
+        key_span: Span,
+        value: Box<AttributeValue>,
+        span: Span,
+    },
 }
 
 impl AttributeValue {
@@ -421,7 +442,17 @@ impl AttributeValue {
         match self {
             AttributeValue::Integer { span, .. }
             | AttributeValue::String { span, .. }
-            | AttributeValue::Ident { span, .. } => *span,
+            | AttributeValue::Ident { span, .. }
+            | AttributeValue::Keyed { span, .. } => *span,
+        }
+    }
+
+    /// If this item is a `key=value` pair, return `(key,
+    /// inner_value)`. `None` for positional items.
+    pub fn as_keyed(&self) -> Option<(&str, &AttributeValue)> {
+        match self {
+            AttributeValue::Keyed { key, value, .. } => Some((key, value)),
+            _ => None,
         }
     }
 
@@ -437,6 +468,9 @@ impl AttributeValue {
                 let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
                 format!("\"{escaped}\"")
             }
+            AttributeValue::Keyed { key, value, .. } => {
+                format!("{key}={}", value.to_tcl_literal())
+            }
         }
     }
 
@@ -445,6 +479,7 @@ impl AttributeValue {
             AttributeValue::Ident { value, .. }
             | AttributeValue::String { value, .. } => value,
             AttributeValue::Integer { .. } => "",
+            AttributeValue::Keyed { .. } => "",
         }
     }
 }

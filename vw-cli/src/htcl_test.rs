@@ -123,6 +123,11 @@ struct TestCase {
     /// True if `@test(dedicated-eda)` — this test wants its own
     /// Vivado process.
     dedicated: bool,
+    /// `@target(part=<id>)` override — swaps the auto-project's
+    /// `-part` argument for this specific test. Meaningful only
+    /// for `dedicated-eda` tests (shared-bucket tests all reuse
+    /// the workspace-default project).
+    target_part_override: Option<String>,
     /// Concrete Tcl lines to ship as setup before invoking the
     /// test proc. Includes proc declarations, `src`-imported code,
     /// and any top-level setup statements.
@@ -188,7 +193,7 @@ async fn discover_tests_in_file(
     // Partition statements: `@test`-proc decls are collected as
     // tests; everything else (including proc decls WITHOUT
     // `@test`, `src` imports, and top-level setup) becomes setup.
-    let mut test_procs: Vec<(String, bool)> = Vec::new();
+    let mut test_procs: Vec<(String, bool, Option<String>)> = Vec::new();
     for stmt in &parsed.document.stmts {
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
@@ -205,7 +210,15 @@ async fn discover_tests_in_file(
                             if value == "dedicated-eda"
                     )
                 });
-                test_procs.push((name, dedicated));
+                // Per-test target override, e.g.
+                // `@test(dedicated-eda target="xcvp1202-vsva2785-3HP-e-S")`.
+                // Swaps the auto-project's `-part` for this test's
+                // Vivado session. Only meaningful for dedicated-eda
+                // tests (the validator warns otherwise); shared tests
+                // silently fall back to the workspace default.
+                let target_part_override =
+                    extract_target_from_test_attr(test_attr);
+                test_procs.push((name, dedicated, target_part_override));
                 // Test proc decls MUST also be shipped as setup —
                 // Vivado has to know about the proc before we call
                 // it. Fall through to the setup-emit below.
@@ -231,7 +244,7 @@ async fn discover_tests_in_file(
         .unwrap_or_else(|_| file.to_string());
 
     let mut out = Vec::new();
-    for (name, dedicated) in test_procs {
+    for (name, dedicated, target_part_override) in test_procs {
         if let Some(filt) = filter {
             if !name.contains(filt) {
                 continue;
@@ -242,10 +255,33 @@ async fn discover_tests_in_file(
             file_path: file.as_std_path().to_path_buf(),
             name,
             dedicated,
+            target_part_override,
             setup_tcl: setup_tcl.clone(),
         });
     }
     Ok(out)
+}
+
+/// Pull the `target=<part>` keyed value out of a `@test(...)`
+/// attribute. Returns `None` if the attribute has no `target`
+/// key or the value isn't a string/ident.
+fn extract_target_from_test_attr(attr: &vw_htcl::Attribute) -> Option<String> {
+    for v in &attr.values {
+        let vw_htcl::AttributeValue::Keyed { key, value, .. } = v else {
+            continue;
+        };
+        if key != "target" {
+            continue;
+        }
+        return match value.as_ref() {
+            vw_htcl::AttributeValue::String { value, .. } => {
+                Some(value.clone())
+            }
+            vw_htcl::AttributeValue::Ident { value, .. } => Some(value.clone()),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Run all shared-bucket tests in ONE Vivado session. First-file
@@ -257,7 +293,22 @@ async fn run_shared_bucket(
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut backend = spawn_backend(ws, verbose, info_with_stack).await?;
+    // Shared bucket uses one Vivado process for every test in it,
+    // so per-test `@target(part=…)` cannot apply — that override
+    // only makes sense in dedicated-eda tests where each run gets
+    // a fresh session. The validator flags this at check time; here
+    // we silently fall back to the workspace default.
+    let auto_project = workspace_auto_project(ws);
+    // Show the first test's name up front with a "starting vivado"
+    // status so the run doesn't look hung during the ~10-30s
+    // Vivado boot. `run_one_test` overwrites this line as soon as
+    // it fires its own "running" line.
+    if let Some(first) = tests.first() {
+        let label = format!("{}::{}", first.display_path, first.name);
+        print_status_line("starting vivado", &label);
+    }
+    let mut backend =
+        spawn_backend(ws, verbose, info_with_stack, auto_project).await?;
     // Track which file's setup we've already shipped.
     let mut shipped: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
@@ -271,7 +322,12 @@ async fn run_shared_bucket(
         )
         .await;
     }
-    let _ = backend.shutdown().await;
+    // Detach shutdown — see `run_dedicated_bucket` for the
+    // rationale; here it saves the summary block from a 10s
+    // Vivado-exit wait tacked onto the tail of `vw test`.
+    tokio::spawn(async move {
+        let _ = backend.shutdown().await;
+    });
     Ok(())
 }
 
@@ -291,8 +347,30 @@ async fn run_dedicated_bucket(
     // ~1-2 GB of RAM so caution around parallelism is warranted;
     // parallel exec is a follow-up.
     let _ = threads;
+    let ws_default = workspace_auto_project(ws);
     for test in tests {
-        let mut backend = spawn_backend(ws, verbose, info_with_stack).await?;
+        // Per-test `@target(part=…)` swaps the auto-project's
+        // `-part` for this test only; falls back to workspace
+        // default. Missing both → no auto-project; downstream code
+        // that needs a project must construct one itself.
+        let auto_project = match &test.target_part_override {
+            Some(part) => Some(vw_vivado::AutoProject {
+                name: ws_default
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "vw_test".to_string()),
+                part: part.clone(),
+            }),
+            None => ws_default.clone(),
+        };
+        // Show the test up front so the runner announces what's
+        // pending during Vivado boot (~10-30s per dedicated-eda
+        // test). Overwritten by run_one_test's "running" once
+        // spawn returns.
+        let label = format!("{}::{}", test.display_path, test.name);
+        print_status_line("starting vivado", &label);
+        let mut backend =
+            spawn_backend(ws, verbose, info_with_stack, auto_project).await?;
         let mut shipped: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
         run_one_test(
@@ -303,7 +381,19 @@ async fn run_dedicated_bucket(
             /*display_shipped=*/ false,
         )
         .await;
-        let _ = backend.shutdown().await;
+        // Detach shutdown. Vivado's tear-down is a 10s-bounded
+        // graceful-exit dance (see VivadoBackend::shutdown), and
+        // for an in-memory test session nothing about that wait is
+        // load-bearing — the child process exit / kill happens
+        // either way. Fire-and-forget so the runner reaches the
+        // summary block immediately after the last test, and so
+        // one test's shutdown overlaps the next test's Vivado
+        // boot instead of serializing. If the process exits before
+        // the shutdown task finishes, VivadoBackend's Drop still
+        // SIGKILLs the child — no orphan.
+        tokio::spawn(async move {
+            let _ = backend.shutdown().await;
+        });
     }
     Ok(())
 }
@@ -363,12 +453,7 @@ async fn run_one_test(
         Err(e) => {
             let elapsed = format_secs(started.elapsed().as_secs_f64());
             clear_running_line();
-            println!(
-                " {} [{}] {}",
-                "FAIL".red().bold(),
-                elapsed.red(),
-                label,
-            );
+            println!(" {} [{}] {}", "FAIL".red().bold(), elapsed.red(), label,);
             summary.failed += 1;
             summary.failures.push(TestFailure {
                 display: label,
@@ -383,16 +468,27 @@ async fn run_one_test(
 /// the label would just fill the log with cursor-return sequences
 /// that get rendered as literal `\r`.
 fn print_running_line(label: &str) {
+    print_status_line("running", label);
+}
+
+/// Same shape as [`print_running_line`] but with a caller-chosen
+/// status word. Used to show `starting vivado` up front while the
+/// backend boots (~10-30s) so the runner doesn't look hung on
+/// dedicated-eda tests before their first eval.
+fn print_status_line(status: &str, label: &str) {
     use std::io::{IsTerminal, Write};
     let mut out = std::io::stdout();
     if !out.is_terminal() {
         return;
     }
+    // Pad status to a consistent width so successive re-renders
+    // ("starting vivado" → "running") overwrite cleanly without
+    // trailing chars leaking through.
     let _ = write!(
         out,
-        "\r {} [ {} ] {}",
+        "\r {} [ {:16} ] {}",
         "RUN ".cyan().bold(),
-        "running".cyan(),
+        status.cyan(),
         label,
     );
     let _ = out.flush();
@@ -417,30 +513,32 @@ async fn spawn_backend(
     ws: &Utf8Path,
     verbose: bool,
     info_with_stack: bool,
+    auto_project: Option<vw_vivado::AutoProject>,
 ) -> Result<vw_vivado::VivadoBackend, Box<dyn std::error::Error>> {
-    let ws_owned = ws.as_std_path().to_path_buf();
-    let rpc_handler = vw_vivado::FnHandler::new(
-        move |method: String, _args: serde_json::Value| {
-            let ws = ws_owned.clone();
-            async move {
-                match method.as_str() {
-                    "workspace_root" => Ok(serde_json::Value::String(
-                        ws.to_string_lossy().to_string(),
-                    )),
-                    other => Err(format!("unknown RPC method: {other}")),
-                }
-            }
-        },
-    );
+    let rpc_handler =
+        vw_vivado::make_handler(Some(ws.as_std_path().to_path_buf()));
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
         info_with_stack,
         rpc_handler: Some(rpc_handler),
+        auto_project,
         ..Default::default()
     })
     .await
     .map_err(|e| format!("failed to start Vivado worker: {e}"))?;
     Ok(backend)
+}
+
+/// Derive the default auto-project from a workspace's `[workspace]
+/// target-part` — same rule vw run uses. Returns `None` for library
+/// workspaces (no target-part).
+fn workspace_auto_project(ws: &Utf8Path) -> Option<vw_vivado::AutoProject> {
+    let cfg = vw_lib::load_workspace_config(ws).ok()?;
+    let part = cfg.workspace.target_part?;
+    Some(vw_vivado::AutoProject {
+        name: cfg.workspace.name,
+        part,
+    })
 }
 
 #[derive(Default)]
@@ -503,9 +601,18 @@ fn print_failure_block(f: &TestFailure) {
                 println!("  {}", line.red());
             }
             if let Some(info) = info {
-                if !info.trim().is_empty() {
+                // Tcl's `errorInfo` embeds the error message at its
+                // top and appends the "while executing…" frames
+                // after it. Rendering the whole thing after the
+                // ERROR block duplicates every line of the message
+                // (which for `assert_file_eq` is the entire diff).
+                // Strip the message prefix off `info` and show
+                // only the frame tail; skip the section entirely
+                // if nothing but the message was present.
+                let frames = strip_message_prefix(info, message);
+                if !frames.trim().is_empty() {
                     println!("\n{}", "stack:".bright_black().bold());
-                    for line in info.lines() {
+                    for line in frames.lines() {
                         println!("  {}", line.bright_black());
                     }
                 }
@@ -518,6 +625,45 @@ fn print_failure_block(f: &TestFailure) {
     println!("{}\n", bar.red());
 }
 
+/// Trim Tcl's echo of the error message from the start of
+/// `errorInfo`. Tcl formats `errorInfo` as
+/// `<message>\n    while executing "..."\n    ...`, so the frame
+/// tail always starts after `message` (whose newlines and
+/// whitespace we match verbatim). When the message doesn't appear
+/// at the top for some reason, we fall back to returning the raw
+/// info unchanged rather than silently swallowing the whole stack.
+fn strip_message_prefix<'a>(info: &'a str, message: &str) -> &'a str {
+    let trimmed = message.trim_end();
+    if let Some(rest) = info.strip_prefix(trimmed) {
+        // Skip any leading whitespace / newlines between the
+        // message and the first `while executing "..."` frame.
+        rest.trim_start_matches(['\n', '\r', ' '])
+    } else {
+        info
+    }
+}
+
 fn format_secs(secs: f64) -> String {
     format!("{secs:>6.3}s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_message_prefix;
+
+    #[test]
+    fn strip_removes_message_echo_and_leading_whitespace() {
+        let message =
+            "assert_file_eq: files differ\n  actual: a\n  expected: b";
+        let info = "assert_file_eq: files differ\n  actual: a\n  expected: b\n    while executing\n\"error \\\"foo\\\"\"";
+        let out = strip_message_prefix(info, message);
+        assert!(out.starts_with("while executing"), "got {out:?}");
+    }
+
+    #[test]
+    fn strip_falls_back_when_prefix_missing() {
+        let info = "totally different\n    while executing\n\"foo\"";
+        let out = strip_message_prefix(info, "assert_file_eq: files differ");
+        assert_eq!(out, info);
+    }
 }

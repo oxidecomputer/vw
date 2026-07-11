@@ -199,6 +199,95 @@ impl HtclBackend {
         let line_index = LineIndex::new(&view.view_source);
 
         let mut diagnostics = Vec::new();
+        // Target-compatibility check. For LSP diagnostics we anchor
+        // the message on the `src @<dep>` statement in the local
+        // file — much more informative than a whole-file gutter
+        // marker. Only fires when the entry workspace declares a
+        // target-part; libraries (no target) are no-op.
+        if let Ok(file_path) = uri.to_file_path() {
+            if let Some(ws) =
+                file_path.parent().and_then(vw_lib::find_workspace_dir)
+            {
+                if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
+                    if let Some(target_part) =
+                        cfg.workspace.target_part.as_deref()
+                    {
+                        let dep_targets = vw_lib::collect_dep_targets(&ws);
+                        let mismatches = vw_lib::check_target_compatibility(
+                            Some(target_part),
+                            &dep_targets,
+                        );
+                        // Anchor each mismatch on the specific
+                        // `src @<dep>` line in the LOCAL file.
+                        for m in &mismatches {
+                            for stmt in &parsed_local.document.stmts {
+                                let vw_htcl::Stmt::Command(cmd) = stmt else {
+                                    continue;
+                                };
+                                let vw_htcl::CommandKind::Src(src) = &cmd.kind
+                                else {
+                                    continue;
+                                };
+                                let Some(raw) = &src.path else { continue };
+                                // Match `@<dep>` or `@<dep>/...`.
+                                let dep_name = raw
+                                    .strip_prefix('@')
+                                    .and_then(|rest| {
+                                        rest.split_once('/')
+                                            .map(|(n, _)| n)
+                                            .or(Some(rest))
+                                    })
+                                    .unwrap_or("");
+                                if dep_name != m.dep {
+                                    continue;
+                                }
+                                let (start, end) =
+                                    local_line_index.range(src.path_span);
+                                let families =
+                                    if m.supported_families.is_empty() {
+                                        "(none)".to_string()
+                                    } else {
+                                        m.supported_families.join(", ")
+                                    };
+                                let (severity, message) = match m.kind {
+                                    vw_lib::TargetMismatchKind::NotSupported => (
+                                        DiagnosticSeverity::ERROR,
+                                        format!(
+                                            "target-part `{}` is on dep `{}`'s \
+                                             `not-supported` list — Xilinx has \
+                                             attested the IP is not usable on \
+                                             this part (declared families: {})",
+                                            m.target_part, m.dep, families,
+                                        ),
+                                    ),
+                                    vw_lib::TargetMismatchKind::Unblessed => (
+                                        DiagnosticSeverity::WARNING,
+                                        format!(
+                                            "target-part `{}` isn't in dep \
+                                             `{}`'s support matrix (declared \
+                                             families: {}); the IP may still \
+                                             work but Xilinx hasn't blessed \
+                                             the combination",
+                                            m.target_part, m.dep, families,
+                                        ),
+                                    ),
+                                };
+                                diagnostics.push(Diagnostic {
+                                    range: Range {
+                                        start: lc_to_pos(start),
+                                        end: lc_to_pos(end),
+                                    },
+                                    severity: Some(severity),
+                                    source: Some("vw-htcl".into()),
+                                    message,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut cross_file_diagnostics: Vec<(Url, Diagnostic)> = Vec::new();
         // Local parse errors.
         for err in &parsed_local.errors {
@@ -1664,11 +1753,7 @@ fn format_attribute(attr: &Attribute) -> String {
 }
 
 fn format_attribute_value(v: &AttributeValue) -> String {
-    match v {
-        AttributeValue::Integer { value, .. } => value.to_string(),
-        AttributeValue::Ident { value, .. } => value.clone(),
-        AttributeValue::String { value, .. } => format!("\"{value}\""),
-    }
+    v.to_tcl_literal()
 }
 
 fn lc_to_pos(lc: LineCol) -> Position {

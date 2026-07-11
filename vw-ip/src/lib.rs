@@ -26,6 +26,7 @@ pub mod overrides;
 pub mod paired_list;
 pub mod presets;
 pub mod summary;
+pub mod targets;
 pub mod tree;
 
 pub use cips_dict::{

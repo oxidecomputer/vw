@@ -508,7 +508,7 @@ fn parse_top_level_attribute(
                 advance_char(input);
                 break;
             }
-            match parse_attribute_value(input, source) {
+            match parse_attribute_item(input, source) {
                 Some(v) => values.push(v),
                 None => {
                     errors.push(ParseError {
@@ -518,11 +518,16 @@ fn parse_top_level_attribute(
                             input.location() as u32 + 1,
                         ),
                     });
-                    // Resync to `,`/`)` so the rest of the list
-                    // still parses.
+                    // Resync to comma/whitespace/`)` so the rest
+                    // of the list still parses.
                     while !at_eof(input, source) {
                         let c = current_char(input, source);
-                        if c == ',' || c == ')' || c == '\n' {
+                        if c == ','
+                            || c == ')'
+                            || c == '\n'
+                            || c == ' '
+                            || c == '\t'
+                        {
                             break;
                         }
                         advance_char(input);
@@ -533,6 +538,11 @@ fn parse_top_level_attribute(
             if at_eof(input, source) {
                 continue;
             }
+            // Item separator: optional comma. Whitespace between
+            // items (already consumed by `skip_attr_ws`) is also
+            // a valid separator — matches the shape
+            // `@test(dedicated-eda part=xcvm3358…)` where items
+            // are space-separated.
             if current_char(input, source) == ',' {
                 advance_char(input);
             }
@@ -616,6 +626,48 @@ fn skip_attr_ws(input: &mut Input<'_>, source: &str) {
             break;
         }
     }
+}
+
+/// Parse one item in an attribute argument list — either a plain
+/// positional value (int, string, ident, kebab-ident) or a
+/// `key=value` pair. Wraps `key=value` in [`AttributeValue::Keyed`]
+/// so downstream can distinguish.
+fn parse_attribute_item(
+    input: &mut Input<'_>,
+    source: &str,
+) -> Option<AttributeValue> {
+    let start = input.location() as u32;
+    // Peek: if the current position parses as `ident=`, it's a
+    // keyed item. Otherwise, delegate to positional
+    // `parse_attribute_value`. We do the peek without committing:
+    // save the cursor, tentatively consume an ident, check for
+    // `=`, and either commit or rewind.
+    //
+    // Rewind story: `input` here is a winnow `LocatingSlice`;
+    // its clone captures the internal cursor so the tentative
+    // parse is undoable.
+    let saved = *input;
+    let key_start = input.location() as u32;
+    let key = consume_ident(input, source);
+    let is_keyed = !key.is_empty()
+        && !at_eof(input, source)
+        && current_char(input, source) == '=';
+    if !is_keyed {
+        // Not a `key=value` item — rewind and parse as positional.
+        *input = saved;
+        return parse_attribute_value(input, source);
+    }
+    let key_span = Span::new(key_start, input.location() as u32);
+    advance_char(input); // consume '='
+                         // Value can be any regular attribute value shape.
+    let value = parse_attribute_value(input, source)?;
+    let end = input.location() as u32;
+    Some(AttributeValue::Keyed {
+        key,
+        key_span,
+        value: Box::new(value),
+        span: Span::new(start, end),
+    })
 }
 
 fn parse_attribute_value(
@@ -2167,6 +2219,61 @@ set cfg [
         assert_eq!(proc.attributes.len(), 2);
         assert_eq!(proc.attributes[0].name, "test");
         assert_eq!(proc.attributes[1].name, "another");
+    }
+
+    #[test]
+    fn attribute_with_whitespace_separated_items() {
+        // `@test(dedicated-eda part=xcvm3358-vsvh1747-2M-e-S)` —
+        // no commas between items, one positional + one keyed.
+        let src = "\
+@test(dedicated-eda part=xcvm3358-vsvh1747-2M-e-S)
+proc foo {} { }
+";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!();
+        };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            panic!();
+        };
+        assert_eq!(proc.attributes.len(), 1);
+        let attr = &proc.attributes[0];
+        assert_eq!(attr.name, "test");
+        assert_eq!(attr.values.len(), 2);
+        // Positional item.
+        match &attr.values[0] {
+            AttributeValue::Ident { value, .. } => {
+                assert_eq!(value, "dedicated-eda")
+            }
+            other => panic!("expected Ident, got {other:?}"),
+        }
+        // Keyed item.
+        match &attr.values[1] {
+            AttributeValue::Keyed { key, value, .. } => {
+                assert_eq!(key, "part");
+                match value.as_ref() {
+                    AttributeValue::Ident { value, .. } => {
+                        assert_eq!(value, "xcvm3358-vsvh1747-2M-e-S")
+                    }
+                    other => panic!("expected Ident, got {other:?}"),
+                }
+            }
+            other => panic!("expected Keyed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_comma_separated_still_works() {
+        // Backward-compat: `@enum(a, b, c)` still parses as three
+        // positional idents.
+        let src = "\
+proc foo {
+  @enum(a, b, c) x
+} { }
+";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
     }
 
     #[test]

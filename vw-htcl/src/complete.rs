@@ -312,6 +312,10 @@ fn enum_value_text(v: &AttributeValue) -> String {
         AttributeValue::Integer { value, .. } => value.to_string(),
         AttributeValue::Ident { value, .. }
         | AttributeValue::String { value, .. } => value.clone(),
+        // `key=value` in an @enum(…) doesn't make semantic sense —
+        // enum values are positional. Render the whole thing as
+        // the literal `key=value` string.
+        AttributeValue::Keyed { .. } => v.to_tcl_literal(),
     }
 }
 

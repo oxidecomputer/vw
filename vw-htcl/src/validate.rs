@@ -271,24 +271,58 @@ fn walk_procs_for_test_check(
                             span: attr.span,
                         });
                     }
+                    let mut has_dedicated = false;
+                    let mut target_key_present = false;
                     for value in &attr.values {
-                        let ok = matches!(
-                            value,
-                            crate::ast::AttributeValue::Ident { value: v, .. }
-                                if v == "dedicated-eda"
-                        );
-                        if !ok {
-                            diags.push(Diagnostic {
-                                severity: Severity::Warning,
-                                message: format!(
-                                    "`@test(…)` value must be \
-                                     `dedicated-eda` (the only \
-                                     recognized value); got `{}`",
-                                    render_attribute_value(value),
-                                ),
-                                span: attr.span,
-                            });
+                        match value {
+                            crate::ast::AttributeValue::Ident {
+                                value: v,
+                                ..
+                            } if v == "dedicated-eda" => {
+                                has_dedicated = true;
+                            }
+                            crate::ast::AttributeValue::Keyed {
+                                key, ..
+                            } if key == "target" => {
+                                target_key_present = true;
+                            }
+                            crate::ast::AttributeValue::Keyed {
+                                key, ..
+                            } => {
+                                diags.push(Diagnostic {
+                                    severity: Severity::Warning,
+                                    message: format!(
+                                        "`@test(...)` — unrecognized key \
+                                         `{key}` (only `target=<part>` is \
+                                         supported today)"
+                                    ),
+                                    span: attr.span,
+                                });
+                            }
+                            _ => {
+                                diags.push(Diagnostic {
+                                    severity: Severity::Warning,
+                                    message: format!(
+                                        "`@test(…)` value must be either the \
+                                         `dedicated-eda` marker or \
+                                         `target=<part>`; got `{}`",
+                                        render_attribute_value(value),
+                                    ),
+                                    span: attr.span,
+                                });
+                            }
                         }
+                    }
+                    if target_key_present && !has_dedicated {
+                        diags.push(Diagnostic {
+                            severity: Severity::Warning,
+                            message: "`@test(target=…)` requires the \
+                                      `dedicated-eda` marker — shared-bucket \
+                                      tests cannot override the \
+                                      auto-project's `-part`"
+                                .into(),
+                            span: attr.span,
+                        });
                     }
                     if let Some(sig) = &proc.signature {
                         if !sig.args.is_empty() {
@@ -314,13 +348,7 @@ fn walk_procs_for_test_check(
 }
 
 fn render_attribute_value(v: &crate::ast::AttributeValue) -> String {
-    match v {
-        crate::ast::AttributeValue::Integer { value, .. } => value.to_string(),
-        crate::ast::AttributeValue::String { value, .. } => {
-            format!("\"{value}\"")
-        }
-        crate::ast::AttributeValue::Ident { value, .. } => value.clone(),
-    }
+    v.to_tcl_literal()
 }
 
 /// Walk every top-level `src @<name>` statement in `document` and
@@ -2860,7 +2888,8 @@ fn validate_command(
                 let referenced = match value {
                     AttributeValue::Ident { value, .. }
                     | AttributeValue::String { value, .. } => value.as_str(),
-                    AttributeValue::Integer { .. } => continue,
+                    AttributeValue::Integer { .. }
+                    | AttributeValue::Keyed { .. } => continue,
                 };
                 if !seen.contains_key(referenced) {
                     diags.push(Diagnostic {
@@ -2879,7 +2908,8 @@ fn validate_command(
                 let referenced = match value {
                     AttributeValue::Ident { value, .. }
                     | AttributeValue::String { value, .. } => value.as_str(),
-                    AttributeValue::Integer { .. } => continue,
+                    AttributeValue::Integer { .. }
+                    | AttributeValue::Keyed { .. } => continue,
                 };
                 if seen.contains_key(referenced) {
                     diags.push(Diagnostic {
@@ -2940,7 +2970,8 @@ fn collect_one_of_groups(
                 | AttributeValue::String { value, .. } => {
                     group.insert(value.clone());
                 }
-                AttributeValue::Integer { .. } => continue,
+                AttributeValue::Integer { .. }
+                | AttributeValue::Keyed { .. } => continue,
             }
         }
         if group.len() >= 2 && seen.insert(group.clone()) {
@@ -3007,6 +3038,11 @@ fn check_enum(
             AttributeValue::Integer { value, .. } => value.to_string(),
             AttributeValue::Ident { value, .. }
             | AttributeValue::String { value, .. } => value.clone(),
+            // `key=value` in @enum(…) doesn't make semantic sense
+            // (enum values are positional). Include the literal
+            // `key=value` string so a runtime match against the
+            // raw arg still works if someone actually did that.
+            AttributeValue::Keyed { .. } => v.to_tcl_literal(),
         })
         .collect();
     if !allowed.iter().any(|a| a == literal) {
@@ -4834,7 +4870,7 @@ proc handle {v: E::A} string { }
     }
 
     #[test]
-    fn test_attribute_wrong_value_warns() {
+    fn test_attribute_wrong_positional_value_warns() {
         let src = "@test(bogus)\nproc t {} { }\n";
         let d = diags(src);
         assert!(
@@ -4870,6 +4906,51 @@ proc outer {} {
             d.iter().any(|x| x.severity == Severity::Warning
                 && x.message.contains("nested proc")),
             "expected nested-proc warning: {d:?}",
+        );
+    }
+
+    // ─── @test(target=…) keyed-item checks ─────────────────────
+
+    #[test]
+    fn test_attribute_with_dedicated_eda_and_target_ok() {
+        let src = "\
+@test(dedicated-eda target=\"xcvm3358-vsvh1747-2M-e-S\")
+proc t {} { }
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("`@test")
+                && !x.message.contains("target=")),
+            "unexpected @test diag: {d:?}",
+        );
+    }
+
+    #[test]
+    fn test_target_without_dedicated_eda_warns() {
+        // Shared bucket can't honor per-test parts.
+        let src = "\
+@test(target=\"xcvm3358-vsvh1747-2M-e-S\")
+proc t {} { }
+";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning
+                && x.message.contains("dedicated-eda")),
+            "expected dedicated-eda requirement warning: {d:?}",
+        );
+    }
+
+    #[test]
+    fn test_attribute_unknown_key_warns() {
+        let src = "\
+@test(dedicated-eda family=versal)
+proc t {} { }
+";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning
+                && x.message.contains("unrecognized key")),
+            "expected unrecognized-key warning: {d:?}",
         );
     }
 }

@@ -181,6 +181,29 @@ pub struct VivadoConfig {
     /// from the shim is answered with "no RPC handler
     /// configured".
     pub rpc_handler: Option<std::sync::Arc<dyn crate::RpcHandler>>,
+    /// When set, spawn creates an in-memory Vivado project with
+    /// the given (project_name, target_part) as soon as Vivado is
+    /// ready to accept commands. Eliminates the "no open project"
+    /// bootstrap problem for `ip::check` / `get_ipdefs` — those
+    /// commands need a project (the IP catalog is per-part).
+    /// Composes with `@test(dedicated-eda part=…)` where the test
+    /// runner overrides the part for isolated tests.
+    pub auto_project: Option<AutoProject>,
+}
+
+/// Auto-created in-memory Vivado project. Materialized inside
+/// [`VivadoBackend::spawn`] via
+/// `create_project -in_memory -name <name> -part <part>` as soon
+/// as the shim connects. Removes the need for every htcl entry to
+/// bootstrap a project by hand and unblocks IP-catalog queries at
+/// module load time.
+#[derive(Clone, Debug)]
+pub struct AutoProject {
+    /// Project name shown to Vivado. Typically the workspace name.
+    pub name: String,
+    /// Full Vivado part specifier
+    /// (e.g. `xcvm3358-vsvh1747-2M-e-S`).
+    pub part: String,
 }
 
 /// Vivado [`EdaBackend`] implementation.
@@ -417,7 +440,7 @@ impl VivadoBackend {
             .transpose()
             .map_err(BackendError::Io)?;
 
-        Ok(Self {
+        let mut backend = Self {
             child: Some(child),
             _master: pair.master,
             proto_read: proto_rx,
@@ -436,7 +459,32 @@ impl VivadoBackend {
             building_pty_context: Vec::new(),
             _shim_dir: shim_dir,
             _scratch_dir: scratch_dir,
-        })
+        };
+        // Auto-create the in-memory project if the caller specified
+        // one. Runs BEFORE we return to the caller so the first
+        // user eval sees an existing project — `ip::check` /
+        // `get_ipdefs` / etc. work without special-casing. `vw` is
+        // a VHDL-first tool: force TARGET_LANGUAGE to VHDL so IP
+        // wrappers emit `<name>_wrapper.vhd` (default is Verilog,
+        // which silently generates `.v` files and downstream tools
+        // like `vw::make_wrapper` that hunt for `.vhd` fail with
+        // an unhelpful "no wrapper found" message).
+        if let Some(ap) = &config.auto_project {
+            use vw_eda::EdaBackend as _;
+            let tcl = format!(
+                "create_project -in_memory -name {{{name}}} -part {{{part}}}\n\
+                 set_property TARGET_LANGUAGE VHDL [current_project]",
+                name = ap.name,
+                part = ap.part,
+            );
+            backend.eval(&tcl).await.map_err(|e| {
+                BackendError::Worker(format!(
+                    "auto-creating in-memory project (name={}, part={}): {e}",
+                    ap.name, ap.part,
+                ))
+            })?;
+        }
+        Ok(backend)
     }
 
     /// Install a sink that's called per streaming chunk as output
@@ -573,6 +621,22 @@ impl VivadoBackend {
                         }
                         sink(kind, &s.data);
                     } else {
+                        // Same separator rule as `emit_pty_chunk` —
+                        // if the shim's incoming chunk is a
+                        // classified WARNING/ERROR and the tail of
+                        // `accumulated` isn't newline-terminated,
+                        // inject one so the failure-block renderer
+                        // sees line-bounded messages instead of
+                        // `…clk_in1ERROR:…` smashes.
+                        let kind = classify_chunk_for_sink(&s.data);
+                        if matches!(
+                            kind,
+                            StreamKind::Warning | StreamKind::Error
+                        ) && !accumulated.is_empty()
+                            && !accumulated.ends_with('\n')
+                        {
+                            accumulated.push('\n');
+                        }
                         accumulated.push_str(&s.data);
                     }
                 }
@@ -914,6 +978,19 @@ impl VivadoBackend {
             }
             sink(kind, payload);
         } else {
+            // A classified WARNING/ERROR is always the start of a
+            // new logical message from Vivado. The PTY pump can
+            // split chunks at arbitrary byte boundaries, so the
+            // preceding chunk may lack a trailing newline — if we
+            // just push_str, we get e.g. `/clocky/clk_in1ERROR: [BD
+            // 41-1031]…` in the failure block. Inject a separator
+            // so downstream renderers see line-bounded messages.
+            if matches!(kind, StreamKind::Warning | StreamKind::Error)
+                && !accumulated.is_empty()
+                && !accumulated.ends_with('\n')
+            {
+                accumulated.push('\n');
+            }
             accumulated.push_str(payload);
         }
     }

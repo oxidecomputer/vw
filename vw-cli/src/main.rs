@@ -915,6 +915,26 @@ fn run_ip_generate(
             // default one alongside `module.htcl` on first generation;
             // never clobber an existing user-edited toml.
             ensure_module_vw_toml(&module_dir)?;
+            // Extract `<xilinx:supportedFamilies>` from the source
+            // component.xml and write it into the module's vw.toml
+            // `[targets] supported` list. This lets downstream
+            // `vw check` catch device-family mismatches statically
+            // — no Vivado runtime dependency.
+            let targets = vw_ip::targets::extract_targets(
+                std::path::Path::new(input.as_str()),
+            );
+            if !targets.supported.is_empty()
+                || !targets.not_supported.is_empty()
+            {
+                if let Err(e) = upsert_targets_in_vw_toml(&module_dir, &targets)
+                {
+                    eprintln!(
+                        "{} updating {}/vw.toml `[targets]`: {e}",
+                        "warning:".bright_yellow(),
+                        module_dir,
+                    );
+                }
+            }
         }
         None => {
             // stdout mode has no way to represent multiple files;
@@ -940,6 +960,73 @@ fn run_ip_generate(
 /// the user can edit it (add deps, rename the workspace) without
 /// having their changes overwritten the next time `regenerate.sh`
 /// runs.
+/// Serialize a `[targets] supported = [...]` section into `dir/vw.
+/// toml`, upserting: if the file already declares `[targets]`,
+/// replace the `supported` list; otherwise append a fresh section.
+/// Other sections (workspace, dependencies) are preserved verbatim.
+///
+/// Uses a text-level upsert rather than a serde round-trip so
+/// user-authored comments and formatting in other sections don't
+/// get flattened.
+fn upsert_targets_in_vw_toml(
+    dir: &Utf8Path,
+    targets: &vw_ip::targets::ExtractedTargets,
+) -> Result<(), String> {
+    let toml_path = dir.join("vw.toml");
+    let mut existing = std::fs::read_to_string(&toml_path)
+        .map_err(|e| format!("reading {toml_path}: {e}"))?;
+    // Render the new block once — same shape whether we're
+    // inserting or replacing. `not-supported` is written only when
+    // non-empty so IPs whose XML is uniformly blessed produce a
+    // tidy vw.toml with just `supported`.
+    let mut new_block = String::from("[targets]\nsupported = [\n");
+    for t in &targets.supported {
+        new_block.push_str(&format!("    \"{t}\",\n"));
+    }
+    new_block.push_str("]\n");
+    if !targets.not_supported.is_empty() {
+        new_block.push_str("not-supported = [\n");
+        for t in &targets.not_supported {
+            new_block.push_str(&format!("    \"{t}\",\n"));
+        }
+        new_block.push_str("]\n");
+    }
+
+    // If a `[targets]` section already exists, replace it in place
+    // (from its header line up to but not including the next
+    // `[section]` header or EOF). Otherwise append at the bottom.
+    if let Some(section_start) = existing.find("[targets]") {
+        // Find end: the byte just before the next top-level
+        // section header, or EOF.
+        let after_hdr = section_start + "[targets]".len();
+        let mut end = existing.len();
+        let mut cur = after_hdr;
+        let bytes = existing.as_bytes();
+        while cur < bytes.len() {
+            if bytes[cur] == b'\n'
+                && cur + 1 < bytes.len()
+                && bytes[cur + 1] == b'['
+            {
+                end = cur + 1;
+                break;
+            }
+            cur += 1;
+        }
+        existing.replace_range(section_start..end, &new_block);
+    } else {
+        if !existing.ends_with('\n') {
+            existing.push('\n');
+        }
+        if !existing.ends_with("\n\n") {
+            existing.push('\n');
+        }
+        existing.push_str(&new_block);
+    }
+    std::fs::write(&toml_path, existing)
+        .map_err(|e| format!("writing {toml_path}: {e}"))?;
+    Ok(())
+}
+
 fn ensure_module_vw_toml(dir: &Utf8Path) -> Result<(), String> {
     let toml_path = dir.join("vw.toml");
     if toml_path.exists() {
@@ -1296,6 +1383,64 @@ async fn check_htcl_with_mode(
     }
     for d in &validator_diags {
         emit(Some(d.severity), &d.message, d.span);
+    }
+
+    // Target-compatibility check. Only fires when the entry
+    // workspace declares a `target-part` — library workspaces
+    // (no target) skip silently.
+    let entry_path = std::path::Path::new(file.as_str());
+    if let Some(ws) = entry_path.parent().and_then(vw_lib::find_workspace_dir) {
+        if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
+            if let Some(target_part) = cfg.workspace.target_part.as_deref() {
+                let dep_targets = vw_lib::collect_dep_targets(&ws);
+                for (dep, err) in &dep_targets.errors {
+                    eprintln!(
+                        "{} bad `[targets]` pattern in dep `{dep}`: {err}",
+                        "warning:".bright_yellow(),
+                    );
+                    warning_count += 1;
+                }
+                let mismatches = vw_lib::check_target_compatibility(
+                    Some(target_part),
+                    &dep_targets,
+                );
+                for m in &mismatches {
+                    let families = if m.supported_families.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        m.supported_families.join(", ")
+                    };
+                    match m.kind {
+                        vw_lib::TargetMismatchKind::NotSupported => {
+                            eprintln!(
+                                "{} target-part `{}` is on dep `{}`'s \
+                                 `not-supported` list — Xilinx has attested \
+                                 the IP is not usable on this part \
+                                 (declared families: {})",
+                                "error:".bright_red(),
+                                m.target_part,
+                                m.dep,
+                                families,
+                            );
+                            error_count += 1;
+                        }
+                        vw_lib::TargetMismatchKind::Unblessed => {
+                            eprintln!(
+                                "{} target-part `{}` isn't in dep `{}`'s \
+                                 support matrix (declared families: {}); the \
+                                 IP may still work but Xilinx hasn't blessed \
+                                 the combination",
+                                "warning:".bright_yellow(),
+                                m.target_part,
+                                m.dep,
+                                families,
+                            );
+                            warning_count += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if error_count > 0 || warning_count > 0 {
@@ -1666,29 +1811,28 @@ async fn run_htcl(
         .parent()
         .and_then(vw_lib::find_workspace_dir)
         .map(|p| p.into_std_path_buf());
-    let rpc_handler = vw_vivado::FnHandler::new(
-        move |method: String, _args: serde_json::Value| {
-            let ws = rpc_workspace_root.clone();
-            async move {
-                match method.as_str() {
-                    "workspace_root" => match ws {
-                        Some(p) => Ok(serde_json::Value::String(
-                            p.to_string_lossy().to_string(),
-                        )),
-                        None => Err("no workspace root: entry file has no \
-                             `vw.toml` in its parent chain"
-                            .to_string()),
-                    },
-                    other => Err(format!("unknown RPC method: {other}")),
-                }
-            }
-        },
-    );
+    // Auto-project bootstrap: if the enclosing workspace declares
+    // `target-part`, ship a `create_project -in_memory` down the
+    // wire before user code runs. Eliminates the "no open project"
+    // failure mode for `ip::check` / `get_ipdefs` / etc., and gives
+    // the whole session a stable part context for downstream
+    // implementation/timing steps.
+    let auto_project = rpc_workspace_root.as_deref().and_then(|ws| {
+        let ws_utf8 = camino::Utf8Path::from_path(ws)?;
+        let cfg = vw_lib::load_workspace_config(ws_utf8).ok()?;
+        let part = cfg.workspace.target_part?;
+        Some(vw_vivado::AutoProject {
+            name: cfg.workspace.name,
+            part,
+        })
+    });
+    let rpc_handler = vw_vivado::make_handler(rpc_workspace_root);
     let mut backend =
         vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
             verbose,
             info_with_stack,
             rpc_handler: Some(rpc_handler),
+            auto_project,
             ..Default::default()
         })
         .await

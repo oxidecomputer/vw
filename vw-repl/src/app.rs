@@ -2732,36 +2732,31 @@ async fn worker_task(
     info_with_stack: bool,
     rpc_workspace_root: Option<std::path::PathBuf>,
 ) {
+    // Auto-project bootstrap: same rule as `vw run` — if the
+    // enclosing workspace declares a `target-part`, create an
+    // in-memory project up front so `ip::check`, `get_ipdefs`,
+    // and every other project-scoped call have a project to
+    // read at the first user eval.
+    let auto_project = rpc_workspace_root.as_deref().and_then(|ws| {
+        let ws_utf8 = camino::Utf8Path::from_path(ws)?;
+        let cfg = vw_lib::load_workspace_config(ws_utf8).ok()?;
+        let part = cfg.workspace.target_part?;
+        Some(vw_vivado::AutoProject {
+            name: cfg.workspace.name,
+            part,
+        })
+    });
     // RPC handler — mirrors `vw run`'s. `vw::workspace_root`
     // answers with the entry / cwd's nearest `vw.toml` parent;
     // unknown methods fail loudly so future htcl calls surface
     // a clear "unknown method" instead of hanging.
-    let rpc_handler = vw_vivado::FnHandler::new(
-        move |method: String, _args: serde_json::Value| {
-            let ws = rpc_workspace_root.clone();
-            async move {
-                match method.as_str() {
-                    "workspace_root" => match ws {
-                        Some(p) => Ok(serde_json::Value::String(
-                            p.to_string_lossy().to_string(),
-                        )),
-                        None => {
-                            Err("no workspace root: neither the initial-load \
-                             file nor the current cwd has a `vw.toml` \
-                             in its parent chain"
-                                .to_string())
-                        }
-                    },
-                    other => Err(format!("unknown RPC method: {other}")),
-                }
-            }
-        },
-    );
+    let rpc_handler = vw_vivado::make_handler(rpc_workspace_root);
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
         verbose_log,
         info_with_stack,
         rpc_handler: Some(rpc_handler),
+        auto_project,
         ..Default::default()
     })
     .await;
@@ -3337,14 +3332,9 @@ fn build_flag_detail(arg: &vw_htcl::ast::ProcArg) -> Option<String> {
 /// are truncated to the first ~32 chars with an ellipsis so the
 /// signature-help / hover / completion popups don't blow wide.
 pub fn format_default_value(arg: &vw_htcl::ast::ProcArg) -> Option<String> {
-    use vw_htcl::ast::AttributeValue;
     let attr = arg.attribute("default")?;
     let first = attr.values.first()?;
-    let raw = match first {
-        AttributeValue::Integer { value, .. } => value.to_string(),
-        AttributeValue::Ident { value, .. } => value.clone(),
-        AttributeValue::String { value, .. } => format!("\"{value}\""),
-    };
+    let raw = first.to_tcl_literal();
     const MAX: usize = 32;
     if raw.chars().count() > MAX {
         let truncated: String = raw.chars().take(MAX - 1).collect();
