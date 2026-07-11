@@ -66,6 +66,25 @@ pub trait LanguageBackend: Send + Sync {
     /// every text update.
     async fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic>;
 
+    /// Workspace-wide diagnostics, keyed by file URI. The server
+    /// serves these to the editor via `workspace/diagnostic` (LSP
+    /// 3.17 pull-based workspace diagnostics — Helix's `space-D`
+    /// picker consumes them).
+    ///
+    /// Backends compute these from the workspace view attached to
+    /// every open document — a validator diagnostic that landed in
+    /// an imported file's region gets routed back to that file's
+    /// URI. Files that no open document transitively `src`s stay
+    /// silent; that's a soft edge of the model but a good default
+    /// (an isolated file with no reachable entry is unlikely to be
+    /// what the user is looking for).
+    ///
+    /// Default impl returns empty so backends without workspace-
+    /// diagnostic support don't have to stub it out.
+    async fn workspace_diagnostics(&self) -> Vec<(Url, Vec<Diagnostic>)> {
+        Vec::new()
+    }
+
     /// Document symbols ("outline view") for `uri`.
     async fn document_symbols(&self, uri: &Url) -> Vec<DocumentSymbol>;
 

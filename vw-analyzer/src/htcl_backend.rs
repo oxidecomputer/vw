@@ -65,6 +65,14 @@ pub(crate) struct DocAnalysis {
     /// filtered to local-file spans. Served verbatim by
     /// `LanguageBackend::diagnostics`.
     pub diagnostics: Vec<Diagnostic>,
+    /// Same validator errors, but for spans that land in
+    /// TRANSITIVELY-imported files. Each entry is
+    /// `(origin_file_uri, diagnostic_with_file_local_range)`.
+    /// The `workspace/diagnostic` handler routes these back to the
+    /// files that actually contain the error, giving the editor a
+    /// workspace-wide picker (`space-D` in Helix) even for files
+    /// the user hasn't opened.
+    pub cross_file_diagnostics: Vec<(Url, Diagnostic)>,
 }
 
 struct DocState {
@@ -191,6 +199,7 @@ impl HtclBackend {
         let line_index = LineIndex::new(&view.view_source);
 
         let mut diagnostics = Vec::new();
+        let mut cross_file_diagnostics: Vec<(Url, Diagnostic)> = Vec::new();
         // Local parse errors.
         for err in &parsed_local.errors {
             let (start, end) = local_line_index.range(err.span);
@@ -205,7 +214,15 @@ impl HtclBackend {
                 ..Default::default()
             });
         }
-        // Workspace-view validator, filtered to local-file spans.
+        // Precompute a per-imported-file `LineIndex` on demand.
+        // Kept keyed by region index so multiple diagnostics
+        // landing in the same file only build the index once.
+        let mut import_line_indexes: HashMap<usize, LineIndex> = HashMap::new();
+        // Workspace-view validator. Diagnostics whose span sits
+        // in the local prefix land in `diagnostics`; those that
+        // land in an imported region get retranslated into that
+        // file's own line/col and stashed for the workspace-
+        // diagnostic path.
         for d in validate_with_all_extras_and_vars(
             &parsed_view.document,
             &view.view_source,
@@ -215,24 +232,61 @@ impl HtclBackend {
             &std::collections::HashSet::new(),
             &view.dep_names,
         ) {
-            if d.span.start >= view.local_len {
-                continue;
-            }
-            let (start, end) = line_index.range(d.span);
             let severity = match d.severity {
                 Severity::Error => DiagnosticSeverity::ERROR,
                 Severity::Warning => DiagnosticSeverity::WARNING,
             };
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: lc_to_pos(start),
-                    end: lc_to_pos(end),
-                },
-                severity: Some(severity),
-                source: Some("vw-htcl".into()),
-                message: d.message,
-                ..Default::default()
+            if d.span.start < view.local_len {
+                let (start, end) = line_index.range(d.span);
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: lc_to_pos(start),
+                        end: lc_to_pos(end),
+                    },
+                    severity: Some(severity),
+                    source: Some("vw-htcl".into()),
+                    message: d.message,
+                    ..Default::default()
+                });
+                continue;
+            }
+            // Locate which imported file the span belongs to and
+            // translate its offset into that file's coordinates.
+            // Skip diagnostics that don't land in any tracked
+            // region — shouldn't happen with the current view
+            // builder, but the model allows for view-source
+            // regions unmapped to files (empty for now).
+            let Some((region_idx, region, file_offset_start)) =
+                view.imports.iter().enumerate().find_map(|(i, r)| {
+                    (d.span.start >= r.start && d.span.start < r.end)
+                        .then(|| (i, r, d.span.start - r.start))
+                })
+            else {
+                continue;
+            };
+            let file_offset_end = d.span.end.saturating_sub(region.start);
+            let file_text_range =
+                &view.view_source[region.start as usize..region.end as usize];
+            let li = import_line_indexes
+                .entry(region_idx)
+                .or_insert_with(|| LineIndex::new(file_text_range));
+            let (start, end) = li.range(vw_htcl::Span {
+                start: file_offset_start,
+                end: file_offset_end.min(region.end - region.start),
             });
+            cross_file_diagnostics.push((
+                region.file_uri.clone(),
+                Diagnostic {
+                    range: Range {
+                        start: lc_to_pos(start),
+                        end: lc_to_pos(end),
+                    },
+                    severity: Some(severity),
+                    source: Some("vw-htcl".into()),
+                    message: d.message,
+                    ..Default::default()
+                },
+            ));
         }
 
         Arc::new(DocAnalysis {
@@ -242,6 +296,7 @@ impl HtclBackend {
             parsed_view,
             local_line_index,
             diagnostics,
+            cross_file_diagnostics,
         })
     }
 }
@@ -435,6 +490,70 @@ impl LanguageBackend for HtclBackend {
             return Vec::new();
         };
         analysis.diagnostics.clone()
+    }
+
+    async fn workspace_diagnostics(&self) -> Vec<(Url, Vec<Diagnostic>)> {
+        // Walk every open document's committed analysis. Each
+        // carries its own local diagnostics AND the retranslated
+        // diagnostics from every file it transitively `src`s.
+        //
+        // Snapshot the URI list first so we can drop the docs
+        // read lock before calling `analysis_for` on each (which
+        // takes its own read).
+        let uris: Vec<Url> = self.docs.read().await.keys().cloned().collect();
+        let roots = self.workspace_roots_snapshot().await;
+        // Group by origin URI so a file `src`d by multiple open
+        // docs doesn't get its diagnostics duplicated; when the
+        // same file surfaces via more than one analysis, we keep
+        // just the first non-empty set. In practice the analyses
+        // agree because the validator is deterministic per input.
+        let mut by_uri: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
+        for uri in &uris {
+            let Some(analysis) = self.analysis_for(uri).await else {
+                continue;
+            };
+            // Every open document contributes an entry — even an
+            // EMPTY one — so the editor clears stale errors when
+            // the user fixes them. Without this, a file that
+            // *used* to have errors keeps showing them until it's
+            // reopened.
+            by_uri
+                .entry(uri.clone())
+                .or_insert_with(|| analysis.diagnostics.clone());
+            // Seed an empty entry for every imported file that
+            // sits inside the workspace. This is what makes fixed
+            // errors CLEAR: after the fix, `cross_file_diagnostics`
+            // has no entry for that file, but the fan-out still
+            // sees the URI (from `view.imports`) and publishes an
+            // empty payload — the editor's cached "there were
+            // errors here" state gets overwritten with "no
+            // errors." Without this seed, cleared files wouldn't
+            // reappear in the output map at all.
+            for import in &analysis.view.imports {
+                if !roots.is_empty()
+                    && !uri_under_roots(&import.file_uri, &roots)
+                {
+                    continue;
+                }
+                by_uri.entry(import.file_uri.clone()).or_default();
+            }
+            for (u, d) in &analysis.cross_file_diagnostics {
+                // Only surface diagnostics from files that sit
+                // inside the editor's own workspace roots. Deps
+                // (`~/.vw/deps`, the amd/ trees, etc.) get walked
+                // by `build_view` for symbol resolution, but the
+                // user isn't editing them from this workspace —
+                // reporting a dep-side error in `space-D` is
+                // noise. When no roots are set (e.g. the file was
+                // opened standalone), fall through: nothing to
+                // filter against.
+                if !roots.is_empty() && !uri_under_roots(u, &roots) {
+                    continue;
+                }
+                by_uri.entry(u.clone()).or_default().push(d.clone());
+            }
+        }
+        by_uri.into_iter().collect()
     }
 
     async fn document_symbols(&self, uri: &Url) -> Vec<DocumentSymbol> {
@@ -1005,6 +1124,25 @@ impl HtclBackend {
 /// `.git/`, `.vw/`, `node_modules/` at any depth. Silently swallows
 /// I/O errors on individual directories — a permission-denied
 /// subtree just contributes nothing to the results.
+/// True when `uri`'s filesystem path lies under any of `roots`.
+/// Non-file URIs and paths that don't resolve into any root fall
+/// through as `false` — the caller's default behavior is "not in
+/// the workspace, don't fan out." Both sides get canonicalized so
+/// a symlinked workspace root matches a real-path URI (`Path::
+/// starts_with` is purely lexical). Canonicalization failures
+/// (missing files, permission errors) fall back to the lexical
+/// compare, which still catches the common case.
+fn uri_under_roots(uri: &Url, roots: &[std::path::PathBuf]) -> bool {
+    let Ok(path) = uri.to_file_path() else {
+        return false;
+    };
+    let canonical_path = path.canonicalize().unwrap_or(path);
+    roots.iter().any(|r| {
+        let canonical_root = r.canonicalize().unwrap_or_else(|_| r.clone());
+        canonical_path.starts_with(&canonical_root)
+    })
+}
+
 fn walk_htcl_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -2508,11 +2646,12 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         );
     }
 
-    /// Regression against the on-disk cpm5 tree for BOTH goto and
-    /// hover on `vivado_cmd::create_bd_cell` and
-    /// `vivado_cmd::create_ip` — the two `[…]` calls inside the
-    /// `if {$bd} { … } else { … }` scaffold at the top of
-    /// `create_cpm5`.
+    /// Regression against the on-disk cpm5 tree for goto and hover
+    /// on `vivado_cmd::create_bd_cell` — the sole cell-creation
+    /// call at the top of `create_cpm5`. (Previously covered
+    /// `vivado_cmd::create_ip` too, but the IP generator's
+    /// `-bd 0` path is now rejected up front with an `error`, so
+    /// the generated wrapper only calls `create_bd_cell`.)
     #[tokio::test]
     async fn goto_and_hover_on_create_bd_cell_and_create_ip_in_cpm5() {
         let cpm5_module =
@@ -2524,7 +2663,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let cpm5_uri = Url::from_file_path(&cpm5_module).unwrap();
         let text = std::fs::read_to_string(&cpm5_module).unwrap();
         backend.set_text_sync(cpm5_uri.clone(), text.clone()).await;
-        for needle in &["vivado_cmd::create_bd_cell", "vivado_cmd::create_ip"] {
+        for needle in &["vivado_cmd::create_bd_cell"] {
             let (line, character) = text
                 .lines()
                 .enumerate()
@@ -2907,6 +3046,131 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
                 .iter()
                 .any(|d| d.message.contains("undefined argument -whoz")),
             "{diags:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_surface_errors_in_imported_files() {
+        // Break the imported lib (return with a value in an
+        // unannotated proc — one of the new checks) and open the
+        // main file that `src`s it. The main file itself is
+        // error-free. workspace_diagnostics must report the lib's
+        // diagnostic against the LIB's URI so the editor's
+        // workspace picker points to the right file.
+        let dir = tempfile::tempdir().unwrap();
+        let lib_path = dir.path().join("broken.htcl");
+        std::fs::write(&lib_path, "proc broken {} { return 42 }\n").unwrap();
+        let main_path = dir.path().join("main.htcl");
+        let main_src = "src broken\n";
+        std::fs::write(&main_path, main_src).unwrap();
+        let backend = HtclBackend::new();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let lib_uri = Url::from_file_path(&lib_path).unwrap();
+        // Set the editor's workspace root to the temp dir so the
+        // filter accepts the lib file (which lives inside it).
+        backend
+            .set_workspace_roots(vec![dir.path().to_path_buf()])
+            .await;
+        backend
+            .set_text_sync(main_uri.clone(), main_src.into())
+            .await;
+        let ws: std::collections::HashMap<Url, Vec<Diagnostic>> =
+            backend.workspace_diagnostics().await.into_iter().collect();
+        // Main entry gets an entry (possibly empty), so the editor
+        // can clear stale state.
+        assert!(ws.contains_key(&main_uri), "main uri missing: {ws:?}");
+        let lib_diags = ws.get(&lib_uri).unwrap_or_else(|| {
+            panic!("no diagnostics routed to {lib_uri}: {ws:?}")
+        });
+        assert!(
+            lib_diags
+                .iter()
+                .any(|d| d.message.contains("no declared return type")),
+            "expected the return-in-unannotated-proc error in lib: {lib_diags:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_clear_when_import_is_fixed() {
+        // When the user fixes an error in an imported file, the
+        // next workspace_diagnostics call must include an
+        // entry for that file — with an EMPTY diagnostic list.
+        // That empty payload is what the editor overwrites its
+        // cached "had errors" state with; without it, the
+        // stale errors linger in `space-D` even after the fix.
+        let dir = tempfile::tempdir().unwrap();
+        let lib_path = dir.path().join("lib.htcl");
+        std::fs::write(&lib_path, "proc broken {} { return 42 }\n").unwrap();
+        let main_path = dir.path().join("main.htcl");
+        let main_src = "src lib\n";
+        std::fs::write(&main_path, main_src).unwrap();
+        let backend = HtclBackend::new();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let lib_uri = Url::from_file_path(&lib_path).unwrap();
+        backend
+            .set_workspace_roots(vec![dir.path().to_path_buf()])
+            .await;
+        backend
+            .set_text_sync(main_uri.clone(), main_src.into())
+            .await;
+        // Sanity: broken lib produces a workspace diagnostic.
+        let ws: std::collections::HashMap<Url, Vec<Diagnostic>> =
+            backend.workspace_diagnostics().await.into_iter().collect();
+        assert!(
+            !ws.get(&lib_uri).map(|v| v.is_empty()).unwrap_or(true),
+            "expected non-empty lib diagnostics before fix: {ws:?}",
+        );
+        // Fix the lib on disk. Since main.htcl is what's open,
+        // resetting main's text re-triggers the workspace build
+        // and reloads lib from disk.
+        std::fs::write(&lib_path, "proc fixed {} { puts hi }\n").unwrap();
+        backend
+            .set_text_sync(main_uri.clone(), main_src.into())
+            .await;
+        let ws: std::collections::HashMap<Url, Vec<Diagnostic>> =
+            backend.workspace_diagnostics().await.into_iter().collect();
+        // The lib URI must appear with an empty list so the
+        // editor clears its cached errors.
+        let lib_after = ws.get(&lib_uri).unwrap_or_else(|| {
+            panic!("lib uri missing from post-fix workspace diags: {ws:?}")
+        });
+        assert!(
+            lib_after.is_empty(),
+            "expected empty lib diagnostics after fix, got {lib_after:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_skip_out_of_workspace_deps() {
+        // The workspace is `main_dir`; the imported `dep.htcl`
+        // lives OUTSIDE it. Errors in the dep should NOT show up
+        // in workspace diagnostics — that's just noise for a file
+        // the user isn't editing from this workspace.
+        let dep_dir = tempfile::tempdir().unwrap();
+        let dep_path = dep_dir.path().join("dep.htcl");
+        std::fs::write(&dep_path, "proc broken {} { return 42 }\n").unwrap();
+        let main_dir = tempfile::tempdir().unwrap();
+        let main_path = main_dir.path().join("main.htcl");
+        // Use an absolute `src` pointing at the dep tempfile.
+        let dep_str = dep_path.to_string_lossy().into_owned();
+        // Strip the .htcl since `src` re-adds it.
+        let dep_no_ext = dep_str.trim_end_matches(".htcl");
+        let main_src = format!("src {dep_no_ext}\n");
+        std::fs::write(&main_path, &main_src).unwrap();
+        let backend = HtclBackend::new();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let dep_uri = Url::from_file_path(&dep_path).unwrap();
+        backend
+            .set_workspace_roots(vec![main_dir.path().to_path_buf()])
+            .await;
+        backend
+            .set_text_sync(main_uri.clone(), main_src.clone())
+            .await;
+        let ws: std::collections::HashMap<Url, Vec<Diagnostic>> =
+            backend.workspace_diagnostics().await.into_iter().collect();
+        assert!(
+            !ws.contains_key(&dep_uri),
+            "dep diagnostics should be filtered out: {ws:?}",
         );
     }
 }

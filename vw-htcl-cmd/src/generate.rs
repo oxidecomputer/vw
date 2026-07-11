@@ -193,11 +193,20 @@ pub fn generate(page: &ManPage, opts: &GenerateOptions) -> String {
     //      rarely uses a dedicated Returns: header, so this is
     //      actually the common path. The phrase table is the same
     //      either way.
+    //   4. Fallback to `string`. The emitted body ALWAYS ends with
+    //      `return [extern::_vw_global_call ...]`, which in Tcl
+    //      yields whatever the underlying command returns — a
+    //      string, possibly empty. The htcl validator rejects
+    //      value-returning procs with no return-type annotation,
+    //      so we must always emit one. `string` is the safe
+    //      universal fallback for the commands whose Returns:
+    //      prose doesn't match any of the specific phrases.
     let return_type = overrides
         .and_then(|o| o.returns.as_deref())
         .map(String::from)
         .or_else(|| infer_return_type(page.returns.as_deref()))
-        .or_else(|| infer_return_type(Some(page.description.as_slice())));
+        .or_else(|| infer_return_type(Some(page.description.as_slice())))
+        .or_else(|| Some("string".to_string()));
     emit_proc(&mut out, cmd, &args, return_type.as_deref(), &body);
 
     writeln!(out).unwrap();

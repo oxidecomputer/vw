@@ -98,7 +98,25 @@ impl Analyzer {
                 count = diags.len(),
                 "publishing diagnostics"
             );
-            client.publish_diagnostics(uri_task, diags, version).await;
+            client
+                .publish_diagnostics(uri_task.clone(), diags, version)
+                .await;
+            // Fan out cross-file diagnostics for EVERY file the
+            // just-completed analysis touched. Helix's `space-D`
+            // workspace-diagnostic view reads its cache of pushed
+            // `publishDiagnostics` — the LSP 3.17 pull path we
+            // implement in `workspace_diagnostic` isn't wired in
+            // there yet, so without this fan-out the picker stays
+            // empty until the user actually opens each broken
+            // file. We publish empty diagnostics for files with
+            // no findings too, so a fixed error clears from the
+            // picker as soon as the change commits.
+            for (uri, diagnostics) in backend.workspace_diagnostics().await {
+                if uri == uri_task {
+                    continue;
+                }
+                client.publish_diagnostics(uri, diagnostics, None).await;
+            }
         });
     }
 }
@@ -206,6 +224,20 @@ impl LanguageServer for Analyzer {
                 }),
                 rename_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                // LSP 3.17 pull-based diagnostics — Helix uses this
+                // for `space-D`'s workspace-wide diagnostic picker.
+                // `workspace_diagnostics: true` also opts us into
+                // the `workspace/diagnostic` request; without it the
+                // editor only knows about diagnostics we've
+                // proactively pushed for open files.
+                diagnostic_provider: Some(
+                    DiagnosticServerCapabilities::Options(DiagnosticOptions {
+                        identifier: Some("vw-htcl".into()),
+                        inter_file_dependencies: true,
+                        workspace_diagnostics: true,
+                        work_done_progress_options: Default::default(),
+                    }),
+                ),
                 ..Default::default()
             },
         })
@@ -414,6 +446,65 @@ impl LanguageServer for Analyzer {
         } else {
             Ok(Some(locs))
         }
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        // Pull-based single-file diagnostics. Same payload the
+        // push path serves via `publishDiagnostics` — the editor
+        // may request it explicitly (Helix does when the buffer
+        // opens, before any push has fired) as a
+        // no-guess-when-they-arrive alternative.
+        let uri = params.text_document.uri.clone();
+        let items = match self.backend_for(&uri) {
+            Some(backend) => backend.diagnostics(&uri).await,
+            None => Vec::new(),
+        };
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(
+                RelatedFullDocumentDiagnosticReport {
+                    related_documents: None,
+                    full_document_diagnostic_report:
+                        FullDocumentDiagnosticReport {
+                            result_id: None,
+                            items,
+                        },
+                },
+            ),
+        ))
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        _params: WorkspaceDiagnosticParams,
+    ) -> Result<WorkspaceDiagnosticReportResult> {
+        // Collect from every backend. Each returns a set of
+        // (uri, diagnostics) tuples pulled from its open docs'
+        // workspace-view analyses — files transitively `src`d by
+        // an open document surface their errors here even if the
+        // user hasn't opened them, which is what makes Helix's
+        // `space-D` picker useful for whole-workspace triage.
+        let mut items = Vec::new();
+        for backend in &self.backends {
+            for (uri, diagnostics) in backend.workspace_diagnostics().await {
+                items.push(WorkspaceDocumentDiagnosticReport::Full(
+                    WorkspaceFullDocumentDiagnosticReport {
+                        uri,
+                        version: None,
+                        full_document_diagnostic_report:
+                            FullDocumentDiagnosticReport {
+                                result_id: None,
+                                items: diagnostics,
+                            },
+                    },
+                ));
+            }
+        }
+        Ok(WorkspaceDiagnosticReportResult::Report(
+            WorkspaceDiagnosticReport { items },
+        ))
     }
 }
 

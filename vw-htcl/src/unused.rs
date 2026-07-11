@@ -474,6 +474,18 @@ pub(crate) fn collect_uses_in_command(
     source: &str,
     uses: &mut HashSet<String>,
 ) {
+    // Scope-opening commands (`proc`, `namespace eval`) live in
+    // their own frame — a `$y` in a nested proc's body doesn't
+    // reference the outer scope's `y`. `descend_scopes` walks
+    // those bodies with a fresh decls/uses table; skip them here
+    // so the outer scope doesn't count their body-word contents
+    // as its own uses.
+    if matches!(
+        cmd.kind,
+        CommandKind::Proc(_) | CommandKind::NamespaceEval(_)
+    ) {
+        return;
+    }
     // Special case: `set foo` (exactly 2 words) is a *read* of `foo`,
     // not a decl. `collect_decls` correctly ignores this shape, but
     // we also need to count it here as a use so a `set foo 1; set foo`
@@ -571,7 +583,91 @@ fn collect_uses_in_word(word: &Word, source: &str, uses: &mut HashSet<String>) {
                     collect_uses_in_command(inner, source, uses);
                 }
             }
-            WordPart::Text { .. } | WordPart::Escape { .. } => {}
+            WordPart::Text { value, .. } => {
+                // Braced words (`expr { $kind eq "..." }`,
+                // `if { $x == 1 } {...}`, condition bodies of
+                // `while`/`for`, etc.) are stored as opaque Text
+                // — the parser doesn't split their `$var`
+                // substrings into VarRefs because inside `{...}`
+                // Tcl doesn't perform variable substitution at
+                // parse time. But at runtime, `expr` (and the
+                // implicit-`expr` bodies of `if`/`while`/`for`)
+                // DO interpolate variables. Scan the text for
+                // `$IDENT` patterns and record each as a use so
+                // a `set kind ""; catch { set kind [...] };
+                // expr { $kind == "x" }` shape doesn't warn
+                // `kind` as unused.
+                //
+                // Conservative false-positive rate is fine here:
+                // the worst case is a literal `$foo` in a text
+                // that ALSO happens to match a same-named local,
+                // suppressing a legitimate warning. Missing real
+                // uses is worse (that's a spurious warning users
+                // learn to ignore).
+                if word.form == WordForm::Braced {
+                    scan_brace_var_refs(value, uses);
+                }
+            }
+            WordPart::Escape { .. } => {}
+        }
+    }
+}
+
+/// Scan `text` for `$IDENT` and `${IDENT}` occurrences and record
+/// each identifier as a use. Handles arrays (`$arr(key)` → both
+/// `arr(key)` and `arr`), namespace qualifiers (`$ns::x`), and
+/// escaped dollars (`\$foo` → skipped). Doesn't try to be Tcl-
+/// precise — the goal is to catch the common variable-reference
+/// shapes in expr and control-flow bodies.
+fn scan_brace_var_refs(text: &str, uses: &mut HashSet<String>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b':';
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        // Skip escaped `\$`.
+        if i > 0 && bytes[i - 1] == b'\\' {
+            i += 1;
+            continue;
+        }
+        let name_start;
+        let name_end;
+        if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            // `${...}` — read until matching `}`.
+            name_start = i + 2;
+            let mut j = name_start;
+            while j < bytes.len() && bytes[j] != b'}' {
+                j += 1;
+            }
+            name_end = j;
+            i = j + 1;
+        } else {
+            name_start = i + 1;
+            let mut j = name_start;
+            while j < bytes.len() && is_ident(bytes[j]) {
+                j += 1;
+            }
+            // Include an `(...)` array-index suffix if present.
+            if j < bytes.len() && bytes[j] == b'(' {
+                while j < bytes.len() && bytes[j] != b')' {
+                    j += 1;
+                }
+                if j < bytes.len() {
+                    j += 1;
+                }
+            }
+            name_end = j;
+            i = j;
+        }
+        if name_end > name_start {
+            let name = &text[name_start..name_end];
+            uses.insert(name.to_string());
+            if let Some(paren) = name.find('(') {
+                uses.insert(name[..paren].to_string());
+            }
         }
     }
 }
@@ -915,14 +1011,48 @@ proc outer {} {
 
     #[test]
     fn use_via_expr_arg_of_expr_command() {
-        // `expr` is a body-host too (it takes a Tcl script arg).
-        // Wait — actually `expr {…}` isn't listed in is_body_host.
-        // If this test fails, we've correctly documented that
-        // `expr {$x + 1}` doesn't count as a use of $x — the user
-        // has to write `expr $x + 1` (bare) for it to be visible.
-        // Regardless, we assert on the CURRENT behavior for the
-        // test to be stable.
+        // Bare-form `expr $x + 1` — the `$x` word is a proper
+        // VarRef part, no brace-scanning needed.
         let src = "proc f {x} { return [expr $x + 1] }\n";
+        assert!(diags(src).is_empty(), "{:?}", diags(src));
+    }
+
+    #[test]
+    fn use_via_expr_braced_arg() {
+        // Braced form `expr { $x + 1 }` — the `$x` inside `{...}`
+        // is stored as opaque text by the parser (Tcl doesn't
+        // substitute inside braces at parse time), but at runtime
+        // `expr` interpolates it. Regression against the
+        // `lift::vivado_property` shape where a `set kind ""`
+        // + `catch { set kind [...] }` + `expr { $kind eq ... }`
+        // was falsely flagged as unused. Scan the braced text
+        // for `$IDENT` patterns and count them as uses.
+        let src = "proc f {} {\n\
+                     set x 1\n\
+                     return [expr {$x + 1}]\n\
+                   }\n";
+        assert!(diags(src).is_empty(), "{:?}", diags(src));
+    }
+
+    #[test]
+    fn use_via_expr_braced_arg_with_string_ops() {
+        // Real-world shape: guard-init + reassign-in-catch + read
+        // in expr braces. Matches the lift.htcl `vivado_property`
+        // proc that was warning `unused local 'kind'`.
+        let src = "proc f {} {\n\
+                     set kind \"\"\n\
+                     catch { set kind hello }\n\
+                     return [expr {$kind eq \"string\" || $kind eq \"bool\"}]\n\
+                   }\n";
+        assert!(diags(src).is_empty(), "{:?}", diags(src));
+    }
+
+    #[test]
+    fn use_via_braced_var_with_namespace_qualifier() {
+        let src = "proc f {} {\n\
+                     set ns::x 1\n\
+                     return [expr {$ns::x + 1}]\n\
+                   }\n";
         assert!(diags(src).is_empty(), "{:?}", diags(src));
     }
 }

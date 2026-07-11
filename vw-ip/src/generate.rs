@@ -660,25 +660,33 @@ fn build_single_create_body(vlnv: &str, ip_name: &str) -> String {
     writeln!(out, "if {{$config eq \"\"}} {{").unwrap();
     writeln!(out, "  set config [{ip_name}::Config::empty]").unwrap();
     writeln!(out, "}}").unwrap();
-    writeln!(out, "if {{$bd}} {{").unwrap();
+    // `-bd 0` (project-IP mode) is deprecated at the typed-wrapper
+    // level — `create_ip` yields a raw module-name string, not a
+    // `bd_cell`, so returning it violates the declared return type.
+    // Fail loudly with a pointer to the direct `vivado_cmd::create_ip`
+    // escape hatch instead of silently returning the wrong shape.
+    // We error UP FRONT (before any `set cell`) so the rest of the
+    // body has a single, statically type-consistent flow: `$cell`
+    // is always the `bd_cell` `create_bd_cell` returns. No user code
+    // currently passes `-bd 0`; add a separate typed proc returning
+    // `string` if project-IP wrapping is needed later.
+    writeln!(out, "if {{!$bd}} {{").unwrap();
     writeln!(
         out,
-        "  set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
-    )
-    .unwrap();
-    writeln!(out, "}} else {{").unwrap();
-    writeln!(
-        out,
-        "  set cell [vivado_cmd::create_ip -vlnv {vlnv} -module_name $name]"
+        "  error \"{ip_name}::create -bd 0 is not currently supported by \
+             the typed wrapper — the project-IP return value is a raw \
+             module name (string), not a bd_cell. Call \
+             vivado_cmd::create_ip directly if you need project mode.\""
     )
     .unwrap();
     writeln!(out, "}}").unwrap();
+    writeln!(
+        out,
+        "set cell [vivado_cmd::create_bd_cell -type ip -vlnv {vlnv} -name $name]"
+    )
+    .unwrap();
     emit_config_finalize(&mut out, ip_name);
-    // Return the identifier sub-procs / downstream code needs. In
-    // bd mode that's `$cell` (a bd_cell path); in ip mode `$name`
-    // (module name) since `$cell` is an XCI path.
-    writeln!(out, "if {{$bd}} {{ return $cell }} else {{ return $name }}")
-        .unwrap();
+    writeln!(out, "return $cell").unwrap();
     out
 }
 
@@ -2104,20 +2112,14 @@ fn emit_config_finalize(out: &mut String, ip_name: &str) {
         "set _dict [Properties::to_dotted_flat -v [{config_ty}::to -v $config]]"
     )
     .unwrap();
+    // `-bd 0` was rejected up top with an `error`; the finalize
+    // only needs the `bd_cell` path.
     writeln!(out, "if {{[llength $_dict] > 0}} {{").unwrap();
-    writeln!(out, "  if {{$bd}} {{").unwrap();
     writeln!(
         out,
-        "    vivado_cmd::set_property -dict $_dict -objects $cell"
+        "  vivado_cmd::set_property -dict $_dict -objects $cell"
     )
     .unwrap();
-    writeln!(out, "  }} else {{").unwrap();
-    writeln!(
-        out,
-        "    vivado_cmd::set_property -dict $_dict -objects [get_ips $name]"
-    )
-    .unwrap();
-    writeln!(out, "  }}").unwrap();
     writeln!(out, "}}").unwrap();
 }
 
@@ -3395,11 +3397,13 @@ mod tests {
 
     #[test]
     fn bd_switch_arg_toggles_construction() {
-        // Every generated wrapper — single-shape or split-shape —
-        // should carry the `-bd` arg and a Tcl `if {$bd}` block
-        // that picks between `create_bd_cell` (default) and
-        // `create_ip`. Regression test for the omission that had
-        // wrappers only supporting the block-design path.
+        // Every generated wrapper carries the `-bd` arg for API
+        // stability. The `-bd 0` runtime path is now rejected with
+        // an `error` at the top of the body (project-IP mode
+        // returns a string, not a bd_cell — see
+        // `build_single_create_body` for the rationale), so the
+        // body only calls `create_bd_cell`. `create_ip` no longer
+        // appears in the generated wrapper.
         for out in [
             generate(
                 &mk_component(),
@@ -3420,9 +3424,10 @@ mod tests {
             .into_single(),
         ] {
             assert!(out.contains("@enum(0, 1) @default(0) bd"), "{out}");
-            assert!(out.contains("if {$bd} {"), "{out}");
+            assert!(out.contains("if {!$bd} {"), "{out}");
+            assert!(out.contains("-bd 0 is not currently supported"), "{out}");
             assert!(out.contains("create_bd_cell"), "{out}");
-            assert!(out.contains("create_ip -vlnv"), "{out}");
+            assert!(!out.contains("create_ip -vlnv"), "{out}");
             let parsed = vw_htcl::parse(&out);
             assert!(
                 parsed.errors.is_empty(),
@@ -3562,11 +3567,13 @@ mod tests {
             create_range.contains("demo::Config::empty"),
             "create should coerce empty-string default to Config::empty:\n{create_range}"
         );
-        // Both bd branches.
+        // Only the bd-cell path — the `-bd 0` branch is rejected
+        // up top and no longer emits its own `set_property`
+        // variant against `[get_ips $name]`.
         assert!(
             create_range.contains("set_property -dict $_dict -objects $cell")
         );
-        assert!(create_range
+        assert!(!create_range
             .contains("set_property -dict $_dict -objects [get_ips $name]"));
     }
 
