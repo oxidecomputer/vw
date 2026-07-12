@@ -130,25 +130,48 @@ impl Session {
     /// committed batch. Later batches shadow earlier ones so
     /// re-binding `set foo […]` overrides the previous entry.
     ///
-    /// The signature table is rebuilt per batch here — batches
-    /// commit in order and each is inspected independently, so
-    /// value_type inside a batch resolves against that batch's
-    /// own procs. Cross-batch signature resolution would require
-    /// threading the full accumulated sig table, which currently
-    /// isn't needed for the putr use case (values reach `set`
-    /// through proc calls the batch itself defines or imports).
+    /// Signature lookup is CUMULATIVE: batch N's `set foo [bar]`
+    /// resolves against every proc defined in batches ≤ N. This
+    /// matters at the REPL when a user runs `src @vw` in one
+    /// batch (populating `vw::vhdl_dependency_sources`) and then
+    /// `set deps [vw::vhdl_dependency_sources]` in the next —
+    /// without the cumulative table, `deps` would type-infer as
+    /// `None` and the next batch's `putr $deps` would fall
+    /// through to plain `puts` and dump the flat Tcl list.
     pub fn top_level_var_types(
         &self,
     ) -> std::collections::HashMap<String, vw_htcl::TypeExpr> {
         let mut types = std::collections::HashMap::new();
+        // Accumulated signatures across every committed batch —
+        // owned entries because each batch's sig_table borrows
+        // from the batch's own document; keeping references
+        // across batches would require self-referential lifetimes.
+        let mut cumulative_sigs: std::collections::HashMap<
+            String,
+            vw_htcl::ProcSignature,
+        > = std::collections::HashMap::new();
         for batch in &self.batches {
             let mut sig_diags = Vec::new();
-            let sig_table = vw_htcl::validate::build_signature_table(
+            let batch_sigs = vw_htcl::validate::build_signature_table(
                 &batch.document,
                 &mut sig_diags,
             );
+            // Merge into the cumulative store — later batches win
+            // on name collisions (Tcl re-definition semantics).
+            for (name, sig) in &batch_sigs {
+                cumulative_sigs.insert(name.clone(), (*sig).clone());
+            }
+            // Re-project as `&ProcSignature` for
+            // `top_level_var_types`, which takes borrows.
+            let sig_view: std::collections::HashMap<
+                String,
+                &vw_htcl::ProcSignature,
+            > = cumulative_sigs
+                .iter()
+                .map(|(n, s)| (n.clone(), s))
+                .collect();
             let batch_types =
-                vw_htcl::top_level_var_types(&batch.document, &sig_table);
+                vw_htcl::top_level_var_types(&batch.document, &sig_view);
             for (name, ty) in batch_types {
                 types.insert(name, ty);
             }
@@ -259,6 +282,28 @@ mod tests {
         let arg_names: Vec<&str> =
             sig.args.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(arg_names, vec!["y", "z"]);
+    }
+
+    #[test]
+    fn top_level_var_types_resolves_across_batches() {
+        // Regression: batch 1 defines `proc lookup {} dict { ... }`;
+        // batch 2 does `set d [lookup]`. `top_level_var_types` must
+        // report `d: dict` — before the fix, each batch's inference
+        // saw only its own procs, so `d` came back untyped and the
+        // downstream `putr $d` fell through to plain `puts`.
+        let mut s = Session::new();
+        s.commit(batch_from("proc lookup {} dict { return {a 1} }\n"));
+        s.commit(batch_from("set d [lookup]\n"));
+        let types = s.top_level_var_types();
+        let ty = types
+            .get("d")
+            .expect("`d` should have an inferred type across batches");
+        match ty {
+            vw_htcl::TypeExpr::Named { name, .. } => {
+                assert_eq!(name, "dict")
+            }
+            other => panic!("expected `dict`, got {other:?}"),
+        }
     }
 
     #[test]

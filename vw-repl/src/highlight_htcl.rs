@@ -278,7 +278,7 @@ impl<'a> Scanner<'a> {
                 }
                 _ => {}
             }
-            self.scan_command();
+            self.scan_command(limit);
         }
     }
 
@@ -297,10 +297,13 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn scan_command(&mut self) {
+    fn scan_command(&mut self, limit: usize) {
         let mut state = CmdState::default();
         loop {
             self.skip_horizontal_ws();
+            if self.pos >= limit {
+                return;
+            }
             match self.peek() {
                 None => return,
                 Some(b'\n') | Some(b';') | Some(b']') => return,
@@ -308,8 +311,19 @@ impl<'a> Scanner<'a> {
             }
             self.scan_word(&mut state);
             state.word_idx += 1;
-            // After scanning a word, advance state per its
-            // classification — handled inside scan_word.
+            // Guard against an inner scan (bare-word / braced /
+            // bracketed) overshooting the parent's byte limit. The
+            // narrow case that used to bite: `{lib srcs}` in
+            // command-arg position — scan_braced_as_script hands the
+            // interior to scan_script(close_pos), scan_command then
+            // consumes past the closing `}` because it only looked
+            // for `\n`/`;`/`]` as terminators. After the outer scan
+            // resumed, every span from `$deps { … }` was emitted a
+            // second time, and the per-line renderer duplicated the
+            // corresponding text on screen.
+            if self.pos >= limit {
+                return;
+            }
         }
     }
 
@@ -968,6 +982,41 @@ mod tests {
     #[test]
     fn per_line_preserves_content() {
         let src = "set a 1\nproc f {} unit {}\nputs hi";
+        let lines = highlight_per_line(src, Style::default());
+        let mut reconstructed = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                reconstructed.push('\n');
+            }
+            for span in line {
+                reconstructed.push_str(span.content.as_ref());
+            }
+        }
+        assert_eq!(reconstructed, src);
+    }
+
+    #[test]
+    fn braced_word_scan_does_not_overshoot_close() {
+        // Regression: `{lib srcs}` as an arg to `dict for` was
+        // recursed into as a script, but `scan_command` inside
+        // that recursion consumed past the closing `}` because
+        // it only checked for `\n`/`;`/`]`. The outer scan then
+        // re-tokenized everything from `$deps` onward, and the
+        // renderer duplicated the corresponding text on screen.
+        //
+        // Assert token spans are non-overlapping and monotonic.
+        let src = "dict for {lib srcs} $deps {\n  puts $lib\n}";
+        let tokens = highlight_source(src);
+        let mut prev_end = 0usize;
+        for t in &tokens {
+            assert!(
+                t.range.start >= prev_end,
+                "overlap at {:?} after prev end {prev_end} — full: {tokens:?}",
+                t.range,
+            );
+            prev_end = t.range.end;
+        }
+        // And reconstructing per-line output round-trips.
         let lines = highlight_per_line(src, Style::default());
         let mut reconstructed = String::new();
         for (i, line) in lines.iter().enumerate() {

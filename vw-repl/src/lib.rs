@@ -20,7 +20,7 @@
 
 mod app;
 pub mod highlight;
-mod highlight_htcl;
+pub mod highlight_htcl;
 mod history;
 pub mod lower;
 mod popup;
