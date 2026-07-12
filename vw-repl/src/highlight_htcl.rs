@@ -220,6 +220,10 @@ struct CmdState {
     /// "args-block braces hold parameters" + "word-3 is return
     /// type" behaviour.
     is_proc_decl: bool,
+    /// True when word-0 was `dict`. Drives the `dict for` /
+    /// `dict get` / etc. compound-head recognition — word-1 is a
+    /// sub-command keyword rather than a plain arg.
+    is_dict: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -694,6 +698,9 @@ impl<'a> Scanner<'a> {
                     } else if BUILTIN_KEYWORDS.contains(&word) {
                         Some(keyword_style())
                     } else if BUILTIN_FUNCS.contains(&word) {
+                        if word == "dict" {
+                            state.is_dict = true;
+                        }
                         Some(builtin_func_style())
                     } else {
                         Some(function_style())
@@ -701,6 +708,16 @@ impl<'a> Scanner<'a> {
                 } else if state.is_proc_decl && state.word_idx == 3 {
                     // Return-type slot (bare-ident form).
                     Some(type_style())
+                } else if state.is_dict && state.word_idx == 1 {
+                    // `dict for`, `dict get`, `dict set`, …
+                    // Compound-head sub-command; color like the
+                    // top-level keyword it stands in for.
+                    Some(keyword_style())
+                } else if word == "true" || word == "false" {
+                    // Boolean literals in arg position — same
+                    // treatment as top-level bool sniffing so
+                    // `-flag true` reads consistently.
+                    Some(keyword_style())
                 } else if word.starts_with('-') && word.len() > 1 {
                     // Flag-style word.
                     Some(attribute_style())

@@ -252,6 +252,10 @@ pub(crate) fn collect_decls(
                     "upvar" => collect_upvar_decls(cmd, decls),
                     "catch" => collect_catch_decls(cmd, decls),
                     "regexp" | "regsub" => collect_regexp_decls(cmd, decls),
+                    // `dict for {kv} DICT BODY` — the varname list
+                    // at words[2] binds one or two locals in the
+                    // enclosing frame, same as `foreach`.
+                    "dict" => collect_dict_for_decls(cmd, decls),
                     _ => {}
                 }
             }
@@ -430,6 +434,30 @@ pub(crate) fn collect_foreach_decls(
         add_foreach_target(target, decls);
         i += 2;
     }
+}
+
+/// Extract the key/value binding names from `dict for {kv} DICT
+/// BODY`. Only recognizes the `for` sub-command; other `dict`
+/// forms (`dict get`, `dict set`, …) don't introduce bindings.
+///
+/// The varname list at `words[2]` follows the same shape as
+/// `foreach`'s first-arg target — either a bare word (rare; Tcl
+/// requires exactly two names in the braced form for `dict for`
+/// but the parser accepts anything) or a braced whitespace-
+/// separated list. Both shapes flow through `add_foreach_target`.
+pub(crate) fn collect_dict_for_decls(
+    cmd: &Command,
+    decls: &mut HashMap<String, DeclSite>,
+) {
+    // `dict for {kv} DICT BODY` needs at least 5 words. If the
+    // second word isn't `for`, this isn't the binding form — skip.
+    if cmd.words.len() < 5 {
+        return;
+    }
+    if cmd.words.get(1).and_then(Word::as_text) != Some("for") {
+        return;
+    }
+    add_foreach_target(&cmd.words[2], decls);
 }
 
 fn add_foreach_target(target: &Word, decls: &mut HashMap<String, DeclSite>) {

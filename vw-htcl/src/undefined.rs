@@ -692,6 +692,23 @@ proc f {obj} {
     }
 
     #[test]
+    fn dict_for_binds_key_and_value_vars() {
+        // `dict for {lib srcs} $deps { … }` — the two brace-list
+        // names bind for the body's lifetime, same as a `foreach
+        // {k v} $pairs { … }`. Before the fix, `$lib` / `$srcs`
+        // inside the body were flagged as undefined.
+        let src = "\
+proc f {deps} {
+  dict for {lib srcs} $deps {
+    puts $lib
+    puts $srcs
+  }
+}
+";
+        assert!(errors(src).is_empty(), "{:?}", errors(src));
+    }
+
+    #[test]
     fn set_inside_foreach_body_defines_in_outer_scope() {
         // Repro for the port.htcl false-positive: `foreach x [...] {
         // set val [...]; puts $val }`. The `set val` is inside the

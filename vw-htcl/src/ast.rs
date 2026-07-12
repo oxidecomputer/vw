@@ -504,6 +504,21 @@ pub struct Word {
     pub form: WordForm,
     pub parts: Vec<WordPart>,
     pub span: Span,
+    /// Populated at parse time for braced-word args that are
+    /// KNOWN to be script bodies: the third arg of `foreach`, the
+    /// fourth arg of `dict for`, both branches of `if`, etc.
+    /// `None` for everything else — including bare braced strings
+    /// and braced expressions.
+    ///
+    /// Interior spans are absolute (whole-source) coordinates,
+    /// same convention as [`Proc::body`]. Populated by
+    /// `parser::populate_procs` after the initial word parse.
+    ///
+    /// Downstream tools (validator, putr rewriter, LSP hover /
+    /// goto, syntax highlighter) descend into this when
+    /// non-`None` so behavior inside a control-flow body matches
+    /// behavior at the top level.
+    pub body: Option<Vec<Stmt>>,
 }
 
 impl Word {

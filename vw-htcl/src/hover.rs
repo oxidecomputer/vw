@@ -112,6 +112,13 @@ pub fn hover_at<'a>(
     if let Some(t) = hover_in_set_binding(document, source, offset, &table) {
         return Some(t);
     }
+    // Cursor on a binder-name inside a control-flow varname-list
+    // (`foreach {a b}`, `dict for {k v}`, `catch BODY resvar`).
+    // Same LocalVar hover shape as the `set NAME` binding site so
+    // the two look identical to the reader.
+    if let Some(t) = hover_in_control_flow_binding(document, source, offset) {
+        return Some(t);
+    }
     hover_in_stmts(&document.stmts, &table, source, offset)
         // Fallback: a `$var` reference — including one buried in opaque
         // text (a command substitution or `if`/`while` condition).
@@ -158,6 +165,109 @@ fn hover_in_set_binding<'a>(
         span: name_word.span,
         ty,
     })
+}
+
+/// Cursor sits on a bare identifier inside a control-flow varname
+/// list — the `lib` / `srcs` inside `dict for {lib srcs} …`, an
+/// `a` / `b` inside `foreach {a b} …`, or the result-var of
+/// `catch { … } err`. Returns a `LocalVar` target pointing at the
+/// whole braced word (or the bare word), so hover shows the same
+/// `$name` shape it would show on a `$name` reference lower in
+/// the body.
+///
+/// Sub-token spans inside the braced list aren't currently
+/// tracked by the parser, so the returned span covers the whole
+/// braced group — the click target still lands on `lib` (or
+/// wherever the cursor is), just with a slightly wider highlight.
+fn hover_in_control_flow_binding<'a>(
+    document: &'a Document,
+    source: &'a str,
+    offset: u32,
+) -> Option<HoverTarget<'a>> {
+    use crate::ast::{CommandKind, WordForm, WordPart};
+    let (stmts, _enclosing) = innermost_scope(document, offset);
+    // Walk statements looking for a Generic-command whose head is
+    // a body-host and whose varname arg contains `offset`.
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        if !cmd.span.contains(offset) {
+            continue;
+        }
+        if !matches!(cmd.kind, CommandKind::Generic) {
+            continue;
+        }
+        let Some(head) = cmd.words.first().and_then(|w| w.as_text()) else {
+            continue;
+        };
+        // Collect (word-idx, is-varname-list) tuples per head.
+        let varname_word_indices: Vec<usize> = match head {
+            "foreach" => {
+                // Word 1, 3, 5, … up to body_idx (last word).
+                let body_idx = cmd.words.len().saturating_sub(1);
+                (1..body_idx).step_by(2).collect()
+            }
+            "dict" => {
+                if cmd.words.get(1).and_then(|w| w.as_text()) == Some("for") {
+                    vec![2]
+                } else {
+                    continue;
+                }
+            }
+            "catch" => vec![2, 3],
+            _ => continue,
+        };
+        for idx in varname_word_indices {
+            let Some(word) = cmd.words.get(idx) else {
+                continue;
+            };
+            if !word.span.contains(offset) {
+                continue;
+            }
+            // Figure out which sub-name the cursor is on.
+            let target_name = match word.form {
+                WordForm::Bare => word.as_text()?.to_string(),
+                WordForm::Braced => {
+                    let WordPart::Text {
+                        value,
+                        span: text_span,
+                    } = word.parts.first()?
+                    else {
+                        continue;
+                    };
+                    // Find the whitespace-delimited token at the
+                    // cursor offset within the braced interior.
+                    let rel = offset.saturating_sub(text_span.start) as usize;
+                    let bytes = value.as_bytes();
+                    let mut start = rel.min(bytes.len());
+                    while start > 0
+                        && !bytes[start - 1].is_ascii_whitespace()
+                        && bytes[start - 1] != b'{'
+                    {
+                        start -= 1;
+                    }
+                    let mut end = rel.min(bytes.len());
+                    while end < bytes.len()
+                        && !bytes[end].is_ascii_whitespace()
+                        && bytes[end] != b'}'
+                    {
+                        end += 1;
+                    }
+                    if start >= end {
+                        continue;
+                    }
+                    value[start..end].to_string()
+                }
+                _ => continue,
+            };
+            let _ = source; // reserved for future sub-token spans
+            return Some(HoverTarget::LocalVar {
+                name: target_name,
+                span: word.span,
+                ty: None,
+            });
+        }
+    }
+    None
 }
 
 fn find_set_command_at(stmts: &[Stmt], offset: u32) -> Option<&Command> {
@@ -657,6 +767,12 @@ pub(crate) fn is_body_host(head: &str) -> bool {
             | "namespace"
             | "on"
             | "apply"
+            // `dict for` — head word alone doesn't disambiguate
+            // (`dict get`/`dict set`/… have no script body); we
+            // include `dict` here and let the per-word-form loop
+            // skip non-braced args. False positives cost a
+            // reparse but never produce spurious hover results.
+            | "dict"
     )
 }
 
@@ -917,6 +1033,54 @@ proc p {} {\n  set count 0\n  use $count\n}\n";
         let target = hover_at(&parsed.document, src, pos).unwrap();
         match target {
             HoverTarget::LocalVar { name, .. } => assert_eq!(name, "count"),
+            other => panic!("expected LocalVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_var_ref_inside_dict_for_body_resolves_to_kv_binder() {
+        // `dict for {lib srcs} $deps { … $lib … }` — hovering the
+        // `$lib` reference in the body should resolve to the
+        // binder at the `{lib srcs}` list.
+        let src = "\
+set deps [some_proc]
+dict for {lib srcs} $deps {
+  puts $lib
+}
+";
+        let parsed = parse(src);
+        let pos = first(src, "$lib\n") + 1;
+        let target = hover_at(&parsed.document, src, pos).unwrap();
+        match target {
+            HoverTarget::LocalVar { name, .. } => assert_eq!(name, "lib"),
+            other => panic!("expected LocalVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_bare_name_inside_dict_for_kv_list_resolves() {
+        // Cursor on `lib` INSIDE `{lib srcs}` — the binding site
+        // itself. Same LocalVar hover shape as if the cursor were
+        // on `$lib` later in the body.
+        let src = "dict for {lib srcs} $deps { puts $lib }\n";
+        let parsed = parse(src);
+        let pos = first(src, "lib srcs");
+        let target = hover_at(&parsed.document, src, pos).unwrap();
+        match target {
+            HoverTarget::LocalVar { name, .. } => assert_eq!(name, "lib"),
+            other => panic!("expected LocalVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_foreach_kv_list_binder_resolves() {
+        // Same story for `foreach {a b} $pairs { … }`.
+        let src = "foreach {a b} $pairs { puts $a }\n";
+        let parsed = parse(src);
+        let pos = first(src, "a b}");
+        let target = hover_at(&parsed.document, src, pos).unwrap();
+        match target {
+            HoverTarget::LocalVar { name, .. } => assert_eq!(name, "a"),
             other => panic!("expected LocalVar, got {other:?}"),
         }
     }

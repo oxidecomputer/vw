@@ -381,6 +381,8 @@ fn is_body_host(head: &str) -> bool {
             | "namespace"
             | "on"
             | "apply"
+            // `dict for` — same rationale as `hover::is_body_host`.
+            | "dict"
     )
 }
 
@@ -727,6 +729,30 @@ proc p {} {\n\
         let pos = first(src, "$vlnv") + 1;
         let target = definition_at(&parsed.document, src, pos).unwrap();
         assert_eq!(target.start, first(src, "vlnv"));
+    }
+
+    #[test]
+    fn var_ref_inside_dict_for_body_goes_to_kv_binder() {
+        let src = "\
+set deps [some_proc]
+dict for {lib srcs} $deps {
+  puts $lib
+}
+";
+        let parsed = parse(src);
+        let pos = first(src, "$lib\n") + 1;
+        let target = definition_at(&parsed.document, src, pos).unwrap();
+        // Target should be the `{lib srcs}` braced word.
+        assert_eq!(target.start, first(src, "{lib srcs}"));
+    }
+
+    #[test]
+    fn var_ref_inside_foreach_body_goes_to_binder() {
+        let src = "foreach x {a b c} {\n  puts $x\n}\n";
+        let parsed = parse(src);
+        let pos = first(src, "$x\n") + 1;
+        let target = definition_at(&parsed.document, src, pos).unwrap();
+        assert_eq!(target.start, first(src, "x {a"));
     }
 
     #[test]

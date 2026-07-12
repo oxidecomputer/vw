@@ -231,6 +231,24 @@ pub fn emit_primitive_prelude() -> Vec<String> {
                 proc from_raw {args} { ::vw::kwargs $args {v \"\"}; return $v }\n\
             }\n"
         ),
+        // Runtime `::putr` — fallback for the compile-time putr
+        // rewrite. `vw-htcl/src/putr.rs` catches every TOP-LEVEL
+        // `putr <x>` at parse time and dispatches it to the right
+        // `T::repr` when the type is statically known. It does
+        // NOT descend into braced-word bodies of control-flow
+        // builtins (`foreach { … }`, `dict for { … } { … } { … }`,
+        // `for { … } { … } { … }`, etc.), so a `putr $x` inside
+        // one of those lands at Tcl as a literal command call.
+        // Without this runtime proc, Tcl would report `invalid
+        // command name \"putr\"`.
+        //
+        // Best-effort heuristic dispatch at runtime: multi-element
+        // values render through `list::repr` (one-per-line);
+        // scalars land through plain `puts`. Callers who want
+        // dict rendering call `::dict::repr -v $x` directly.
+        quote_tcl!(
+            "proc ::putr {v} { if {[llength $v] > 1} { puts [::list::repr -v $v] } else { puts $v } }\n"
+        ),
     ]
 }
 
@@ -735,18 +753,26 @@ mod tests {
     #[test]
     fn primitive_prelude_emits_one_namespace_block_per_type() {
         let procs = emit_primitive_prelude();
-        // 6 types, each emitted as a single `namespace eval`
-        // block that internally defines repr/from/to.
-        assert_eq!(procs.len(), 6);
+        // 6 types (namespace-eval blocks) plus the standalone
+        // runtime `::putr` fallback.
+        assert_eq!(procs.len(), 7);
         assert!(procs.iter().any(|p| p.contains("namespace eval string")));
         assert!(procs.iter().any(|p| p.contains("namespace eval int")));
         assert!(procs.iter().any(|p| p.contains("namespace eval bool")));
         assert!(procs.iter().any(|p| p.contains("namespace eval unit")));
         assert!(procs.iter().any(|p| p.contains("namespace eval list")));
         assert!(procs.iter().any(|p| p.contains("namespace eval dict")));
-        // Each block contains the full triplet (repr + from + to)
-        // and uses `return` in every body.
+        // Standalone runtime `::putr` fallback for braced-body
+        // scripts where the compile-time rewrite can't fire.
+        assert!(procs.iter().any(|p| p.contains("proc ::putr")));
+        // Every NAMESPACE-BLOCK entry contains the full
+        // repr/from/to triplet — the standalone `::putr` entry
+        // (which is a bare proc, not a namespace block) is
+        // exempted.
         for p in &procs {
+            if !p.contains("namespace eval") {
+                continue;
+            }
             assert!(p.contains("proc repr"), "missing repr in: {p}");
             assert!(p.contains("proc from"), "missing from in: {p}");
             assert!(p.contains("proc to"), "missing to in: {p}");

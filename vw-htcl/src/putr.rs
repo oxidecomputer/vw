@@ -207,6 +207,16 @@ fn walk_stmts(
                     );
                 }
             }
+            // Descend into control-flow braced bodies (foreach,
+            // dict for, for, while, if, catch — populated by
+            // `parser::populate_control_flow_bodies`). Without
+            // this, `putr` inside a `foreach { … }` body would
+            // reach Tcl as a literal command call.
+            if let Some(body) = &word.body {
+                walk_stmts(
+                    source, body, sig_table, proc_table, var_table, rewrites,
+                );
+            }
         }
     }
 }

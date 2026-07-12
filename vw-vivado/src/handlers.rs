@@ -27,6 +27,15 @@
 //!   `vw::make_wrapper`. Kept separate from design sources
 //!   because wrappers have their own regen lifecycle and
 //!   typically compile into a distinct library (`ip`).
+//! - `design_constraints` — every Vivado constraint file under
+//!   `<workspace>/constraints/**/*.{xdc,sdc}`. Fed to `read_xdc`
+//!   during synth prep.
+//! - `design_synth_constraints` / `design_place_constraints` /
+//!   `design_route_constraints` — phase-scoped variants that
+//!   walk `constraints/synth/`, `constraints/place/`,
+//!   `constraints/route/` respectively. Used to attach USED_IN
+//!   flags to `read_xdc` so route-only constraints don't apply
+//!   during synthesis (and vice versa).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,15 +76,30 @@ async fn dispatch(
             vhdl_dependency_sources(
                 workspace_root,
                 /*include_test=*/ false,
+                extract_exclude_sim_only(&args),
             )
             .await
         }
         "vhdl_dependency_sources_with_test" => {
-            vhdl_dependency_sources(workspace_root, /*include_test=*/ true)
-                .await
+            vhdl_dependency_sources(
+                workspace_root,
+                /*include_test=*/ true,
+                extract_exclude_sim_only(&args),
+            )
+            .await
         }
         "vhdl_design_sources" => vhdl_design_sources(workspace_root),
         "vhdl_ip_sources" => vhdl_ip_sources(workspace_root),
+        "design_constraints" => design_constraints(workspace_root),
+        "design_synth_constraints" => {
+            design_phase_constraints(workspace_root, ConstraintPhase::Synth)
+        }
+        "design_place_constraints" => {
+            design_phase_constraints(workspace_root, ConstraintPhase::Place)
+        }
+        "design_route_constraints" => {
+            design_phase_constraints(workspace_root, ConstraintPhase::Route)
+        }
         other => Err(format!("unknown RPC method: {other}")),
     }
 }
@@ -89,6 +113,7 @@ async fn dispatch(
 async fn vhdl_dependency_sources(
     workspace_root: Option<&std::path::Path>,
     include_test: bool,
+    exclude_sim_only: bool,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
     // Auto-fetch missing git deps. `workspace_has_unlocked_git_deps`
@@ -116,8 +141,12 @@ async fn vhdl_dependency_sources(
             .await
             .map_err(|e| format!("auto-updating workspace: {e}"))?;
     }
-    let sources = vw_lib::vhdl_dependency_sources_with_test(&ws, include_test)
-        .map_err(|e| format!("enumerating VHDL dep sources: {e}"))?;
+    let sources = vw_lib::vhdl_dependency_sources_ext(
+        &ws,
+        include_test,
+        exclude_sim_only,
+    )
+    .map_err(|e| format!("enumerating VHDL dep sources: {e}"))?;
     let mut by_library: std::collections::BTreeMap<String, Vec<Value>> =
         std::collections::BTreeMap::new();
     for src in sources {
@@ -156,6 +185,54 @@ fn vhdl_ip_sources(
     let paths = vw_lib::vhdl_ip_sources(&ws)
         .map_err(|e| format!("enumerating VHDL IP sources: {e}"))?;
     Ok(paths_to_json_array(paths))
+}
+
+/// `design_constraints` — return every constraint file under
+/// `<workspace>/constraints/**/*.{xdc,sdc}` as a JSON array of
+/// absolute-path strings. Empty array when the workspace has no
+/// `constraints/` dir.
+fn design_constraints(
+    workspace_root: Option<&std::path::Path>,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let paths = vw_lib::design_constraints(&ws)
+        .map_err(|e| format!("enumerating constraint files: {e}"))?;
+    Ok(paths_to_json_array(paths))
+}
+
+/// Which phase-scoped constraints dir to enumerate. Mirrors the
+/// phase-specific accessors in `vw_lib`; kept as a small internal
+/// enum so the dispatch match up top can name each variant without
+/// duplicating the workspace-root plumbing three times.
+enum ConstraintPhase {
+    Synth,
+    Place,
+    Route,
+}
+
+fn design_phase_constraints(
+    workspace_root: Option<&std::path::Path>,
+    phase: ConstraintPhase,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let paths = match phase {
+        ConstraintPhase::Synth => vw_lib::design_synth_constraints(&ws),
+        ConstraintPhase::Place => vw_lib::design_place_constraints(&ws),
+        ConstraintPhase::Route => vw_lib::design_route_constraints(&ws),
+    }
+    .map_err(|e| format!("enumerating phase-scoped constraint files: {e}"))?;
+    Ok(paths_to_json_array(paths))
+}
+
+/// Pull the `exclude_sim_only` boolean out of an RPC args object.
+/// Missing / null / non-boolean values default to `false` so the
+/// legacy call shape (`vw::vhdl_dependency_sources` with no args)
+/// stays byte-for-byte compatible.
+fn extract_exclude_sim_only(args: &Value) -> bool {
+    args.as_object()
+        .and_then(|o| o.get("exclude_sim_only"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn paths_to_json_array(paths: Vec<std::path::PathBuf>) -> Value {

@@ -73,8 +73,12 @@ pub fn resolve_var_def<'a>(
     sig.args.iter().find(|a| a.name == name).map(VarDef::Param)
 }
 
-/// If `cmd` defines variable `name` (`set name ...` or `variable
-/// name ...`), return the span of the defined name.
+/// If `cmd` defines variable `name` — via `set NAME …` / `variable
+/// NAME …` / `foreach NAME …` / `foreach {A B …} …` / `dict for {K
+/// V} …` / `catch BODY NAME` — return the span to anchor
+/// hover/goto on. Braced varname-list positions (`foreach {a b}`,
+/// `dict for {k v}`) return the span of the whole braced word;
+/// sub-token spans would need extra parser wiring.
 fn local_def_target(cmd: &Command, name: &str) -> Option<Span> {
     match &cmd.kind {
         CommandKind::Set => {
@@ -82,11 +86,50 @@ fn local_def_target(cmd: &Command, name: &str) -> Option<Span> {
             (target.as_text()? == name).then_some(target.span)
         }
         CommandKind::Generic => {
-            if cmd.words.first()?.as_text()? != "variable" {
-                return None;
+            let head = cmd.words.first()?.as_text()?;
+            match head {
+                "variable" => {
+                    let target = cmd.words.get(1)?;
+                    (target.as_text()? == name).then_some(target.span)
+                }
+                "foreach" => {
+                    // Iterator target(s) at word 1 (and every
+                    // second word after, up to but not including
+                    // the body). Matches `unused::collect_foreach_decls`.
+                    let body_idx = cmd.words.len().saturating_sub(1);
+                    let mut i = 1;
+                    while i < body_idx {
+                        if word_declares_name(&cmd.words[i], name) {
+                            return Some(cmd.words[i].span);
+                        }
+                        i += 2;
+                    }
+                    None
+                }
+                "dict" => {
+                    // `dict for {K V} DICT BODY` — the kv list is at
+                    // word 2, only for the `for` sub-command.
+                    if cmd.words.get(1)?.as_text()? != "for" {
+                        return None;
+                    }
+                    let target = cmd.words.get(2)?;
+                    if word_declares_name(target, name) {
+                        Some(target.span)
+                    } else {
+                        None
+                    }
+                }
+                "catch" => {
+                    // `catch BODY [RESVAR [OPTVAR]]` — words 2/3.
+                    for w in cmd.words.iter().skip(2).take(2) {
+                        if word_declares_name(w, name) {
+                            return Some(w.span);
+                        }
+                    }
+                    None
+                }
+                _ => None,
             }
-            let target = cmd.words.get(1)?;
-            (target.as_text()? == name).then_some(target.span)
         }
         CommandKind::Proc(_)
         | CommandKind::Src(_)
@@ -94,6 +137,25 @@ fn local_def_target(cmd: &Command, name: &str) -> Option<Span> {
         | CommandKind::TypeDecl(_)
         | CommandKind::EnumDecl(_) => None,
     }
+}
+
+/// True when `word` names `target` — either as a bare identifier
+/// (`foreach x …`) or as a whitespace-separated token inside a
+/// braced list (`foreach {a b} …`, `dict for {k v} …`).
+fn word_declares_name(word: &crate::ast::Word, target: &str) -> bool {
+    use crate::ast::{WordForm, WordPart};
+    // Bare word: exact match.
+    if word.form == WordForm::Bare {
+        return word.as_text() == Some(target);
+    }
+    // Braced list: whitespace-split the interior Text.
+    if word.form != WordForm::Braced {
+        return false;
+    }
+    let Some(WordPart::Text { value, .. }) = word.parts.first() else {
+        return false;
+    };
+    value.split_whitespace().any(|tok| tok == target)
 }
 
 /// The innermost proc whose body contains `offset`, together with that

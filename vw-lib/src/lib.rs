@@ -1629,7 +1629,7 @@ pub struct VhdlDepSource {
 pub fn vhdl_dependency_sources(
     workspace_dir: &Utf8Path,
 ) -> Result<Vec<VhdlDepSource>> {
-    vhdl_dependency_sources_with_test(workspace_dir, false)
+    vhdl_dependency_sources_ext(workspace_dir, false, false)
 }
 
 /// Detect whether the workspace has any git deps declared in
@@ -1681,6 +1681,19 @@ pub fn vhdl_dependency_sources_with_test(
     workspace_dir: &Utf8Path,
     include_test: bool,
 ) -> Result<Vec<VhdlDepSource>> {
+    vhdl_dependency_sources_ext(workspace_dir, include_test, false)
+}
+
+/// Full-shape enumeration primitive. `exclude_sim_only = true`
+/// drops every dep whose vw.toml sets `sim_only = true` (unisim,
+/// xpm, etc.) — used by synth flows that need the design-only
+/// surface. `include_test` mirrors the same knob on the sibling
+/// wrapper.
+pub fn vhdl_dependency_sources_ext(
+    workspace_dir: &Utf8Path,
+    include_test: bool,
+    exclude_sim_only: bool,
+) -> Result<Vec<VhdlDepSource>> {
     // Walk the entry workspace's deps + transitive deps. We need
     // each dep's Dependency config (for src/recursive/exclude),
     // so `transitive_dep_cache_paths` (name → path only) isn't
@@ -1704,6 +1717,15 @@ pub fn vhdl_dependency_sources_with_test(
             .chain(cfg.test_dependencies.into_iter().filter(|_| want_test))
             .collect();
         for (name, dep) in deps {
+            // Skip sim-only deps when the caller wants a
+            // synth-clean surface. Filter happens BEFORE the
+            // transitive-workspace push, so if a dep is a
+            // workspace whose only purpose is sim glue, we
+            // don't descend and pick up its transitive deps
+            // either.
+            if exclude_sim_only && dep.sim_only {
+                continue;
+            }
             let Some(dep_path) =
                 resolve_dep_source_path(workspace_dir, &ws, &name, &dep)?
             else {
@@ -1909,6 +1931,107 @@ pub fn vhdl_design_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
         find_vhdl_files(hdl_dir.as_std_path(), /*recursive=*/ true, &[])?;
     files.sort();
     Ok(files)
+}
+
+/// Enumerate every Vivado design-constraint file under
+/// `<workspace_dir>/constraints/**/*.{xdc,sdc}`. Handles both
+/// physical (`.xdc`) and Synopsys-style (`.sdc`) constraints —
+/// both are accepted by `read_xdc` in Vivado.
+///
+/// Returned separately from [`vhdl_design_sources`] because
+/// constraints have their own file kind and a different
+/// consumption command (`read_xdc` vs. `read_vhdl`).
+///
+/// Empty vec when `constraints/` doesn't exist yet.
+pub fn design_constraints(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    design_constraints_in(workspace_dir, None)
+}
+
+/// Enumerate only the `synth`-scoped constraints —
+/// `<workspace_dir>/constraints/synth/**/*.{xdc,sdc}`. Used to
+/// hand synthesis-only constraints to `read_xdc -used_in
+/// synthesis` (or the equivalent set_property USED_IN) so
+/// route/place-only constraints don't spuriously apply during
+/// synth. Empty vec when the subdir doesn't exist.
+pub fn design_synth_constraints(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<PathBuf>> {
+    design_constraints_in(workspace_dir, Some("synth"))
+}
+
+/// Enumerate only the `place`-scoped constraints under
+/// `<workspace_dir>/constraints/place/**/*.{xdc,sdc}`. Mirrors
+/// [`design_synth_constraints`] for the placement flow. Empty
+/// vec when the subdir doesn't exist.
+pub fn design_place_constraints(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<PathBuf>> {
+    design_constraints_in(workspace_dir, Some("place"))
+}
+
+/// Enumerate only the `route`-scoped constraints under
+/// `<workspace_dir>/constraints/route/**/*.{xdc,sdc}`. Mirrors
+/// [`design_synth_constraints`] for the routing flow. Empty
+/// vec when the subdir doesn't exist.
+pub fn design_route_constraints(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<PathBuf>> {
+    design_constraints_in(workspace_dir, Some("route"))
+}
+
+/// Enumeration primitive shared by [`design_constraints`] and
+/// the phase-scoped variants. `subdir = None` walks
+/// `<workspace_dir>/constraints/`; `subdir = Some(name)` walks
+/// `<workspace_dir>/constraints/<name>/`.
+fn design_constraints_in(
+    workspace_dir: &Utf8Path,
+    subdir: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let mut dir = workspace_dir.join("constraints");
+    if let Some(sub) = subdir {
+        dir = dir.join(sub);
+    }
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    find_constraint_files_impl(
+        dir.as_std_path(),
+        &mut files,
+        /*recursive=*/ true,
+    )?;
+    files.sort();
+    Ok(files)
+}
+
+/// Mirror of `find_vhdl_files_impl` but for the `.xdc` / `.sdc`
+/// extension set. Kept separate rather than parameterizing the
+/// existing walker because the extension list is small and
+/// domain-specific — a generic "find by extensions" helper would
+/// obscure the intent at the call site.
+fn find_constraint_files_impl(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    recursive: bool,
+) -> Result<()> {
+    for entry in fs::read_dir(dir).map_err(|e| VwError::FileSystem {
+        message: format!("Failed to read directory: {e}"),
+    })? {
+        let entry = entry.map_err(|e| VwError::FileSystem {
+            message: format!("Failed to read directory entry: {e}"),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            if recursive {
+                find_constraint_files_impl(&path, files, recursive)?;
+            }
+        } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            if ext == "xdc" || ext == "sdc" {
+                files.push(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Enumerate every generated IP wrapper under
@@ -4574,6 +4697,59 @@ branch = "main"
     }
 
     #[test]
+    fn vhdl_dependency_sources_exclude_sim_only_flag() {
+        // Two path deps: one flagged `sim_only = true` (mirrors
+        // real deps like `unisim` / `xpm`) and one regular.
+        // With the flag off both contribute; with it on only
+        // the non-sim dep does.
+        let tmp = tempfile::tempdir().unwrap();
+        let sim_dep = tmp.path().join("sim");
+        std::fs::create_dir_all(sim_dep.join("hdl")).unwrap();
+        std::fs::write(sim_dep.join("hdl/sim.vhd"), "").unwrap();
+        let real_dep = tmp.path().join("real");
+        std::fs::create_dir_all(real_dep.join("hdl")).unwrap();
+        std::fs::write(real_dep.join("hdl/real.vhd"), "").unwrap();
+
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            format!(
+                r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.sim]
+path = "{}"
+src = ["hdl"]
+recursive = true
+sim_only = true
+
+[dependencies.real]
+path = "{}"
+src = ["hdl"]
+recursive = true
+"#,
+                sim_dep.display(),
+                real_dep.display(),
+            ),
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+
+        // Default (flag = false): both deps contribute.
+        let all = vhdl_dependency_sources(&ws_utf8).unwrap();
+        assert_eq!(all.len(), 2, "{all:?}");
+
+        // Flag on: only the non-sim dep survives.
+        let synth_clean =
+            vhdl_dependency_sources_ext(&ws_utf8, false, true).unwrap();
+        assert_eq!(synth_clean.len(), 1, "{synth_clean:?}");
+        assert_eq!(synth_clean[0].library, "real");
+    }
+
+    #[test]
     fn vhdl_dependency_sources_include_test_flag() {
         // A test-only dep contributes iff include_test is set.
         let tmp = tempfile::tempdir().unwrap();
@@ -4643,6 +4819,87 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         let sources = vhdl_dependency_sources(&ws_utf8).unwrap();
         assert_eq!(sources.len(), 1, "{sources:?}");
         assert!(sources[0].path.ends_with("a.vhd"));
+    }
+
+    #[test]
+    fn design_constraints_empty_when_no_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        assert!(design_constraints(&ws).unwrap().is_empty());
+    }
+
+    #[test]
+    fn phase_scoped_constraints_isolate_per_subdir() {
+        // Regression guard: `synth/` files must not leak into
+        // `place/` or `route/`, and vice versa. Also verifies
+        // the whole-tree `design_constraints` still returns
+        // everything.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let c = ws.join("constraints");
+        std::fs::create_dir_all(c.join("synth")).unwrap();
+        std::fs::create_dir_all(c.join("place")).unwrap();
+        std::fs::create_dir_all(c.join("route")).unwrap();
+        std::fs::write(c.join("global.xdc"), "").unwrap();
+        std::fs::write(c.join("synth/only.xdc"), "").unwrap();
+        std::fs::write(c.join("place/only.xdc"), "").unwrap();
+        std::fs::write(c.join("route/only.xdc"), "").unwrap();
+
+        let synth = design_synth_constraints(&ws).unwrap();
+        assert_eq!(synth.len(), 1);
+        assert!(synth[0].ends_with("synth/only.xdc"));
+
+        let place = design_place_constraints(&ws).unwrap();
+        assert_eq!(place.len(), 1);
+        assert!(place[0].ends_with("place/only.xdc"));
+
+        let route = design_route_constraints(&ws).unwrap();
+        assert_eq!(route.len(), 1);
+        assert!(route[0].ends_with("route/only.xdc"));
+
+        // Aggregate walk returns everything under constraints/
+        // regardless of subdir.
+        let all = design_constraints(&ws).unwrap();
+        assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn phase_scoped_constraints_empty_when_subdir_missing() {
+        // `constraints/` exists (some other subdir) but
+        // `constraints/synth/` does not — expect empty, not error.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let c = ws.join("constraints");
+        std::fs::create_dir_all(c.join("place")).unwrap();
+        std::fs::write(c.join("place/only.xdc"), "").unwrap();
+
+        assert!(design_synth_constraints(&ws).unwrap().is_empty());
+        assert!(design_route_constraints(&ws).unwrap().is_empty());
+        assert_eq!(design_place_constraints(&ws).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn design_constraints_finds_xdc_and_sdc_recursively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let c = ws.join("constraints");
+        std::fs::create_dir_all(c.join("sub")).unwrap();
+        std::fs::write(c.join("timing.xdc"), "").unwrap();
+        std::fs::write(c.join("sub/pins.xdc"), "").unwrap();
+        std::fs::write(c.join("sub/synopsys.sdc"), "").unwrap();
+        // Non-constraint sibling — should be skipped.
+        std::fs::write(c.join("readme.md"), "").unwrap();
+
+        let files = design_constraints(&ws).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 3, "{files:?}");
+        assert!(names.contains(&"timing.xdc".to_string()));
+        assert!(names.contains(&"pins.xdc".to_string()));
+        assert!(names.contains(&"synopsys.sdc".to_string()));
+        assert!(!names.contains(&"readme.md".to_string()));
     }
 
     #[test]

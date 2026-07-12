@@ -185,8 +185,117 @@ pub(crate) fn populate_procs(
                 ns.body = body_stmts;
                 populate_procs(&mut ns.body, source, errors);
             }
-            _ => {}
+            _ => {
+                // Generic (unrecognized) command: check the head
+                // word against the Tcl-builtin control-flow set
+                // and, when it's one of `foreach` / `for` /
+                // `while` / `if` / `catch` / `dict for`,
+                // recursively parse the arg-word(s) that are
+                // KNOWN to be script bodies. Populates
+                // `Word::body`; downstream tools (validator,
+                // putr rewrite, hover, goto, syntax highlight)
+                // key off that field to descend uniformly with
+                // top-level statements.
+                populate_control_flow_bodies(cmd, source, errors);
+            }
         }
+    }
+}
+
+/// Body-arg positions per builtin. Word-index 0 is the head, so
+/// `foreach var list body` puts the body at word 3. `dict for
+/// {kv} dict body` is the two-word head form.
+fn populate_control_flow_bodies(
+    cmd: &mut crate::ast::Command,
+    source: &str,
+    errors: &mut Vec<ParseError>,
+) {
+    // Word 0: head. Everything below tests it against the known
+    // set. Non-literal heads (interpolation, subst) fall through
+    // — we can't statically match them and the analyzer treats
+    // them as generic.
+    let Some(head) = cmd.words.first().and_then(|w| w.as_text()) else {
+        return;
+    };
+    // Collect word-indices whose braced form should be parsed as
+    // a script. Multiple positions handle `for INIT COND STEP
+    // BODY` and `if COND BODY [elseif COND BODY]* [else BODY]`.
+    let body_positions: Vec<usize> = match head {
+        "foreach" => vec![cmd.words.len().saturating_sub(1)],
+        "while" => vec![2],
+        "for" => vec![1, 3, 4], // init, step, body — cond is an expr
+        "catch" => vec![1],
+        "dict"
+            // `dict for {kv} DICT BODY` — head is the two-word
+            // sub-command form. Only recognize the `for` variant
+            // for body descent; other `dict` sub-commands have no
+            // script args.
+            if cmd.words.get(1).and_then(|w| w.as_text()) == Some("for") => {
+                vec![cmd.words.len().saturating_sub(1)]
+            }
+        "if" => {
+            // `if COND BODY [elseif COND BODY]* [else BODY]`.
+            // Scan word-by-word: after `if`/`elseif` we skip the
+            // condition and mark the next word as a body; after
+            // `else` the very next word is a body.
+            let mut out = Vec::new();
+            let mut i = 1usize;
+            while i < cmd.words.len() {
+                let w = cmd.words.get(i).and_then(|w| w.as_text());
+                if w == Some("elseif") || i == 1 {
+                    // condition at i (or i+1 for elseif), body at i+1 (or i+2)
+                    let (cond_idx, body_idx) = if w == Some("elseif") {
+                        (i + 1, i + 2)
+                    } else {
+                        (i, i + 1)
+                    };
+                    let _ = cond_idx;
+                    if body_idx < cmd.words.len() {
+                        out.push(body_idx);
+                    }
+                    i = body_idx + 1;
+                } else if w == Some("else") {
+                    if i + 1 < cmd.words.len() {
+                        out.push(i + 1);
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out
+        }
+        _ => return,
+    };
+    for idx in body_positions {
+        let Some(word) = cmd.words.get_mut(idx) else {
+            continue;
+        };
+        if word.form != crate::ast::WordForm::Braced {
+            // Only descend when the arg is a braced literal —
+            // an interpolated body (`$body_var`) can't be
+            // statically parsed.
+            continue;
+        }
+        // Interior text: `span` covers `{...}`; strip the two
+        // brace bytes.
+        let interior_start = word.span.start + 1;
+        let interior_end = word.span.end.saturating_sub(1);
+        if interior_end <= interior_start {
+            continue;
+        }
+        let interior = &source[interior_start as usize..interior_end as usize];
+        let (mut body_stmts, body_errs) =
+            parse_fragment(interior, Mode::Toplevel);
+        for stmt in &mut body_stmts {
+            shift_stmt(stmt, interior_start);
+        }
+        for mut err in body_errs {
+            err.span = err.span.shifted(interior_start);
+            errors.push(err);
+        }
+        populate_procs(&mut body_stmts, source, errors);
+        word.body = Some(body_stmts);
     }
 }
 
@@ -965,6 +1074,10 @@ fn parse_word(input: &mut Input<'_>, source: &str) -> Result<Word, InnerError> {
         form,
         parts,
         span: Span::new(start as u32, end as u32),
+        // `body` is set by `populate_procs` for known control-flow
+        // builtins whose Nth arg is a script body. Initial parse
+        // leaves it None.
+        body: None,
     })
 }
 
@@ -1364,6 +1477,71 @@ mod tests {
         let out = parse("");
         assert!(out.document.stmts.is_empty());
         assert!(out.errors.is_empty());
+    }
+
+    #[test]
+    fn control_flow_bodies_get_parsed_into_word_body() {
+        // `dict for {kv} DICT BODY` — head is 2-word `dict for`,
+        // body is the LAST arg. The braced body should get its
+        // interior parsed and populated on `Word::body`, with
+        // absolute spans, so hover/goto/putr can descend.
+        let src = "dict for {lib srcs} $deps {\n  puts $lib\n  putr $srcs\n}";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!("expected command");
+        };
+        // Last word is the body braced-word.
+        let body_word = cmd.words.last().unwrap();
+        assert_eq!(body_word.form, crate::ast::WordForm::Braced);
+        let body = body_word
+            .body
+            .as_ref()
+            .expect("dict-for body should have parsed statements");
+        // Body has three top-level commands: puts, putr, and a
+        // synthesized command boundary if parsing picked one up.
+        // Expect at least two commands (puts + putr).
+        assert!(body.len() >= 2, "body: {body:?}");
+        let Stmt::Command(first) = &body[0] else {
+            panic!("expected first body stmt to be a command");
+        };
+        assert_eq!(first.words[0].as_text(), Some("puts"));
+        // Spans should be absolute (whole-source).
+        assert!(
+            first.span.start > 20,
+            "expected absolute span past outer command head, got {:?}",
+            first.span,
+        );
+    }
+
+    #[test]
+    fn foreach_body_populated() {
+        let src = "foreach x {a b c} {\n  puts $x\n}";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!("expected command");
+        };
+        // Body is the last (third-index) word.
+        let body_word = cmd.words.last().unwrap();
+        assert!(
+            body_word.body.is_some(),
+            "foreach body should have parsed statements",
+        );
+    }
+
+    #[test]
+    fn if_bodies_populated() {
+        let src = "if {$x > 0} {\n  puts big\n} else {\n  puts small\n}";
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let Stmt::Command(cmd) = &out.document.stmts[0] else {
+            panic!("expected command");
+        };
+        // Both bodies (word 2 for the `if` body, word 4 for the
+        // else body) should be populated.
+        assert!(cmd.words[2].body.is_some(), "if-body should be parsed");
+        assert!(cmd.words[4].body.is_some(), "else-body should be parsed");
     }
 
     #[test]
