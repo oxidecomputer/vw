@@ -11,11 +11,10 @@ use std::process;
 
 use vw_eda::EdaBackend;
 use vw_lib::{
-    add_dependency_with_token, clear_cache, extract_hostname_from_repo_url,
-    generate_deps_tcl, get_access_credentials_from_netrc, init_workspace,
-    list_dependencies, list_testbenches, load_workspace_config,
-    remove_dependency, run_testbench, update_workspace_with_token, Credentials,
-    VersionInfo, VhdlStandard,
+    add_dependency_with_token, clear_cache, generate_deps_tcl,
+    get_access_credentials_for_repo, get_access_credentials_for_workspace,
+    init_workspace, list_dependencies, list_testbenches, remove_dependency,
+    run_testbench, update_workspace_with_token, VersionInfo, VhdlStandard,
 };
 
 mod htcl_test;
@@ -331,33 +330,9 @@ enum IpCommand {
     },
 }
 
-/// Helper function to get access credentials for a repository URL from netrc if available
-async fn get_access_credentials_for_repo(
-    repo_url: &str,
-) -> Option<Credentials> {
-    if let Ok(hostname) = extract_hostname_from_repo_url(repo_url) {
-        if let Ok(Some(creds)) = get_access_credentials_from_netrc(&hostname) {
-            return Some(creds);
-        }
-    }
-    None
-}
-
-/// Helper function to get access credentials for workspace dependencies from netrc
-async fn get_access_credentials_for_workspace(
-    workspace_dir: &camino::Utf8Path,
-) -> Option<Credentials> {
-    // Load workspace config and check if any dependencies might need authentication
-    if let Ok(config) = load_workspace_config(workspace_dir) {
-        for dep in config.dependencies.values() {
-            let Some(repo) = dep.repo() else { continue };
-            if let Some(creds) = get_access_credentials_for_repo(repo).await {
-                return Some(creds);
-            }
-        }
-    }
-    None
-}
+// Netrc credential lookup moved to `vw_lib` so `vw-vivado`'s
+// RPC auto-update path can reuse it. See
+// `vw_lib::get_access_credentials_for_workspace`.
 
 #[tokio::main]
 async fn main() {
@@ -392,7 +367,8 @@ async fn main() {
             );
         }
         Commands::Update => {
-            let access_creds = get_access_credentials_for_workspace(&cwd).await;
+            let access_creds =
+                get_access_credentials_for_workspace(&cwd, false);
             match update_workspace_with_token(&cwd, access_creds).await {
                 Ok(result) => {
                     for dep in result.dependencies {
@@ -431,7 +407,7 @@ async fn main() {
             recursive,
             sim_only,
         } => {
-            let access_creds = get_access_credentials_for_repo(&repo).await;
+            let access_creds = get_access_credentials_for_repo(&repo);
             match add_dependency_with_token(
                 &cwd,
                 repo.clone(),

@@ -876,6 +876,48 @@ pub fn get_access_credentials_from_netrc(
     Ok(None)
 }
 
+/// Look up netrc credentials for a git-repository URL. Returns
+/// `None` when the URL has no parseable host, or the host has no
+/// entry in `~/.netrc`. Never errors — a missing / malformed
+/// netrc is treated as "no credentials," matching the "unauthenticated
+/// clone" path.
+///
+/// Callers: `vw-cli::Commands::Update`, `vw-vivado`'s
+/// auto-update RPC handler.
+pub fn get_access_credentials_for_repo(repo_url: &str) -> Option<Credentials> {
+    let hostname = extract_hostname_from_repo_url(repo_url).ok()?;
+    get_access_credentials_from_netrc(&hostname).ok().flatten()
+}
+
+/// Scan the workspace's declared git dependencies for the first
+/// one that has netrc credentials. Cheap and pragmatic: one set
+/// of credentials feeds the whole `update_workspace_with_token`
+/// pass (all deps to the same host share the same login), and
+/// most workspaces target a single provider (github, gitea, …)
+/// so the first match is usually the right one.
+///
+/// `include_test = true` also scans `[test-dependencies]`,
+/// matching the same shape [`vhdl_dependency_sources_with_test`]
+/// uses. Returns `None` when no git dep has creds — e.g. when
+/// every git URL is a public repo.
+pub fn get_access_credentials_for_workspace(
+    workspace_dir: &Utf8Path,
+    include_test: bool,
+) -> Option<Credentials> {
+    let cfg = load_workspace_config(workspace_dir).ok()?;
+    for dep in cfg
+        .dependencies
+        .values()
+        .chain(cfg.test_dependencies.values().filter(|_| include_test))
+    {
+        let Some(repo) = dep.repo() else { continue };
+        if let Some(creds) = get_access_credentials_for_repo(repo) {
+            return Some(creds);
+        }
+    }
+    None
+}
+
 /// Get access token for a given host from the netrc file.
 ///
 /// This function reads the user's .netrc file and looks for credentials
@@ -1546,6 +1588,362 @@ pub struct TestbenchInfo {
 /// Returns an empty vec when `<workspace_dir>/test/` doesn't exist
 /// — matches `vw test`'s expected "no tests found" UX rather than
 /// erroring.
+/// One VHDL source shipped by a dep: the target VHDL library name
+/// it should compile into, plus the absolute on-disk path.
+///
+/// Library name is derived from the dep name with hyphens replaced
+/// by underscores — the same rule the `vhdl_ls.toml` generator
+/// already uses, matching NVC/Vivado convention. This will move to
+/// a dep-controlled override later; for now the rule is uniform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VhdlDepSource {
+    pub library: String,
+    pub path: PathBuf,
+}
+
+/// Enumerate every VHDL source published by any transitive dep
+/// of `workspace_dir`. Files are absolute paths pointing at the
+/// dep's materialized cache (or its local path, for
+/// `path = "..."` deps).
+///
+/// A dep only contributes when it explicitly declares a `src`
+/// field in its vw.toml entry. Path deps for htcl-only libraries
+/// (e.g. `[dependencies.vw] path = "..."`) omit `src` and
+/// therefore publish no VHDL — otherwise a recursive scan would
+/// happily pick up the library's OWN `target/`, `test/`, and
+/// other non-shipped subtrees.
+///
+/// For each `src` entry we honor the dep's `recursive` /
+/// `exclude` config, matching what `vw update` uses when it
+/// populates the cache from a git dep. For path deps the same
+/// filtering runs at read time (no copy step) so both dep kinds
+/// present identical surfaces.
+///
+/// Depends on the deps being present on disk — call after
+/// `vw update`. Missing dep caches are silently skipped so a
+/// half-updated workspace still gives a partial result rather
+/// than erroring mid-enumeration.
+///
+/// Sort order: library name, then path within library. Callers
+/// that need topological order do their own downstream analysis.
+pub fn vhdl_dependency_sources(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<VhdlDepSource>> {
+    vhdl_dependency_sources_with_test(workspace_dir, false)
+}
+
+/// Detect whether the workspace has any git deps declared in
+/// vw.toml but missing from vw.lock — the state where the user
+/// hasn't yet run `vw update`, or the lockfile has been
+/// truncated / wiped. Cheap check (loads the config + lockfile
+/// once, no network); consumers use it to decide whether to
+/// auto-invoke [`update_workspace`].
+///
+/// `include_test` mirrors the same flag on the enumeration side
+/// so a test-deps-only unlocked entry is caught when the caller
+/// intends to enumerate test-deps too.
+pub fn workspace_has_unlocked_git_deps(
+    workspace_dir: &Utf8Path,
+    include_test: bool,
+) -> Result<bool> {
+    let cfg = load_workspace_config(workspace_dir)?;
+    let git_names: Vec<&str> = cfg
+        .dependencies
+        .iter()
+        .chain(cfg.test_dependencies.iter().filter(|_| include_test))
+        .filter(|(_, dep)| matches!(dep.source, DependencySource::Git { .. }))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if git_names.is_empty() {
+        return Ok(false);
+    }
+    match load_lock_file(workspace_dir) {
+        Ok(lock) => Ok(git_names
+            .iter()
+            .any(|n| !lock.dependencies.contains_key(*n))),
+        // No lockfile at all: every git dep is unlocked.
+        Err(_) => Ok(true),
+    }
+}
+
+/// Same as [`vhdl_dependency_sources`] but optionally includes
+/// the entry workspace's `[test-dependencies]`. Cargo-parity
+/// semantic for `dev-dependencies`: test-deps are private to the
+/// workspace that declares them. Recursed-into workspaces are
+/// walked with `include_test = false` so a dep's own test-deps
+/// aren't pulled into your consumer.
+///
+/// The test runner uses `include_test = true` so htcl tests
+/// under `test/` can enumerate `[test-dependencies]` VHDL
+/// alongside regular deps. Production `vw run` uses `false` so
+/// test-only VHDL doesn't sneak into a synth flow.
+pub fn vhdl_dependency_sources_with_test(
+    workspace_dir: &Utf8Path,
+    include_test: bool,
+) -> Result<Vec<VhdlDepSource>> {
+    // Walk the entry workspace's deps + transitive deps. We need
+    // each dep's Dependency config (for src/recursive/exclude),
+    // so `transitive_dep_cache_paths` (name → path only) isn't
+    // enough — walk the graph ourselves.
+    let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    let mut queue: Vec<(Utf8PathBuf, bool)> =
+        vec![(workspace_dir.to_path_buf(), include_test)];
+    while let Some((ws, want_test)) = queue.pop() {
+        if !visited.insert(ws.as_std_path().to_path_buf()) {
+            continue;
+        }
+        let Ok(cfg) = load_workspace_config(&ws) else {
+            continue;
+        };
+        // Combine regular + test deps for this level.
+        let deps: Vec<(String, Dependency)> = cfg
+            .dependencies
+            .into_iter()
+            .chain(cfg.test_dependencies.into_iter().filter(|_| want_test))
+            .collect();
+        for (name, dep) in deps {
+            let Some(dep_path) =
+                resolve_dep_source_path(workspace_dir, &ws, &name, &dep)?
+            else {
+                continue;
+            };
+            // If the dep is itself a workspace, follow it too so
+            // we pick up its own deps' VHDL. Recursed workspaces
+            // never see their own test-deps — Cargo parity.
+            if dep_path.join("vw.toml").is_file() {
+                if let Ok(u) = Utf8PathBuf::from_path_buf(dep_path.clone()) {
+                    queue.push((u, false));
+                }
+            }
+            let files = enumerate_dep_vhdl_files(&dep_path, &dep)?;
+            if files.is_empty() {
+                continue;
+            }
+            let library = library_name_for_dep(&name);
+            for path in files {
+                out.push(VhdlDepSource {
+                    library: library.clone(),
+                    path,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.library.cmp(&b.library).then(a.path.cmp(&b.path)));
+    Ok(out)
+}
+
+/// Resolve one dep's on-disk root. Local (`path = "..."`) deps
+/// point at the user's tree; git deps resolve through the
+/// workspace's lockfile. Returns `Ok(None)` when the dep is a
+/// git dep the caller hasn't `vw update`-d yet — the enumeration
+/// treats that as "no VHDL" rather than erroring, since a half-
+/// updated workspace shouldn't gate every downstream call.
+fn resolve_dep_source_path(
+    entry_workspace_dir: &Utf8Path,
+    parent_workspace_dir: &Utf8Path,
+    name: &str,
+    dep: &Dependency,
+) -> Result<Option<PathBuf>> {
+    if let Some(p) = dep.local_path() {
+        // Relative path deps resolve against the workspace that
+        // DECLARES them (same rule Cargo uses). Absolute paths
+        // pass through unchanged. This lets a workspace ship a
+        // portable path-dep like `path = "test/fixtures/foo"`
+        // without hard-coding a machine-specific prefix.
+        if p.is_absolute() {
+            return Ok(Some(p.to_path_buf()));
+        }
+        return Ok(Some(parent_workspace_dir.as_std_path().join(p)));
+    }
+    // Git dep — look up the resolved cache path in the lockfile
+    // of the ENTRY workspace (only the entry has a meaningful
+    // lockfile; transitive walks reuse the entry's pins for
+    // Cargo-parity).
+    let Ok(lock) = load_lock_file(entry_workspace_dir) else {
+        return Ok(None);
+    };
+    let Some(locked) = lock.dependencies.get(name) else {
+        return Ok(None);
+    };
+    Ok(Some(resolve_dep_path(&locked.path)?))
+}
+
+/// Enumerate every VHDL file a dep publishes, honoring its
+/// declared `src` / `recursive` / `exclude` filters. Empty when
+/// `dep.src` is empty (htcl-only dep, publishes no VHDL).
+///
+/// Two dep kinds diverge here:
+/// - **Git deps** cache into `~/.vw/deps/<name>-<sha>/` with the
+///   `src` prefix STRIPPED at copy time. `copy_vhdl_files_glob`
+///   flattens away the source repo's directory structure. So
+///   applying `src` here as a subdirectory path finds nothing —
+///   we just walk the whole cache dir recursively (its contents
+///   were already filtered by the update step).
+/// - **Path deps** point at an unmodified checkout of the dep's
+///   tree, so `src` still maps to a real subdirectory.
+fn enumerate_dep_vhdl_files(
+    dep_root: &Path,
+    dep: &Dependency,
+) -> Result<Vec<PathBuf>> {
+    if dep.src.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Git-dep cache: flattened at copy time — walk everything and
+    // apply the exclude patterns (which are structure-relative, so
+    // they still work as-is over the flat tree).
+    if !dep.is_local() {
+        let mut files =
+            find_vhdl_files(dep_root, /*recursive=*/ true, &[])?;
+        if !dep.exclude.is_empty() {
+            let exclude_patterns: Vec<glob::Pattern> = dep
+                .exclude
+                .iter()
+                .filter_map(|p| glob::Pattern::new(p).ok())
+                .collect();
+            files.retain(|f| {
+                let rel = f.strip_prefix(dep_root).unwrap_or(f);
+                let rel_str = rel.to_string_lossy();
+                !exclude_patterns.iter().any(|p| p.matches(&rel_str))
+            });
+        }
+        files.sort();
+        files.dedup();
+        return Ok(files);
+    }
+    // Path dep: honor src patterns against the real tree.
+    let exclude_patterns: Vec<glob::Pattern> = dep
+        .exclude
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+    let mut out = Vec::new();
+    for src_pattern in &dep.src {
+        let src_path = dep_root.join(src_pattern);
+        let candidates = if src_path.is_dir() {
+            let base =
+                src_path.to_str().ok_or_else(|| VwError::FileSystem {
+                    message: "Invalid UTF-8 in dep src path".to_string(),
+                })?;
+            let mut cands = Vec::new();
+            let patterns = if dep.recursive {
+                vec![format!("{base}/**/*.vhd"), format!("{base}/**/*.vhdl")]
+            } else {
+                vec![format!("{base}/*.vhd"), format!("{base}/*.vhdl")]
+            };
+            for p in patterns {
+                let entries =
+                    glob::glob(&p).map_err(|e| VwError::FileSystem {
+                        message: format!("Invalid glob pattern '{p}': {e}"),
+                    })?;
+                for entry in entries.flatten() {
+                    cands.push((src_path.clone(), entry));
+                }
+            }
+            cands
+        } else if src_path.is_file() {
+            vec![(
+                src_path
+                    .parent()
+                    .ok_or_else(|| VwError::FileSystem {
+                        message: "dep src file has no parent".to_string(),
+                    })?
+                    .to_path_buf(),
+                src_path.clone(),
+            )]
+        } else {
+            // Glob pattern rooted at the dep root — exclude
+            // patterns match relative to the dep root here.
+            let base = dep_root.to_path_buf();
+            let pat = src_path
+                .to_str()
+                .ok_or_else(|| VwError::FileSystem {
+                    message: "Invalid UTF-8 in dep src glob".to_string(),
+                })?
+                .to_string();
+            let entries =
+                glob::glob(&pat).map_err(|e| VwError::FileSystem {
+                    message: format!("Invalid glob pattern '{pat}': {e}"),
+                })?;
+            entries.flatten().map(|e| (base.clone(), e)).collect()
+        };
+        for (strip_prefix, path) in candidates {
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str());
+            if ext != Some("vhd") && ext != Some("vhdl") {
+                continue;
+            }
+            if !exclude_patterns.is_empty() {
+                let rel = path.strip_prefix(&strip_prefix).unwrap_or(&path);
+                let rel_str = rel.to_string_lossy();
+                if exclude_patterns.iter().any(|p| p.matches(&rel_str)) {
+                    continue;
+                }
+            }
+            out.push(path);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Enumerate every VHDL source under `<workspace_dir>/hdl/`
+/// (recursively). These are the workspace's own design sources,
+/// as distinct from IP wrappers (which live under `target/ip/` and
+/// are enumerated by a separate helper) and testbenches (which
+/// live under `bench/`).
+///
+/// Returns an empty vec when `<workspace_dir>/hdl/` doesn't exist
+/// — a freshly-scaffolded workspace hasn't checked anything in
+/// yet, and that's not an error.
+pub fn vhdl_design_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    let hdl_dir = workspace_dir.join("hdl");
+    if !hdl_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files =
+        find_vhdl_files(hdl_dir.as_std_path(), /*recursive=*/ true, &[])?;
+    files.sort();
+    Ok(files)
+}
+
+/// Enumerate every generated IP wrapper under
+/// `<workspace_dir>/target/ip/**/*.{vhd,vhdl}`. Populated by
+/// `vw::make_wrapper` — see `~/src/htcl/vw/module.htcl` — which
+/// drops one `wrapper.vhd` per IP into `target/ip/<ip>/`.
+///
+/// Returned separately from [`vhdl_design_sources`] because IP
+/// wrappers have a different lifecycle: they're TOOL-generated
+/// (regen on IP config change), not human-authored, and typically
+/// compile into their own VHDL library (`ip` by convention). The
+/// caller decides the library assignment.
+///
+/// Empty vec when `target/ip/` doesn't exist yet — a fresh
+/// workspace hasn't run `vw::make_wrapper` for anything.
+pub fn vhdl_ip_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    let ip_dir = workspace_dir.join("target").join("ip");
+    if !ip_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files =
+        find_vhdl_files(ip_dir.as_std_path(), /*recursive=*/ true, &[])?;
+    files.sort();
+    Ok(files)
+}
+
+/// Derive the VHDL library name a dep's sources compile into.
+/// Hyphens become underscores (Vivado's `xelab` and NVC both
+/// reject library names containing hyphens). Same rule
+/// `vhdl_ls.toml` generation uses so the analyzer and the
+/// synthesizer see identical library assignments.
+fn library_name_for_dep(name: &str) -> String {
+    name.replace('-', "_")
+}
+
 pub fn list_htcl_tests(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
     let test_dir = workspace_dir.join("test");
     if !test_dir.exists() {
@@ -3839,5 +4237,475 @@ mod dependency_source_tests {
         dt.per_dep.insert(name, patterns);
         let mismatches = check_target_compatibility(None, &dt);
         assert!(mismatches.is_empty());
+    }
+
+    #[test]
+    fn library_name_hyphens_become_underscores() {
+        assert_eq!(library_name_for_dep("clk-wizard"), "clk_wizard");
+        assert_eq!(library_name_for_dep("gtwiz-versal"), "gtwiz_versal");
+        assert_eq!(library_name_for_dep("cpm5"), "cpm5");
+    }
+
+    #[test]
+    fn vhdl_design_sources_empty_when_no_hdl_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        // No `hdl/` yet — return empty, not error.
+        let sources = vhdl_design_sources(&ws).unwrap();
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn vhdl_dependency_sources_skips_deps_without_src() {
+        // Regression guard: a path dep with no `src` field is
+        // htcl-only and shouldn't contribute VHDL. Previously the
+        // enumeration walked each dep's whole tree recursively,
+        // scooping up e.g. `target/ip/*/wrapper.vhd` from an htcl
+        // library's own generated artifacts.
+        let tmp = tempfile::tempdir().unwrap();
+        // Fake htcl-only dep: has a stray .vhd (like a generated
+        // wrapper) but declares no `src`.
+        let htcl_dep = tmp.path().join("htcl-only-dep");
+        std::fs::create_dir_all(htcl_dep.join("target/ip/foo")).unwrap();
+        std::fs::write(
+            htcl_dep.join("target/ip/foo/wrapper.vhd"),
+            "-- generated",
+        )
+        .unwrap();
+        // Fake VHDL dep: declares `src = ["hdl"]`.
+        let vhdl_dep = tmp.path().join("vhdl-dep");
+        std::fs::create_dir_all(vhdl_dep.join("hdl")).unwrap();
+        std::fs::write(vhdl_dep.join("hdl/mod.vhd"), "-- source").unwrap();
+
+        // Entry workspace vw.toml referencing both.
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            format!(
+                r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.htcl-only-dep]
+path = "{}"
+
+[dependencies.vhdl-dep]
+path = "{}"
+src = ["hdl"]
+recursive = true
+"#,
+                htcl_dep.display(),
+                vhdl_dep.display(),
+            ),
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        let sources = vhdl_dependency_sources(&ws_utf8).unwrap();
+        // Only the vhdl-dep contributes. htcl-only-dep is skipped
+        // even though its tree contains a .vhd file.
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].library, "vhdl_dep");
+        assert!(
+            sources[0].path.ends_with("hdl/mod.vhd"),
+            "unexpected path {}",
+            sources[0].path.display(),
+        );
+    }
+
+    #[test]
+    fn vhdl_dependency_sources_git_cache_is_flattened() {
+        // Regression: git-dep caches under `~/.vw/deps/<name>-<sha>/`
+        // are FLATTENED at copy time — `copy_vhdl_files_glob` strips
+        // the source repo's `hdl/ip/vhd/synchronizers/` prefix off,
+        // so files land directly at the cache root. Enumeration
+        // must NOT re-apply the `src` pattern as a subdir join
+        // (which would find nothing) — instead it walks the cache
+        // root recursively.
+        let tmp = tempfile::tempdir().unwrap();
+        // Simulated cache — flat file layout.
+        let cache = tmp.path().join("cache/quartz_sync-abc");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("meta_sync.vhd"), "").unwrap();
+        std::fs::write(cache.join("bacd.vhd"), "").unwrap();
+
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.quartz_sync]
+repo = "https://example.invalid/quartz"
+branch = "main"
+src = ["hdl/ip/vhd/synchronizers"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("vw.lock"),
+            format!(
+                r#"
+[dependencies.quartz_sync]
+repo = "https://example.invalid/quartz"
+commit = "abc"
+path = "{}"
+src = ["hdl/ip/vhd/synchronizers"]
+recursive = false
+sim_only = false
+submodules = false
+exclude = []
+"#,
+                cache.display(),
+            ),
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        let sources = vhdl_dependency_sources(&ws_utf8).unwrap();
+        // Both files show up despite `src` pointing at a
+        // subdirectory that doesn't exist in the flat cache.
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources.iter().all(|s| s.library == "quartz_sync"));
+    }
+
+    #[test]
+    fn vhdl_dependency_sources_finds_git_dep_via_lockfile() {
+        // Simulates the real workflow: a git dep declared in
+        // vw.toml, resolved to a cache dir via vw.lock. The
+        // lockfile's `path` is absolute so we don't need to
+        // override `VW_DEPS_DIR`.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache/quartz_sync-abc123");
+        std::fs::create_dir_all(cache.join("hdl/ip/vhd/synchronizers"))
+            .unwrap();
+        std::fs::write(
+            cache.join("hdl/ip/vhd/synchronizers/sync.vhd"),
+            "-- synced",
+        )
+        .unwrap();
+
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.quartz-sync]
+repo = "https://example.invalid/quartz"
+branch = "main"
+src = ["hdl/ip/vhd/synchronizers"]
+recursive = false
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("vw.lock"),
+            format!(
+                r#"
+[dependencies.quartz-sync]
+repo = "https://example.invalid/quartz"
+commit = "abc123"
+path = "{}"
+src = ["hdl/ip/vhd/synchronizers"]
+recursive = false
+sim_only = false
+submodules = false
+exclude = []
+"#,
+                cache.display(),
+            ),
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        let sources = vhdl_dependency_sources(&ws_utf8).unwrap();
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].library, "quartz_sync");
+        assert!(sources[0].path.ends_with("sync.vhd"));
+    }
+
+    #[test]
+    fn vhdl_dependency_sources_resolves_relative_path_dep() {
+        // Portable fixture pattern: a path dep whose `path`
+        // is relative to the declaring workspace's vw.toml —
+        // Cargo-parity. Same fixture works from any machine.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join("fixtures/lib/hdl")).unwrap();
+        std::fs::write(ws.join("fixtures/lib/hdl/a.vhd"), "").unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.lib]
+path = "fixtures/lib"
+src = ["hdl"]
+recursive = true
+"#,
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        let sources = vhdl_dependency_sources(&ws_utf8).unwrap();
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert!(sources[0].path.ends_with("hdl/a.vhd"));
+    }
+
+    #[test]
+    fn get_access_credentials_for_workspace_only_scans_test_deps_when_asked() {
+        // No netrc → both variants return None regardless of
+        // dep-set — regression guard for the `include_test`
+        // dispatch path. The bigger scenario (netrc HIT for a
+        // git URL) is covered by the underlying
+        // `get_access_credentials_from_netrc` test.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.g]
+repo = "https://example.invalid/x"
+branch = "main"
+
+[test-dependencies.gt]
+repo = "https://example.invalid/y"
+branch = "main"
+"#,
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        assert!(
+            get_access_credentials_for_workspace(&ws_utf8, false).is_none(),
+        );
+        assert!(get_access_credentials_for_workspace(&ws_utf8, true).is_none(),);
+    }
+
+    #[test]
+    fn unlocked_git_deps_detection() {
+        // No git deps → never unlocked, regardless of lockfile.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.local]
+path = "/tmp/somewhere"
+"#,
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws.clone()).unwrap();
+        assert!(!workspace_has_unlocked_git_deps(&ws_utf8, false).unwrap());
+        assert!(!workspace_has_unlocked_git_deps(&ws_utf8, true).unwrap());
+
+        // Git dep + missing lockfile → unlocked.
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.g]
+repo = "https://example.invalid/x"
+branch = "main"
+src = ["hdl"]
+"#,
+        )
+        .unwrap();
+        assert!(workspace_has_unlocked_git_deps(&ws_utf8, false).unwrap());
+
+        // Git dep + lockfile that has an entry for it → locked.
+        std::fs::write(
+            ws.join("vw.lock"),
+            r#"
+[dependencies.g]
+repo = "https://example.invalid/x"
+commit = "abc"
+path = "/tmp/g"
+src = ["hdl"]
+recursive = false
+sim_only = false
+submodules = false
+exclude = []
+"#,
+        )
+        .unwrap();
+        assert!(!workspace_has_unlocked_git_deps(&ws_utf8, false).unwrap());
+
+        // Git test-dep, lockfile only has the regular dep → unlocked
+        // for the with-test caller, locked for the plain caller.
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.g]
+repo = "https://example.invalid/x"
+branch = "main"
+
+[test-dependencies.gt]
+repo = "https://example.invalid/y"
+branch = "main"
+"#,
+        )
+        .unwrap();
+        assert!(!workspace_has_unlocked_git_deps(&ws_utf8, false).unwrap());
+        assert!(workspace_has_unlocked_git_deps(&ws_utf8, true).unwrap());
+    }
+
+    #[test]
+    fn vhdl_dependency_sources_include_test_flag() {
+        // A test-only dep contributes iff include_test is set.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep = tmp.path().join("dep");
+        std::fs::create_dir_all(dep.join("hdl")).unwrap();
+        std::fs::write(dep.join("hdl/tbutil.vhd"), "").unwrap();
+
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            format!(
+                r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[test-dependencies.tbutil]
+path = "{}"
+src = ["hdl"]
+recursive = true
+"#,
+                dep.display(),
+            ),
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        // Production mode: test-dep hidden.
+        assert!(vhdl_dependency_sources(&ws_utf8).unwrap().is_empty());
+        // Test mode: test-dep visible.
+        let with_test =
+            vhdl_dependency_sources_with_test(&ws_utf8, true).unwrap();
+        assert_eq!(with_test.len(), 1);
+        assert_eq!(with_test[0].library, "tbutil");
+    }
+
+    #[test]
+    fn vhdl_dependency_sources_honors_exclude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dep = tmp.path().join("dep");
+        std::fs::create_dir_all(dep.join("hdl/sims")).unwrap();
+        std::fs::write(dep.join("hdl/a.vhd"), "").unwrap();
+        std::fs::write(dep.join("hdl/b_tb.vhd"), "").unwrap();
+        std::fs::write(dep.join("hdl/sims/x.vhd"), "").unwrap();
+
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            format!(
+                r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[dependencies.dep]
+path = "{}"
+src = ["hdl"]
+recursive = true
+exclude = ["**/sims/**", "**/*_tb.vhd"]
+"#,
+                dep.display(),
+            ),
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        let sources = vhdl_dependency_sources(&ws_utf8).unwrap();
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert!(sources[0].path.ends_with("a.vhd"));
+    }
+
+    #[test]
+    fn vhdl_ip_sources_empty_when_no_target_ip_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        assert!(vhdl_ip_sources(&ws).unwrap().is_empty());
+    }
+
+    #[test]
+    fn vhdl_ip_sources_walks_target_ip_recursively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let ip = ws.join("target/ip");
+        std::fs::create_dir_all(ip.join("clocky")).unwrap();
+        std::fs::create_dir_all(ip.join("cips")).unwrap();
+        std::fs::write(ip.join("clocky/wrapper.vhd"), "").unwrap();
+        std::fs::write(ip.join("cips/wrapper.vhd"), "").unwrap();
+        // Non-VHDL siblings shouldn't get pulled in.
+        std::fs::write(ip.join("clocky/notes.md"), "").unwrap();
+
+        let sources = vhdl_ip_sources(&ws).unwrap();
+        let names: Vec<String> = sources
+            .iter()
+            .map(|p| {
+                let ip_name = p
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                ip_name.to_string()
+            })
+            .collect();
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(names.contains(&"clocky".to_string()));
+        assert!(names.contains(&"cips".to_string()));
+    }
+
+    #[test]
+    fn vhdl_design_sources_walks_recursive_and_sorts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let hdl = ws.join("hdl");
+        std::fs::create_dir_all(hdl.join("sub")).unwrap();
+        // Files under both root and a subdir; one non-VHDL to
+        // prove the extension filter kicks in.
+        std::fs::write(hdl.join("b.vhd"), "").unwrap();
+        std::fs::write(hdl.join("a.vhd"), "").unwrap();
+        std::fs::write(hdl.join("sub").join("c.vhdl"), "").unwrap();
+        std::fs::write(hdl.join("readme.md"), "").unwrap();
+
+        let sources = vhdl_design_sources(&ws).unwrap();
+        let names: Vec<String> = sources
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Sorted absolute paths → `a.vhd` before `b.vhd`, and
+        // `sub/c.vhdl` lands where its full path sorts. Not
+        // asserting exact order across subdirs — just checking
+        // both extensions and the recursion picked up the sub.
+        assert!(names.contains(&"a.vhd".to_string()));
+        assert!(names.contains(&"b.vhd".to_string()));
+        assert!(names.contains(&"c.vhdl".to_string()));
+        assert!(!names.contains(&"readme.md".to_string()));
     }
 }

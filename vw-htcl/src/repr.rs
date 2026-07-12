@@ -184,6 +184,53 @@ pub fn emit_primitive_prelude() -> Vec<String> {
                 proc from_raw {args} { ::vw::kwargs $args {v \"\"}; return \"\" }\n\
             }\n"
         ),
+        // list: newline-joined for repr. Tcl's default string form
+        // is space-separated with brace-escaping — technically the
+        // canonical rendering, but unreadable at scale (lists of
+        // paths are the common case at the REPL). Rendering one
+        // entry per line is the pragmatic choice.
+        //
+        // `from` / `to` stay identity — the boundary with Vivado
+        // still expects the Tcl-list byte form, only the human
+        // rendering changes. `to_raw` / `from_raw` also identity
+        // for the same reason.
+        quote_tcl!(
+            "namespace eval list {\n  \
+                proc repr {args} { ::vw::kwargs $args {v \"\"}; return [join $v \"\\n\"] }\n  \
+                proc from {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
+                proc to {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
+                proc to_raw {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
+                proc from_raw {args} { ::vw::kwargs $args {v \"\"}; return $v }\n\
+            }\n"
+        ),
+        // dict: readable, structure-aware rendering.
+        //
+        // - Single-value entries (`llength $v == 1`) render inline
+        //   as `key = value`.
+        // - Multi-value entries render as `key:` followed by one
+        //   indented item per line.
+        //
+        // The `llength > 1` heuristic isn't perfect — a bare
+        // multi-word string is ambiguous with a Tcl list at this
+        // level — but the concrete case that motivated this
+        // (JSON-derived dicts of lists via the RPC) is exactly
+        // the shape where `llength` accurately distinguishes
+        // structure from prose. `key = 1 2 3` (all-on-one-line) is
+        // unreadable for paths; `key:\n  a\n  b\n  c` is exactly
+        // what a human wants to skim.
+        //
+        // `from` / `to` / `to_raw` / `from_raw` are identity so
+        // the extern boundary still round-trips the Tcl byte
+        // form. Only human display changes.
+        quote_tcl!(
+            "namespace eval dict {\n  \
+                proc repr {args} { ::vw::kwargs $args {v \"\"}; set _out {}; dict for {_k _dv} $v { if {[llength $_dv] > 1} { lappend _out \"$_k:\"; foreach _item $_dv { lappend _out \"  $_item\" } } else { lappend _out \"$_k = $_dv\" } }; return [join $_out \"\\n\"] }\n  \
+                proc from {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
+                proc to {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
+                proc to_raw {args} { ::vw::kwargs $args {v \"\"}; return $v }\n  \
+                proc from_raw {args} { ::vw::kwargs $args {v \"\"}; return $v }\n\
+            }\n"
+        ),
     ]
 }
 
@@ -688,13 +735,15 @@ mod tests {
     #[test]
     fn primitive_prelude_emits_one_namespace_block_per_type() {
         let procs = emit_primitive_prelude();
-        // 4 types, each emitted as a single `namespace eval`
+        // 6 types, each emitted as a single `namespace eval`
         // block that internally defines repr/from/to.
-        assert_eq!(procs.len(), 4);
+        assert_eq!(procs.len(), 6);
         assert!(procs.iter().any(|p| p.contains("namespace eval string")));
         assert!(procs.iter().any(|p| p.contains("namespace eval int")));
         assert!(procs.iter().any(|p| p.contains("namespace eval bool")));
         assert!(procs.iter().any(|p| p.contains("namespace eval unit")));
+        assert!(procs.iter().any(|p| p.contains("namespace eval list")));
+        assert!(procs.iter().any(|p| p.contains("namespace eval dict")));
         // Each block contains the full triplet (repr + from + to)
         // and uses `return` in every body.
         for p in &procs {

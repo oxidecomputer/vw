@@ -2916,6 +2916,7 @@ name = "vw-vivado"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "camino",
  "colored",
  "portable-pty",
  "serde",
@@ -2926,6 +2927,7 @@ dependencies = [
  "tokio",
  "tracing",
  "vw-eda",
+ "vw-lib",
 ]
 
 [[package]]
