@@ -134,10 +134,12 @@ enum Commands {
         )]
         scaffold: bool,
     },
-    #[command(about = "Run an htcl script against a Vivado worker")]
+    #[command(about = "Run an htcl script against a Vivado worker. \
+                     With no file, discovers `<workspace>/design.htcl`.")]
     Run {
-        #[arg(help = "Path to an .htcl source file")]
-        file: Utf8PathBuf,
+        #[arg(help = "Path to an .htcl source file. Omit to run the \
+                    workspace's `design.htcl`.")]
+        file: Option<Utf8PathBuf>,
         #[arg(
             long,
             help = "Parse and print diagnostics only; don't launch Vivado"
@@ -671,8 +673,18 @@ async fn main() {
             verbose,
             info_with_stack,
         } => {
+            let resolved = match file {
+                Some(f) => f,
+                None => match discover_entry_file(&cwd) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("{} {e}", "error:".bright_red());
+                        process::exit(1);
+                    }
+                },
+            };
             if let Err(e) = run_htcl(
-                &file,
+                &resolved,
                 check,
                 part.as_deref(),
                 verbose,
@@ -694,9 +706,19 @@ async fn main() {
             part,
             info_with_stack,
         } => {
+            // Same `design.htcl` auto-discovery as `vw run`: if the
+            // user didn't pass `--load`, look for a `design.htcl`
+            // in the enclosing workspace and source it up front.
+            // Silent no-op when there's no workspace or no
+            // `design.htcl` — the REPL still boots and the user
+            // can `:load` something explicitly.
+            let resolved_load = initial_load.or_else(|| {
+                vw_lib::find_workspace_dir(cwd.as_std_path())
+                    .and_then(|ws| vw_lib::find_design_file(&ws))
+            });
             if let Err(e) = vw_repl::run(vw_repl::ReplOptions {
                 verbose,
-                initial_load,
+                initial_load: resolved_load,
                 part,
                 info_with_stack,
             })
@@ -738,8 +760,8 @@ async fn main() {
             if discovered.is_empty() {
                 eprintln!(
                     "{} nothing to check — pass a file, or run from a \
-                     directory with a `vw.toml` that has a `module.htcl` \
-                     or `test/*.htcl`",
+                     directory with a `vw.toml` that has a `design.htcl`, \
+                     `module.htcl`, or `test/*.htcl`",
                     "note:".bright_yellow(),
                 );
                 return;
@@ -1298,19 +1320,44 @@ struct CheckTarget {
 }
 
 /// Discover files to check when the user runs `vw check` from a
-/// workspace directory with no explicit file list. Adds
-/// `<ws>/module.htcl` when present (checked in normal mode) plus
-/// every `<ws>/test/**/*.htcl` (checked in test-mode).
+/// workspace directory with no explicit file list. Picks up
+/// `<ws>/design.htcl` (project entry) and `<ws>/module.htcl`
+/// (library entry) — either or both may be present — plus every
+/// `<ws>/test/**/*.htcl` (checked in test-mode).
 ///
 /// Errors when we can't find the enclosing workspace at all —
 /// otherwise returns an empty vec, letting the caller print
 /// "nothing to check" without treating it as a hard failure.
+/// Locate the workspace's `design.htcl` for a bare `vw run` with
+/// no file argument. Errors with a targeted message when the
+/// workspace doesn't have one — the user's next move is either
+/// `vw run <file>` or creating a `design.htcl`.
+fn discover_entry_file(
+    cwd: &Utf8Path,
+) -> Result<Utf8PathBuf, Box<dyn std::error::Error>> {
+    let ws = vw_lib::find_workspace_dir(cwd.as_std_path())
+        .ok_or("not in a vw workspace (no vw.toml in the parent chain)")?;
+    vw_lib::find_design_file(&ws).ok_or_else(|| {
+        format!(
+            "no `design.htcl` in {ws}; pass a file explicitly \
+             (`vw run <file>`) or create a `design.htcl`",
+        )
+        .into()
+    })
+}
+
 fn discover_check_targets(
     cwd: &Utf8Path,
 ) -> Result<Vec<CheckTarget>, Box<dyn std::error::Error>> {
     let ws = vw_lib::find_workspace_dir(cwd.as_std_path())
         .ok_or("not in a vw workspace (no vw.toml in the parent chain)")?;
     let mut targets = Vec::new();
+    if let Some(design) = vw_lib::find_design_file(&ws) {
+        targets.push(CheckTarget {
+            path: design,
+            include_test_deps: false,
+        });
+    }
     let module = ws.join("module.htcl");
     if module.is_file() {
         targets.push(CheckTarget {

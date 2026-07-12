@@ -2508,6 +2508,16 @@ fn save_workspace_config(
 /// find_workspace_dir`. The `vw-analyzer` multi-root discovery
 /// (LSP `initialize`-supplied roots) is a different concept and
 /// stays in the analyzer.
+/// Return `<workspace_dir>/design.htcl` when it exists on disk,
+/// else `None`. Mirrors the `module.htcl` convention for library
+/// workspaces — `design.htcl` is the project workspace's entry
+/// script, auto-discovered by `vw run` / `vw repl` / `vw check`
+/// when the user invokes them with no file argument.
+pub fn find_design_file(workspace_dir: &Utf8Path) -> Option<Utf8PathBuf> {
+    let p = workspace_dir.join("design.htcl");
+    p.is_file().then_some(p)
+}
+
 pub fn find_workspace_dir(start: &Path) -> Option<Utf8PathBuf> {
     // Canonicalize UP FRONT so the walk-up starts from an
     // absolute path. Callers hand us relative or empty paths in
