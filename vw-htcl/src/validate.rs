@@ -273,6 +273,7 @@ fn walk_procs_for_test_check(
                     }
                     let mut has_dedicated = false;
                     let mut target_key_present = false;
+                    let mut variant_key_present = false;
                     for value in &attr.values {
                         match value {
                             crate::ast::AttributeValue::Ident {
@@ -288,13 +289,18 @@ fn walk_procs_for_test_check(
                             }
                             crate::ast::AttributeValue::Keyed {
                                 key, ..
+                            } if key == "variant" => {
+                                variant_key_present = true;
+                            }
+                            crate::ast::AttributeValue::Keyed {
+                                key, ..
                             } => {
                                 diags.push(Diagnostic {
                                     severity: Severity::Warning,
                                     message: format!(
                                         "`@test(...)` — unrecognized key \
-                                         `{key}` (only `target=<part>` is \
-                                         supported today)"
+                                         `{key}` (recognized: `target=<part>`, \
+                                         `variant=<name>`)"
                                     ),
                                     span: attr.span,
                                 });
@@ -303,9 +309,10 @@ fn walk_procs_for_test_check(
                                 diags.push(Diagnostic {
                                     severity: Severity::Warning,
                                     message: format!(
-                                        "`@test(…)` value must be either the \
-                                         `dedicated-eda` marker or \
-                                         `target=<part>`; got `{}`",
+                                        "`@test(…)` value must be the \
+                                         `dedicated-eda` marker, \
+                                         `target=<part>`, or `variant=<name>`; \
+                                         got `{}`",
                                         render_attribute_value(value),
                                     ),
                                     span: attr.span,
@@ -320,6 +327,26 @@ fn walk_procs_for_test_check(
                                       `dedicated-eda` marker — shared-bucket \
                                       tests cannot override the \
                                       auto-project's `-part`"
+                                .into(),
+                            span: attr.span,
+                        });
+                    }
+                    if variant_key_present && !has_dedicated {
+                        diags.push(Diagnostic {
+                            severity: Severity::Warning,
+                            message: "`@test(variant=…)` requires the \
+                                      `dedicated-eda` marker — shared-bucket \
+                                      tests cannot switch design surfaces"
+                                .into(),
+                            span: attr.span,
+                        });
+                    }
+                    if target_key_present && variant_key_present {
+                        diags.push(Diagnostic {
+                            severity: Severity::Warning,
+                            message: "`@test(...)` — pick one of \
+                                      `target=<part>` or `variant=<name>`, \
+                                      not both (variants own their parts)"
                                 .into(),
                             span: attr.span,
                         });
@@ -4951,6 +4978,49 @@ proc t {} { }
             d.iter().any(|x| x.severity == Severity::Warning
                 && x.message.contains("unrecognized key")),
             "expected unrecognized-key warning: {d:?}",
+        );
+    }
+
+    #[test]
+    fn test_attribute_variant_with_dedicated_eda_ok() {
+        let src = "\
+@test(dedicated-eda variant=\"vpk120\")
+proc t {} { }
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("`@test")),
+            "unexpected @test diag: {d:?}",
+        );
+    }
+
+    #[test]
+    fn test_variant_without_dedicated_eda_warns() {
+        let src = "\
+@test(variant=\"vpk120\")
+proc t {} { }
+";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning
+                && x.message.contains("dedicated-eda")),
+            "expected dedicated-eda requirement warning: {d:?}",
+        );
+    }
+
+    #[test]
+    fn test_target_and_variant_together_warns() {
+        // Mutually exclusive within `@test` — variants own their
+        // parts, so specifying both is a config bug.
+        let src = "\
+@test(dedicated-eda target=\"xcv...\" variant=\"vpk120\")
+proc t {} { }
+";
+        let d = diags(src);
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning
+                && x.message.contains("pick one of")),
+            "expected pick-one-of warning: {d:?}",
         );
     }
 }

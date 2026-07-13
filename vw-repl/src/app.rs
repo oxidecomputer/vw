@@ -440,6 +440,7 @@ async fn run_inner(
         verbose_log_path.clone(),
         info_with_stack,
         opts.part.clone(),
+        opts.variant.clone(),
         rpc_workspace_root,
     ));
 
@@ -2725,6 +2726,7 @@ impl App {
 // Worker task: owns the Vivado backend, serializes evals.
 // ---------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_task(
     mut rx: mpsc::Receiver<WorkerCmd>,
     tx: mpsc::UnboundedSender<WorkerEvent>,
@@ -2732,43 +2734,48 @@ async fn worker_task(
     verbose_log: Option<std::path::PathBuf>,
     info_with_stack: bool,
     part: Option<String>,
+    variant: Option<String>,
     rpc_workspace_root: Option<std::path::PathBuf>,
 ) {
-    // Auto-project bootstrap: same rule as `vw run` — if the
-    // enclosing workspace declares `[[target-parts]]`, create an
-    // in-memory project up front so `ip::check`, `get_ipdefs`,
-    // and every other project-scoped call have a project to
-    // read at the first user eval. `part` is the CLI's `--part`
-    // selector; `None` uses the workspace default.
-    let auto_project_result = rpc_workspace_root
+    // Auto-project bootstrap: same rule as `vw run`. If the
+    // enclosing workspace declares `[[target-parts]]` or
+    // `[[workspace.variants]]`, create an in-memory project up
+    // front so `ip::check`, `get_ipdefs`, and every other
+    // project-scoped call have a project to read at the first
+    // user eval. `part` (part-mode workspaces) and `variant`
+    // (variant-mode workspaces) come from `--part` / `--variant`
+    // respectively; the workspace shape decides which applies.
+    let ws_utf8 = rpc_workspace_root
         .as_deref()
         .and_then(camino::Utf8Path::from_path)
-        .and_then(|ws| vw_lib::load_workspace_config(ws).ok())
-        .map(|cfg| {
-            cfg.workspace.select_target_part(part.as_deref()).map(
-                |maybe_part| {
-                    maybe_part.map(|p| vw_vivado::AutoProject {
-                        name: cfg.workspace.name.clone(),
-                        part: p.to_string(),
-                    })
-                },
-            )
-        });
-    let auto_project = match auto_project_result {
-        Some(Ok(ap)) => ap,
-        Some(Err(e)) => {
-            let _ = tx.send(WorkerEvent::StartFailed(
-                vw_eda::BackendError::Worker(e.to_string()),
-            ));
-            return;
-        }
-        None => None,
+        .map(|p| p.to_path_buf());
+    let (auto_project, active_variant) = match ws_utf8.as_deref() {
+        Some(ws) => match resolve_worker_selection(
+            ws,
+            part.as_deref(),
+            variant.as_deref(),
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = tx.send(WorkerEvent::StartFailed(
+                    vw_eda::BackendError::Worker(e),
+                ));
+                return;
+            }
+        },
+        None => (None, None),
     };
     // RPC handler — mirrors `vw run`'s. `vw::workspace_root`
     // answers with the entry / cwd's nearest `vw.toml` parent;
     // unknown methods fail loudly so future htcl calls surface
-    // a clear "unknown method" instead of hanging.
-    let rpc_handler = vw_vivado::make_handler(rpc_workspace_root);
+    // a clear "unknown method" instead of hanging. The
+    // session-scoped `active_variant` is the fallback the
+    // `vhdl_design_sources` filter uses when no per-call kwarg
+    // overrides it.
+    let rpc_handler = vw_vivado::make_handler_with_variant(
+        rpc_workspace_root,
+        active_variant,
+    );
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
         verbose_log,
@@ -3095,6 +3102,58 @@ fn send_osc52(text: &str) {
 /// Matches the recursion shape that `vw_htcl::signature_table`
 /// uses — qualified names like `util::props` resolve to a proc
 /// declared inside `namespace eval util { … }`.
+/// Same rule as `vw-cli::resolve_workspace_selection`, mirrored
+/// here so the REPL worker doesn't take a cross-crate dep on the
+/// CLI. Returns `(auto_project, active_variant)` when the
+/// workspace is happy with the flags, `Err(String)` for
+/// mode-mismatch or bad selectors.
+fn resolve_worker_selection(
+    ws: &camino::Utf8Path,
+    part: Option<&str>,
+    variant: Option<&str>,
+) -> Result<(Option<vw_vivado::AutoProject>, Option<String>), String> {
+    let Ok(cfg) = vw_lib::load_workspace_config(ws) else {
+        return Ok((None, None));
+    };
+    let ws_info = &cfg.workspace;
+    if variant.is_some() && ws_info.variants.is_empty() {
+        return Err(format!(
+            "workspace at {ws} has no `[[workspace.variants]]`; \
+             remove `--variant` or add variants to vw.toml",
+        ));
+    }
+    if part.is_some() && !ws_info.variants.is_empty() {
+        return Err(format!(
+            "workspace at {ws} is variant-mode; use `--variant <name>` \
+             instead of `--part`",
+        ));
+    }
+    if !ws_info.variants.is_empty() {
+        let Some(v) =
+            ws_info.select_variant(variant).map_err(|e| e.to_string())?
+        else {
+            return Ok((None, None));
+        };
+        return Ok((
+            Some(vw_vivado::AutoProject {
+                name: ws_info.name.clone(),
+                part: v.part.clone(),
+            }),
+            Some(v.name.clone()),
+        ));
+    }
+    let selected = ws_info
+        .select_target_part(part)
+        .map_err(|e| e.to_string())?;
+    Ok((
+        selected.map(|p| vw_vivado::AutoProject {
+            name: ws_info.name.clone(),
+            part: p.to_string(),
+        }),
+        None,
+    ))
+}
+
 fn lookup_proc_doc_comments<'a>(
     doc: &'a vw_htcl::Document,
     qualified_name: &str,

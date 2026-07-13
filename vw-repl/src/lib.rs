@@ -111,8 +111,14 @@ pub struct ReplOptions {
     pub info_with_stack: bool,
     /// Optional `--part <id>` selector — picks a non-default
     /// `[[target-parts]]` entry to drive the auto-project. `None`
-    /// uses the workspace default.
+    /// uses the workspace default. Mutually exclusive with
+    /// `variant`; the CLI enforces this via clap.
     pub part: Option<String>,
+    /// Optional `--variant <name>` selector — picks a
+    /// `[[workspace.variants]]` entry to drive the auto-project
+    /// AND to filter design sources via the session-scoped
+    /// active-variant fallback in the RPC handler.
+    pub variant: Option<String>,
 }
 
 /// Run the REPL until the user exits. Owns the terminal alternate

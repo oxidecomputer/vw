@@ -210,12 +210,29 @@ impl HtclBackend {
             {
                 if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
                     // LSP checks the DEFAULT part only — cheap and
-                    // reflects what `vw run` would boot with. The
-                    // CLI's `vw check --all-parts` covers the
-                    // wider matrix on demand.
-                    if let Ok(Some(target_part)) =
-                        cfg.workspace.default_target_part()
-                    {
+                    // reflects what `vw run` would boot with. In
+                    // variant-mode workspaces the default variant's
+                    // part is what runs by default; in part-mode
+                    // workspaces we fall back to the default target
+                    // part. The CLI's `vw check --all-parts` /
+                    // `--all-variants` covers the wider matrix on
+                    // demand.
+                    let resolved_part: Option<String> =
+                        if !cfg.workspace.variants.is_empty() {
+                            cfg.workspace
+                                .default_variant()
+                                .ok()
+                                .flatten()
+                                .map(|v| v.part.clone())
+                        } else {
+                            cfg.workspace
+                                .default_target_part()
+                                .ok()
+                                .flatten()
+                                .map(|p| p.to_string())
+                        };
+                    if let Some(target_part) = resolved_part {
+                        let target_part = target_part.as_str();
                         let dep_targets = vw_lib::collect_dep_targets(&ws);
                         let mismatches = vw_lib::check_target_compatibility(
                             Some(target_part),

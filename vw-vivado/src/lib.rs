@@ -14,6 +14,6 @@ mod handlers;
 mod rpc;
 mod worker;
 
-pub use handlers::make_handler;
+pub use handlers::{make_handler, make_handler_with_variant};
 pub use rpc::{FnHandler, RpcHandler};
 pub use worker::{AutoProject, StreamKind, VivadoBackend, VivadoConfig};

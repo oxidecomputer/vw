@@ -147,10 +147,20 @@ enum Commands {
         #[arg(
             long,
             value_name = "ID",
+            conflicts_with = "variant",
             help = "Select a non-default `[[target-parts]]` entry by full \
-                    part ID or unique substring (e.g. `--part 3HP`)"
+                    part ID or unique substring (e.g. `--part 3HP`). \
+                    Mutually exclusive with `--variant`."
         )]
         part: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "part",
+            help = "Select a non-default `[[workspace.variants]]` entry by \
+                    exact name. Variants own their parts inline."
+        )]
+        variant: Option<String>,
         #[arg(
             short,
             long,
@@ -185,10 +195,20 @@ enum Commands {
         #[arg(
             long,
             value_name = "ID",
+            conflicts_with = "variant",
             help = "Select a non-default `[[target-parts]]` entry by full \
-                    part ID or unique substring"
+                    part ID or unique substring. Mutually exclusive with \
+                    `--variant`."
         )]
         part: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "part",
+            help = "Select a non-default `[[workspace.variants]]` entry by \
+                    exact name."
+        )]
+        variant: Option<String>,
         #[arg(
             long = "info-with-stack",
             help = "Attach the Tcl call stack to INFO messages too \
@@ -205,7 +225,7 @@ enum Commands {
         #[arg(
             long,
             value_name = "ID",
-            conflicts_with = "all_parts",
+            conflicts_with_all = ["all_parts", "variant", "all_variants"],
             help = "Check against a specific `[[target-parts]]` entry by \
                     full part ID or unique substring. Default: the workspace's \
                     default part."
@@ -213,11 +233,27 @@ enum Commands {
         part: Option<String>,
         #[arg(
             long = "all-parts",
-            conflicts_with = "part",
+            conflicts_with_all = ["part", "variant", "all_variants"],
             help = "Check against every declared `[[target-parts]]` entry \
                     instead of just the default"
         )]
         all_parts: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["part", "all_parts", "all_variants"],
+            help = "Check against a specific `[[workspace.variants]]` entry \
+                    by exact name. Default: the workspace's default variant."
+        )]
+        variant: Option<String>,
+        #[arg(
+            long = "all-variants",
+            conflicts_with_all = ["part", "all_parts", "variant"],
+            help = "Check against every declared `[[workspace.variants]]` \
+                    entry (each variant's `.part`) instead of just the \
+                    default"
+        )]
+        all_variants: bool,
     },
     #[command(about = "Run htcl-level tests (@test procs under test/)")]
     Test {
@@ -234,11 +270,21 @@ enum Commands {
         #[arg(
             long,
             value_name = "ID",
+            conflicts_with = "variant",
             help = "Select the workspace-default `[[target-parts]]` entry \
                     for tests without their own `@test(target=…)`; matches \
                     by full ID or unique substring"
         )]
         part: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "part",
+            help = "Select a specific `[[workspace.variants]]` entry as the \
+                    default for tests without their own \
+                    `@test(variant=…)`"
+        )]
+        variant: Option<String>,
         #[arg(
             short,
             long,
@@ -646,6 +692,7 @@ async fn main() {
             file,
             check,
             part,
+            variant,
             verbose,
             info_with_stack,
         } => {
@@ -663,6 +710,7 @@ async fn main() {
                 &resolved,
                 check,
                 part.as_deref(),
+                variant.as_deref(),
                 verbose,
                 info_with_stack,
             )
@@ -680,6 +728,7 @@ async fn main() {
             verbose,
             initial_load,
             part,
+            variant,
             info_with_stack,
         } => {
             // Same `design.htcl` auto-discovery as `vw run`: if the
@@ -696,6 +745,7 @@ async fn main() {
                 verbose,
                 initial_load: resolved_load,
                 part,
+                variant,
                 info_with_stack,
             })
             .await
@@ -708,6 +758,8 @@ async fn main() {
             files,
             part,
             all_parts,
+            variant,
+            all_variants,
         } => {
             // Two shapes:
             //   `vw check FILE [FILE...]` — check the explicit list.
@@ -743,8 +795,18 @@ async fn main() {
                 return;
             }
             let mut had_errors = false;
-            let part_selector =
-                PartSelector::from_flags(part.as_deref(), all_parts);
+            // conflicts_with on the clap args guarantees at most
+            // one non-Default source at a time. Map both flag
+            // families to the same PartSelector; the resolver
+            // decides which config block applies based on the
+            // workspace shape.
+            let part_selector = if let Some(v) = variant.as_deref() {
+                PartSelector::Explicit(v.to_string())
+            } else if all_variants {
+                PartSelector::All
+            } else {
+                PartSelector::from_flags(part.as_deref(), all_parts)
+            };
             for target in &discovered {
                 let res = check_htcl_with_mode(
                     &target.path,
@@ -777,6 +839,7 @@ async fn main() {
             list,
             test_threads,
             part,
+            variant,
             verbose,
             info_with_stack,
         } => {
@@ -786,6 +849,7 @@ async fn main() {
                 list,
                 test_threads,
                 part.as_deref(),
+                variant.as_deref(),
                 verbose,
                 info_with_stack,
             )
@@ -1304,6 +1368,72 @@ struct CheckTarget {
 /// Errors when we can't find the enclosing workspace at all —
 /// otherwise returns an empty vec, letting the caller print
 /// "nothing to check" without treating it as a hard failure.
+/// Resolve the CLI's `--part` / `--variant` flags against the
+/// workspace's declared parts / variants and return the
+/// `(auto_project, active_variant)` pair the RPC and Vivado
+/// spawn need. Applies mutual-exclusion / mode-mismatch rules:
+///
+/// - `--variant` on a part-mode workspace (no
+///   `[[workspace.variants]]`) → error.
+/// - `--part` on a variant-mode workspace → error (variants own
+///   their parts).
+/// - Neither flag → workspace default (either the default
+///   target-part or the default variant's `.part`).
+///
+/// The `active_variant` slot flows into the RPC session so
+/// `vw::vhdl_design_sources` filters by the CLI-picked variant
+/// automatically, without design.htcl having to name it.
+pub(crate) fn resolve_workspace_selection(
+    ws: &camino::Utf8Path,
+    part: Option<&str>,
+    variant: Option<&str>,
+) -> Result<(Option<vw_vivado::AutoProject>, Option<String>), String> {
+    let Ok(cfg) = vw_lib::load_workspace_config(ws) else {
+        return Ok((None, None));
+    };
+    let ws_info = &cfg.workspace;
+    // Mode-mismatch guards.
+    if variant.is_some() && ws_info.variants.is_empty() {
+        return Err(format!(
+            "workspace at {ws} has no `[[workspace.variants]]` block; \
+             remove `--variant` or add variants to vw.toml",
+        ));
+    }
+    if part.is_some() && !ws_info.variants.is_empty() {
+        return Err(format!(
+            "workspace at {ws} is variant-mode (has \
+             `[[workspace.variants]]`); use `--variant <name>` instead of \
+             `--part` — variants own their parts inline",
+        ));
+    }
+    // Resolve to a specific variant (variant mode) or part (part mode).
+    if !ws_info.variants.is_empty() {
+        let selected =
+            ws_info.select_variant(variant).map_err(|e| e.to_string())?;
+        let Some(v) = selected else {
+            return Ok((None, None));
+        };
+        Ok((
+            Some(vw_vivado::AutoProject {
+                name: ws_info.name.clone(),
+                part: v.part.clone(),
+            }),
+            Some(v.name.clone()),
+        ))
+    } else {
+        let selected = ws_info
+            .select_target_part(part)
+            .map_err(|e| e.to_string())?;
+        Ok((
+            selected.map(|p| vw_vivado::AutoProject {
+                name: ws_info.name.clone(),
+                part: p.to_string(),
+            }),
+            None,
+        ))
+    }
+}
+
 /// Locate the workspace's `design.htcl` for a bare `vw run` with
 /// no file argument. Errors with a targeted message when the
 /// workspace doesn't have one — the user's next move is either
@@ -1379,27 +1509,61 @@ impl PartSelector {
     }
 
     /// Resolve to a concrete list of part strings against `ws_info`.
-    /// Returns an empty vec for a library workspace (no target
-    /// parts declared) — caller treats that as "no compat check."
+    /// Handles both the legacy `[[target-parts]]` shape and the
+    /// new `[[workspace.variants]]` shape (variants own their
+    /// parts inline; the compat check treats them the same way
+    /// once the part is extracted). Returns an empty vec for a
+    /// library workspace (neither block populated) — caller
+    /// treats that as "no compat check."
     fn resolve<'a>(
         &self,
         ws_info: &'a vw_lib::WorkspaceInfo,
-    ) -> std::result::Result<Vec<&'a str>, vw_lib::TargetSelectError> {
+    ) -> std::result::Result<Vec<&'a str>, String> {
+        if !ws_info.variants.is_empty() {
+            return self.resolve_variant_mode(ws_info);
+        }
         if ws_info.target_parts.is_empty() {
             return Ok(Vec::new());
         }
         match self {
-            Self::Default => {
-                Ok(ws_info.default_target_part()?.into_iter().collect())
-            }
-            Self::Explicit(q) => {
-                Ok(ws_info.select_target_part(Some(q))?.into_iter().collect())
-            }
+            Self::Default => Ok(ws_info
+                .default_target_part()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .collect()),
+            Self::Explicit(q) => Ok(ws_info
+                .select_target_part(Some(q))
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .collect()),
             Self::All => Ok(ws_info
                 .target_parts
                 .iter()
                 .map(|p| p.part.as_str())
                 .collect()),
+        }
+    }
+
+    fn resolve_variant_mode<'a>(
+        &self,
+        ws_info: &'a vw_lib::WorkspaceInfo,
+    ) -> std::result::Result<Vec<&'a str>, String> {
+        match self {
+            Self::Default => Ok(ws_info
+                .default_variant()
+                .map_err(|e| e.to_string())?
+                .map(|v| v.part.as_str())
+                .into_iter()
+                .collect()),
+            Self::Explicit(q) => Ok(ws_info
+                .select_variant(Some(q))
+                .map_err(|e| e.to_string())?
+                .map(|v| v.part.as_str())
+                .into_iter()
+                .collect()),
+            Self::All => {
+                Ok(ws_info.variants.iter().map(|v| v.part.as_str()).collect())
+            }
         }
     }
 }
@@ -1865,6 +2029,7 @@ async fn run_htcl(
     file: &camino::Utf8Path,
     check_only: bool,
     part: Option<&str>,
+    variant: Option<&str>,
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1985,30 +2150,27 @@ async fn run_htcl(
         .and_then(vw_lib::find_workspace_dir)
         .map(|p| p.into_std_path_buf());
     // Auto-project bootstrap: if the enclosing workspace declares
-    // `[[target-parts]]`, ship a `create_project -in_memory` down
-    // the wire before user code runs. `--part <id>` picks a
-    // non-default entry; otherwise we use the workspace default.
-    // Eliminates the "no open project" failure mode for
+    // `[[target-parts]]` or `[[workspace.variants]]`, ship a
+    // `create_project -in_memory` down the wire before user code
+    // runs. `--variant <name>` picks a variant (variant-mode
+    // workspaces); `--part <id>` picks a target-parts entry
+    // (part-mode workspaces). Otherwise the workspace default
+    // wins. Eliminates the "no open project" failure mode for
     // `ip::check` / `get_ipdefs` / etc., and gives the whole
     // session a stable part context for downstream
-    // implementation/timing steps. `select_target_part` errors
-    // out on bad selectors — surface those before booting Vivado.
-    let auto_project = rpc_workspace_root
+    // implementation/timing steps.
+    let ws_utf8 = rpc_workspace_root
         .as_deref()
         .and_then(camino::Utf8Path::from_path)
-        .and_then(|ws| vw_lib::load_workspace_config(ws).ok())
-        .map(|cfg| {
-            cfg.workspace.select_target_part(part).map(|maybe_part| {
-                maybe_part.map(|p| vw_vivado::AutoProject {
-                    name: cfg.workspace.name.clone(),
-                    part: p.to_string(),
-                })
-            })
-        })
-        .transpose()
-        .map_err(|e| e.to_string())?
-        .flatten();
-    let rpc_handler = vw_vivado::make_handler(rpc_workspace_root);
+        .map(|p| p.to_path_buf());
+    let (auto_project, active_variant) = match ws_utf8.as_deref() {
+        Some(ws) => resolve_workspace_selection(ws, part, variant)?,
+        None => (None, None),
+    };
+    let rpc_handler = vw_vivado::make_handler_with_variant(
+        rpc_workspace_root,
+        active_variant,
+    );
     let mut backend =
         vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
             verbose,

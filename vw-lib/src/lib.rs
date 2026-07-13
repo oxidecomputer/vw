@@ -234,8 +234,30 @@ pub struct WorkspaceInfo {
     ///
     /// Empty for library workspaces (they publish `[targets]`
     /// instead — see [`TargetsConfig`]).
+    ///
+    /// Mutually exclusive with [`variants`](Self::variants) — a
+    /// workspace declares one shape or the other, never both.
+    /// Variants own their parts inline; `[[target-parts]]` is for
+    /// projects whose parts are truly interchangeable and don't
+    /// change what source files compile.
     #[serde(default, rename = "target-parts")]
     pub target_parts: Vec<TargetPart>,
+    /// Project-scope: named feature-flag-style variants. Each
+    /// variant declares its own part inline and an optional list
+    /// of `exclusive` file paths (workspace-relative globs) that
+    /// are ONLY compiled when that variant is active.
+    ///
+    /// Mutually exclusive with [`target_parts`](Self::target_parts)
+    /// — see the docstring there. Empty for the common
+    /// "no variants" case, in which case part selection is
+    /// driven purely by `[[target-parts]]`.
+    ///
+    /// One entry must be marked `default = true` when the list
+    /// has more than one; the default drives the auto-project on
+    /// `vw run` / `vw repl` / `vw test`. The CLI's
+    /// `--variant <name>` flag selects a non-default entry.
+    #[serde(default)]
+    pub variants: Vec<Variant>,
 }
 
 /// One entry in a workspace's `[[target-parts]]` list.
@@ -275,6 +297,72 @@ pub enum TargetSelectError {
          disambiguate with a longer substring or the full part ID"
     )]
     Ambiguous { query: String, matches: Vec<String> },
+}
+
+/// One entry in a workspace's `[[workspace.variants]]` list.
+///
+/// A variant is a feature-flag-style selection that:
+/// - pins a specific Vivado part (inline, not via cross-reference)
+/// - optionally names an `exclusive` list of source-file globs
+///   (workspace-relative) that ONLY compile when this variant
+///   is the active one.
+///
+/// Files NOT listed in any variant's `exclusive` set are shared —
+/// they always contribute to `vhdl_design_sources` regardless
+/// of the active variant.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Variant {
+    /// Human-facing selector, e.g. `vpk120` or `metro`. Matched
+    /// exactly by `--variant <name>`. Must be unique within a
+    /// workspace's variants list.
+    pub name: String,
+    /// Full Vivado part identifier, e.g.
+    /// `xcvp1202-vsva2785-2MHP-e-S`. Drives the auto-project
+    /// when this variant is active.
+    pub part: String,
+    /// `true` marks this entry as the default variant. Exactly
+    /// one entry must set this when the list has more than one.
+    /// A single-entry list may omit the flag — the sole entry
+    /// is implicitly the default.
+    #[serde(default)]
+    pub default: bool,
+    /// Workspace-relative globs (e.g. `"hdl/ethernet-vpk120.vhd"`
+    /// or `"hdl/board-vpk120/**/*.vhd"`) matching files that
+    /// ONLY compile when this variant is active. Files that
+    /// don't match any variant's exclusive set are always shared.
+    #[serde(default)]
+    pub exclusive: Vec<String>,
+}
+
+/// Errors surfaced when validating or selecting a variant from a
+/// workspace's `[[variants]]` list. Same shape as
+/// [`TargetSelectError`] with variant-flavored messages.
+#[derive(Debug, thiserror::Error)]
+pub enum VariantSelectError {
+    #[error(
+        "workspace declares both `[[target-parts]]` and \
+         `[[workspace.variants]]` — they're mutually exclusive; \
+         variants own their parts inline, so remove `[[target-parts]]`"
+    )]
+    BothPartsAndVariants,
+    #[error(
+        "workspace has {count} `[[workspace.variants]]` entries but \
+         none are marked `default = true`; add `default = true` to \
+         exactly one entry"
+    )]
+    NoDefault { count: usize },
+    #[error(
+        "workspace has multiple `[[workspace.variants]]` entries \
+         marked `default = true` ({defaults:?}); only one may be default"
+    )]
+    MultipleDefaults { defaults: Vec<String> },
+    #[error("no `[[workspace.variants]]` entry named `{query}`")]
+    NoMatch { query: String },
+    #[error(
+        "duplicate variant name `{name}` in \
+         `[[workspace.variants]]` — variant names must be unique"
+    )]
+    DuplicateName { name: String },
 }
 
 impl WorkspaceInfo {
@@ -338,6 +426,58 @@ impl WorkspaceInfo {
                 matches: matches.iter().map(|p| p.part.clone()).collect(),
             }),
         }
+    }
+
+    /// Return the default variant, if any. Empty list yields
+    /// `Ok(None)` (workspaces without variants). Single-entry
+    /// list yields that entry as the implicit default
+    /// (regardless of the `default` flag). Multi-entry list
+    /// requires exactly one `default = true`.
+    pub fn default_variant(
+        &self,
+    ) -> std::result::Result<Option<&Variant>, VariantSelectError> {
+        match self.variants.len() {
+            0 => Ok(None),
+            1 => Ok(Some(&self.variants[0])),
+            _ => {
+                let defaults: Vec<&Variant> =
+                    self.variants.iter().filter(|v| v.default).collect();
+                match defaults.len() {
+                    1 => Ok(Some(defaults[0])),
+                    0 => Err(VariantSelectError::NoDefault {
+                        count: self.variants.len(),
+                    }),
+                    _ => Err(VariantSelectError::MultipleDefaults {
+                        defaults: defaults
+                            .iter()
+                            .map(|v| v.name.clone())
+                            .collect(),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Resolve a CLI `--variant <name>` selector against the
+    /// workspace's variants. `None` returns the default (via
+    /// [`default_variant`](Self::default_variant)). `Some`
+    /// matches by exact name only — unlike `--part`, no
+    /// substring fallback: variant names are short enough that
+    /// substring matching would be more confusing than useful.
+    pub fn select_variant(
+        &self,
+        query: Option<&str>,
+    ) -> std::result::Result<Option<&Variant>, VariantSelectError> {
+        let Some(q) = query else {
+            return self.default_variant();
+        };
+        self.variants
+            .iter()
+            .find(|v| v.name == q)
+            .map(Some)
+            .ok_or_else(|| VariantSelectError::NoMatch {
+                query: q.to_string(),
+            })
     }
 }
 
@@ -978,6 +1118,7 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
             name,
             version: "0.1.0".to_string(),
             target_parts: Vec::new(),
+            variants: Vec::new(),
         },
         dependencies: HashMap::new(),
         test_dependencies: HashMap::new(),
@@ -1211,6 +1352,7 @@ pub async fn add_dependency_with_token(
                     name: "workspace".to_string(),
                     version: "0.1.0".to_string(),
                     target_parts: Vec::new(),
+                    variants: Vec::new(),
                 },
                 dependencies: HashMap::new(),
                 test_dependencies: HashMap::new(),
@@ -1923,6 +2065,32 @@ fn enumerate_dep_vhdl_files(
 /// — a freshly-scaffolded workspace hasn't checked anything in
 /// yet, and that's not an error.
 pub fn vhdl_design_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    vhdl_design_sources_for_variant(workspace_dir, None)
+}
+
+/// Enumerate every VHDL source under `<workspace>/hdl/**` and
+/// filter by the `exclusive` file lists on the workspace's
+/// variants:
+///
+/// - A file is "variant-owned" if it matches any `exclusive`
+///   glob on ANY variant (across the whole list).
+/// - Variant-owned files contribute ONLY when their owning
+///   variant is the active one.
+/// - Files not in any `exclusive` set are shared and always
+///   contribute.
+///
+/// `active_variant` is the CURRENTLY active variant's name; when
+/// `None`, no variant is active (used by the analyzer's default
+/// path and by tools that don't yet flow a variant selection
+/// through). Under `None`, variant-owned files are still
+/// excluded — otherwise a variant-mode workspace would drag
+/// every other variant's exclusive sources into the surface.
+///
+/// Empty vec when `<workspace_dir>/hdl/` doesn't exist.
+pub fn vhdl_design_sources_for_variant(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<Vec<PathBuf>> {
     let hdl_dir = workspace_dir.join("hdl");
     if !hdl_dir.exists() {
         return Ok(Vec::new());
@@ -1930,7 +2098,84 @@ pub fn vhdl_design_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
     let mut files =
         find_vhdl_files(hdl_dir.as_std_path(), /*recursive=*/ true, &[])?;
     files.sort();
+    // Compile each variant's `exclusive` globs relative to the
+    // workspace root. Empty variants list → nothing to filter,
+    // early-return keeps the common no-variants path cheap.
+    let cfg = match load_workspace_config(workspace_dir) {
+        Ok(c) => c,
+        // No workspace config → can't know about variants, skip filter.
+        Err(_) => return Ok(files),
+    };
+    if cfg.workspace.variants.is_empty() {
+        return Ok(files);
+    }
+    let owner = build_variant_ownership(workspace_dir, &cfg.workspace)?;
+    files.retain(|path| {
+        match owner.owner_of(path) {
+            // Shared file — always keep.
+            None => true,
+            // Variant-owned file — keep iff active variant owns it.
+            Some(name) => Some(name) == active_variant,
+        }
+    });
     Ok(files)
+}
+
+/// Precomputed variant-ownership index. Each entry maps a
+/// canonicalized absolute path to the variant that "owns" it
+/// (the first variant whose `exclusive` glob matched during the
+/// build). Files not present in the map are shared.
+struct VariantOwnership {
+    /// Absolute path → owning variant name.
+    owners: std::collections::HashMap<PathBuf, String>,
+}
+
+impl VariantOwnership {
+    fn owner_of(&self, path: &Path) -> Option<&str> {
+        self.owners.get(path).map(|s| s.as_str())
+    }
+}
+
+fn build_variant_ownership(
+    workspace_dir: &Utf8Path,
+    ws: &WorkspaceInfo,
+) -> Result<VariantOwnership> {
+    let mut owners: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
+    for variant in &ws.variants {
+        for pattern in &variant.exclusive {
+            // Absolutize relative-to-workspace patterns so the
+            // glob crate walks the right filesystem tree.
+            let abs_pattern = workspace_dir.as_std_path().join(pattern);
+            let pattern_str =
+                abs_pattern.to_str().ok_or_else(|| VwError::FileSystem {
+                    message: format!(
+                        "variant `{}` exclusive pattern is not valid UTF-8: {}",
+                        variant.name,
+                        abs_pattern.display(),
+                    ),
+                })?;
+            let entries =
+                glob::glob(pattern_str).map_err(|e| VwError::FileSystem {
+                    message: format!(
+                        "variant `{}` invalid glob `{pattern}`: {e}",
+                        variant.name,
+                    ),
+                })?;
+            for entry in entries.flatten() {
+                if !entry.is_file() {
+                    continue;
+                }
+                // First-writer wins: if two variants claim the
+                // same file exclusively, the first entry in the
+                // list owns it. That's a config bug the user
+                // should fix; we don't error to keep the surface
+                // predictable in the interim.
+                owners.entry(entry).or_insert_with(|| variant.name.clone());
+            }
+        }
+    }
+    Ok(VariantOwnership { owners })
 }
 
 /// Enumerate every Vivado design-constraint file under
@@ -3092,8 +3337,34 @@ pub fn load_workspace_config(
         })?;
 
     let config: WorkspaceConfig = toml::from_str(&config_content)?;
-
+    validate_variant_shape(&config.workspace)?;
     Ok(config)
+}
+
+/// Post-deserialize validation for the `[[target-parts]]` /
+/// `[[workspace.variants]]` mutual exclusion + variant-name
+/// uniqueness. Returns [`VwError::Config`] with the same
+/// user-facing message the [`VariantSelectError`] carries so
+/// the loader surfaces the specific failure verbatim.
+fn validate_variant_shape(ws: &WorkspaceInfo) -> Result<()> {
+    if !ws.variants.is_empty() && !ws.target_parts.is_empty() {
+        return Err(VwError::Config {
+            message: VariantSelectError::BothPartsAndVariants.to_string(),
+        });
+    }
+    let mut seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    for v in &ws.variants {
+        if !seen.insert(v.name.as_str()) {
+            return Err(VwError::Config {
+                message: VariantSelectError::DuplicateName {
+                    name: v.name.clone(),
+                }
+                .to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn load_lock_file(workspace_dir: &Utf8Path) -> Result<LockFile> {
@@ -4284,6 +4555,197 @@ mod dependency_source_tests {
         );
     }
 
+    #[test]
+    fn workspace_config_parses_variants_block() {
+        let toml = r#"
+            [workspace]
+            name = "metroid"
+            version = "0.1.0"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+            default = true
+            exclusive = ["hdl/ethernet-vpk120.vhd"]
+
+            [[workspace.variants]]
+            name = "metro"
+            part = "xcvp1202-vsva2785-3HP-e-S"
+            exclusive = ["hdl/ethernet-metro.vhd"]
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.workspace.variants.len(), 2);
+        assert_eq!(cfg.workspace.variants[0].name, "vpk120");
+        assert_eq!(
+            cfg.workspace.variants[0].part,
+            "xcvp1202-vsva2785-2MHP-e-S"
+        );
+        assert!(cfg.workspace.variants[0].default);
+        assert_eq!(
+            cfg.workspace.variants[0].exclusive,
+            vec!["hdl/ethernet-vpk120.vhd"],
+        );
+        assert_eq!(cfg.workspace.variants[1].name, "metro");
+        assert!(!cfg.workspace.variants[1].default);
+        // Empty target_parts — variants own their parts inline.
+        assert!(cfg.workspace.target_parts.is_empty());
+    }
+
+    #[test]
+    fn variants_and_target_parts_are_mutually_exclusive() {
+        // Deserialization allows both (unknown-field serde is
+        // lenient), but `load_workspace_config` refuses to
+        // return a config that has both — variants own parts.
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+
+            [[workspace.target-parts]]
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+
+            [[workspace.variants]]
+            name = "v"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        let err = validate_variant_shape(&cfg.workspace).unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected mutual-exclusion error: {err}",
+        );
+    }
+
+    #[test]
+    fn duplicate_variant_names_error() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-3HP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        let err = validate_variant_shape(&cfg.workspace).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate variant name"),
+            "expected duplicate-name error: {err}",
+        );
+    }
+
+    #[test]
+    fn default_variant_no_variants_yields_none() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.workspace.default_variant().unwrap().is_none());
+    }
+
+    #[test]
+    fn default_variant_multi_with_default_flag() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+            default = true
+
+            [[workspace.variants]]
+            name = "metro"
+            part = "xcvp1202-vsva2785-3HP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        let v = cfg.workspace.default_variant().unwrap().unwrap();
+        assert_eq!(v.name, "vpk120");
+    }
+
+    #[test]
+    fn default_variant_multi_without_default_errors() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+
+            [[workspace.variants]]
+            name = "metro"
+            part = "xcvp1202-vsva2785-3HP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert!(matches!(
+            cfg.workspace.default_variant(),
+            Err(VariantSelectError::NoDefault { count: 2 }),
+        ));
+    }
+
+    #[test]
+    fn select_variant_exact_match_only() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+            default = true
+
+            [[workspace.variants]]
+            name = "metro"
+            part = "xcvp1202-vsva2785-3HP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        // Exact match returns the entry.
+        assert_eq!(
+            cfg.workspace
+                .select_variant(Some("metro"))
+                .unwrap()
+                .unwrap()
+                .name,
+            "metro",
+        );
+        // Substring is NOT accepted — variant names are the
+        // whole selector.
+        assert!(matches!(
+            cfg.workspace.select_variant(Some("vpk")),
+            Err(VariantSelectError::NoMatch { .. }),
+        ));
+    }
+
+    #[test]
+    fn single_variant_no_default_flag_still_parses() {
+        // A single-variant list is legal without `default = true`
+        // (the default becomes implicit — same rule as
+        // `[[target-parts]]` single-entry).
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert!(validate_variant_shape(&cfg.workspace).is_ok());
+        assert_eq!(cfg.workspace.variants.len(), 1);
+    }
+
     fn make_dep(name: &str, patterns: &[&str]) -> (String, Vec<TargetPattern>) {
         let compiled: Vec<TargetPattern> = patterns
             .iter()
@@ -4964,5 +5426,155 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         assert!(names.contains(&"b.vhd".to_string()));
         assert!(names.contains(&"c.vhdl".to_string()));
         assert!(!names.contains(&"readme.md".to_string()));
+    }
+
+    fn make_variant_ws(tmp: &tempfile::TempDir) -> Utf8PathBuf {
+        // Layout:
+        //   hdl/shared.vhd        (in no variant's exclusive → always included)
+        //   hdl/ethernet-vpk120.vhd   (owned by vpk120)
+        //   hdl/ethernet-metro.vhd    (owned by metro)
+        let ws = tmp.path().to_path_buf();
+        let hdl = ws.join("hdl");
+        std::fs::create_dir_all(&hdl).unwrap();
+        std::fs::write(hdl.join("shared.vhd"), "").unwrap();
+        std::fs::write(hdl.join("ethernet-vpk120.vhd"), "").unwrap();
+        std::fs::write(hdl.join("ethernet-metro.vhd"), "").unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[[workspace.variants]]
+name = "vpk120"
+part = "xcvp1202-vsva2785-2MHP-e-S"
+default = true
+exclusive = ["hdl/ethernet-vpk120.vhd"]
+
+[[workspace.variants]]
+name = "metro"
+part = "xcvp1202-vsva2785-3HP-e-S"
+exclusive = ["hdl/ethernet-metro.vhd"]
+"#,
+        )
+        .unwrap();
+        Utf8PathBuf::from_path_buf(ws).unwrap()
+    }
+
+    #[test]
+    fn design_sources_filter_by_active_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_ws(&tmp);
+
+        // Active variant vpk120 → keeps shared + vpk120 file,
+        // excludes metro's.
+        let sources =
+            vhdl_design_sources_for_variant(&ws, Some("vpk120")).unwrap();
+        let names: Vec<String> = sources
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"shared.vhd".to_string()));
+        assert!(names.contains(&"ethernet-vpk120.vhd".to_string()));
+        assert!(!names.contains(&"ethernet-metro.vhd".to_string()));
+
+        // Flip to metro.
+        let sources =
+            vhdl_design_sources_for_variant(&ws, Some("metro")).unwrap();
+        let names: Vec<String> = sources
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"shared.vhd".to_string()));
+        assert!(names.contains(&"ethernet-metro.vhd".to_string()));
+        assert!(!names.contains(&"ethernet-vpk120.vhd".to_string()));
+    }
+
+    #[test]
+    fn design_sources_no_active_variant_still_filters_out_owned_files() {
+        // When active_variant is None but the workspace declares
+        // variants, ALL exclusive files are dropped — otherwise
+        // we'd spuriously pull every variant's owned files into
+        // one giant surface (which is the exact bug variants
+        // exist to solve).
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_ws(&tmp);
+        let sources = vhdl_design_sources_for_variant(&ws, None).unwrap();
+        let names: Vec<String> = sources
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["shared.vhd"]);
+    }
+
+    #[test]
+    fn design_sources_no_variants_declared_returns_all() {
+        // A workspace without any variants keeps the pre-variants
+        // behavior — every `.vhd` under `hdl/` shows up.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::create_dir_all(ws.join("hdl")).unwrap();
+        std::fs::write(ws.join("hdl/a.vhd"), "").unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        let sources = vhdl_design_sources_for_variant(&ws_utf8, None).unwrap();
+        assert_eq!(sources.len(), 1);
+    }
+
+    #[test]
+    fn design_sources_variant_exclusive_supports_globs() {
+        // `exclusive = ["hdl/board-vpk120/**/*.vhd"]` scopes an
+        // entire subtree to a variant.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::create_dir_all(ws.join("hdl/board-vpk120/sub")).unwrap();
+        std::fs::create_dir_all(ws.join("hdl/board-metro")).unwrap();
+        std::fs::write(ws.join("hdl/shared.vhd"), "").unwrap();
+        std::fs::write(ws.join("hdl/board-vpk120/top.vhd"), "").unwrap();
+        std::fs::write(ws.join("hdl/board-vpk120/sub/x.vhd"), "").unwrap();
+        std::fs::write(ws.join("hdl/board-metro/top.vhd"), "").unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[[workspace.variants]]
+name = "vpk120"
+part = "xcvp1202-vsva2785-2MHP-e-S"
+default = true
+exclusive = ["hdl/board-vpk120/**/*.vhd"]
+
+[[workspace.variants]]
+name = "metro"
+part = "xcvp1202-vsva2785-3HP-e-S"
+exclusive = ["hdl/board-metro/**/*.vhd"]
+"#,
+        )
+        .unwrap();
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        let sources =
+            vhdl_design_sources_for_variant(&ws_utf8, Some("vpk120")).unwrap();
+        let names: Vec<String> = sources
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // shared + both vpk120 files, no metro files.
+        assert_eq!(sources.len(), 3, "{names:?}");
+        assert!(names.iter().any(|n| n == "shared.vhd"));
+        assert!(
+            names.iter().filter(|n| n.as_str() == "top.vhd").count() == 1,
+            "expected exactly one top.vhd (vpk120's), got {names:?}",
+        );
     }
 }

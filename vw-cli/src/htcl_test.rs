@@ -30,12 +30,14 @@ use vw_eda::EdaBackend;
 use crate::load_htcl_program_for_test;
 
 /// Entry point wired from `main.rs::Commands::Test`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_htcl_tests(
     cwd: &Utf8Path,
     filter: Option<String>,
     list: bool,
     test_threads: usize,
     part: Option<&str>,
+    variant: Option<&str>,
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -93,6 +95,7 @@ pub async fn run_htcl_tests(
             shared,
             &mut summary,
             part,
+            variant,
             verbose,
             info_with_stack,
         )
@@ -105,6 +108,7 @@ pub async fn run_htcl_tests(
             test_threads,
             &mut summary,
             part,
+            variant,
             verbose,
             info_with_stack,
         )
@@ -137,6 +141,14 @@ struct TestCase {
     /// for `dedicated-eda` tests (shared-bucket tests all reuse
     /// the workspace-default project).
     target_part_override: Option<String>,
+    /// `@test(dedicated-eda variant=<name>)` override — selects a
+    /// specific `[[workspace.variants]]` entry for this test.
+    /// The variant's `part` becomes the auto-project part; its
+    /// name flows through to `vw::vhdl_design_sources` so
+    /// variant-exclusive files filter correctly. Same
+    /// dedicated-eda restriction as `target_part_override`.
+    /// Meaningful only in variant-mode workspaces.
+    variant_override: Option<String>,
     /// Concrete Tcl lines to ship as setup before invoking the
     /// test proc. Includes proc declarations, `src`-imported code,
     /// and any top-level setup statements.
@@ -202,7 +214,8 @@ async fn discover_tests_in_file(
     // Partition statements: `@test`-proc decls are collected as
     // tests; everything else (including proc decls WITHOUT
     // `@test`, `src` imports, and top-level setup) becomes setup.
-    let mut test_procs: Vec<(String, bool, Option<String>)> = Vec::new();
+    let mut test_procs: Vec<(String, bool, Option<String>, Option<String>)> =
+        Vec::new();
     for stmt in &parsed.document.stmts {
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
@@ -227,7 +240,14 @@ async fn discover_tests_in_file(
                 // silently fall back to the workspace default.
                 let target_part_override =
                     extract_target_from_test_attr(test_attr);
-                test_procs.push((name, dedicated, target_part_override));
+                let variant_override =
+                    extract_variant_from_test_attr(test_attr);
+                test_procs.push((
+                    name,
+                    dedicated,
+                    target_part_override,
+                    variant_override,
+                ));
                 // Test proc decls MUST also be shipped as setup —
                 // Vivado has to know about the proc before we call
                 // it. Fall through to the setup-emit below.
@@ -253,7 +273,8 @@ async fn discover_tests_in_file(
         .unwrap_or_else(|_| file.to_string());
 
     let mut out = Vec::new();
-    for (name, dedicated, target_part_override) in test_procs {
+    for (name, dedicated, target_part_override, variant_override) in test_procs
+    {
         if let Some(filt) = filter {
             if !name.contains(filt) {
                 continue;
@@ -265,10 +286,33 @@ async fn discover_tests_in_file(
             name,
             dedicated,
             target_part_override,
+            variant_override,
             setup_tcl: setup_tcl.clone(),
         });
     }
     Ok(out)
+}
+
+/// Pull the `variant=<name>` keyed value out of a `@test(...)`
+/// attribute. Same shape as [`extract_target_from_test_attr`]
+/// but for the variant-mode workspace path.
+fn extract_variant_from_test_attr(attr: &vw_htcl::Attribute) -> Option<String> {
+    for v in &attr.values {
+        let vw_htcl::AttributeValue::Keyed { key, value, .. } = v else {
+            continue;
+        };
+        if key != "variant" {
+            continue;
+        }
+        return match value.as_ref() {
+            vw_htcl::AttributeValue::String { value, .. } => {
+                Some(value.clone())
+            }
+            vw_htcl::AttributeValue::Ident { value, .. } => Some(value.clone()),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Pull the `target=<part>` keyed value out of a `@test(...)`
@@ -300,16 +344,18 @@ async fn run_shared_bucket(
     tests: Vec<TestCase>,
     summary: &mut RunSummary,
     part: Option<&str>,
+    variant: Option<&str>,
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Shared bucket uses one Vivado process for every test in it,
-    // so per-test `@target(part=…)` cannot apply — that override
-    // only makes sense in dedicated-eda tests where each run gets
-    // a fresh session. The validator flags this at check time; here
-    // we silently fall back to the workspace default (or the CLI's
-    // `--part` selector if the user passed one).
-    let auto_project = workspace_auto_project(ws, part)?;
+    // so per-test `@target(part=…)` / `@target(variant=…)` cannot
+    // apply — those overrides only make sense in dedicated-eda
+    // tests where each run gets a fresh session. The validator
+    // flags this at check time; here we silently fall back to the
+    // workspace default (or the CLI's `--part` / `--variant`
+    // selector if the user passed one).
+    let auto_project = workspace_auto_project(ws, part, variant)?;
     // Show the first test's name up front with a "starting vivado"
     // status so the run doesn't look hung during the ~10-30s
     // Vivado boot. `run_one_test` overwrites this line as soon as
@@ -318,8 +364,15 @@ async fn run_shared_bucket(
         let label = format!("{}::{}", first.display_path, first.name);
         print_status_line("starting vivado", &label);
     }
-    let mut backend =
-        spawn_backend(ws, verbose, info_with_stack, auto_project).await?;
+    let active_variant = resolve_active_variant_name(ws, variant)?;
+    let mut backend = spawn_backend(
+        ws,
+        verbose,
+        info_with_stack,
+        auto_project,
+        active_variant,
+    )
+    .await?;
     // Track which file's setup we've already shipped.
     let mut shipped: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
@@ -344,12 +397,14 @@ async fn run_shared_bucket(
 
 /// Run `@test(dedicated-eda)` tests, each in its own Vivado
 /// process. `test_threads` caps parallelism.
+#[allow(clippy::too_many_arguments)]
 async fn run_dedicated_bucket(
     ws: &Utf8Path,
     tests: Vec<TestCase>,
     test_threads: usize,
     summary: &mut RunSummary,
     part: Option<&str>,
+    variant: Option<&str>,
     verbose: bool,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -359,21 +414,56 @@ async fn run_dedicated_bucket(
     // ~1-2 GB of RAM so caution around parallelism is warranted;
     // parallel exec is a follow-up.
     let _ = threads;
-    let ws_default = workspace_auto_project(ws, part)?;
+    let ws_default = workspace_auto_project(ws, part, variant)?;
+    // Precompute variant → part for cheap per-test lookup below.
+    // `None` when the workspace has no variants block; a missing
+    // variant name gets a targeted error rather than a silent
+    // fallback so a typo in `@test(dedicated-eda variant=vpk20)`
+    // fails loud.
+    let ws_cfg = vw_lib::load_workspace_config(ws).ok();
     for test in tests {
-        // Per-test `@target(part=…)` swaps the auto-project's
-        // `-part` for this test only; falls back to workspace
-        // default. Missing both → no auto-project; downstream code
-        // that needs a project must construct one itself.
-        let auto_project = match &test.target_part_override {
-            Some(part) => Some(vw_vivado::AutoProject {
+        // Resolution order per-test:
+        //   1. `variant=<name>`   → variant.part, override name  from ws_default
+        //   2. `target=<part>`    → the literal part
+        //   3. no override        → workspace default (whatever `part` selected)
+        let auto_project = if let Some(vname) = &test.variant_override {
+            let Some(cfg) = &ws_cfg else {
+                return Err(format!(
+                    "test `{}` requested variant `{}` but the workspace \
+                     has no `vw.toml` — declare a `[[workspace.variants]]` \
+                     block first",
+                    test.name, vname,
+                )
+                .into());
+            };
+            let variant = cfg
+                .workspace
+                .select_variant(Some(vname))
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "test `{}` requested variant `{}` but the workspace \
+                         has no `[[workspace.variants]]` block",
+                        test.name, vname,
+                    )
+                })?;
+            Some(vw_vivado::AutoProject {
                 name: ws_default
                     .as_ref()
                     .map(|p| p.name.clone())
                     .unwrap_or_else(|| "vw_test".to_string()),
-                part: part.clone(),
-            }),
-            None => ws_default.clone(),
+                part: variant.part.clone(),
+            })
+        } else if let Some(p) = &test.target_part_override {
+            Some(vw_vivado::AutoProject {
+                name: ws_default
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "vw_test".to_string()),
+                part: p.clone(),
+            })
+        } else {
+            ws_default.clone()
         };
         // Show the test up front so the runner announces what's
         // pending during Vivado boot (~10-30s per dedicated-eda
@@ -381,8 +471,24 @@ async fn run_dedicated_bucket(
         // spawn returns.
         let label = format!("{}::{}", test.display_path, test.name);
         print_status_line("starting vivado", &label);
-        let mut backend =
-            spawn_backend(ws, verbose, info_with_stack, auto_project).await?;
+        // Per-test variant precedence: `@test(dedicated-eda variant=…)`
+        // wins over the CLI `--variant`, which in turn wins over the
+        // workspace default. Only meaningful when the workspace is
+        // variant-mode; part-mode workspaces get `None` and the
+        // session-scoped filter stays inert.
+        let active_variant = if test.variant_override.is_some() {
+            test.variant_override.clone()
+        } else {
+            resolve_active_variant_name(ws, variant)?
+        };
+        let mut backend = spawn_backend(
+            ws,
+            verbose,
+            info_with_stack,
+            auto_project,
+            active_variant,
+        )
+        .await?;
         let mut shipped: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
         run_one_test(
@@ -526,9 +632,12 @@ async fn spawn_backend(
     verbose: bool,
     info_with_stack: bool,
     auto_project: Option<vw_vivado::AutoProject>,
+    active_variant: Option<String>,
 ) -> Result<vw_vivado::VivadoBackend, Box<dyn std::error::Error>> {
-    let rpc_handler =
-        vw_vivado::make_handler(Some(ws.as_std_path().to_path_buf()));
+    let rpc_handler = vw_vivado::make_handler_with_variant(
+        Some(ws.as_std_path().to_path_buf()),
+        active_variant,
+    );
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
         info_with_stack,
@@ -541,20 +650,75 @@ async fn spawn_backend(
     Ok(backend)
 }
 
+/// Resolve the active variant name for a workspace given the
+/// CLI's `--variant` selector. Returns `None` for workspaces with
+/// no `[[workspace.variants]]` block (variant-mode is inactive).
+/// Errors mirror `workspace_auto_project`'s selector-mismatch
+/// checks — a workspace-mode/selector mismatch is caller error.
+fn resolve_active_variant_name(
+    ws: &Utf8Path,
+    variant: Option<&str>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Ok(cfg) = vw_lib::load_workspace_config(ws) else {
+        return Ok(None);
+    };
+    if cfg.workspace.variants.is_empty() {
+        return Ok(None);
+    }
+    let selected = cfg
+        .workspace
+        .select_variant(variant)
+        .map_err(|e| e.to_string())?;
+    Ok(selected.map(|v| v.name.clone()))
+}
+
 /// Derive the auto-project from a workspace's `[[target-parts]]`
-/// block — same rule `vw run` uses. `part` is the CLI's `--part`
-/// selector (`None` picks the workspace default). Returns:
-/// - `Ok(None)` for library workspaces (no target parts declared)
-/// - `Ok(Some(_))` when a part resolves cleanly
-/// - `Err(_)` when the CLI selector is bogus or the multi-entry
-///   list has no default marked.
+/// or `[[workspace.variants]]` block — same rule `vw run` uses.
+/// - `part` is the CLI's `--part` selector; ignored when the
+///   workspace is variant-mode.
+/// - `variant` is the CLI's `--variant` selector; ignored when the
+///   workspace is part-mode.
+///
+/// Returns:
+/// - `Ok(None)` for library workspaces (neither block declared)
+/// - `Ok(Some(_))` when a part / variant resolves cleanly
+/// - `Err(_)` when the CLI selector is bogus, the multi-entry list
+///   has no default marked, or the user passed a selector that
+///   doesn't match the workspace's declared mode.
 fn workspace_auto_project(
     ws: &Utf8Path,
     part: Option<&str>,
+    variant: Option<&str>,
 ) -> Result<Option<vw_vivado::AutoProject>, Box<dyn std::error::Error>> {
     let Ok(cfg) = vw_lib::load_workspace_config(ws) else {
         return Ok(None);
     };
+    if !cfg.workspace.variants.is_empty() {
+        if part.is_some() {
+            return Err(format!(
+                "workspace `{}` declares `[[workspace.variants]]` — use \
+                 `--variant <name>` instead of `--part`",
+                cfg.workspace.name,
+            )
+            .into());
+        }
+        let selected = cfg
+            .workspace
+            .select_variant(variant)
+            .map_err(|e| e.to_string())?;
+        return Ok(selected.map(|v| vw_vivado::AutoProject {
+            name: cfg.workspace.name.clone(),
+            part: v.part.clone(),
+        }));
+    }
+    if variant.is_some() {
+        return Err(format!(
+            "workspace `{}` does not declare `[[workspace.variants]]` — \
+             remove `--variant` or add a variants block",
+            cfg.workspace.name,
+        )
+        .into());
+    }
     let selected = cfg
         .workspace
         .select_target_part(part)

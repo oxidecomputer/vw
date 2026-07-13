@@ -49,11 +49,32 @@ use crate::rpc::{FnHandler, RpcHandler};
 /// pass `None` when the caller couldn't discover one (the RPC
 /// method then returns an error instead of a bogus path).
 pub fn make_handler(workspace_root: Option<PathBuf>) -> Arc<dyn RpcHandler> {
+    make_handler_with_variant(workspace_root, None)
+}
+
+/// Like [`make_handler`] but also carries a session-scoped active
+/// variant name — the value the CLI's `--variant <name>` flag
+/// picked. When present, RPC methods that filter by variant
+/// (currently `vhdl_design_sources`) fall back to this instead
+/// of the workspace default. Explicit per-call `variant` kwargs
+/// still take precedence.
+pub fn make_handler_with_variant(
+    workspace_root: Option<PathBuf>,
+    active_variant: Option<String>,
+) -> Arc<dyn RpcHandler> {
     let workspace_root = workspace_root.map(Arc::new);
+    let active_variant = active_variant.map(Arc::new);
     FnHandler::new(move |method: String, args: Value| {
         let ws = workspace_root.clone();
+        let av = active_variant.clone();
         async move {
-            dispatch(&method, args, ws.as_deref().map(|p| p.as_ref())).await
+            dispatch(
+                &method,
+                args,
+                ws.as_deref().map(|p| p.as_ref()),
+                av.as_deref().map(|s| s.as_str()),
+            )
+            .await
         }
     })
 }
@@ -62,6 +83,7 @@ async fn dispatch(
     method: &str,
     args: Value,
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
 ) -> Result<Value, String> {
     match method {
         "workspace_root" => workspace_root
@@ -71,6 +93,9 @@ async fn dispatch(
                  parent chain"
                     .to_string()
             }),
+        "active_variant" => {
+            Ok(active_variant_value(workspace_root, active_variant))
+        }
         "diff_files" => diff_files(args),
         "vhdl_dependency_sources" => {
             vhdl_dependency_sources(
@@ -88,7 +113,10 @@ async fn dispatch(
             )
             .await
         }
-        "vhdl_design_sources" => vhdl_design_sources(workspace_root),
+        "vhdl_design_sources" => vhdl_design_sources(
+            workspace_root,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
         "vhdl_ip_sources" => vhdl_ip_sources(workspace_root),
         "design_constraints" => design_constraints(workspace_root),
         "design_synth_constraints" => {
@@ -167,11 +195,59 @@ async fn vhdl_dependency_sources(
 /// Empty array when the workspace has no `hdl/` dir yet.
 fn vhdl_design_sources(
     workspace_root: Option<&std::path::Path>,
+    variant: Option<String>,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
-    let paths = vw_lib::vhdl_design_sources(&ws)
-        .map_err(|e| format!("enumerating VHDL design sources: {e}"))?;
+    // When no variant was passed but the workspace declares
+    // variants, fall back to the workspace default so the flow
+    // "just works" from `design.htcl` without an explicit
+    // selector. The design-sources filter uses the resolved
+    // name to keep only shared + active-variant files.
+    let resolved = match variant {
+        Some(name) => Some(name),
+        None => workspace_default_variant_name(&ws),
+    };
+    let paths =
+        vw_lib::vhdl_design_sources_for_variant(&ws, resolved.as_deref())
+            .map_err(|e| format!("enumerating VHDL design sources: {e}"))?;
     Ok(paths_to_json_array(paths))
+}
+
+/// Look up the workspace's default variant name. Returns `None`
+/// when the workspace has no variants OR the variants block is
+/// malformed (no default flag on a multi-entry list). Errors
+/// are swallowed here — the caller has already produced a
+/// diagnostic through the check machinery; we don't want the
+/// RPC path to surface the same problem twice.
+fn workspace_default_variant_name(ws: &camino::Utf8Path) -> Option<String> {
+    let cfg = vw_lib::load_workspace_config(ws).ok()?;
+    cfg.workspace
+        .default_variant()
+        .ok()
+        .flatten()
+        .map(|v| v.name.clone())
+}
+
+/// `active_variant` — return the name of the variant driving this
+/// Vivado session, as a JSON string. Session-scoped precedence:
+/// the CLI's `--variant <name>` selector wins; when unset, the
+/// workspace default is used; when the workspace declares no
+/// variants at all, the empty string is returned so htcl callers
+/// can branch on `[vw::active_variant]` without try/catch.
+fn active_variant_value(
+    workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
+) -> Value {
+    if let Some(name) = active_variant {
+        return Value::String(name.to_string());
+    }
+    let ws = workspace_root
+        .and_then(|p| camino::Utf8PathBuf::from_path_buf(p.to_path_buf()).ok());
+    let name = ws
+        .as_deref()
+        .and_then(workspace_default_variant_name)
+        .unwrap_or_default();
+    Value::String(name)
 }
 
 /// `vhdl_ip_sources` — return every generated IP wrapper under
@@ -222,6 +298,16 @@ fn design_phase_constraints(
     }
     .map_err(|e| format!("enumerating phase-scoped constraint files: {e}"))?;
     Ok(paths_to_json_array(paths))
+}
+
+/// Pull the `variant` string out of an RPC args object. Missing /
+/// null / non-string values return `None` — the handler then
+/// falls back to the workspace's default variant.
+fn extract_variant(args: &Value) -> Option<String> {
+    args.as_object()
+        .and_then(|o| o.get("variant"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
 }
 
 /// Pull the `exclude_sim_only` boolean out of an RPC args object.
