@@ -41,6 +41,11 @@ pub enum PopupState {
     /// matcher state and rendering; this enum just multiplexes
     /// into [`crate::symbol_search`].
     SymbolSearch(crate::symbol_search::SymbolPicker),
+    /// Fuzzy diagnostic finder (Ctrl-F). Snapshots scrollback
+    /// Error/Warning/Notice entries; Enter jumps the viewport to
+    /// the chosen entry and drops a persistent left-gutter
+    /// marker so the user can find it in a busy log.
+    DiagnosticSearch(crate::diag_search::DiagnosticPicker),
 }
 
 /// Keybinding cheat-sheet shown by Ctrl-H. Lists every key chord the
@@ -472,6 +477,14 @@ const HELP_ROWS: &[HelpRow] = &[
     HelpRow {
         keys: "Ctrl-S",
         description: "fuzzy symbol search (Tab toggles libraries view)",
+    },
+    HelpRow {
+        keys: "Ctrl-F",
+        description: "find diagnostic in scrollback (Ctrl-E/K/W/N toggle Error/Critical/Warning/Info filters; Enter jumps + marks)",
+    },
+    HelpRow {
+        keys: "Alt-C",
+        description: "clear the diagnostic-finder jump marker",
     },
 ];
 

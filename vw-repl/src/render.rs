@@ -604,6 +604,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             collapse_state: None,
+            is_critical_warning: false,
         }
     }
 

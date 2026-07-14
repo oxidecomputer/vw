@@ -108,7 +108,7 @@ fn split_body_and_stack(text: &str) -> (String, Option<String>) {
 
 /// What category an entry in the scrollback log belongs to. Drives
 /// the per-line gutter prefix and color.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollbackKind {
     /// Echo of an input the user submitted.
     Input,
@@ -116,7 +116,15 @@ pub enum ScrollbackKind {
     Result,
     /// Captured stdout from `puts` etc. during an eval.
     Stdout,
-    /// An error — TCL-level or REPL-level.
+    /// An error — TCL-level or REPL-level. Also the visual bucket
+    /// for Vivado CRITICAL WARNINGs, which the block classifier
+    /// keeps semantically distinct for log-level filtering but
+    /// which render with the same red ✗ treatment (per the
+    /// stream handler's Severity match). Entries in this kind
+    /// that came from a CW are additionally flagged via
+    /// [`ScrollbackEntry::is_critical_warning`] so the
+    /// diagnostics finder can offer a separate `Critical` filter
+    /// checkbox on top of the Error filter.
     Error,
     /// A pre-flight warning the user should see before the
     /// underlying eval result — e.g. "this call uses keyword args
@@ -198,6 +206,15 @@ pub struct ScrollbackEntry {
     /// scrollback for a WARNING never has to expand anything to
     /// find it.
     pub collapse_state: Option<bool>,
+    /// True when this entry originated from a Vivado CRITICAL
+    /// WARNING (not a plain ERROR). The two share
+    /// [`ScrollbackKind::Error`] for rendering — same red gutter
+    /// — but the diagnostics finder uses this flag to let the
+    /// user filter Critical warnings independently of plain
+    /// Errors. Default `false` for entries pushed by paths that
+    /// don't know severity (Input echoes, Result returns,
+    /// synthetic Notices).
+    pub is_critical_warning: bool,
 }
 
 /// Drag-selection over scrollback rows. Coordinates are `(row, col)`
@@ -335,6 +352,23 @@ pub struct App {
     /// because it compared raw `text.lines().count()` against a
     /// heuristic threshold.
     last_max_scroll: u16,
+    /// Scrollback entry index the user last jumped to via the
+    /// diagnostic-finder popup (Ctrl-F → Enter). While `Some`, the
+    /// renderer paints a persistent left-gutter marker on every
+    /// wrapped row of that entry so the user can spot it in a
+    /// busy log. Alt-C clears it. `None` on startup and after
+    /// clear; not affected by scrolling or new entries appending.
+    marker_entry: Option<usize>,
+    /// One-shot request from the popup layer to scroll the
+    /// specified scrollback entry into view on the next frame.
+    /// Consumed by `ui::draw_scrollback` — it computes the
+    /// wrapped-row offset of that entry (from the same per-entry
+    /// count pass it already does) and writes it into
+    /// `scrollback_scroll` + disengages `scrollback_follow`.
+    /// Kept as a `usize` scrollback-idx rather than a pre-computed
+    /// row offset because the offset depends on area.width, which
+    /// the popup key handler doesn't know.
+    pending_jump: Option<usize>,
     reverse_search: Option<ReverseSearch>,
     /// Active LSP-style popup over the input editor (completion,
     /// signature help, hover). When `Some`, the key handler routes
@@ -703,6 +737,8 @@ impl App {
             scrollback_follow: true,
             last_rendered_scroll: 0,
             last_max_scroll: 0,
+            marker_entry: None,
+            pending_jump: None,
             reverse_search: None,
             popup: None,
             worker_state: WorkerState::Starting,
@@ -770,6 +806,36 @@ impl App {
     /// at the bottom re-engages tail-follow.
     pub fn set_last_max_scroll(&mut self, max_scroll: u16) {
         self.last_max_scroll = max_scroll;
+    }
+
+    /// Renderer-invoked writeback used by the pending-jump path —
+    /// the popup handler doesn't know area.width so it can't
+    /// compute the target scroll offset itself, and instead
+    /// stashes a `pending_jump` scrollback index that the
+    /// renderer translates into an offset and writes back here.
+    /// General-purpose scroll changes go through
+    /// [`Self::scroll_by`]; this setter is not a substitute.
+    pub fn set_scrollback_scroll(&mut self, offset: u16) {
+        self.scrollback_scroll = offset;
+    }
+
+    /// Scrollback entry index the user last jumped to (or `None`
+    /// if the marker has been cleared or was never set). Consulted
+    /// by `ui::draw_scrollback` to paint the persistent gutter
+    /// marker on that entry's wrapped rows.
+    pub fn marker_entry(&self) -> Option<usize> {
+        self.marker_entry
+    }
+
+    /// Consume any pending "scroll this entry into view" request
+    /// from the popup layer. Returns `Some(idx)` exactly once per
+    /// jump request; subsequent frames return `None`. The renderer
+    /// uses the per-entry wrapped-row count it computes anyway to
+    /// translate `idx` into an absolute scroll offset — that
+    /// translation needs area.width, which is why the popup can't
+    /// pre-compute it.
+    pub fn take_pending_jump(&mut self) -> Option<usize> {
+        self.pending_jump.take()
     }
 
     /// Toggle terminal mouse capture. Writes the enable/disable
@@ -1171,6 +1237,76 @@ impl App {
                     _ => true, // swallow other keys; popup stays open
                 }
             }
+            crate::popup::PopupState::DiagnosticSearch(picker) => {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => {
+                        self.popup = None;
+                        true
+                    }
+                    (KeyCode::Up, _) => {
+                        picker.move_up();
+                        true
+                    }
+                    (KeyCode::Down, _) => {
+                        picker.move_down();
+                        true
+                    }
+                    (KeyCode::Char('e'), m)
+                        if m.contains(KeyModifiers::CONTROL) =>
+                    {
+                        picker.toggle_kind(ScrollbackKind::Error);
+                        true
+                    }
+                    (KeyCode::Char('w'), m)
+                        if m.contains(KeyModifiers::CONTROL) =>
+                    {
+                        picker.toggle_kind(ScrollbackKind::Warning);
+                        true
+                    }
+                    (KeyCode::Char('n'), m)
+                        if m.contains(KeyModifiers::CONTROL) =>
+                    {
+                        picker.toggle_kind(ScrollbackKind::Notice);
+                        true
+                    }
+                    (KeyCode::Char('k'), m)
+                        if m.contains(KeyModifiers::CONTROL) =>
+                    {
+                        // Ctrl-K toggles the Critical-warning
+                        // subset filter. Only meaningful inside
+                        // the popup — outside, Ctrl-K is
+                        // scrollback-up, which the popup handler
+                        // shadows while active.
+                        picker.toggle_critical();
+                        true
+                    }
+                    (KeyCode::Backspace, _) => {
+                        picker.pop_char();
+                        true
+                    }
+                    (KeyCode::Char(c), m)
+                        if !m.contains(KeyModifiers::CONTROL) =>
+                    {
+                        picker.push_char(c);
+                        true
+                    }
+                    (KeyCode::Enter, _) => {
+                        // Snapshot the target BEFORE dropping the
+                        // popup — `picker` borrows through
+                        // `self.popup`; setting `self.popup = None`
+                        // invalidates it.
+                        let target = picker
+                            .current()
+                            .map(|it| (it.scrollback_idx, it.kind));
+                        self.popup = None;
+                        if let Some((idx, kind)) = target {
+                            self.jump_to_scrollback_entry(idx, kind);
+                        }
+                        true
+                    }
+                    _ => true,
+                }
+            }
         }
     }
 
@@ -1373,6 +1509,42 @@ impl App {
             ));
         let picker = crate::symbol_search::SymbolPicker::new(index);
         self.popup = Some(crate::popup::PopupState::SymbolSearch(picker));
+    }
+
+    /// Ctrl-F opens the diagnostics finder. Snapshots the current
+    /// scrollback (Error/Warning/Notice only) and hands it to the
+    /// picker. Snapshot semantics: rows appended after open aren't
+    /// visible in this session of the picker; user reopens to see
+    /// them. Prevents result-index churn while typing a query
+    /// against a still-streaming scrollback.
+    fn trigger_diagnostic_search(&mut self) {
+        let picker = crate::diag_search::DiagnosticPicker::from_scrollback(
+            &self.scrollback,
+        );
+        self.popup = Some(crate::popup::PopupState::DiagnosticSearch(picker));
+    }
+
+    /// Set the marker on `idx`, request the next render to scroll
+    /// that entry into view, and disengage tail-follow. Called
+    /// when the diagnostics-finder popup Accept fires; the
+    /// scrolling itself happens in the renderer next frame
+    /// (needs area.width to translate entry-idx → row offset).
+    /// `_kind` is captured for future use — right now the marker
+    /// styling is kind-agnostic (fixed color), but a per-kind
+    /// tint would use it.
+    fn jump_to_scrollback_entry(&mut self, idx: usize, _kind: ScrollbackKind) {
+        if idx >= self.scrollback.len() {
+            return;
+        }
+        self.marker_entry = Some(idx);
+        self.pending_jump = Some(idx);
+        self.scrollback_follow = false;
+    }
+
+    /// Alt-C clears the persistent marker. No-op when no marker
+    /// is set; harmless to press repeatedly.
+    fn clear_marker(&mut self) {
+        self.marker_entry = None;
     }
 
     /// Insert `text` at the current cursor position, replacing the
@@ -1898,6 +2070,20 @@ impl App {
                 // multiplexers, and "S" for "search" is the more
                 // discoverable mnemonic.)
                 self.trigger_symbol_search();
+            }
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                // Fuzzy diagnostics finder. Snapshots the current
+                // scrollback's Error/Warning/Notice entries. Enter
+                // jumps the viewport to the chosen entry and drops
+                // a persistent left-gutter marker (Alt-C clears).
+                self.trigger_diagnostic_search();
+            }
+            (KeyCode::Char('c'), KeyModifiers::ALT) => {
+                // Clear the diagnostics-finder jump marker. No-op
+                // when nothing is marked. Picked Alt-C over Ctrl-L
+                // (which many terminals eat for "clear screen") and
+                // Ctrl-K (already bound to scroll-up).
+                self.clear_marker();
             }
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 self.history_step(-1);
@@ -2590,6 +2776,10 @@ impl App {
                             self.push_none_block(lines);
                         }
                         vw_vivado::Block::Diagnostic { severity, lines } => {
+                            let is_critical = matches!(
+                                severity,
+                                vw_vivado::Severity::CriticalWarning
+                            );
                             let scrollback_kind = match severity {
                                 vw_vivado::Severity::Info => {
                                     ScrollbackKind::Notice
@@ -2603,6 +2793,9 @@ impl App {
                                 // keeps them semantically distinct
                                 // for log-level filtering, but the
                                 // visual severity is the same.
+                                // `is_critical` above carries the
+                                // discriminator through to the
+                                // scrollback entry for the finder.
                                 vw_vivado::Severity::CriticalWarning
                                 | vw_vivado::Severity::Error => {
                                     ScrollbackKind::Error
@@ -2615,33 +2808,14 @@ impl App {
                                     ScrollbackKind::Stdout
                                 }
                             };
-                            // Rejoin the diagnostic's lines (severity
-                            // header + any `at <path>:<line>` stack
-                            // frames the shim attached), rewrite Tcl
-                            // frames onto real htcl source, then tag
-                            // traceless warnings/errors with the
-                            // currently-executing user command's
-                            // origin — same treatment vw run applies
-                            // via `render_chunk`.
                             let joined = lines.join("\n");
                             let resolved = self.resolve_stack_frames(&joined);
                             let tagged = self.tag_streamed_message(
                                 scrollback_kind,
                                 resolved,
                             );
-                            // Split the diagnostic body from any
-                            // attached stack trace so the message
-                            // itself stays fully visible while the
-                            // `at <path>:<line> in ::<proc>` tail
-                            // becomes its own start-collapsed
-                            // entry. Without this the entire entry
-                            // (message + stack) is toggleable as
-                            // one unit, and a small 3-line WARNING
-                            // shows a `▼` marker that clutters the
-                            // scrollback without buying any real
-                            // ability to elide meaningful noise.
                             let (body, stack) = split_body_and_stack(&tagged);
-                            self.push(scrollback_kind, body);
+                            self.push_diag(scrollback_kind, body, is_critical);
                             if let Some(stack) = stack {
                                 self.push_stack_trace(stack);
                             }
@@ -2678,6 +2852,10 @@ impl App {
                             // scrollback-kind mapping as the
                             // Stream-event path so future accumulator
                             // changes don't silently lose messages.
+                            let is_critical = matches!(
+                                severity,
+                                vw_vivado::Severity::CriticalWarning
+                            );
                             let scrollback_kind = match severity {
                                 vw_vivado::Severity::Info => {
                                     ScrollbackKind::Notice
@@ -2700,7 +2878,7 @@ impl App {
                                 resolved,
                             );
                             let (body, stack) = split_body_and_stack(&tagged);
-                            self.push(scrollback_kind, body);
+                            self.push_diag(scrollback_kind, body, is_critical);
                             if let Some(stack) = stack {
                                 self.push_stack_trace(stack);
                             }
@@ -2914,6 +3092,43 @@ impl App {
             started_at,
             completed_at: None,
             collapse_state,
+            is_critical_warning: false,
+        });
+    }
+
+    /// Push a diagnostic that came from the Vivado stream, tagging
+    /// it as a CRITICAL WARNING when the source severity was
+    /// `Severity::CriticalWarning`. CW entries share
+    /// [`ScrollbackKind::Error`]'s red gutter but carry the
+    /// [`ScrollbackEntry::is_critical_warning`] flag so the
+    /// diagnostics-finder popup can offer a `Critical` filter
+    /// checkbox that surfaces just them.
+    pub(crate) fn push_diag(
+        &mut self,
+        kind: ScrollbackKind,
+        text: String,
+        is_critical_warning: bool,
+    ) {
+        if !is_critical_warning {
+            self.push(kind, text);
+            return;
+        }
+        // CW path: mirror `push`'s tab expansion + collapse-state
+        // logic (single source of truth would be nicer but the
+        // needed customization is tiny), then set the flag.
+        let text = if text.contains('\t') {
+            text.replace('\t', "    ")
+        } else {
+            text
+        };
+        let collapse_state = compute_collapse_state(&text, self.collapse_mode);
+        self.scrollback.push(ScrollbackEntry {
+            kind,
+            text,
+            started_at: None,
+            completed_at: None,
+            collapse_state,
+            is_critical_warning: true,
         });
     }
 
@@ -2962,6 +3177,7 @@ impl App {
             started_at: None,
             completed_at: None,
             collapse_state,
+            is_critical_warning: false,
         });
     }
 

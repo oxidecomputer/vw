@@ -20,6 +20,7 @@
 
 mod app;
 pub mod config;
+pub mod diag_search;
 pub mod highlight;
 pub mod highlight_htcl;
 mod history;

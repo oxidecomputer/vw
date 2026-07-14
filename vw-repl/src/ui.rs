@@ -65,6 +65,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             crate::popup::PopupState::SymbolSearch(p) => {
                 crate::symbol_search::draw_symbol_picker(f, p);
             }
+            crate::popup::PopupState::DiagnosticSearch(p) => {
+                crate::diag_search::draw_diagnostic_picker(f, p);
+            }
         }
     }
 }
@@ -134,6 +137,33 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     app.set_scrollback_area(paragraph_area);
 
     let max_scroll = total.saturating_sub(paragraph_area.height as u32);
+    // Consume any pending "jump this entry into view" request from
+    // the diagnostics-finder popup. Translation happens here (not
+    // in App) because it needs the per-entry wrapped-row counts we
+    // just computed — the popup key handler doesn't know
+    // area.width. Center-aligned when possible so the marked
+    // entry sits in the middle of the viewport; otherwise
+    // clamped by max_scroll.
+    if let Some(jump_idx) = app.take_pending_jump() {
+        let mut acc: u32 = 0;
+        for (i, c) in counts.iter().enumerate() {
+            if i == jump_idx {
+                break;
+            }
+            acc = acc.saturating_add(*c);
+        }
+        let center_offset = acc
+            .saturating_sub(paragraph_area.height as u32 / 3)
+            .min(max_scroll)
+            .min(u32::from(u16::MAX)) as u16;
+        // Writing scrollback_scroll (via App's setter) requires a
+        // path through the crate; simpler is to write the offset
+        // through set_last_rendered_scroll AND scrollback_scroll —
+        // we do both here so tail-follow disengage (done by the
+        // popup handler) sticks and the effective offset the
+        // renderer uses below is the jumped one.
+        app.set_scrollback_scroll(center_offset);
+    }
     let scroll_offset = if app.scrollback_follow() {
         max_scroll
     } else {
@@ -250,6 +280,57 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     // visual separation between the two regions.
     let paragraph = Paragraph::new(visible).scroll((local_scroll, 0));
     f.render_widget(paragraph, paragraph_area);
+
+    // Marker overlay for the entry the user jumped to via
+    // the diagnostics finder (Ctrl-F → Enter). Persistent until
+    // Alt-C clears it. Paints a bright colored bar in the
+    // leftmost column of every visible wrapped row of the marked
+    // entry. Color follows the entry's kind (red for Error,
+    // orange for Warning, gray for Notice) so the marker also
+    // reinforces the severity at a glance.
+    if let Some(marker_idx) = app.marker_entry() {
+        // Compute absolute row range of the marked entry.
+        let mut acc: u32 = 0;
+        let mut marker_range: Option<(u32, u32)> = None;
+        for (i, c) in counts.iter().enumerate() {
+            if i == marker_idx {
+                marker_range = Some((acc, acc.saturating_add(*c)));
+                break;
+            }
+            acc = acc.saturating_add(*c);
+        }
+        if let Some((start, end)) = marker_range {
+            // Intersect with viewport row range.
+            let iso_start = start.max(scroll_offset);
+            let iso_end = end.min(
+                scroll_offset.saturating_add(paragraph_area.height as u32),
+            );
+            if iso_start < iso_end {
+                let kind = app.scrollback().get(marker_idx).map(|e| e.kind);
+                let marker_color = match kind {
+                    Some(crate::app::ScrollbackKind::Error) => Color::Red,
+                    Some(crate::app::ScrollbackKind::Warning) => {
+                        Color::Rgb(255, 140, 0)
+                    }
+                    Some(crate::app::ScrollbackKind::Notice) => {
+                        Color::Rgb(180, 130, 220)
+                    }
+                    _ => Color::Rgb(180, 130, 220),
+                };
+                let marker_style = Style::default()
+                    .fg(marker_color)
+                    .add_modifier(Modifier::BOLD);
+                let buf = f.buffer_mut();
+                for row in iso_start..iso_end {
+                    let y = paragraph_area.y + (row - scroll_offset) as u16;
+                    // `▎` = left one-eighth block — reads as a
+                    // continuous vertical bar down the left edge
+                    // when stacked across rows.
+                    buf.set_string(paragraph_area.x, y, "▎", marker_style);
+                }
+            }
+        }
+    }
 
     // Scrollbar overlay — only when content overflows the viewport.
     // ScrollbarState's `content_length` is the total scrollable
