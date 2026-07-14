@@ -96,6 +96,7 @@ async fn dispatch(
         "active_variant" => {
             Ok(active_variant_value(workspace_root, active_variant))
         }
+        "project_name" => project_name_value(workspace_root),
         "diff_files" => diff_files(args),
         "vhdl_dependency_sources" => {
             vhdl_dependency_sources(
@@ -226,6 +227,24 @@ fn workspace_default_variant_name(ws: &camino::Utf8Path) -> Option<String> {
         .ok()
         .flatten()
         .map(|v| v.name.clone())
+}
+
+/// `project_name` — return the `[workspace] name` field of the
+/// entry workspace's `vw.toml`, as a JSON string. Errors when no
+/// workspace can be discovered; the shim propagates that as a
+/// normal Tcl error so htcl callers can branch on it.
+///
+/// Used by `vw::synth` and other library procs that want to tag
+/// log messages with the project name (`log::info -id [vw::project_name]
+/// -msg "…"`) without hard-coding it in every entry file.
+fn project_name_value(
+    workspace_root: Option<&std::path::Path>,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let cfg = vw_lib::load_workspace_config(&ws).map_err(|e| {
+        format!("failed to load workspace config at {ws}: {e}")
+    })?;
+    Ok(Value::String(cfg.workspace.name.clone()))
 }
 
 /// `active_variant` — return the name of the variant driving this
