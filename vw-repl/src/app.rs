@@ -2787,6 +2787,25 @@ impl App {
         } else {
             None
         };
+        // Expand tabs to spaces at push time so BOTH `entry_lines_
+        // windowed` (which builds rendered spans) and `count_wrapped_
+        // rows` (which does the outer viewport math) see the same
+        // character content. If a `\t` survives into the render
+        // pipeline, ratatui's Buffer writes a `\t` cell that
+        // iTerm2 (and any real terminal) interprets as "move
+        // cursor to next tab stop" — a control code, not a
+        // printable glyph. Cells between the cursor's start
+        // column and the tab stop stay whatever they were in the
+        // previous frame, producing the `728_` / `FO:` / `.v:`
+        // leftover fragments Vivado's parameter-dump output was
+        // showing. Four spaces per tab matches typical editor
+        // defaults and keeps the expansion fixed-count so
+        // downstream width math (`chars().count()`) stays honest.
+        let text = if text.contains('\t') {
+            text.replace('\t', "    ")
+        } else {
+            text
+        };
         // Uniform Mathematica-notebook-style collapsibility: every
         // multi-line entry is toggleable (Shift+click), and
         // anything larger than COLLAPSE_AUTO_THRESHOLD lines starts

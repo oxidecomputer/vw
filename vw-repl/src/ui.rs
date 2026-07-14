@@ -190,6 +190,17 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
         .saturating_sub(skipped_rows)
         .min(u32::from(u16::MAX)) as u16;
 
+    // Blank the scrollback area first. ratatui's Paragraph doesn't
+    // guarantee overwriting cells past its own content, so a frame
+    // that emits shorter/fewer wrapped lines than the previous one
+    // (very common under live streaming — a new INFO chunk shifts
+    // the viewport and the tail cells of the prior frame stay
+    // dirty) shows up as leftover fragments in the wrong color,
+    // usually looking like `INFO:` / `.v:` / hex-digit tails
+    // grafted onto the front of the current line. `Clear` writes
+    // spaces with the default style over `area`, so subsequent
+    // paragraph render lands on a clean slate.
+    f.render_widget(Clear, area);
     // No surrounding block: the scrollback's main job is to be
     // copy-pastable. A box-drawing border around each visible row
     // means any selection that spans full lines pulls in `│` chars
