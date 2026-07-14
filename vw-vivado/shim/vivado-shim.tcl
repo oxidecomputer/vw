@@ -1214,6 +1214,36 @@ proc ::vw::qualify_proc_name {name caller_ns} {
 # Install the ::proc override. Idempotent — re-running is cheap
 # once the wrapper is in place. The original `proc` is renamed to
 # `::vw::orig_proc_for_body_wrap` and delegated to.
+## Install a proc WITHOUT the body-wrap. Called by codegen-emitted
+## infrastructure (enum variant constructors, `<T>::to_raw` /
+## `<T>::from_raw` lifts, list/dict monomorphized repr walkers,
+## primitive-type identity procs) where the wrap's per-call
+## `capture_stack` + `emit_pty_ctx_begin/end` cost dwarfs the actual
+## work — a proc that only does `return [list Scalar $v]` shouldn't
+## take 100μs of instrumentation per call, and calling it 200K
+## times during collection construction pushes total overhead into
+## the multi-second range for no debug benefit.
+##
+## Named `codegen_proc` (not `proc_no_wrap` or similar) so the
+## intent is clear at the emit site: this is for COMPILER-EMITTED
+## infrastructure, not for user-authored procs the user might want
+## to opt out of instrumentation on. Per-user opt-out — if we ever
+## need it — is a separate mechanism.
+##
+## Behavior when the body-wrap isn't installed yet (very early
+## shim startup, before `install_proc_body_wrap` runs): falls
+## through to the raw `::proc` builtin. Codegen shipped before the
+## wrap install still produces working procs; they don't gain the
+## wrap retroactively once it installs, which is exactly the point
+## — they opted out.
+proc ::vw::codegen_proc {name spec body} {
+    if {[info commands ::vw::orig_proc_for_body_wrap] ne ""} {
+        uplevel 1 [list ::vw::orig_proc_for_body_wrap $name $spec $body]
+    } else {
+        uplevel 1 [list ::proc $name $spec $body]
+    }
+}
+
 proc ::vw::install_proc_body_wrap {} {
     if {[info commands ::vw::orig_proc_for_body_wrap] ne ""} {
         return
@@ -1243,8 +1273,51 @@ proc ::vw::install_proc_body_wrap {} {
         # user eval might reach into. `::vw::*` covers our shim,
         # `::tcl::*` guards Tcl's core, everything else in the
         # top-level or user namespaces gets the wrap.
+        #
+        # Also skip codegen-emitted infrastructure procs — the
+        # compiler-generated per-type `repr` / `to` / `from` /
+        # `to_raw` / `from_raw` lifts, `tag` / `payload` /
+        # `empty` helpers, and the top-level `::putr`. Each of
+        # these is a tiny passthrough proc where the per-call
+        # `capture_stack` + `emit_pty_ctx_begin/end` cost
+        # dominates: a `list<bd_pin>` return with a million
+        # elements calls `bd_pin::repr` a million times, and a
+        # `Properties`-typed proc constructing 200K entries calls
+        # `Property::Scalar` 200K times. The raw log for those
+        # cases shows the wait period is almost entirely
+        # `__VW_CTX_BEGIN__` / `__VW_CTX_END__` marker traffic,
+        # not the actual work. Stack context on a proc that just
+        # does `return [list Scalar $v]` adds nothing.
+        #
+        # Enum variant constructors (`Property::Scalar` etc.)
+        # have no distinctive name pattern, so we detect them
+        # structurally via the body-shape regex below.
         if {[string match ::vw::* $qualified]
-            || [string match ::tcl::* $qualified]} {
+            || [string match ::tcl::* $qualified]
+            || [string match *::repr $qualified]
+            || [string match *::to $qualified]
+            || [string match *::from $qualified]
+            || [string match *::to_raw $qualified]
+            || [string match *::from_raw $qualified]
+            || [string match *::tag $qualified]
+            || [string match *::payload $qualified]
+            || [string match *::empty $qualified]
+            || $qualified eq "::putr"} {
+            return [uplevel 1 [list ::vw::orig_proc_for_body_wrap \
+                $name $spec $body]]
+        }
+        # Enum-variant-constructor detection: body is exactly
+        # `return [list <ident>]` (empty payload) or
+        # `return [list <ident> $v]` (single-payload). This is the
+        # canonical shape `emit_constructor` in vw-htcl emits, and
+        # a user writing that body verbatim would get their proc
+        # silently un-instrumented — an acceptable false-positive
+        # since (a) no stack trace context is genuinely useful for
+        # a one-liner list-wrapper, and (b) the pattern is narrow
+        # enough to be near-impossible to hit by accident.
+        if {[regexp \
+                {^\s*return\s+\[list\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+\$v)?\]\s*$} \
+                $body]} {
             return [uplevel 1 [list ::vw::orig_proc_for_body_wrap \
                 $name $spec $body]]
         }

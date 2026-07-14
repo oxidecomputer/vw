@@ -11,9 +11,15 @@
 //! the `eval` op only; structured ops land in phase 4.
 
 mod handlers;
+mod raw_log;
 mod rpc;
+pub mod stream;
 mod worker;
 
 pub use handlers::{make_handler, make_handler_with_variant};
+pub use raw_log::raw_log_path_for_workspace;
 pub use rpc::{FnHandler, RpcHandler};
+pub use stream::{
+    severity_of, stream_kind_for, Block, BlockAccumulator, LogLevel, Severity,
+};
 pub use worker::{AutoProject, StreamKind, VivadoBackend, VivadoConfig};

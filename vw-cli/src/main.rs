@@ -46,6 +46,38 @@ impl From<CliVhdlStandard> for VhdlStandard {
     }
 }
 
+/// Clap ValueEnum mirror of [`vw_vivado::LogLevel`]. Lives here
+/// rather than in vw-vivado so the backend crate stays clap-free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliLogLevel {
+    /// Show every block raw — including Vivado's banners, tables,
+    /// hierarchy summaries, and other non-diagnostic noise. The
+    /// same content the raw `vivado.log` receives.
+    Debug,
+    /// Show INFO+ diagnostics. NONE-block noise renders dimmed
+    /// (vw run) or collapsed (repl). Default.
+    Info,
+    /// Show WARNING+ diagnostics. NONE + INFO are elided.
+    Warning,
+    /// Show CRITICAL WARNING+ diagnostics. NONE + INFO + WARNING
+    /// are elided.
+    Critical,
+    /// Show only ERRORs. Everything else is elided.
+    Error,
+}
+
+impl From<CliLogLevel> for vw_vivado::LogLevel {
+    fn from(lvl: CliLogLevel) -> Self {
+        match lvl {
+            CliLogLevel::Debug => vw_vivado::LogLevel::Debug,
+            CliLogLevel::Info => vw_vivado::LogLevel::Info,
+            CliLogLevel::Warning => vw_vivado::LogLevel::Warning,
+            CliLogLevel::Critical => vw_vivado::LogLevel::Critical,
+            CliLogLevel::Error => vw_vivado::LogLevel::Error,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "vw")]
 #[command(about = "A VHDL workspace management tool")]
@@ -162,11 +194,16 @@ enum Commands {
         )]
         variant: Option<String>,
         #[arg(
-            short,
-            long,
-            help = "Forward Vivado's banner and info messages to stderr"
+            long = "log-level",
+            value_enum,
+            default_value_t = CliLogLevel::Info,
+            help = "Minimum severity to show. `debug` shows everything \
+                    (including Vivado's non-diagnostic noise); INFO+ \
+                    filters and dims/collapses non-diagnostic output. \
+                    The full raw stream always lands in \
+                    `<workspace>/target/logs/vivado-*.log`."
         )]
-        verbose: bool,
+        log_level: CliLogLevel,
         #[arg(
             long = "info-with-stack",
             help = "Attach the Tcl call stack to INFO messages too \
@@ -181,11 +218,14 @@ enum Commands {
     )]
     Repl {
         #[arg(
-            short,
-            long,
-            help = "Forward Vivado's banner / info chatter to scrollback"
+            long = "log-level",
+            value_enum,
+            default_value_t = CliLogLevel::Info,
+            help = "Minimum severity shown in scrollback. `debug` shows \
+                    every block raw; INFO+ collapses non-diagnostic \
+                    output into a togglable placeholder."
         )]
-        verbose: bool,
+        log_level: CliLogLevel,
         #[arg(
             long = "load",
             value_name = "FILE",
@@ -286,11 +326,13 @@ enum Commands {
         )]
         variant: Option<String>,
         #[arg(
-            short,
-            long,
-            help = "Forward Vivado banner/info to stderr during test evals"
+            long = "log-level",
+            value_enum,
+            default_value_t = CliLogLevel::Info,
+            help = "Minimum severity to show during test evals. See \
+                    `vw run --help` for the full model."
         )]
-        verbose: bool,
+        log_level: CliLogLevel,
         #[arg(
             long = "info-with-stack",
             help = "Attach the Tcl call stack to INFO messages too"
@@ -693,7 +735,7 @@ async fn main() {
             check,
             part,
             variant,
-            verbose,
+            log_level,
             info_with_stack,
         } => {
             let resolved = match file {
@@ -711,7 +753,7 @@ async fn main() {
                 check,
                 part.as_deref(),
                 variant.as_deref(),
-                verbose,
+                log_level.into(),
                 info_with_stack,
             )
             .await
@@ -725,7 +767,7 @@ async fn main() {
             vw_analyzer::run_stdio().await;
         }
         Commands::Repl {
-            verbose,
+            log_level,
             initial_load,
             part,
             variant,
@@ -742,7 +784,7 @@ async fn main() {
                     .and_then(|ws| vw_lib::find_design_file(&ws))
             });
             if let Err(e) = vw_repl::run(vw_repl::ReplOptions {
-                verbose,
+                log_level: log_level.into(),
                 initial_load: resolved_load,
                 part,
                 variant,
@@ -840,7 +882,7 @@ async fn main() {
             test_threads,
             part,
             variant,
-            verbose,
+            log_level,
             info_with_stack,
         } => {
             if let Err(e) = htcl_test::run_htcl_tests(
@@ -850,7 +892,7 @@ async fn main() {
                 test_threads,
                 part.as_deref(),
                 variant.as_deref(),
-                verbose,
+                log_level.into(),
                 info_with_stack,
             )
             .await
@@ -1854,6 +1896,75 @@ fn ansi_from_pieces(pieces: &[vw_repl::highlight::Piece]) -> String {
     out
 }
 
+/// Encode a [`vw_vivado::Severity`] as a `u8` matching the ladder's
+/// `PartialOrd`. Used for `AtomicU8::fetch_max` on the "worst seen
+/// during this session" counter — atomic comparison over the raw
+/// integer is thread-safe without needing a mutex, and the mapping
+/// is a static one-liner rather than a lookup table.
+fn severity_as_u8(s: vw_vivado::Severity) -> u8 {
+    match s {
+        vw_vivado::Severity::None => 0,
+        vw_vivado::Severity::Info => 1,
+        vw_vivado::Severity::Warning => 2,
+        vw_vivado::Severity::CriticalWarning => 3,
+        vw_vivado::Severity::Error => 4,
+    }
+}
+
+/// Render one classified [`vw_vivado::Block`] to stdout, applying the
+/// user-selected log level:
+///
+/// - `Block::Diagnostic { severity, .. }` — passes through
+///   [`render_chunk`] with the block joined back into a single
+///   chunk, provided the severity clears `log_level`.
+/// - `Block::None { .. }` — at `LogLevel::Debug`, renders raw via
+///   the Stdout path so users see every byte Vivado emitted. At
+///   Info+, prints each line dimmed so users still know noise
+///   flowed through without it dominating the console. (The REPL's
+///   version of this path renders NONE blocks as a togglable
+///   collapsed placeholder — vw run's flat output can't collapse,
+///   so it dims instead.)
+fn render_block(
+    block: &vw_vivado::Block,
+    log_level: vw_vivado::LogLevel,
+    proc_table: &std::collections::HashMap<String, vw_repl::ProcLocation>,
+    origin: Option<&vw_repl::Origin>,
+    input_file: Option<&std::path::Path>,
+) {
+    use colored::Colorize;
+    match block {
+        vw_vivado::Block::Diagnostic { severity, lines } => {
+            if !log_level.allows(*severity) {
+                return;
+            }
+            let kind = vw_vivado::stream_kind_for(*severity);
+            let joined = lines.join("\n");
+            render_chunk(kind, &joined, proc_table, origin, input_file);
+        }
+        vw_vivado::Block::None { lines } => {
+            if matches!(log_level, vw_vivado::LogLevel::Debug) {
+                // Raw pass-through — same style as if it hadn't been
+                // block-grouped at all.
+                let joined = lines.join("\n");
+                render_chunk(
+                    vw_vivado::StreamKind::Stdout,
+                    &joined,
+                    proc_table,
+                    origin,
+                    input_file,
+                );
+            } else {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                for line in lines {
+                    let _ = writeln!(out, "{}", line.dimmed());
+                }
+                let _ = out.flush();
+            }
+        }
+    }
+}
+
 /// Stream-sink rendering for `vw run`. Mirrors the REPL's
 /// scrollback colors + stack-frame rewriting so both surfaces
 /// look the same:
@@ -1921,7 +2032,8 @@ fn render_chunk(
         _ => resolved,
     };
     let prefix = match kind {
-        vw_vivado::StreamKind::Error => "✗ ",
+        vw_vivado::StreamKind::Error
+        | vw_vivado::StreamKind::CriticalWarning => "✗ ",
         vw_vivado::StreamKind::Warning => "⚠ ",
         vw_vivado::StreamKind::Info => "· ",
         vw_vivado::StreamKind::Stdout => "",
@@ -1934,7 +2046,10 @@ fn render_chunk(
             "  "
         };
         let styled_prefix: String = match kind {
-            vw_vivado::StreamKind::Error => leading.red().bold().to_string(),
+            vw_vivado::StreamKind::Error
+            | vw_vivado::StreamKind::CriticalWarning => {
+                leading.red().bold().to_string()
+            }
             vw_vivado::StreamKind::Warning => {
                 leading.truecolor(255, 140, 0).bold().to_string()
             }
@@ -1942,7 +2057,8 @@ fn render_chunk(
             vw_vivado::StreamKind::Stdout => leading.to_string(),
         };
         let styled_line: String = match kind {
-            vw_vivado::StreamKind::Error => line.red().to_string(),
+            vw_vivado::StreamKind::Error
+            | vw_vivado::StreamKind::CriticalWarning => line.red().to_string(),
             vw_vivado::StreamKind::Warning => {
                 line.truecolor(255, 140, 0).to_string()
             }
@@ -2030,9 +2146,17 @@ async fn run_htcl(
     check_only: bool,
     part: Option<&str>,
     variant: Option<&str>,
-    verbose: bool,
+    log_level: vw_vivado::LogLevel,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Under the hood the block renderer decides what to show; the
+    // backend's `verbose` toggle still gates the unclassified PTY
+    // firehose (banner, source echo, idle chatter). At log_level =
+    // Debug the user wants everything, so verbose stays on; at
+    // higher levels it stays off, and the classifier's NONE-block
+    // path is the only source of non-diagnostic content — which the
+    // renderer then dims or collapses.
+    let verbose = matches!(log_level, vw_vivado::LogLevel::Debug);
     let program = load_htcl_program(file).await?;
     // Keep `program` alive — the stack-frame rewriting needs the
     // LoadedProgram for body-span resolution. We borrow `source`
@@ -2168,15 +2292,36 @@ async fn run_htcl(
         None => (None, None),
     };
     let rpc_handler = vw_vivado::make_handler_with_variant(
-        rpc_workspace_root,
+        rpc_workspace_root.clone(),
         active_variant,
     );
+    // Raw byte-log: `<workspace>/target/logs/vivado-<ts>.log`.
+    // Failure to create the directory demotes to no-log rather than
+    // aborting the run — the log is a diagnostic aid, and a
+    // misconfigured target/ dir shouldn't block a synth flow.
+    let raw_log = rpc_workspace_root.as_deref().and_then(|ws| {
+        match vw_vivado::raw_log_path_for_workspace(ws) {
+            Ok(p) => {
+                eprintln!(
+                    "{} {}",
+                    "raw vivado log:".bright_black(),
+                    p.display().to_string().bright_black(),
+                );
+                Some(p)
+            }
+            Err(e) => {
+                eprintln!("{} raw log unavailable: {e}", "warning:".yellow());
+                None
+            }
+        }
+    });
     let mut backend =
         vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
             verbose,
             info_with_stack,
             rpc_handler: Some(rpc_handler),
             auto_project,
+            raw_log,
             ..Default::default()
         })
         .await
@@ -2202,19 +2347,47 @@ async fn run_htcl(
     // uses with `pending_origins[pending_eval_index]`.
     let current_origin =
         std::sync::Arc::new(std::sync::Mutex::new(None::<vw_repl::Origin>));
+    // Segmenter state — shared between the sink (which pushes into
+    // it per chunk) and the outer scope (which flushes any trailing
+    // NONE after the last eval returns so the tail doesn't get
+    // silently dropped when Vivado's last write is non-diagnostic).
+    let block_acc = std::sync::Arc::new(std::sync::Mutex::new(
+        vw_vivado::BlockAccumulator::new(),
+    ));
+    // Track the highest severity classified during the session. We
+    // check `kind` — not the rendered block — so `--log-level=error`
+    // can't silence a CRITICAL WARNING into a false-pass exit code.
+    // Encoded as u8 (0..=4) matching the Severity ladder so a plain
+    // atomic fetch_max gets us thread-safe "worst so far" semantics
+    // without a mutex.
+    let worst_severity = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+        severity_as_u8(vw_vivado::Severity::None),
+    ));
     {
         let procs = std::sync::Arc::clone(&proc_table);
         let input_file = std::sync::Arc::clone(&input_file_for_stack);
         let origin = std::sync::Arc::clone(&current_origin);
+        let acc = std::sync::Arc::clone(&block_acc);
+        let worst = std::sync::Arc::clone(&worst_severity);
         backend.set_stdout_sink(move |kind, chunk: &str| {
             let cur_origin = origin.lock().ok().and_then(|g| g.clone());
-            render_chunk(
-                kind,
-                chunk,
-                &procs,
-                cur_origin.as_ref(),
-                Some(input_file.as_path()),
+            worst.fetch_max(
+                severity_as_u8(vw_vivado::severity_of(kind)),
+                std::sync::atomic::Ordering::Relaxed,
             );
+            let blocks = acc
+                .lock()
+                .map(|mut a| a.push(kind, chunk))
+                .unwrap_or_default();
+            for block in blocks {
+                render_block(
+                    &block,
+                    log_level,
+                    &procs,
+                    cur_origin.as_ref(),
+                    Some(input_file.as_path()),
+                );
+            }
         });
     }
 
@@ -2417,5 +2590,42 @@ async fn run_htcl(
         }
     }
     let _ = backend.shutdown().await;
+    // Flush any trailing NONE block the last chunk left in the
+    // accumulator. Vivado's final write is often non-diagnostic
+    // (banner, resource summary, "synth_design completed" table);
+    // without this the very end of the session would sit unemitted
+    // when the caller's eval returns and the sink stops being
+    // called. render_block honors the log-level here too, so
+    // trailing noise still gets dimmed at Info+ and shown raw at
+    // Debug.
+    let trailing = block_acc.lock().map(|mut a| a.flush()).unwrap_or_default();
+    let cur_origin = current_origin.lock().ok().and_then(|g| g.clone());
+    for block in trailing {
+        render_block(
+            &block,
+            log_level,
+            &proc_table,
+            cur_origin.as_ref(),
+            Some(input_file_for_stack.as_path()),
+        );
+    }
+    // Severity-driven exit code. If ANY chunk classified as
+    // CRITICAL WARNING or ERROR during the session, propagate a
+    // non-zero exit so CI wrappers / scripts can gate on it. We
+    // read the classification counter — NOT the render decision —
+    // so a user passing `--log-level=error` can't hide a
+    // CRITICAL WARNING into a false-pass. The diagnostic itself
+    // has already streamed through the log-level filter (or was
+    // suppressed at the caller's request); this is just about the
+    // process return code.
+    let worst = worst_severity.load(std::sync::atomic::Ordering::Relaxed);
+    if worst >= severity_as_u8(vw_vivado::Severity::CriticalWarning) {
+        let label = if worst >= severity_as_u8(vw_vivado::Severity::Error) {
+            "error"
+        } else {
+            "critical warning"
+        };
+        return Err(format!("session emitted at least one {label}").into());
+    }
     Ok(())
 }

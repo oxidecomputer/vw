@@ -115,14 +115,17 @@ pub enum StreamKind {
     Info,
     /// Vivado `WARNING:` line.
     Warning,
-    /// Vivado `ERROR:` or `CRITICAL WARNING:` line. Both render
-    /// with the same red ✗ treatment — critical warnings are
-    /// semantically hard failures ("this may fail the run") even
-    /// though Vivado's severity hierarchy nests them below ERROR.
-    /// Distinct from the final [`BackendError::Tcl`] returned by
-    /// `eval` — these are emitted *during* an eval and the final
-    /// error often refers back to them ("failed due to earlier
-    /// errors").
+    /// Vivado `CRITICAL WARNING:` line. Semantically means "your
+    /// run may fail because of this" — Vivado nests this severity
+    /// between WARNING and ERROR. Distinct from
+    /// [`StreamKind::Error`] so log-level filtering can treat them
+    /// separately (`--log-level=error` hides critical warnings;
+    /// `--log-level=critical` keeps them).
+    CriticalWarning,
+    /// Vivado `ERROR:` line. Distinct from the final
+    /// [`BackendError::Tcl`] returned by `eval` — these are emitted
+    /// *during* an eval and the final error often refers back to
+    /// them ("failed due to earlier errors").
     Error,
 }
 
@@ -174,6 +177,17 @@ pub struct VivadoConfig {
     /// truncated) at spawn time and flushed per-line so it's safe
     /// to `tail -f` from another terminal.
     pub verbose_log: Option<PathBuf>,
+    /// Optional path to a byte-perfect raw log of Vivado's PTY
+    /// output. When set, every byte the PTY pump reads is teed to
+    /// this file BEFORE any line-splitting, classification, or
+    /// filtering — the file is the ground truth of what Vivado
+    /// emitted this session. Callers are responsible for making
+    /// the parent directory exist; the convention is
+    /// `<workspace>/target/logs/vivado-<timestamp>.log`, produced
+    /// by [`raw_log_path_for_workspace`]. Distinct from
+    /// [`verbose_log`], which only captures unclassified firehose
+    /// output routed through the classifier.
+    pub raw_log: Option<PathBuf>,
     /// Optional RPC handler for shim-initiated calls (`vw::…`
     /// procs that reach back into Rust for values Vivado can't
     /// provide). Dispatched from the proto-read task per inbound
@@ -383,8 +397,21 @@ impl VivadoBackend {
         let reader = pair.master.try_clone_reader().map_err(|e| {
             BackendError::Worker(format!("pty reader clone failed: {e}"))
         })?;
+        // Open the raw byte-log if the caller asked for one.
+        // Parent-directory creation is the caller's job — see
+        // `raw_log_path_for_workspace`; here we just open (creating
+        // the file, truncating on repeat) and wrap for buffered
+        // per-chunk flush. Failure to open bubbles as a spawn
+        // error rather than silently disabling the log — the
+        // caller opted in, so a broken opt-in should be loud.
+        let raw_log: Option<BufWriter<File>> = config
+            .raw_log
+            .as_ref()
+            .map(|p| File::create(p).map(BufWriter::new))
+            .transpose()
+            .map_err(BackendError::Io)?;
         let (pty_tx, pty_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let stdout_pump = spawn_stdout_pump(reader, pty_tx);
+        let stdout_pump = spawn_stdout_pump(reader, pty_tx, raw_log);
 
         // Wait for the shim to connect.
         let accept_result =
@@ -499,6 +526,97 @@ impl VivadoBackend {
         F: FnMut(StreamKind, &str) + Send + 'static,
     {
         self.stdout_sink = Some(Box::new(sink));
+    }
+
+    /// The Vivado child process's OS pid, if the child is still
+    /// alive. Callers use this to send SIGINT for eval
+    /// cancellation — see [`Self::interrupt`] for the mechanism
+    /// and design assumptions.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|c| c.process_id())
+    }
+
+    /// Cancel the current in-flight Tcl eval WITHOUT killing the
+    /// Vivado session. Sends `SIGINT` to the child; Vivado's Tcl
+    /// runtime installs a `SIGINT` handler that traps the signal
+    /// into `interp cancel`, so the mechanism is:
+    ///
+    /// 1. Vivado receives `SIGINT` in the middle of executing the
+    ///    current eval body (a `synth_ip`, a long `get_pins
+    ///    -hierarchical`, whatever).
+    /// 2. Tcl catches the signal, sets the "cancel" flag on the
+    ///    active interpreter, and the currently-executing script
+    ///    returns with `TCL_ERROR` / message `"interrupted"`.
+    /// 3. Our shim wraps every user eval in `catch`, so the error
+    ///    is caught, wrapped into a protocol response, and sent
+    ///    back over the wire. The eval returns from the caller's
+    ///    perspective as a normal [`vw_eda::BackendError::Tcl`]
+    ///    with the interrupted message.
+    /// 4. Vivado's outer read loop is untouched — it goes right
+    ///    back to reading the next request from the shim's
+    ///    protocol socket. Project state, IP synth results, all
+    ///    open designs survive.
+    ///
+    /// Same semantics as pressing Ctrl-C on an interactive
+    /// `vivado -mode tcl` console: the running command aborts,
+    /// the Tcl prompt returns.
+    ///
+    /// **Signals the process group, not the process.** Vivado on
+    /// disk is a bash wrapper (`~/Xilinx/…/bin/vivado`) that runs
+    /// `loader -exec vivado …` without `exec`, so bash sticks
+    /// around as the child we spawned, and the actual Vivado
+    /// runtime is a grandchild via loader. If we `kill(pid,
+    /// SIGINT)` we hit bash-running-a-script, which normally does
+    /// NOT forward SIGINT to its children — the signal dies with
+    /// bash's SIGINT-default handling and Vivado never sees it.
+    ///
+    /// portable-pty sets each spawned command up as its own
+    /// session leader with a fresh PGID = its own pid, and
+    /// descendants inherit that PGID unless they explicitly call
+    /// `setpgrp`. So `kill(-pid, SIGINT)` — i.e. signalling the
+    /// negative-of-pid, which POSIX interprets as "the process
+    /// group with this ID" — reaches bash, loader, and Vivado
+    /// all at once. Bash is a no-op recipient (script mode
+    /// SIGINT); loader relays; Vivado's Tcl runtime catches it
+    /// and does the `interp cancel`.
+    ///
+    /// **Design assumption**: SIGINT-under-PTY behaves the same
+    /// as SIGINT-on-console. Historically true for Vivado 2020+
+    /// (we're on 2025.1). If a future release drops that
+    /// handling, callers see `interrupt()` return without
+    /// actually cancelling — the current eval keeps running. We
+    /// have no clean fallback in that world; the eval would have
+    /// to be killed via full backend restart.
+    ///
+    /// Returns the pid (== pgid) we signalled so callers can log
+    /// something meaningful ("interrupted eval on pid 12345").
+    /// Returns `None` if the child is already gone — in which
+    /// case there's nothing to interrupt anyway.
+    ///
+    /// Unix-only. Windows has no analogue that reliably pumps
+    /// into the child's Tcl signal handler, and every vw
+    /// interactive user is on Unix; when Windows matters we'll
+    /// add a ConPTY-native cancellation path.
+    #[cfg(unix)]
+    pub fn interrupt(&self) -> Option<u32> {
+        let pid = self.child_pid()?;
+        // SAFETY: `libc::kill(-pid, SIGINT)` on a process group
+        // we spawned. Negative pid selects the pgid. The only
+        // failure modes documented for the syscall are EPERM
+        // (we don't own the group — impossible here, we're the
+        // parent) and ESRCH (the group is empty — handled as a
+        // silent no-op; race window with child exit is benign).
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGINT);
+        }
+        Some(pid)
+    }
+
+    /// Windows stub: no-op. See the unix variant's doc for the
+    /// eval-cancellation model.
+    #[cfg(not(unix))]
+    pub fn interrupt(&self) -> Option<u32> {
+        None
     }
 
     fn alloc_id(&self) -> u64 {
@@ -1166,6 +1284,7 @@ impl Drop for VivadoBackend {
 fn spawn_stdout_pump(
     mut reader: Box<dyn Read + Send>,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
+    mut raw_log: Option<BufWriter<File>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -1174,6 +1293,18 @@ fn spawn_stdout_pump(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    // Raw byte-log tee. Write BEFORE any line
+                    // processing so the log is a byte-perfect
+                    // record of what Vivado emitted — CR/LF
+                    // preserved, non-UTF-8 bytes preserved, tables
+                    // and banners preserved. Flush per chunk so a
+                    // `tail -f` from another terminal stays near
+                    // real-time. Errors are ignored: dropping a log
+                    // write should never take out the eval channel.
+                    if let Some(w) = raw_log.as_mut() {
+                        let _ = w.write_all(&buf[..n]);
+                        let _ = w.flush();
+                    }
                     // DIAGNOSTIC (temporary): log every `read(2)`
                     // completion so we can see when Vivado actually
                     // wrote bytes to the PTY. Paired with the
@@ -1253,7 +1384,9 @@ pub(crate) fn classify_vivado_message_line(line: &str) -> Option<StreamKind> {
     // of this" (bad connection, missing property, etc.), which
     // reads like a hard failure to the user. Rendering it with the
     // same red ✗ style as ERROR matches how a reader treats it.
-    if l.starts_with("ERROR:") || l.starts_with("CRITICAL WARNING:") {
+    if l.starts_with("CRITICAL WARNING:") {
+        Some(StreamKind::CriticalWarning)
+    } else if l.starts_with("ERROR:") {
         Some(StreamKind::Error)
     } else if l.starts_with("WARNING:") {
         Some(StreamKind::Warning)
@@ -1378,8 +1511,12 @@ impl PtyClassifier {
         // line WARNING/ERROR text with `\n` between the header
         // and a body) without the noise.
         if let Some(p) = self.pending.as_mut() {
-            let merges =
-                matches!(p.kind, StreamKind::Warning | StreamKind::Error);
+            let merges = matches!(
+                p.kind,
+                StreamKind::Warning
+                    | StreamKind::CriticalWarning
+                    | StreamKind::Error
+            );
             // Only a leading-whitespace non-empty line is a
             // real continuation. Vivado indents every body line
             // of a multi-line message (e.g. the `.xci` path
@@ -1663,12 +1800,12 @@ mod tests {
             ),
             (
                 "CRITICAL WARNING: [Vivado 12-180] ...",
-                // Critical warnings render as Errors — same red ✗
-                // treatment. Vivado's severity ranking puts them
-                // between WARNING and ERROR, but semantically
-                // they mean "this may fail the run," which reads
-                // as a hard failure to a user scanning scrollback.
-                StreamKind::Error,
+                // Critical warnings classify as their own kind so
+                // log-level filtering can treat them distinctly from
+                // ERROR. Downstream renderers may still paint them
+                // with the red ✗ treatment, but the classifier keeps
+                // the semantic distinction intact.
+                StreamKind::CriticalWarning,
             ),
             (
                 "INFO: [Vivado 12-3661] auto-pinning enabled",
@@ -1813,5 +1950,93 @@ mod tests {
         // that — Vivado occasionally indents scripted messages.
         let chunk = "  WARNING: [X 1-2] indented\n  at foo:1\n";
         assert_eq!(classify_chunk_for_sink(chunk), StreamKind::Warning);
+    }
+
+    /// Regression test for `VivadoBackend::interrupt`'s
+    /// process-group signalling.
+    ///
+    /// The `vivado` on-disk binary is a bash wrapper that runs
+    /// `loader -exec vivado ...` WITHOUT `exec` — so bash stays
+    /// as our direct child (which is what `Child::process_id`
+    /// returns) and the actual Vivado runtime is a grandchild.
+    /// A naive `kill(pid, SIGINT)` hits bash-running-a-script,
+    /// which does NOT forward SIGINT to its child; Vivado never
+    /// sees it. `interrupt` fixes this by signalling the process
+    /// GROUP (`kill(-pid, SIGINT)`) — under portable-pty every
+    /// spawned command becomes its own session leader with a
+    /// fresh PGID equal to its pid, and children inherit that
+    /// PGID, so the group signal reaches everyone.
+    ///
+    /// This test mirrors the shape without needing Vivado: bash
+    /// spawns a long `sleep` in the background then waits for
+    /// it. Same lack-of-`exec` as the Vivado wrapper. The group
+    /// signal must terminate both bash AND the sleep within a
+    /// small bounded time (a signal that lands takes
+    /// milliseconds; anything past 3s means we missed the
+    /// target).
+    ///
+    /// If this test starts failing under a future portable-pty
+    /// release, the fix in `interrupt` needs revisiting — some
+    /// alternate mechanism (writing ETX to the PTY, using
+    /// `process_group_leader`, or an out-of-band `interp cancel`
+    /// through the shim protocol) will be needed instead.
+    #[cfg(unix)]
+    #[test]
+    fn interrupt_reaches_wrapped_grandchild_via_process_group() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::time::{Duration, Instant};
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+
+        // Mirror the Vivado wrapper's shape: bash spawns a
+        // long-running child WITHOUT `exec`, then waits. The
+        // background `sleep` is the stand-in for Vivado's
+        // `loader`/runtime; `wait $!` is what keeps bash in the
+        // foreground so it can propagate the eventual exit.
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("-c");
+        cmd.arg("sleep 300 & wait $!");
+        let mut child =
+            pair.slave.spawn_command(cmd).expect("spawn bash wrapper");
+        // Match VivadoBackend::spawn: drop the slave so the
+        // master sees EOF at child exit.
+        drop(pair.slave);
+        let pid = child.process_id().expect("child pid");
+
+        // Give bash a beat to fork off the `sleep` before we
+        // signal. Without this the test races between spawn and
+        // signal delivery.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // The exact call `VivadoBackend::interrupt` makes.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGINT);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_status)) => return, // pass
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        panic!(
+                            "wrapper + grandchild did not exit \
+                             within 3s of group SIGINT — signalling \
+                             mechanism is broken"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("try_wait error: {e}"),
+            }
+        }
     }
 }

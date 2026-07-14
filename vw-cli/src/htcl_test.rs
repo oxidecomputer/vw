@@ -38,7 +38,7 @@ pub async fn run_htcl_tests(
     test_threads: usize,
     part: Option<&str>,
     variant: Option<&str>,
-    verbose: bool,
+    log_level: vw_vivado::LogLevel,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ws = vw_lib::find_workspace_dir(cwd.as_std_path())
@@ -96,7 +96,7 @@ pub async fn run_htcl_tests(
             &mut summary,
             part,
             variant,
-            verbose,
+            log_level,
             info_with_stack,
         )
         .await?;
@@ -109,7 +109,7 @@ pub async fn run_htcl_tests(
             &mut summary,
             part,
             variant,
-            verbose,
+            log_level,
             info_with_stack,
         )
         .await?;
@@ -345,9 +345,10 @@ async fn run_shared_bucket(
     summary: &mut RunSummary,
     part: Option<&str>,
     variant: Option<&str>,
-    verbose: bool,
+    log_level: vw_vivado::LogLevel,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let verbose = matches!(log_level, vw_vivado::LogLevel::Debug);
     // Shared bucket uses one Vivado process for every test in it,
     // so per-test `@target(part=…)` / `@target(variant=…)` cannot
     // apply — those overrides only make sense in dedicated-eda
@@ -405,9 +406,10 @@ async fn run_dedicated_bucket(
     summary: &mut RunSummary,
     part: Option<&str>,
     variant: Option<&str>,
-    verbose: bool,
+    log_level: vw_vivado::LogLevel,
     info_with_stack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let verbose = matches!(log_level, vw_vivado::LogLevel::Debug);
     let threads = test_threads.max(1);
     // Sequential for MVP — a proper semaphore-based parallel run
     // would use tokio::task::JoinSet. Vivado processes each hold
@@ -638,11 +640,18 @@ async fn spawn_backend(
         Some(ws.as_std_path().to_path_buf()),
         active_variant,
     );
+    // Raw byte-log per spawn — test runs may spawn multiple Vivados
+    // in the dedicated bucket; each gets its own timestamped log
+    // under target/logs/. Silent-on-error: the test runner already
+    // owns the output surface, and a broken target/ dir shouldn't
+    // fail the test.
+    let raw_log = vw_vivado::raw_log_path_for_workspace(ws.as_std_path()).ok();
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
         info_with_stack,
         rpc_handler: Some(rpc_handler),
         auto_project,
+        raw_log,
         ..Default::default()
     })
     .await

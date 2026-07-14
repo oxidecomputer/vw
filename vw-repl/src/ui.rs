@@ -116,6 +116,13 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     let mut visible: Vec<Line<'static>> =
         Vec::with_capacity(area.height as usize + 16);
     let mut accumulated: u32 = 0;
+    // `skipped_rows` counts wrapped rows preceding the first row we
+    // actually emit into `visible`. For entries fully above the
+    // viewport we add their whole `count`; for the FIRST partially-
+    // visible entry we add whatever wrapped rows come between the
+    // entry's start and the first source line the windowed slicer
+    // emits. Combined, this keeps `local_scroll = viewport_start -
+    // skipped_rows` correct even when we slice inside an entry.
     let mut skipped_rows: u32 = 0;
     {
         let scrollback = app.scrollback();
@@ -132,7 +139,28 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
             if accumulated >= viewport_end {
                 break;
             }
-            let lines = crate::render::entry_lines(entry, area.width);
+            // Windowed slice: emit only source lines whose wrapped-
+            // row range overlaps the viewport. Local window is in
+            // this entry's own row space (0-indexed), so subtract
+            // `accumulated` first.
+            let local_start = viewport_start.saturating_sub(accumulated);
+            let local_end = viewport_end.saturating_sub(accumulated);
+            let (lines, offset) = crate::render::entry_lines_windowed(
+                entry,
+                area.width,
+                local_start..local_end,
+            );
+            // Only the FIRST windowed entry contributes an intra-
+            // entry offset; subsequent entries fall wholly within
+            // the viewport and start rendering at row 0 locally.
+            // For the first sliced entry, add the wrapped rows the
+            // slicer skipped (source lines above the visible
+            // window) to `skipped_rows` so downstream math stays
+            // symmetric with the whole-entry-skipped case.
+            if visible.is_empty() {
+                skipped_rows =
+                    skipped_rows.saturating_add(local_start - offset);
+            }
             let wrapped = crate::render::wrap_lines(lines, area.width);
             visible.extend(wrapped);
             accumulated = entry_end;

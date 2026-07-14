@@ -42,6 +42,30 @@ use crate::session::{Session, SessionBatch};
 use crate::ui::{self, WorkerStatusView};
 use crate::{ReplError, ReplOptions};
 
+/// A multi-line entry with more than this many source lines
+/// auto-collapses into a `▶`-marked placeholder at push time,
+/// Mathematica-notebook style. Shift-click still toggles the
+/// state, so the raw content is one gesture away — the threshold
+/// just keeps a wall of text from dominating scrollback when a
+/// large `list<T>` or `Properties` value comes back. Chosen at 100
+/// because that's roughly the transition point where a viewport-
+/// filling block stops being scannable and starts being intrusive.
+pub const COLLAPSE_AUTO_THRESHOLD: usize = 100;
+
+/// Decide the initial [`ScrollbackEntry::collapse_state`] for an
+/// entry with `text`. Every multi-line entry gets a `Some(bool)`
+/// so it's toggleable via Shift+click; single-line entries get
+/// `None` because a placeholder around one row of content adds
+/// affordance without meaningful eliding. Above the auto-threshold
+/// the initial state is collapsed.
+fn compute_collapse_state(text: &str) -> Option<bool> {
+    let lines = text.lines().count();
+    if lines < 2 {
+        return None;
+    }
+    Some(lines > COLLAPSE_AUTO_THRESHOLD)
+}
+
 /// What category an entry in the scrollback log belongs to. Drives
 /// the per-line gutter prefix and color.
 #[derive(Clone, Copy, Debug)]
@@ -61,6 +85,16 @@ pub enum ScrollbackKind {
     Warning,
     /// Internal notice (`vivado: ready`, `:load`, `:restart`, etc.).
     Notice,
+    /// Non-diagnostic Vivado chatter that landed as its own single-
+    /// line NONE block — the `----` divider after an INFO,
+    /// `Attempting to get a license…` status echoes, single-line
+    /// section banners. Rendered dimmed dark-gray with a plain
+    /// `  ` prefix so it reads as "background noise" without
+    /// pretending to be an INFO (which would carry `· `) or a
+    /// user-facing Stdout entry (which would be bright white).
+    /// Multi-line NONE blocks go through the collapsible path
+    /// instead — see `push_none_block`.
+    Chatter,
 }
 
 /// Tracks where each echoed top-level statement's Input entry
@@ -111,6 +145,19 @@ pub struct ScrollbackEntry {
     /// elapsed time from `started_at`); `Some(t)` freezes the
     /// timer at the final duration once the batch completes.
     pub completed_at: Option<std::time::Instant>,
+    /// Non-`None` marks this entry as a collapsible NONE-severity
+    /// block (Vivado's non-diagnostic output: tables, banners,
+    /// section headers). `Some(true)` = collapsed (renderer shows
+    /// a single `▶` placeholder with a preview + hidden-line
+    /// count); `Some(false)` = expanded (all lines render dimmed
+    /// with a `▼` marker on the first line). `None` = normal
+    /// entry, no collapse handling.
+    ///
+    /// Only NONE blocks get this treatment — diagnostics are
+    /// always shown at full fidelity so a user scanning
+    /// scrollback for a WARNING never has to expand anything to
+    /// find it.
+    pub collapse_state: Option<bool>,
 }
 
 /// Drag-selection over scrollback rows. Coordinates are `(row, col)`
@@ -199,6 +246,14 @@ pub struct App {
     /// there's no active reader to wait for.
     session: std::sync::Arc<std::sync::RwLock<Session>>,
     scrollback: Vec<ScrollbackEntry>,
+    /// Segments Vivado's classified stream into per-chunk Diagnostic
+    /// entries and grouped NONE-block collapsibles before pushing
+    /// into scrollback. Same accumulator vw-cli uses, but here it
+    /// lives on `App` because Stream events flow through the main
+    /// task's single event loop — no cross-thread sharing needed.
+    /// Diagnostic blocks and NONE blocks land in scrollback via
+    /// [`Self::push`] and [`Self::push_none_block`] respectively.
+    block_acc: vw_vivado::BlockAccumulator,
     scrollback_scroll: u16,
     /// Whether the terminal is currently capturing mouse events.
     /// Default ON since we implement our own drag-to-select +
@@ -238,6 +293,14 @@ pub struct App {
     /// editor handoff. See [`crate::popup`].
     popup: Option<crate::popup::PopupState>,
     worker_state: WorkerState,
+    /// Vivado child's OS pid, cached from `WorkerEvent::Started`.
+    /// Consulted by the Ctrl-C handler to send SIGINT for eval
+    /// cancellation without going through `worker_tx` (which is
+    /// blocked by the in-flight `backend.eval` we'd be trying to
+    /// cancel). `None` before Started, or when the PTY layer
+    /// couldn't report a pid — in either case Ctrl-C falls back
+    /// to its non-eval behavior (clear the current input).
+    child_pid: Option<u32>,
     worker_tx: mpsc::Sender<WorkerCmd>,
     eval_rx: mpsc::UnboundedReceiver<WorkerEvent>,
     /// Sender-side of the worker-event channel, kept on App so
@@ -312,7 +375,15 @@ enum WorkerCmd {
 
 /// Events sent from the worker task back to the UI.
 enum WorkerEvent {
-    Started,
+    /// Vivado spawn succeeded. Carries the child's OS pid so the
+    /// UI can send SIGINT for eval cancellation without going
+    /// through the worker channel (which is blocked by the
+    /// in-flight eval it would need to cancel). `None` when the
+    /// PTY layer couldn't report a pid — cancellation degrades
+    /// to a no-op in that case.
+    Started {
+        child_pid: Option<u32>,
+    },
     /// One streaming chunk from the worker, with its source-of-
     /// origin tag so the UI can render Vivado WARNING/ERROR lines
     /// distinctly from user `puts` output.
@@ -398,12 +469,16 @@ async fn run_inner(
 ) -> Result<(), ReplError> {
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCmd>(8);
     let (event_tx, eval_rx) = mpsc::unbounded_channel::<WorkerEvent>();
-    let verbose = opts.verbose;
     let info_with_stack = opts.info_with_stack;
-    // Verbose output can't go to stderr in REPL mode — that's the
-    // same fd the TUI renders on, so any byte stomps through the
-    // alternate-screen buffer. Route it to a per-process tempfile
-    // instead and tell the user where to find it.
+    // At `--log-level=debug` the user wants the unclassified PTY
+    // firehose (banners, source echo, idle chatter) too; anything
+    // less filters it out. The firehose can't go to stderr under
+    // the TUI's alternate screen — that fd is the render surface —
+    // so route it to a per-process tempfile the user can `tail -f`
+    // from another terminal. Distinct from the raw byte-log wired
+    // downstream: this file holds only the leftover unclassified
+    // lines, whereas the raw log holds every byte.
+    let verbose = matches!(opts.log_level, vw_vivado::LogLevel::Debug);
     let verbose_log_path = if verbose {
         Some(
             std::env::temp_dir()
@@ -555,6 +630,7 @@ impl App {
                 std::sync::RwLock::new(Session::new()),
             ),
             scrollback: Vec::new(),
+            block_acc: vw_vivado::BlockAccumulator::new(),
             scrollback_scroll: 0,
             mouse_capture: true,
             scrollback_area: None,
@@ -564,6 +640,7 @@ impl App {
             reverse_search: None,
             popup: None,
             worker_state: WorkerState::Starting,
+            child_pid: None,
             worker_tx,
             eval_rx,
             event_tx,
@@ -1478,11 +1555,59 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(sel) = self.selection.take() {
+                    // Shift + pure click (no drag) on a collapsible
+                    // block toggles its expanded state. Detect "pure
+                    // click" by comparing anchor == cursor: Drag
+                    // events are the only path that moves `cursor`
+                    // off `anchor`, so any drag at all falls through
+                    // to the copy path. Drag-select inside an
+                    // expanded block still works because the
+                    // anchor/cursor pair diverges as soon as the
+                    // first Drag event fires.
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT)
+                        && sel.anchor == sel.cursor
+                        && self.toggle_collapsible_at(sel.anchor.0)
+                    {
+                        return;
+                    }
                     self.copy_selection_to_clipboard(sel);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Map a wrapped-row index (0-based, spans all of `scrollback`)
+    /// to the entry that occupies it, and if that entry is a
+    /// collapsible NONE block, toggle its expand state. Returns
+    /// `true` when a toggle happened so the caller can suppress the
+    /// fallthrough "copy empty selection" path — a Shift-click on a
+    /// diagnostic line should still do nothing (not clobber the
+    /// clipboard with an empty string, not act on the diagnostic
+    /// entry), so a `false` here means "not our gesture, keep
+    /// falling through."
+    ///
+    /// Walks entries left-to-right, summing wrapped-row counts until
+    /// we find the entry the row lives in. O(N) per click — cheap at
+    /// scrollback sizes we care about.
+    fn toggle_collapsible_at(&mut self, wrapped_row: usize) -> bool {
+        let width = self.scrollback_area.map(|a| a.width).unwrap_or(0);
+        let mut cursor: usize = 0;
+        for entry in self.scrollback.iter_mut() {
+            let rows = crate::render::count_wrapped_rows(entry, width) as usize;
+            let end = cursor.saturating_add(rows);
+            if (cursor..end).contains(&wrapped_row) {
+                match entry.collapse_state {
+                    Some(expanded) => {
+                        entry.collapse_state = Some(!expanded);
+                        return true;
+                    }
+                    None => return false,
+                }
+            }
+            cursor = end;
+        }
+        false
     }
 
     /// Translate a screen cell `(col, row)` inside the scrollback
@@ -1604,12 +1729,61 @@ impl App {
                 self.exit = true;
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                // Clear the current input (reedline convention). Once
-                // we have eval cancellation we'll also kick the
-                // worker here when an eval is in flight.
-                self.input = TextArea::default();
-                self.history_cursor = None;
-                self.history_draft.clear();
+                // Two modes for Ctrl-C:
+                //
+                // - **Eval in flight** (`WorkerState::Running`):
+                //   send SIGINT to the Vivado child, which its Tcl
+                //   runtime traps into `interp cancel` — the
+                //   current eval aborts and returns a "interrupted"
+                //   error through the shim protocol, without
+                //   killing the Vivado session. Full mechanism +
+                //   design assumptions on
+                //   `vw_vivado::VivadoBackend::interrupt`. No fall-
+                //   through to the input clear; the input line is
+                //   probably empty during an eval anyway, and
+                //   preserving whatever the user typed lets them
+                //   resubmit / edit after the cancel lands.
+                //
+                // - **No eval running**: clear the current input
+                //   (reedline / readline convention).
+                if matches!(self.worker_state, WorkerState::Running) {
+                    if let Some(pid) = self.child_pid {
+                        // Signal the process GROUP, not the process.
+                        // Vivado's on-disk binary is a bash wrapper
+                        // that forks loader+Vivado as children without
+                        // `exec`, so `kill(pid, SIGINT)` would only
+                        // hit bash and bash won't forward it. See
+                        // `VivadoBackend::interrupt` for the full
+                        // writeup — we mirror the same `-pid`
+                        // negation here rather than round-tripping
+                        // through the worker channel (which is
+                        // blocked on the very eval we're cancelling).
+                        //
+                        // SAFETY: kill on a pgid we spawned. ESRCH
+                        // (empty group / race with child exit) is a
+                        // silent no-op.
+                        unsafe {
+                            libc::kill(-(pid as libc::pid_t), libc::SIGINT);
+                        }
+                        self.push(
+                            ScrollbackKind::Notice,
+                            "interrupt sent — Vivado will abort the \
+                             current eval and return"
+                                .into(),
+                        );
+                    } else {
+                        self.push(
+                            ScrollbackKind::Warning,
+                            "no pid cached; can't interrupt eval — \
+                             restart the REPL to recover"
+                                .into(),
+                        );
+                    }
+                } else {
+                    self.input = TextArea::default();
+                    self.history_cursor = None;
+                    self.history_draft.clear();
+                }
             }
             (KeyCode::F(2), _) => {
                 // Flip terminal mouse-capture mode. OFF (the default)
@@ -2067,6 +2241,11 @@ impl App {
             Ok(l) => l,
             Err(e) => {
                 self.push(ScrollbackKind::Error, format!("ERROR: {e}"));
+                // Prepare failed — no eval will run, so the Input
+                // entry's timer would otherwise tick forever. Freeze
+                // it at the "prepare failed" wall time. Same freeze
+                // path the empty-batch case (line ~2234) uses.
+                self.mark_inputs_completed();
                 return;
             }
         };
@@ -2291,8 +2470,9 @@ impl App {
 
     async fn handle_worker_event(&mut self, event: WorkerEvent) {
         match event {
-            WorkerEvent::Started => {
+            WorkerEvent::Started { child_pid } => {
                 self.worker_state = WorkerState::Ready;
+                self.child_pid = child_pid;
                 self.push(ScrollbackKind::Notice, "vivado ready".into());
                 if let Some(path) = self.opts.initial_load.clone() {
                     match std::fs::read_to_string(path.as_std_path()) {
@@ -2323,33 +2503,60 @@ impl App {
                 self.handle_prepare_done(text, echo, result).await;
             }
             WorkerEvent::Stream { kind, data } => {
-                let scrollback_kind = match kind {
-                    vw_vivado::StreamKind::Stdout => ScrollbackKind::Stdout,
-                    vw_vivado::StreamKind::Info => ScrollbackKind::Notice,
-                    vw_vivado::StreamKind::Warning => ScrollbackKind::Warning,
-                    vw_vivado::StreamKind::Error => ScrollbackKind::Error,
-                };
-                // The PTY filter emits one line per chunk and
-                // the shim's `puts` capture preserves user-side
-                // newlines; trim a single trailing newline so the
-                // scrollback's per-entry layout doesn't insert a
-                // blank gap between Vivado messages.
-                let trimmed = data.trim_end_matches('\n').to_string();
-                if !trimmed.is_empty() {
-                    let resolved = self.resolve_stack_frames(&trimmed);
-                    // Tag warnings/errors that arrived without a
-                    // stack trace with the currently-executing
-                    // user command's origin. Vivado's C++
-                    // property-validation path emits messages
-                    // straight to the PTY without going through
-                    // `::common::send_msg_id`, so neither shim
-                    // override gets a chance to capture a Tcl
-                    // stack — the best we can do from the
-                    // worker's side is "this happened while
-                    // <user line> was running."
-                    let tagged =
-                        self.tag_streamed_message(scrollback_kind, resolved);
-                    self.push(scrollback_kind, tagged);
+                // Feed the chunk into the block accumulator: NONE
+                // blocks (Vivado tables / banners / license chatter)
+                // group into one collapsible scrollback entry per
+                // run of Stdout chunks, while Diagnostic chunks
+                // (INFO / WARNING / CRITICAL / ERROR) flush any
+                // pending NONE and emit themselves at full fidelity.
+                for block in self.block_acc.push(kind, &data) {
+                    match block {
+                        vw_vivado::Block::None { lines } => {
+                            self.push_none_block(lines);
+                        }
+                        vw_vivado::Block::Diagnostic { severity, lines } => {
+                            let scrollback_kind = match severity {
+                                vw_vivado::Severity::Info => {
+                                    ScrollbackKind::Notice
+                                }
+                                vw_vivado::Severity::Warning => {
+                                    ScrollbackKind::Warning
+                                }
+                                // Critical warnings render with the
+                                // same red ✗ treatment as ERROR in
+                                // scrollback — the block classifier
+                                // keeps them semantically distinct
+                                // for log-level filtering, but the
+                                // visual severity is the same.
+                                vw_vivado::Severity::CriticalWarning
+                                | vw_vivado::Severity::Error => {
+                                    ScrollbackKind::Error
+                                }
+                                // Segmenter guarantees Diagnostic
+                                // blocks are never Severity::None,
+                                // but the arm has to exist for the
+                                // match to be exhaustive.
+                                vw_vivado::Severity::None => {
+                                    ScrollbackKind::Stdout
+                                }
+                            };
+                            // Rejoin the diagnostic's lines (severity
+                            // header + any `at <path>:<line>` stack
+                            // frames the shim attached), rewrite Tcl
+                            // frames onto real htcl source, then tag
+                            // traceless warnings/errors with the
+                            // currently-executing user command's
+                            // origin — same treatment vw run applies
+                            // via `render_chunk`.
+                            let joined = lines.join("\n");
+                            let resolved = self.resolve_stack_frames(&joined);
+                            let tagged = self.tag_streamed_message(
+                                scrollback_kind,
+                                resolved,
+                            );
+                            self.push(scrollback_kind, tagged);
+                        }
+                    }
                 }
             }
             WorkerEvent::EvalDone {
@@ -2357,6 +2564,55 @@ impl App {
                 result,
                 last_in_batch,
             } => {
+                // Flush any pending NONE-block content the segmenter
+                // has been holding. Pure `puts` output arrives as
+                // Stdout chunks (Severity::None) and never emits from
+                // the accumulator on its own — the accumulator only
+                // flushes when a *classified* chunk (INFO/WARNING/
+                // ERROR) arrives after it. Without this flush, plain
+                // `puts "muffins"` output sits invisible in
+                // `pending_none` until the next diagnostic — which
+                // for a quiet REPL never comes. Flushing at
+                // EvalDone is the right boundary: every eval's own
+                // output should surface before the next input echo.
+                for block in self.block_acc.flush() {
+                    match block {
+                        vw_vivado::Block::None { lines } => {
+                            self.push_none_block(lines);
+                        }
+                        vw_vivado::Block::Diagnostic { severity, lines } => {
+                            // Diagnostic-in-flush is unexpected —
+                            // the accumulator emits diagnostics
+                            // immediately on push, never holds them
+                            // pending. Route through the same
+                            // scrollback-kind mapping as the
+                            // Stream-event path so future accumulator
+                            // changes don't silently lose messages.
+                            let scrollback_kind = match severity {
+                                vw_vivado::Severity::Info => {
+                                    ScrollbackKind::Notice
+                                }
+                                vw_vivado::Severity::Warning => {
+                                    ScrollbackKind::Warning
+                                }
+                                vw_vivado::Severity::CriticalWarning
+                                | vw_vivado::Severity::Error => {
+                                    ScrollbackKind::Error
+                                }
+                                vw_vivado::Severity::None => {
+                                    ScrollbackKind::Stdout
+                                }
+                            };
+                            let joined = lines.join("\n");
+                            let resolved = self.resolve_stack_frames(&joined);
+                            let tagged = self.tag_streamed_message(
+                                scrollback_kind,
+                                resolved,
+                            );
+                            self.push(scrollback_kind, tagged);
+                        }
+                    }
+                }
                 // Grab the return type + set-binding flag for
                 // THIS command (the one that just finished)
                 // before we advance the index and possibly clear
@@ -2531,12 +2787,38 @@ impl App {
         } else {
             None
         };
+        // Uniform Mathematica-notebook-style collapsibility: every
+        // multi-line entry is toggleable (Shift+click), and
+        // anything larger than COLLAPSE_AUTO_THRESHOLD lines starts
+        // collapsed so a wall of text doesn't dominate the
+        // scrollback. Single-line entries get `None` — a placeholder
+        // for something that fits in one row is worse UX than just
+        // showing the row itself.
+        let collapse_state = compute_collapse_state(&text);
         self.scrollback.push(ScrollbackEntry {
             kind,
             text,
             started_at,
             completed_at: None,
+            collapse_state,
         });
+    }
+
+    /// Push a NONE-severity block: the accumulated non-diagnostic
+    /// chatter between two classified messages (Vivado tables,
+    /// section headers, banners, `VHDL Output written to …` lines).
+    /// Always uses [`ScrollbackKind::Chatter`] — the "background
+    /// noise" bucket that carries the dim dark-gray body style so
+    /// non-diagnostic output visually reads as elidable. Whether
+    /// the entry is collapsed / expanded / not-collapsible is
+    /// decided by [`Self::push`]'s threshold logic (multi-line
+    /// entries over the auto-collapse threshold start collapsed;
+    /// smaller ones expand).
+    pub(crate) fn push_none_block(&mut self, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        self.push(ScrollbackKind::Chatter, lines.join("\n"));
     }
 
     /// Per-Input-entry timer advance triggered by an EvalDone.
@@ -2772,6 +3054,22 @@ async fn worker_task(
     // session-scoped `active_variant` is the fallback the
     // `vhdl_design_sources` filter uses when no per-call kwarg
     // overrides it.
+    // Raw byte-log for the session: <workspace>/target/logs/vivado-<ts>.log.
+    // Under the REPL's alternate screen we can't safely eprintln! the
+    // path (it'd race the TUI), so we swallow errors silently and note
+    // the path once the terminal is restored via `info!`.
+    let raw_log = rpc_workspace_root.as_deref().and_then(|ws| {
+        match vw_vivado::raw_log_path_for_workspace(ws) {
+            Ok(p) => {
+                tracing::info!(path = %p.display(), "raw vivado log");
+                Some(p)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "raw log unavailable");
+                None
+            }
+        }
+    });
     let rpc_handler = vw_vivado::make_handler_with_variant(
         rpc_workspace_root,
         active_variant,
@@ -2782,12 +3080,15 @@ async fn worker_task(
         info_with_stack,
         rpc_handler: Some(rpc_handler),
         auto_project,
+        raw_log,
         ..Default::default()
     })
     .await;
     let mut backend = match backend {
         Ok(b) => {
-            let _ = tx.send(WorkerEvent::Started);
+            let _ = tx.send(WorkerEvent::Started {
+                child_pid: b.child_pid(),
+            });
             b
         }
         Err(e) => {
@@ -3782,5 +4083,62 @@ WARNING: [port::plumb_if_pin-1] skipping foo
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    /// Regression: a pure `puts` output (which classifies as
+    /// `StreamKind::Stdout` → `Severity::None`) has to reach
+    /// scrollback even when NO diagnostic follows it. The block
+    /// segmenter only flushes pending NONE content when a
+    /// classified chunk arrives; without an explicit flush on
+    /// `EvalDone`, `puts "muffins"` on a quiet REPL sits invisible
+    /// in `pending_none` until the next diagnostic (which for a
+    /// small interactive session may never come). The fix: flush
+    /// the accumulator at eval-done boundaries so every eval's own
+    /// output surfaces before the next input echo.
+    #[tokio::test]
+    async fn plain_puts_output_flushes_at_eval_done() {
+        let (worker_tx, _worker_rx) =
+            tokio::sync::mpsc::channel::<WorkerCmd>(8);
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<WorkerEvent>();
+        let mut app =
+            App::new(ReplOptions::default(), worker_tx, event_rx, event_tx);
+        // Emulate the sequence a `puts "muffins"` eval produces:
+        // one Stream chunk carrying the output, then EvalDone.
+        // Both events land through `handle_worker_event`, same as
+        // the real worker task drives them.
+        app.handle_worker_event(WorkerEvent::Stream {
+            kind: vw_vivado::StreamKind::Stdout,
+            data: "muffins\n".to_string(),
+        })
+        .await;
+        // Before EvalDone the accumulator is still holding the
+        // chunk — nothing in scrollback yet.
+        assert!(
+            !app.scrollback().iter().any(|e| e.text.contains("muffins")),
+            "muffins should still be in pending_none before EvalDone"
+        );
+        app.handle_worker_event(WorkerEvent::EvalDone {
+            origin: crate::lower::Origin {
+                file: None,
+                line: 1,
+                snippet: "puts \"muffins\"".to_string(),
+                via: Vec::new(),
+            },
+            result: Ok(vw_eda::EvalOutput::default()),
+            last_in_batch: true,
+        })
+        .await;
+        // After EvalDone the pending NONE content flushes into
+        // scrollback — the user actually sees their output.
+        assert!(
+            app.scrollback().iter().any(|e| e.text.contains("muffins")),
+            "muffins should have flushed into scrollback on EvalDone. \
+             scrollback: {:#?}",
+            app.scrollback()
+                .iter()
+                .map(|e| (e.kind, e.text.clone()))
+                .collect::<Vec<_>>()
+        );
     }
 }

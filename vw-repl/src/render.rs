@@ -31,30 +31,63 @@ use crate::app::{ScrollbackEntry, ScrollbackKind};
 /// right-justify the per-input timer marker on the first line of
 /// an `Input` entry. Pass the same width the renderer will wrap
 /// to so the timer ends up flush at the right margin.
+/// Backwards-compatible full-entry render. Same output as
+/// [`entry_lines_windowed`] called with `0..u32::MAX`. Used by tests
+/// and by the clipboard-copy path (which needs every source line
+/// regardless of what's on screen).
 pub fn entry_lines(
     entry: &ScrollbackEntry,
     area_width: u16,
 ) -> Vec<Line<'static>> {
+    entry_lines_windowed(entry, area_width, 0..u32::MAX).0
+}
+
+/// Produce styled [`Line`] objects for only the source lines whose
+/// **wrapped** rows overlap `window` (0-indexed within this entry's
+/// wrapped row range).
+///
+/// Returns `(lines, offset_into_first)` where `offset_into_first` is
+/// how many wrapped rows of the first emitted line's own wrapped
+/// output precede `window.start`. Callers pass this back through the
+/// ratatui `Paragraph::scroll` residual so the on-screen scroll
+/// alignment stays byte-for-byte identical to what the full-entry
+/// render would have produced.
+///
+/// This is the primary path — a huge scrollback entry (200K lines of
+/// a `list<bd_pin>` repr, say) that intersects the viewport was
+/// previously O(entry.text.lines().count()) work per redraw because
+/// `entry_lines` walked every source line, called `highlight_line` on
+/// each, allocated a `Line` per line, and then handed the whole Vec
+/// to `wrap_lines` which processed it end-to-end. Only the visible
+/// window (typically ≤ area.height rows) ever mattered. This function
+/// still walks the source-line iterator to *count* rows for skipped
+/// lines (that's cheap — just `chars().count()` + arithmetic per
+/// line), but does no allocation or highlighting until we hit the
+/// window. Same output visually; O(entry) → O(visible + prefix_scan).
+pub fn entry_lines_windowed(
+    entry: &ScrollbackEntry,
+    area_width: u16,
+    window: std::ops::Range<u32>,
+) -> (Vec<Line<'static>>, u32) {
+    // Collapsed entries: exactly one placeholder row regardless of
+    // window — the placeholder itself is the whole render.
+    if entry.collapse_state == Some(true) {
+        return (collapsible_lines(entry, true), 0);
+    }
+    // Expanded (Some(false)) and non-collapsible (None) both walk
+    // the windowed source-line path with the entry-kind's normal
+    // prefix/style. Expanded collapsible entries additionally get
+    // a `▼` marker in the leftmost 2-cell column so the toggleable
+    // affordance is visible — users can see this cell is collapsible
+    // without having to try Shift+click on every entry. None entries
+    // (single-line, no meaningful collapse) skip the marker column.
     let orange = Color::Rgb(255, 140, 0);
-    let (prefix, prefix_style) = match entry.kind {
-        ScrollbackKind::Input => (
-            "› ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        ScrollbackKind::Result => ("  ", Style::default().fg(Color::Gray)),
-        ScrollbackKind::Stdout => ("  ", Style::default().fg(Color::White)),
-        ScrollbackKind::Error => (
-            "✗ ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        ScrollbackKind::Warning => (
-            "⚠ ",
-            Style::default().fg(orange).add_modifier(Modifier::BOLD),
-        ),
-        ScrollbackKind::Notice => ("· ", Style::default().fg(Color::DarkGray)),
-    };
+    let (kind_prefix_str, prefix_style) = kind_prefix(entry.kind, orange);
+    let marker_style = Style::default().fg(Color::DarkGray);
+    let has_marker = entry.collapse_state == Some(false);
+    // Continuation rows get an indent matching row 0's total prefix
+    // width so text stays visually aligned across a wrapped entry.
+    let cont_indent = if has_marker { "    " } else { "  " };
     let body_style = match entry.kind {
         ScrollbackKind::Input => Style::default().fg(Color::White),
         ScrollbackKind::Result => Style::default().fg(Color::Gray),
@@ -62,6 +95,9 @@ pub fn entry_lines(
         ScrollbackKind::Error => Style::default().fg(Color::Red),
         ScrollbackKind::Warning => Style::default().fg(orange),
         ScrollbackKind::Notice => Style::default().fg(Color::DarkGray),
+        ScrollbackKind::Chatter => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
     };
     // For Input entries with a timer, render `<elapsed>` flush
     // right on the first line. Color follows whether it's still
@@ -90,10 +126,50 @@ pub fn entry_lines(
         None
     };
     let mut out = Vec::new();
+    // Per-source-line wrapped-row accounting — matches the formula
+    // in `count_wrapped_rows` exactly. Any drift here would misalign
+    // the caller's global row math with the actual rendered rows.
+    let w = area_width.max(1) as usize;
+    let prefix_width = 2;
+    let mut cumulative: u32 = 0;
+    let mut first_emitted_row_start: Option<u32> = None;
+    let mut had_lines = false;
     for (i, line) in entry.text.lines().enumerate() {
-        let leading = if i == 0 { prefix } else { "  " };
-        let mut spans: Vec<Span<'static>> =
-            vec![Span::styled(leading.to_string(), prefix_style)];
+        had_lines = true;
+        let body_chars = line.chars().count();
+        let total = body_chars.saturating_add(prefix_width).max(1);
+        let line_rows = (total.div_ceil(w).max(1)) as u32;
+        let line_end = cumulative.saturating_add(line_rows);
+        // Skip source lines whose wrapped-row range ends before the
+        // window even starts. Cheap — just chars().count() + arith,
+        // no allocations, no highlight calls.
+        if line_end <= window.start {
+            cumulative = line_end;
+            continue;
+        }
+        // Stop once we've moved past the window's end. `cumulative`
+        // here is the FIRST row this line contributes; if that's
+        // already past the window, everything remaining is offscreen.
+        if cumulative >= window.end {
+            break;
+        }
+        if first_emitted_row_start.is_none() {
+            first_emitted_row_start = Some(cumulative);
+        }
+        // Row-0 gutter for a collapsible expanded entry: `▼ ` marker
+        // in dim gray, then the entry-kind's normal prefix. Row 0+ of
+        // the same entry uses `cont_indent` (4 spaces to reserve room
+        // for both the marker column and the kind prefix) so wrapped
+        // text hangs cleanly under row 0's body.
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if i == 0 {
+            if has_marker {
+                spans.push(Span::styled("▼ ".to_string(), marker_style));
+            }
+            spans.push(Span::styled(kind_prefix_str.to_string(), prefix_style));
+        } else {
+            spans.push(Span::styled(cont_indent.to_string(), prefix_style));
+        }
         if let Some(per_line) = input_per_line.as_ref() {
             if let Some(line_spans) = per_line.get(i) {
                 spans.extend(line_spans.iter().cloned());
@@ -122,14 +198,111 @@ pub fn entry_lines(
             }
         }
         out.push(Line::from(spans));
+        cumulative = line_end;
     }
-    if out.is_empty() {
-        out.push(Line::from(vec![Span::styled(
-            prefix.to_string(),
-            prefix_style,
-        )]));
+    if !had_lines && out.is_empty() {
+        // Empty text: match the pre-windowed behavior (one blank
+        // prefix-only line). Only render it if window includes row 0.
+        if window.start == 0 && window.end > 0 {
+            let mut blank_spans: Vec<Span<'static>> = Vec::new();
+            if has_marker {
+                blank_spans.push(Span::styled("▼ ".to_string(), marker_style));
+            }
+            blank_spans
+                .push(Span::styled(kind_prefix_str.to_string(), prefix_style));
+            out.push(Line::from(blank_spans));
+            first_emitted_row_start = Some(0);
+        }
     }
-    out
+    let offset = first_emitted_row_start
+        .map(|s| window.start.saturating_sub(s))
+        .unwrap_or(0);
+    (out, offset)
+}
+
+/// Prefix + style for an entry-kind's row-0 gutter. Extracted so
+/// the collapsed-placeholder renderer can use the same colors as
+/// the expanded path — a collapsed `Result` reads with the same
+/// gray body as an expanded `Result`, a collapsed `Warning` reads
+/// with the same orange bold, etc. Only the entry's Chatter kind
+/// specifically stays dim (that's the "background noise" bucket).
+fn kind_prefix(kind: ScrollbackKind, orange: Color) -> (&'static str, Style) {
+    match kind {
+        ScrollbackKind::Input => (
+            "› ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ScrollbackKind::Result => ("  ", Style::default().fg(Color::Gray)),
+        ScrollbackKind::Stdout => ("  ", Style::default().fg(Color::White)),
+        ScrollbackKind::Error => (
+            "✗ ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        ScrollbackKind::Warning => (
+            "⚠ ",
+            Style::default().fg(orange).add_modifier(Modifier::BOLD),
+        ),
+        ScrollbackKind::Notice => ("· ", Style::default().fg(Color::DarkGray)),
+        // Chatter: 2-space prefix (no diagnostic glyph) + DIM
+        // DarkGray — background-noise bucket for classifier-produced
+        // NONE blocks. Multi-line Chatter still auto-collapses per
+        // COLLAPSE_AUTO_THRESHOLD; the dim style just signals "this
+        // is elidable" even before the user thinks about collapsing.
+        ScrollbackKind::Chatter => (
+            "  ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+    }
+}
+
+/// Render the single-row placeholder for a **collapsed** entry:
+/// dimmed preview of the first non-empty content line plus a
+/// `(N lines hidden)` tail. Uses a uniform dim dark-gray body
+/// style regardless of entry kind — the whole point of collapse
+/// is "this is elided content; expand to read." Rendering it in
+/// the kind's normal color (bright red for Error, orange for
+/// Warning, etc.) makes the placeholder compete visually with
+/// entries that aren't collapsed, defeating the "elided noise"
+/// signal. When the user Shift-clicks to expand, the entry
+/// reverts to its normal kind coloring — that's when you actually
+/// want the Warning to look like a Warning.
+fn collapsible_lines(
+    entry: &ScrollbackEntry,
+    collapsed: bool,
+) -> Vec<Line<'static>> {
+    debug_assert!(
+        collapsed,
+        "expanded entries go through entry_lines_windowed's \
+         regular source-line path — collapsible_lines is the \
+         collapsed-only placeholder helper"
+    );
+    let marker_style = Style::default().fg(Color::DarkGray);
+    let dim = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let source_lines: Vec<&str> = entry.text.lines().collect();
+    // Preview: first non-empty line (else first line, else "").
+    let preview = source_lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .copied()
+        .unwrap_or_default();
+    let count = source_lines.len();
+    let suffix = if count > 1 {
+        format!("  ({count} lines hidden)")
+    } else {
+        String::new()
+    };
+    let mut spans = vec![Span::styled("▶ ".to_string(), marker_style)];
+    spans.push(Span::styled(preview.to_string(), dim));
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix, dim));
+    }
+    vec![Line::from(spans)]
 }
 
 /// `(label, style)` for an entry's elapsed-time marker, or `None`
@@ -211,8 +384,48 @@ pub fn count_wrapped_rows(entry: &ScrollbackEntry, width: u16) -> u32 {
         return 1;
     }
     let w = width as usize;
-    // Every entry kind gets a 2-cell prefix ("› ", "  ", etc.).
-    let prefix_width = 2;
+    // Row-0 gutter width matches what `entry_lines_windowed` emits:
+    //   - collapsible + expanded (Some(false)): 4 cells ("▼ " +
+    //     kind prefix) on row 0, 4-space `cont_indent` on
+    //     continuation rows.
+    //   - collapsed (Some(true)): handled by the `▶` placeholder
+    //     branch below.
+    //   - non-collapsible (None): 2 cells ("kind_prefix").
+    let prefix_width: usize = if entry.collapse_state == Some(false) {
+        4
+    } else {
+        2
+    };
+    // Collapsed entry: exactly one placeholder row of content,
+    // wrapped like any other line if the preview + suffix exceed
+    // the terminal width. The formula has to MATCH what
+    // `collapsible_lines` actually emits, character for character
+    // — any drift shifts every downstream entry's row index by the
+    // rounding error, and a click on the visible content maps to
+    // an adjacent buffer row (visible: "A total of 4711…", copies:
+    // "· INFO: [Common 17-83] Releasing license…").
+    if let Some(true) = entry.collapse_state {
+        let preview = entry
+            .text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        let count = entry.text.lines().count();
+        // Suffix exactly matches the `format!("  ({count} lines
+        // hidden)")` in `collapsible_lines`: 3 (`"  ("`) + digits +
+        // 14 (`" lines hidden)"`).
+        let suffix_width = if count > 1 {
+            3 + count.to_string().chars().count() + 14
+        } else {
+            0
+        };
+        let body_chars = preview.chars().count();
+        let total = body_chars
+            .saturating_add(prefix_width)
+            .saturating_add(suffix_width)
+            .max(1);
+        return total.div_ceil(w).max(1) as u32;
+    }
     let mut rows: u32 = 0;
     let mut had_lines = false;
     for line in entry.text.lines() {
@@ -378,5 +591,85 @@ mod tests {
         // 5.9s should render as "5s" — second granularity only,
         // never fractional.
         assert_eq!(format_duration(Duration::from_millis(5_900)), "5s");
+    }
+
+    // ------------------------------------------------------------------
+    // Windowed slicing regression + correctness
+    // ------------------------------------------------------------------
+
+    fn result_entry(text: &str) -> crate::app::ScrollbackEntry {
+        crate::app::ScrollbackEntry {
+            kind: crate::app::ScrollbackKind::Result,
+            text: text.to_string(),
+            started_at: None,
+            completed_at: None,
+            collapse_state: None,
+        }
+    }
+
+    /// A huge Result entry is what triggered the REPL lock-up: 200K
+    /// source lines, each cheap on its own but O(entry) work per
+    /// redraw when we allocated `Line`s for every one. `entry_lines`
+    /// (which delegates to the windowed impl with a full range)
+    /// still produces every row on demand — for the clipboard-copy
+    /// path — but `entry_lines_windowed` with a tight range should
+    /// produce only what fits.
+    #[test]
+    fn windowed_slicer_emits_only_visible_source_lines() {
+        // Build an entry where each source line fits on ONE wrapped
+        // row (short body + 2-cell prefix < area_width). Then the
+        // number of wrapped rows the entry contributes is exactly
+        // its source-line count, making the assertions easy to
+        // reason about.
+        let source: String =
+            (0..200_000).map(|i| format!("pin_{i}\n")).collect();
+        let entry = result_entry(&source);
+        let (lines, offset) =
+            entry_lines_windowed(&entry, 80, 100_000..100_030);
+        // 30 lines requested, 30 lines emitted.
+        assert_eq!(lines.len(), 30);
+        // Window starts exactly on a source-line boundary — no
+        // sub-line offset.
+        assert_eq!(offset, 0);
+    }
+
+    /// The FIRST emitted source line may land mid-window when the
+    /// window's start lands inside a line's wrapped output. The
+    /// slicer emits the whole line (row 0 of that line) and
+    /// reports the offset so ratatui's Paragraph::scroll can trim
+    /// the top.
+    #[test]
+    fn windowed_slicer_returns_sub_line_offset_when_window_starts_mid_line() {
+        // Build lines that wrap TO exactly 2 wrapped rows each on
+        // a width-10 area (2 prefix + 12 body chars → 14 total →
+        // ceil(14/10) = 2 rows).
+        let source: String =
+            (0..10).map(|i| format!("abcdefghjkl_{i:02}\n")).collect();
+        let entry = result_entry(&source);
+        // Window that starts on the SECOND row of source line 3.
+        // Line 3's wrapped rows are [6, 8) globally; window [7, 12)
+        // should emit lines 3..6 with an offset of 1 wrapped row.
+        let (lines, offset) = entry_lines_windowed(&entry, 10, 7..12);
+        assert!(!lines.is_empty(), "expected some lines emitted");
+        assert_eq!(
+            offset, 1,
+            "first line's row 0 is one row before window.start"
+        );
+    }
+
+    /// Full-range windowing must be identical to `entry_lines` —
+    /// otherwise the `entry_lines` shim would silently render
+    /// something different from what tests / clipboard-copy expect.
+    #[test]
+    fn windowed_slicer_full_range_matches_entry_lines() {
+        let source = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n";
+        let entry = result_entry(source);
+        let unwindowed = entry_lines(&entry, 80);
+        let (windowed, offset) = entry_lines_windowed(&entry, 80, 0..u32::MAX);
+        assert_eq!(unwindowed.len(), windowed.len());
+        for (a, b) in unwindowed.iter().zip(windowed.iter()) {
+            assert_eq!(a.spans.len(), b.spans.len());
+        }
+        assert_eq!(offset, 0);
     }
 }

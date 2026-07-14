@@ -20,3 +20,9 @@ tracing.workspace = true
 portable-pty.workspace = true
 similar.workspace = true
 colored = "2.0"
+
+# Unix-only. Used for `libc::kill(pid, SIGINT)` in
+# `VivadoBackend::interrupt` — the eval-cancellation path documented on
+# that method. Windows falls back to a no-op.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

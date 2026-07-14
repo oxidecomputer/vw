@@ -95,11 +95,12 @@ pub enum ReplError {
 /// Tunable knobs supplied by the CLI invocation.
 #[derive(Clone, Debug, Default)]
 pub struct ReplOptions {
-    /// Forward Vivado's banner / info messages to the scrollback
-    /// rather than swallowing them. Useful for diagnosing a slow or
-    /// misbehaving worker; off by default to keep the log focused
-    /// on the user's evals.
-    pub verbose: bool,
+    /// Minimum severity that renders in scrollback. `Debug` shows
+    /// every block raw (including Vivado's banners, tables, and
+    /// other non-diagnostic noise); higher levels collapse
+    /// non-diagnostic content into a toggleable placeholder and
+    /// hide diagnostics below the threshold.
+    pub log_level: vw_vivado::LogLevel,
     /// If set, source this file into the session immediately after
     /// the Vivado worker comes up. Equivalent to typing `:load
     /// <path>` as the first input.

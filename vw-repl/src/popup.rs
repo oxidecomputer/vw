@@ -416,6 +416,14 @@ const HELP_ROWS: &[HelpRow] = &[
         description: "select for clipboard copy (auto-scrolls past edges)",
     },
     HelpRow {
+        keys: "Shift + click",
+        description: "expand / collapse a ▶ / ▼ non-diagnostic block",
+    },
+    HelpRow {
+        keys: "Ctrl-C (during eval)",
+        description: "cancel the running Vivado eval (session survives)",
+    },
+    HelpRow {
         keys: "F2",
         description: "toggle mouse capture (mouse-app vs terminal-native)",
     },
