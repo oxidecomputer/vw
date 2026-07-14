@@ -25,7 +25,10 @@ use crate::app::{App, ReverseSearch};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 use ratatui::Frame;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -76,10 +79,8 @@ fn input_height(app: &App) -> u16 {
 }
 
 fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
-    // Hand the area back to App so mouse-event handlers can
-    // translate screen coords into scrollback rows.
-    app.set_scrollback_area(area);
     if area.width == 0 || area.height == 0 {
+        app.set_scrollback_area(area);
         return;
     }
 
@@ -90,20 +91,56 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     // tick. With this pass, total work per draw is O(scrollback)
     // for counting + O(viewport) for actually wrapping the
     // visible window.
-    let counts: Vec<u32> = app
+    //
+    // Auto-hide scrollbar policy: count once at full width to
+    // decide "does content fit?"; if it doesn't, narrow the
+    // paragraph by one column to make room for the scrollbar and
+    // recount. This costs a second pass ONLY on frames where the
+    // scrollbar is visible — the common overflow-free case pays
+    // just one pass.
+    let counts_full: Vec<u32> = app
         .scrollback()
         .iter()
         .map(|e| crate::render::count_wrapped_rows(e, area.width))
         .collect();
-    let total: u32 = counts.iter().fold(0u32, |a, b| a.saturating_add(*b));
+    let total_full: u32 =
+        counts_full.iter().fold(0u32, |a, b| a.saturating_add(*b));
+    let needs_scrollbar = total_full > area.height as u32;
 
-    let max_scroll = total.saturating_sub(area.height as u32);
+    // `paragraph_area` is where wrapped text actually renders.
+    // When the scrollbar is on, it takes the rightmost column of
+    // `area`, leaving `area.width - 1` for text. Also the
+    // scrollback_area we hand back to App (for mouse coord
+    // mapping) so a click on the scrollbar column doesn't get
+    // interpreted as a text-selection click.
+    let (paragraph_area, counts, total) = if needs_scrollbar && area.width >= 2
+    {
+        let narrower = Rect {
+            width: area.width - 1,
+            ..area
+        };
+        let cs: Vec<u32> = app
+            .scrollback()
+            .iter()
+            .map(|e| crate::render::count_wrapped_rows(e, narrower.width))
+            .collect();
+        let t: u32 = cs.iter().fold(0u32, |a, b| a.saturating_add(*b));
+        (narrower, cs, t)
+    } else {
+        (area, counts_full, total_full)
+    };
+    // Hand paragraph_area (not `area`) back to App: mouse-coord
+    // translation now excludes the scrollbar column.
+    app.set_scrollback_area(paragraph_area);
+
+    let max_scroll = total.saturating_sub(paragraph_area.height as u32);
     let scroll_offset = if app.scrollback_follow() {
         max_scroll
     } else {
         u32::from(app.scrollback_scroll()).min(max_scroll)
     };
     app.set_last_rendered_scroll(scroll_offset.min(u32::from(u16::MAX)) as u16);
+    app.set_last_max_scroll(max_scroll.min(u32::from(u16::MAX)) as u16);
 
     // Pass 2: walk entries; build wrapped lines only for those
     // intersecting the viewport. Entries entirely above viewport
@@ -111,10 +148,11 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     // pass to ratatui's `Paragraph::scroll`). Entries entirely
     // below viewport stop the walk.
     let viewport_start = scroll_offset;
-    let viewport_end = viewport_start.saturating_add(area.height as u32);
+    let viewport_end =
+        viewport_start.saturating_add(paragraph_area.height as u32);
 
     let mut visible: Vec<Line<'static>> =
-        Vec::with_capacity(area.height as usize + 16);
+        Vec::with_capacity(paragraph_area.height as usize + 16);
     let mut accumulated: u32 = 0;
     // `skipped_rows` counts wrapped rows preceding the first row we
     // actually emit into `visible`. For entries fully above the
@@ -147,7 +185,7 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
             let local_end = viewport_end.saturating_sub(accumulated);
             let (lines, offset) = crate::render::entry_lines_windowed(
                 entry,
-                area.width,
+                paragraph_area.width,
                 local_start..local_end,
             );
             // Only the FIRST windowed entry contributes an intra-
@@ -161,7 +199,8 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
                 skipped_rows =
                     skipped_rows.saturating_add(local_start - offset);
             }
-            let wrapped = crate::render::wrap_lines(lines, area.width);
+            let wrapped =
+                crate::render::wrap_lines(lines, paragraph_area.width);
             visible.extend(wrapped);
             accumulated = entry_end;
         }
@@ -199,7 +238,9 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     // usually looking like `INFO:` / `.v:` / hex-digit tails
     // grafted onto the front of the current line. `Clear` writes
     // spaces with the default style over `area`, so subsequent
-    // paragraph render lands on a clean slate.
+    // paragraph render lands on a clean slate. Clear covers the
+    // full `area` (including any scrollbar column) — Scrollbar
+    // will paint over that column below.
     f.render_widget(Clear, area);
     // No surrounding block: the scrollback's main job is to be
     // copy-pastable. A box-drawing border around each visible row
@@ -208,7 +249,24 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     // scrollback still has its own border, which provides enough
     // visual separation between the two regions.
     let paragraph = Paragraph::new(visible).scroll((local_scroll, 0));
-    f.render_widget(paragraph, area);
+    f.render_widget(paragraph, paragraph_area);
+
+    // Scrollbar overlay — only when content overflows the viewport.
+    // ScrollbarState's `content_length` is the total scrollable
+    // range (max_scroll + 1 so the thumb can reach the very
+    // bottom); `position` is the current scroll offset. Rendered
+    // on the rightmost column of `area`; the paragraph was drawn
+    // in `paragraph_area` which excludes that column so there's
+    // no overpaint on wrapped text.
+    if needs_scrollbar && area.width >= 2 {
+        let content_len = max_scroll.saturating_add(1) as usize;
+        let mut sb_state = ScrollbarState::new(content_len)
+            .position(scroll_offset as usize)
+            .viewport_content_length(paragraph_area.height as usize);
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight);
+        f.render_stateful_widget(scrollbar, area, &mut sb_state);
+    }
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {

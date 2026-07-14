@@ -326,6 +326,15 @@ pub struct App {
     /// than jumping back to whatever stale value is in
     /// `scrollback_scroll`.
     last_rendered_scroll: u16,
+    /// The `max_scroll` (= wrapped rows − viewport height) the
+    /// renderer computed on the most recent frame. Written by
+    /// `ui::draw_scrollback`; consulted by [`Self::scroll_by`] so a
+    /// downward scroll that lands at (or past) the bottom re-engages
+    /// tail-follow. This is safe now that the wrapped-row count is
+    /// exact — the old auto-re-engage misfired on large output
+    /// because it compared raw `text.lines().count()` against a
+    /// heuristic threshold.
+    last_max_scroll: u16,
     reverse_search: Option<ReverseSearch>,
     /// Active LSP-style popup over the input editor (completion,
     /// signature help, hover). When `Some`, the key handler routes
@@ -693,6 +702,7 @@ impl App {
             selection: None,
             scrollback_follow: true,
             last_rendered_scroll: 0,
+            last_max_scroll: 0,
             reverse_search: None,
             popup: None,
             worker_state: WorkerState::Starting,
@@ -752,6 +762,14 @@ impl App {
     /// `scrollback_scroll` value.
     pub fn set_last_rendered_scroll(&mut self, offset: u16) {
         self.last_rendered_scroll = offset;
+    }
+
+    /// Renderer-side writeback for the current frame's `max_scroll`
+    /// (wrapped rows − viewport height). Consulted by
+    /// [`Self::scroll_by`] so a downward wheel/PageDown that lands
+    /// at the bottom re-engages tail-follow.
+    pub fn set_last_max_scroll(&mut self, max_scroll: u16) {
+        self.last_max_scroll = max_scroll;
     }
 
     /// Toggle terminal mouse capture. Writes the enable/disable
@@ -3101,6 +3119,15 @@ impl App {
         let new = base.saturating_add(delta).max(0) as u16;
         if delta < 0 {
             self.scrollback_follow = false;
+        } else if delta > 0 && new >= self.last_max_scroll {
+            // Downward scroll that reaches (or passes) the bottom
+            // re-engages tail-follow — standard terminal-emulator
+            // behavior. Safe now that `last_max_scroll` is the
+            // renderer's exact wrapped-row math, not the old
+            // raw-line-count heuristic that misfired on wrapped
+            // multi-MB entries (spuriously snapping back to bottom
+            // on any scroll-up and making scroll appear dead).
+            self.scrollback_follow = true;
         }
         self.scrollback_scroll = new;
         // Predictively mirror the new offset into
@@ -3113,20 +3140,6 @@ impl App {
         // clamp to max_scroll), so this is at worst a one-frame
         // optimistic preview.
         self.last_rendered_scroll = new;
-        // No auto-re-engage of tail-follow on scroll. The previous
-        // logic compared `offset` against a raw `text.lines().count()`
-        // sum, which dramatically underestimates the wrapped row
-        // count when entries wrap (a single multi-MB `puts` of a
-        // nested dict can wrap to tens of thousands of rows while
-        // contributing one raw line). The underestimate made the
-        // "are we at the bottom?" threshold fire on any scroll up
-        // from the bottom, instantly re-engaging follow and snapping
-        // the viewport back — scroll appeared dead.
-        //
-        // Tail-follow re-engages only via explicit user action: an
-        // `End` or `G` keypress jumps to bottom and reactivates it.
-        // The cost is that auto-snap-back after new output stops
-        // being free; the win is that scroll actually works at scale.
     }
 }
 
