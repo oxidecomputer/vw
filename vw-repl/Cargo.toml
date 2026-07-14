@@ -25,6 +25,8 @@ base64 = "0.22"
 winnow.workspace = true
 nucleo-matcher.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+toml.workspace = true
 
 # Unix-only. Used by the Ctrl-C eval-interrupt path in `app.rs` —
 # `libc::kill(pid, SIGINT)` sends SIGINT directly to the Vivado

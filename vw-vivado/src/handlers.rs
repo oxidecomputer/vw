@@ -241,9 +241,8 @@ fn project_name_value(
     workspace_root: Option<&std::path::Path>,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
-    let cfg = vw_lib::load_workspace_config(&ws).map_err(|e| {
-        format!("failed to load workspace config at {ws}: {e}")
-    })?;
+    let cfg = vw_lib::load_workspace_config(&ws)
+        .map_err(|e| format!("failed to load workspace config at {ws}: {e}"))?;
     Ok(Value::String(cfg.workspace.name.clone()))
 }
 

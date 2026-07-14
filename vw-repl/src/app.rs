@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use tui_textarea::{Input, TextArea};
 use vw_eda::EdaBackend;
 
+use crate::config::{self, CollapseMode};
 use crate::history::History;
 use crate::lower::Origin;
 use crate::session::{Session, SessionBatch};
@@ -58,12 +59,51 @@ pub const COLLAPSE_AUTO_THRESHOLD: usize = 100;
 /// `None` because a placeholder around one row of content adds
 /// affordance without meaningful eliding. Above the auto-threshold
 /// the initial state is collapsed.
-fn compute_collapse_state(text: &str) -> Option<bool> {
+fn compute_collapse_state(text: &str, mode: CollapseMode) -> Option<bool> {
     let lines = text.lines().count();
     if lines < 2 {
         return None;
     }
-    Some(lines > COLLAPSE_AUTO_THRESHOLD)
+    match mode {
+        // Aggressive: every multi-line entry starts collapsed —
+        // `▶`-marked placeholders that expand on demand. Turns
+        // scrollback into a compact index. See
+        // [`crate::config::CollapseMode`].
+        CollapseMode::Aggressive => Some(true),
+        // Normal: only wall-of-text entries auto-collapse; smaller
+        // multi-line output stays inline for at-a-glance scanning.
+        CollapseMode::Normal => Some(lines > COLLAPSE_AUTO_THRESHOLD),
+    }
+}
+
+/// Split a diagnostic's rendered text into `(body, stack)` at the
+/// first line that looks like a stack frame — `  at <path>:<line>`.
+/// The body is everything before that line (message + any wrapped
+/// continuations); the stack is that line and everything after,
+/// trailing newline stripped. `None` for stack means the diagnostic
+/// carried no frames (traceless INFOs, some plain WARNINGs).
+///
+/// The two-space indent + literal `at ` prefix is the shape
+/// [`install_proc_body_wrap`] attaches in `vivado-shim.tcl` — see
+/// its `format_stack` helper. If that format ever drifts, both
+/// sides must stay in sync.
+fn split_body_and_stack(text: &str) -> (String, Option<String>) {
+    let needle = "\n  at ";
+    match text.find(needle) {
+        // The `\n` at `idx` closes the body line; the stack begins
+        // at `idx + 1` so the `  at ` prefix is preserved on the
+        // first stack frame.
+        Some(idx) => {
+            let body = text[..idx].to_string();
+            let stack = text[idx + 1..].trim_end_matches('\n').to_string();
+            if stack.is_empty() {
+                (body, None)
+            } else {
+                (body, Some(stack))
+            }
+        }
+        None => (text.to_string(), None),
+    }
 }
 
 /// What category an entry in the scrollback log belongs to. Drives
@@ -354,6 +394,10 @@ pub struct App {
     /// Set when `:quit` (or Ctrl-D on an empty buffer) fires, so the
     /// outer loop bails out after the current frame.
     exit: bool,
+    /// Auto-collapse policy for multi-line scrollback entries.
+    /// Loaded from `<workspace>/.vw/repl.toml` at startup and
+    /// consulted by [`compute_collapse_state`] on every `push`.
+    collapse_mode: CollapseMode,
 }
 
 enum WorkerState {
@@ -508,6 +552,11 @@ async fn run_inner(
             .and_then(|d| vw_lib::find_workspace_dir(&d))
             .map(|p| p.into_std_path_buf())
     };
+    // Load `<ws>/.vw/repl.toml` — currently just the `[ui] collapse`
+    // knob. Absent / malformed / no-workspace all fall back to
+    // defaults; a config file is optional infrastructure, not a
+    // startup dependency.
+    let repl_config = config::load(rpc_workspace_root.as_deref());
     tokio::spawn(worker_task(
         worker_rx,
         event_tx,
@@ -519,7 +568,13 @@ async fn run_inner(
         rpc_workspace_root,
     ));
 
-    let mut app = App::new(opts, worker_tx, eval_rx, event_tx_for_app);
+    let mut app = App::new(
+        opts,
+        worker_tx,
+        eval_rx,
+        event_tx_for_app,
+        repl_config.ui.collapse,
+    );
     if let Some(p) = verbose_log_path {
         app.push(
             ScrollbackKind::Notice,
@@ -617,6 +672,7 @@ impl App {
         worker_tx: mpsc::Sender<WorkerCmd>,
         eval_rx: mpsc::UnboundedReceiver<WorkerEvent>,
         event_tx: mpsc::UnboundedSender<WorkerEvent>,
+        collapse_mode: CollapseMode,
     ) -> Self {
         let mut input = TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
@@ -651,6 +707,7 @@ impl App {
             pending_input_boundaries: Vec::new(),
             pending_eval_index: 0,
             exit: false,
+            collapse_mode,
         }
     }
 
@@ -2554,7 +2611,22 @@ impl App {
                                 scrollback_kind,
                                 resolved,
                             );
-                            self.push(scrollback_kind, tagged);
+                            // Split the diagnostic body from any
+                            // attached stack trace so the message
+                            // itself stays fully visible while the
+                            // `at <path>:<line> in ::<proc>` tail
+                            // becomes its own start-collapsed
+                            // entry. Without this the entire entry
+                            // (message + stack) is toggleable as
+                            // one unit, and a small 3-line WARNING
+                            // shows a `▼` marker that clutters the
+                            // scrollback without buying any real
+                            // ability to elide meaningful noise.
+                            let (body, stack) = split_body_and_stack(&tagged);
+                            self.push(scrollback_kind, body);
+                            if let Some(stack) = stack {
+                                self.push_stack_trace(stack);
+                            }
                         }
                     }
                 }
@@ -2609,7 +2681,11 @@ impl App {
                                 scrollback_kind,
                                 resolved,
                             );
-                            self.push(scrollback_kind, tagged);
+                            let (body, stack) = split_body_and_stack(&tagged);
+                            self.push(scrollback_kind, body);
+                            if let Some(stack) = stack {
+                                self.push_stack_trace(stack);
+                            }
                         }
                     }
                 }
@@ -2813,7 +2889,7 @@ impl App {
         // scrollback. Single-line entries get `None` — a placeholder
         // for something that fits in one row is worse UX than just
         // showing the row itself.
-        let collapse_state = compute_collapse_state(&text);
+        let collapse_state = compute_collapse_state(&text, self.collapse_mode);
         self.scrollback.push(ScrollbackEntry {
             kind,
             text,
@@ -2838,6 +2914,37 @@ impl App {
             return;
         }
         self.push(ScrollbackKind::Chatter, lines.join("\n"));
+    }
+
+    /// Push a stack trace as its own entry, always Chatter-styled
+    /// and always start-collapsed when it has 2+ lines. Used by the
+    /// diagnostic stream path to split the `at <path>:<line>` tail
+    /// off a WARNING/ERROR body so the human-readable message
+    /// stays fully visible while the stack becomes a
+    /// `▶ at <first-frame>` placeholder — Shift+click to expand.
+    /// Bypasses [`Self::push`]'s auto-threshold: even a 3-frame
+    /// stack collapses, which is the whole point of the split.
+    /// Single-line stacks (one frame) fit in a row and stay
+    /// non-collapsible — a placeholder for a 40-char line reads
+    /// as noise.
+    pub(crate) fn push_stack_trace(&mut self, stack: String) {
+        let text = if stack.contains('\t') {
+            stack.replace('\t', "    ")
+        } else {
+            stack
+        };
+        let collapse_state = if text.lines().count() < 2 {
+            None
+        } else {
+            Some(true)
+        };
+        self.scrollback.push(ScrollbackEntry {
+            kind: ScrollbackKind::Chatter,
+            text,
+            started_at: None,
+            completed_at: None,
+            collapse_state,
+        });
     }
 
     /// Per-Input-entry timer advance triggered by an EvalDone.
@@ -4013,8 +4120,13 @@ WARNING: [port::plumb_if_pin-1] skipping foo
             tokio::sync::mpsc::channel::<WorkerCmd>(8);
         let (event_tx, event_rx) =
             tokio::sync::mpsc::unbounded_channel::<WorkerEvent>();
-        let mut app =
-            App::new(ReplOptions::default(), worker_tx, event_rx, event_tx);
+        let mut app = App::new(
+            ReplOptions::default(),
+            worker_tx,
+            event_rx,
+            event_tx,
+            CollapseMode::Normal,
+        );
 
         // Two-boundary batch. Only boundary 0's echo lives in
         // scrollback (deferred push means boundary 1 stays lazy
@@ -4120,8 +4232,13 @@ WARNING: [port::plumb_if_pin-1] skipping foo
             tokio::sync::mpsc::channel::<WorkerCmd>(8);
         let (event_tx, event_rx) =
             tokio::sync::mpsc::unbounded_channel::<WorkerEvent>();
-        let mut app =
-            App::new(ReplOptions::default(), worker_tx, event_rx, event_tx);
+        let mut app = App::new(
+            ReplOptions::default(),
+            worker_tx,
+            event_rx,
+            event_tx,
+            CollapseMode::Normal,
+        );
         // Emulate the sequence a `puts "muffins"` eval produces:
         // one Stream chunk carrying the output, then EvalDone.
         // Both events land through `handle_worker_event`, same as
