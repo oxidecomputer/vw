@@ -302,6 +302,13 @@ pub struct App {
     /// happens on the main task after the prepare returns, so
     /// there's no active reader to wait for.
     session: std::sync::Arc<std::sync::RwLock<Session>>,
+    /// Shared "already loaded in Vivado" map. Handed to the RPC
+    /// handler at spawn time; refreshed from
+    /// `session.loaded_paths()` after every `commit` so
+    /// `compile_htcl_module` skips re-shipping files whose
+    /// procs are already installed. Correctness invariant lives
+    /// with [`vw_vivado::SharedPreload`].
+    preload: vw_vivado::SharedPreload,
     scrollback: Vec<ScrollbackEntry>,
     /// Segments Vivado's classified stream into per-chunk Diagnostic
     /// entries and grouped NONE-block collapsibles before pushing
@@ -600,6 +607,14 @@ async fn run_inner(
     // defaults; a config file is optional infrastructure, not a
     // startup dependency.
     let repl_config = config::load(rpc_workspace_root.as_deref());
+    // Shared preload map — grows as batches commit. Both the RPC
+    // handler (inside worker_task) and App hold clones of the same
+    // Arc so `compile_htcl_module` sees loaded-file updates as
+    // soon as `App::sync_preload_from_session` publishes them.
+    // See `vw_vivado::SharedPreload` for the correctness invariant.
+    let preload: vw_vivado::SharedPreload = std::sync::Arc::new(
+        std::sync::RwLock::new(std::collections::HashMap::new()),
+    );
     tokio::spawn(worker_task(
         worker_rx,
         event_tx,
@@ -609,6 +624,7 @@ async fn run_inner(
         opts.part.clone(),
         opts.variant.clone(),
         rpc_workspace_root,
+        preload.clone(),
     ));
 
     let mut app = App::new(
@@ -617,6 +633,7 @@ async fn run_inner(
         eval_rx,
         event_tx_for_app,
         repl_config.ui.collapse,
+        preload,
     );
     if let Some(p) = verbose_log_path {
         app.push(
@@ -716,6 +733,7 @@ impl App {
         eval_rx: mpsc::UnboundedReceiver<WorkerEvent>,
         event_tx: mpsc::UnboundedSender<WorkerEvent>,
         collapse_mode: CollapseMode,
+        preload: vw_vivado::SharedPreload,
     ) -> Self {
         let mut input = TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
@@ -728,6 +746,7 @@ impl App {
             session: std::sync::Arc::new(
                 std::sync::RwLock::new(Session::new()),
             ),
+            preload,
             scrollback: Vec::new(),
             block_acc: vw_vivado::BlockAccumulator::new(),
             scrollback_scroll: 0,
@@ -754,6 +773,28 @@ impl App {
             pending_eval_index: 0,
             exit: false,
             collapse_mode,
+        }
+    }
+
+    /// Refresh the shared preload map from the current session's
+    /// `loaded_paths()`. Called immediately after every
+    /// `session.commit(...)` so the next `compile_htcl_module`
+    /// RPC sees the latest set of files installed in the Vivado
+    /// interpreter.
+    ///
+    /// Called AFTER commit (not before / concurrently) so the map
+    /// only names files whose lowered Tcl has been eval'd by
+    /// Vivado — the safety rule spelled out on
+    /// `vw_vivado::SharedPreload`. Wholesale replace (not merge)
+    /// so a file removed from the session — e.g. via a hot-edit
+    /// path in the future — drops out of the preload set too.
+    fn sync_preload_from_session(&self) {
+        let paths = {
+            let s = self.session.read().unwrap();
+            s.loaded_paths()
+        };
+        if let Ok(mut g) = self.preload.write() {
+            *g = paths;
         }
     }
 
@@ -2527,6 +2568,7 @@ impl App {
             // parsed batch to the session anyway so future
             // analyzer queries see the imported procs.
             self.session.write().unwrap().commit(lowered.batch);
+            self.sync_preload_from_session();
             self.push(ScrollbackKind::Notice, "(no Tcl to evaluate)".into());
             // The per-input timer was ticking through prepare;
             // freeze it now — this batch has nothing to eval.
@@ -2607,6 +2649,37 @@ impl App {
             lowered.commands.iter().map(|c| c.is_set_binding).collect();
         self.pending_eval_index = 0;
 
+        // Seed the shared preload map with this batch's file
+        // list BEFORE dispatching. Commands ship in document
+        // order, so any RPC that fires from a command MID-batch
+        // (currently only `compile_htcl_module` from
+        // `vw::configure_ip`) can trust that every proc from
+        // every file preceding it in the same batch is already
+        // installed in Vivado. Without this, the batch's own
+        // `src @vw` recursion doesn't reach the preload until
+        // AFTER the whole batch completes — which means the
+        // first `vw::configure_ip` call re-parses + re-lowers
+        // + re-ships @vw + @vivado-cmd (~10MB of Tcl,
+        // multiple minutes). Preload-then-dispatch turns that
+        // into "just workspace-local files" and shrinks the
+        // compile output by ~100×.
+        //
+        // Safety: the invariant on `SharedPreload` is "files
+        // whose Tcl has been eval'd by Vivado". Populating from
+        // this batch's file list before eval TECHNICALLY breaks
+        // the letter of that rule for the window between
+        // dispatch and completion — but for the specific caller
+        // that uses the preload (`compile_htcl_module`, invoked
+        // from mid-batch procs), the OR pending commands run
+        // strictly BEFORE the invocation, so the corresponding
+        // procs ARE installed by the time the RPC fires.
+        if let Ok(mut g) = self.preload.write() {
+            for f in &lowered.batch.program.files {
+                if let Some(t) = f.mtime {
+                    g.insert(f.path.clone(), t);
+                }
+            }
+        }
         // Commit to the session only after every command in the
         // batch succeeds (see `handle_worker_event`); a failure
         // mid-batch shouldn't pollute the analyzer's view.
@@ -3003,6 +3076,7 @@ impl App {
                             }
                             if let Some(batch) = self.pending_batch.take() {
                                 self.session.write().unwrap().commit(batch);
+                                self.sync_preload_from_session();
                             }
                             self.worker_state = WorkerState::Ready;
                             // Freeze per-input timers at their
@@ -3033,6 +3107,7 @@ impl App {
                         // concern from what the analyzer sees.
                         if let Some(batch) = self.pending_batch.take() {
                             self.session.write().unwrap().commit(batch);
+                            self.sync_preload_from_session();
                         }
                         // Failed evals also freeze their per-input
                         // timer — otherwise the live counter would
@@ -3373,6 +3448,7 @@ async fn worker_task(
     part: Option<String>,
     variant: Option<String>,
     rpc_workspace_root: Option<std::path::PathBuf>,
+    preload: vw_vivado::SharedPreload,
 ) {
     // Auto-project bootstrap: same rule as `vw run`. If the
     // enclosing workspace declares `[[target-parts]]` or
@@ -3425,9 +3501,14 @@ async fn worker_task(
             }
         }
     });
-    let rpc_handler = vw_vivado::make_handler_with_variant(
+    // RPC handler with the shared preload map — App owns the
+    // Arc's other end and updates the map after every
+    // `session.commit()` from `session.loaded_paths()`. See the
+    // `SharedPreload` docs in vw-vivado.
+    let rpc_handler = vw_vivado::make_handler_with_preloaded(
         rpc_workspace_root,
         active_variant,
+        preload,
     );
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
@@ -4355,6 +4436,9 @@ WARNING: [port::plumb_if_pin-1] skipping foo
             event_rx,
             event_tx,
             CollapseMode::Normal,
+            std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         );
 
         // Two-boundary batch. Only boundary 0's echo lives in
@@ -4467,6 +4551,9 @@ WARNING: [port::plumb_if_pin-1] skipping foo
             event_rx,
             event_tx,
             CollapseMode::Normal,
+            std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         );
         // Emulate the sequence a `puts "muffins"` eval produces:
         // one Stream chunk carrying the output, then EvalDone.

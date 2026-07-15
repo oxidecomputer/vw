@@ -77,6 +77,11 @@ pub enum ResolveError {
 /// The convention is intentionally fixed (no `vw.toml` knob) so every
 /// htcl module is laid out the same way — a reader can open
 /// `module.htcl` and know they're at the entry point.
+///
+/// The same convention applies to any directory that appears in a
+/// `src` path — `src ip` where `ip/` is a directory resolves to
+/// `ip/{DEFAULT_MODULE}.htcl` (analogous to Rust's `mod foo;`
+/// picking `foo/mod.rs` when `foo.rs` is absent).
 pub const DEFAULT_MODULE: &str = "module";
 
 /// Resolver that turns import paths into on-disk file paths. Construct
@@ -162,16 +167,41 @@ impl Resolver {
             }
         };
 
-        let with_ext = if candidate.extension().is_some() {
-            candidate.clone()
-        } else {
-            candidate.with_extension("htcl")
-        };
-
-        if !with_ext.exists() {
+        // Directory-as-module: `src ip` where `ip/` is a real
+        // directory containing `module.htcl` resolves to
+        // `ip/module.htcl`. Mirrors the bare-`@dep` behavior — a
+        // dep root and an in-tree subdirectory both use
+        // `module.htcl` as the entry point — and gives users the
+        // Rust-style choice between `foo.htcl` and
+        // `foo/module.htcl` for a growing module. Checked BEFORE
+        // the `.htcl` append so a directory with a sibling
+        // `<name>.htcl` file favors the file (predictable when
+        // both happen to exist during a rename).
+        if candidate.extension().is_none() {
+            let with_ext = candidate.with_extension("htcl");
+            if with_ext.exists() {
+                return Ok(with_ext.canonicalize().unwrap_or(with_ext));
+            }
+            if candidate.is_dir() {
+                let module =
+                    candidate.join(DEFAULT_MODULE).with_extension("htcl");
+                if module.exists() {
+                    return Ok(module.canonicalize().unwrap_or(module));
+                }
+                // Directory exists but has no module.htcl — surface
+                // the module path in the error so the fix is obvious
+                // ("create ip/module.htcl") rather than pointing at
+                // the sibling `.htcl` we tried first.
+                return Err(ResolveError::NotFound { path: module });
+            }
             return Err(ResolveError::NotFound { path: with_ext });
         }
-        Ok(with_ext.canonicalize().unwrap_or(with_ext))
+
+        // Path already carries an extension — take it verbatim.
+        if !candidate.exists() {
+            return Err(ResolveError::NotFound { path: candidate });
+        }
+        Ok(candidate.canonicalize().unwrap_or(candidate))
     }
 }
 
@@ -264,6 +294,73 @@ mod tests {
         let (dir, resolver) = fixture();
         let err = resolver.resolve(dir.path(), "does/not/exist").unwrap_err();
         assert!(matches!(err, ResolveError::NotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn directory_with_module_htcl_resolves() {
+        // `src ip` where `ip/` is a directory with `module.htcl`
+        // inside → `ip/module.htcl`. The layout the metroid
+        // project switched to after reorganizing per-IP files
+        // into per-IP directories.
+        let dir = tempfile::tempdir().unwrap();
+        let ip = dir.path().join("ip");
+        fs::create_dir_all(&ip).unwrap();
+        fs::write(ip.join("module.htcl"), "# entry\n").unwrap();
+        let resolver = Resolver::new();
+        let resolved = resolver.resolve(dir.path(), "ip").unwrap();
+        assert!(resolved.ends_with("ip/module.htcl"), "{resolved:?}");
+    }
+
+    #[test]
+    fn sibling_htcl_wins_over_directory_module() {
+        // When both `foo.htcl` and `foo/module.htcl` exist, prefer
+        // the file. Predictable during a rename: users incrementally
+        // migrating a single-file module to a directory don't get
+        // a surprise resolution swap the moment the directory
+        // sprouts a `module.htcl`.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("foo")).unwrap();
+        fs::write(dir.path().join("foo.htcl"), "# file\n").unwrap();
+        fs::write(dir.path().join("foo").join("module.htcl"), "# dir\n")
+            .unwrap();
+        let resolver = Resolver::new();
+        let resolved = resolver.resolve(dir.path(), "foo").unwrap();
+        assert!(resolved.ends_with("foo.htcl"), "{resolved:?}");
+        assert!(!resolved.ends_with("module.htcl"), "{resolved:?}");
+    }
+
+    #[test]
+    fn directory_without_module_htcl_errors_pointing_at_module() {
+        // Directory exists but lacks `module.htcl` — the error
+        // path should name the missing `module.htcl`, not the
+        // sibling `.htcl` the resolver also considered. That's
+        // what tells the user "add module.htcl here" instead of
+        // "create a sibling file."
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("ip")).unwrap();
+        let resolver = Resolver::new();
+        let err = resolver.resolve(dir.path(), "ip").unwrap_err();
+        match err {
+            ResolveError::NotFound { path } => {
+                assert!(path.ends_with("ip/module.htcl"), "{path:?}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_dep_subpath_can_be_directory_module() {
+        // `src @quartz/ip` where the dep has `ip/module.htcl` —
+        // same directory-as-module rule applies to subpaths of a
+        // named dep, not just to workspace-local paths.
+        let dir = tempfile::tempdir().unwrap();
+        let dep_root = dir.path().join("dep");
+        fs::create_dir_all(dep_root.join("ip")).unwrap();
+        fs::write(dep_root.join("ip").join("module.htcl"), "# entry\n")
+            .unwrap();
+        let resolver = Resolver::new().with_dep("quartz", dep_root);
+        let resolved = resolver.resolve(dir.path(), "@quartz/ip").unwrap();
+        assert!(resolved.ends_with("dep/ip/module.htcl"), "{resolved:?}");
     }
 
     #[test]

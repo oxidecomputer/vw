@@ -36,13 +36,67 @@
 //!   `constraints/route/` respectively. Used to attach USED_IN
 //!   flags to `read_xdc` so route-only constraints don't apply
 //!   during synthesis (and vice versa).
+//! - `synth_needs_update` — content-hash comparison between the
+//!   checkpoint's sidecar manifest and the current tracked source
+//!   set (design VHDL, IP wrappers, synth XDC, workspace `.htcl`,
+//!   vw.toml, vw.lock). Returns `true` when the checkpoint OR
+//!   manifest is missing OR the fingerprints disagree. Backs
+//!   the `vw::synth` cache path.
+//! - `synth_mark_checkpoint` — writes the sidecar manifest for a
+//!   freshly-produced checkpoint. Called after
+//!   `vivado_cmd::write_checkpoint` so the next invocation can
+//!   compare fingerprints and skip resynth on unchanged sources.
+//! - `ip_needs_update` / `ip_mark_checkpoint` — same shape as
+//!   the synth pair, but the fingerprint covers only
+//!   `<ws>/ip/**/*.htcl`. Backs `vw::configure_ip` so the
+//!   `ip::configure` proc (typically a batch of expensive
+//!   `create_ip` / `make_wrapper` calls) is skipped when the
+//!   IP tree hasn't changed since the last checkpoint.
+//! - `compile_htcl_module` — parses + lowers an htcl module (any
+//!   `src`-shaped path resolved against the workspace root) and
+//!   returns the concatenated Tcl. `vw::configure_ip` uses this
+//!   to auto-load `<ws>/ip/module.htcl` when `::ip::configure`
+//!   isn't already defined, so a `src ip` in `design.htcl` isn't
+//!   a hidden requirement.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use serde_json::Value;
 
 use crate::rpc::{FnHandler, RpcHandler};
+
+/// Shared "already loaded in this Vivado session" map. Populated
+/// by the CLI / REPL after each successful htcl load with the
+/// paths + mtimes of every file that was shipped to Vivado.
+/// Consulted by [`compile_htcl_module`] so on-demand
+/// module compilation skips re-shipping files whose procs are
+/// already installed — which is both a big perf win and, more
+/// importantly, KEEPS the RPC path from re-loading dep files that
+/// design.htcl never touched. Concretely: `design.htcl`'s
+/// `src @vw` pulls @vw + @vivado-cmd; a workspace `ip/cips.htcl`
+/// also does `src @cpm5` / `src @cips` / `src @clk-wizard`; those
+/// three are NOT in the initial session because design.htcl
+/// never reached them, and the auto-load path must actually
+/// compile + ship them the first time. See the safety note on
+/// [`SharedPreload`] for how the map's invariants are enforced.
+pub type PreloadedPaths = HashMap<PathBuf, SystemTime>;
+
+/// Shared handle callers hold to update the "already-loaded"
+/// map after each session commit. The RPC handler holds the same
+/// Arc so reads see the most recent update without any explicit
+/// message passing.
+///
+/// **Invariant**: only entries added to this map after Vivado
+/// has finished evaling the corresponding Tcl are safe to skip.
+/// Adding a path prematurely would cause `compile_htcl_module`
+/// to omit content Vivado hasn't seen yet, leading to
+/// `invalid command name` errors at runtime. The REPL updates
+/// after every batch's `EvalDone`; the CLI updates once at the
+/// end of the initial load.
+pub type SharedPreload = Arc<RwLock<PreloadedPaths>>;
 
 /// Build the FnHandler used by every Vivado spawn. `workspace_root`
 /// is the workspace-root path to serve for `vw::workspace_root`;
@@ -62,17 +116,33 @@ pub fn make_handler_with_variant(
     workspace_root: Option<PathBuf>,
     active_variant: Option<String>,
 ) -> Arc<dyn RpcHandler> {
+    let preloaded: SharedPreload = Arc::new(RwLock::new(HashMap::new()));
+    make_handler_with_preloaded(workspace_root, active_variant, preloaded)
+}
+
+/// Full-detail constructor: carries the shared preload map that
+/// [`compile_htcl_module`] consults. Callers who want on-demand
+/// htcl loading to skip files already shipped to this Vivado
+/// session should clone the returned map's Arc, hold onto it,
+/// and update it after every successful load.
+pub fn make_handler_with_preloaded(
+    workspace_root: Option<PathBuf>,
+    active_variant: Option<String>,
+    preloaded: SharedPreload,
+) -> Arc<dyn RpcHandler> {
     let workspace_root = workspace_root.map(Arc::new);
     let active_variant = active_variant.map(Arc::new);
     FnHandler::new(move |method: String, args: Value| {
         let ws = workspace_root.clone();
         let av = active_variant.clone();
+        let pl = preloaded.clone();
         async move {
             dispatch(
                 &method,
                 args,
                 ws.as_deref().map(|p| p.as_ref()),
                 av.as_deref().map(|s| s.as_str()),
+                &pl,
             )
             .await
         }
@@ -84,6 +154,7 @@ async fn dispatch(
     args: Value,
     workspace_root: Option<&std::path::Path>,
     active_variant: Option<&str>,
+    preloaded: &SharedPreload,
 ) -> Result<Value, String> {
     match method {
         "workspace_root" => workspace_root
@@ -129,8 +200,581 @@ async fn dispatch(
         "design_route_constraints" => {
             design_phase_constraints(workspace_root, ConstraintPhase::Route)
         }
+        "synth_needs_update" => {
+            synth_needs_update(workspace_root, active_variant, args)
+        }
+        "synth_mark_checkpoint" => {
+            synth_mark_checkpoint(workspace_root, active_variant, args)
+        }
+        "ip_needs_update" => ip_needs_update(workspace_root, args),
+        "ip_mark_checkpoint" => ip_mark_checkpoint(workspace_root, args),
+        "compile_htcl_module" => {
+            compile_htcl_module(workspace_root, args, preloaded).await
+        }
         other => Err(format!("unknown RPC method: {other}")),
     }
+}
+
+/// `compile_htcl_module` — inputs `{path: "<import>"}` where
+/// `<import>` follows the same resolution rules as an htcl `src`
+/// statement (relative path, absolute path, `@dep/…`, or
+/// directory-as-module). Loads the entry file + every transitive
+/// import, lowers each command to Tcl, and returns the
+/// concatenated Tcl string.
+///
+/// Callers `eval` the returned string to install everything the
+/// module exports into the current interpreter. Used by
+/// `vw::configure_ip` to auto-load `<ws>/ip/module.htcl` when
+/// `::ip::configure` isn't already defined — so the user doesn't
+/// have to remember to `src ip` in their `design.htcl` before
+/// calling the wrapper.
+///
+/// The pipeline mirrors what `vw run` / `vw repl` do internally
+/// (parse → sig-table → per-command lowering → extern rewrite)
+/// but skips overload dispatchers, putr rewrites, and origin
+/// markers. Those matter for user-facing tracebacks and
+/// interactive `putr` — neither is needed for on-demand loading
+/// of a well-formed module.
+async fn compile_htcl_module(
+    workspace_root: Option<&std::path::Path>,
+    args: Value,
+    preloaded: &SharedPreload,
+) -> Result<Value, String> {
+    // Extract owned inputs so the closure passed to
+    // `spawn_blocking` doesn't borrow anything from this async
+    // frame. `path` becomes a String, the preload map is
+    // snapshotted here (short critical section on the RwLock —
+    // NOT held across the compile).
+    let ws = workspace_root_or_error(workspace_root)?;
+    let obj = args.as_object().ok_or_else(|| {
+        "compile_htcl_module: args must be an object with a `path` \
+         string field"
+            .to_string()
+    })?;
+    let path: String = obj
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "compile_htcl_module: missing string `path`".to_string()
+        })?;
+    let preloaded_snapshot: std::collections::HashMap<
+        std::path::PathBuf,
+        std::time::SystemTime,
+    > = preloaded.read().map(|g| g.clone()).unwrap_or_default();
+    let ws_owned = ws.clone();
+
+    // Offload the heavy work — file I/O, htcl parse, per-command
+    // lowering — to the blocking thread pool. Without this, the
+    // async frame runs to completion on the current runtime
+    // thread and starves every other task (in particular the
+    // REPL's 250ms redraw tick, which is why the input timer
+    // appeared to freeze during long compiles). Only mouse
+    // movement was un-freezing it because a mouse event would
+    // hit the `crossterm_events` branch of the select! and
+    // trigger a draw as a side effect of handling the event.
+    tokio::task::spawn_blocking(move || {
+        compile_htcl_module_blocking(ws_owned, path, preloaded_snapshot)
+    })
+    .await
+    .map_err(|e| format!("compile_htcl_module: join error: {e}"))?
+}
+
+/// Sync core of `compile_htcl_module` — runs on the tokio
+/// blocking thread pool so the async runtime stays responsive.
+/// All heavy work (loader recursion, parse, lower, extern
+/// rewrite, disk writes) lives here.
+///
+/// Disk cache: after a successful compile, writes a manifest at
+/// `<ws>/target/.vw-compile-<sanitized-path>.tcl.manifest`
+/// listing every loaded file's path + mtime. On subsequent
+/// invocations, if the manifest exists AND every file's current
+/// mtime matches, returns the cached `.tcl` verbatim in
+/// milliseconds instead of re-running the loader.
+///
+/// The cache is invalidated by any file's mtime changing OR the
+/// preload set changing (folded into the manifest fingerprint).
+/// Not invalidated by ADDING new files (a new `.htcl` under `ip/`
+/// wouldn't be in the manifest); users adding sources should
+/// `rm target/.vw-compile-*` to force recompile.
+fn compile_htcl_module_blocking(
+    ws: camino::Utf8PathBuf,
+    path: String,
+    preloaded_snapshot: std::collections::HashMap<
+        std::path::PathBuf,
+        std::time::SystemTime,
+    >,
+) -> Result<Value, String> {
+    // Compute cache paths early so we can short-circuit on hit.
+    let dbg_name = format!(
+        ".vw-compile-{}.tcl",
+        path.replace(['/', '\\'], "_").replace('@', "at_"),
+    );
+    let target_dir = ws.join("target");
+    let cache_tcl = target_dir.join(&dbg_name);
+    let cache_manifest_name = format!("{dbg_name}.manifest");
+    let cache_manifest = target_dir.join(&cache_manifest_name);
+
+    // Cache hit path: manifest exists AND every listed file's
+    // current mtime matches. The manifest also embeds a hash of
+    // the preload snapshot's paths (sorted) — if the caller now
+    // has a different set of files preloaded, the compile output
+    // would differ, so we invalidate on that too.
+    if let Some(cached) = try_load_cached_compile(
+        cache_manifest.as_std_path(),
+        cache_tcl.as_std_path(),
+        &preloaded_snapshot,
+    ) {
+        return Ok(Value::String(cached));
+    }
+    // Build the resolver with the workspace's transitive deps plus
+    // the Cargo-parity self-injection. Mirrors vw-cli's
+    // `load_htcl_program_with_mode` at a minimum — we don't need
+    // test deps here (the auto-load path never fires from inside
+    // a test).
+    let mut resolver = vw_htcl::Resolver::new();
+    if let Ok(paths) = vw_lib::transitive_dep_cache_paths(&ws) {
+        for (name, cache_path) in paths {
+            resolver = resolver.with_dep(name, cache_path);
+        }
+    }
+    if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
+        resolver = resolver.with_dep_if_absent(
+            cfg.workspace.name.clone(),
+            ws.as_std_path().to_path_buf(),
+        );
+    }
+
+    // Resolve the import path against the workspace root (that's
+    // how `design.htcl` would resolve `src ip`). Directory-as-
+    // module + `.htcl` extension logic is inside `resolve()`.
+    let entry = resolver
+        .resolve(ws.as_std_path(), &path)
+        .map_err(|e| format!("compile_htcl_module: {e}"))?;
+
+    // Preload: skip files the caller has already shipped to this
+    // Vivado session.
+    //
+    // Correctness rule: only files that are actually installed
+    // in the Vivado interp belong in this map. An earlier version
+    // of this code preloaded every `.htcl` under every dep root
+    // the resolver knew about — that was wrong because a
+    // workspace can declare deps (e.g. `@cpm5` / `@cips` /
+    // `@clk-wizard` in metroid) that `design.htcl`'s entry
+    // graph never actually pulls in. Those procs weren't
+    // installed at startup, and preloading their files caused
+    // `invalid command name "cpm5::cpm_pcie0"` at runtime.
+    // Trusting the caller-populated map avoids that class of
+    // bug entirely.
+    let mut noop = NoopLoadObserver;
+    let program = vw_htcl::loader::load_with_preloaded(
+        &entry,
+        &resolver,
+        &mut noop,
+        &preloaded_snapshot,
+    )
+    .map_err(|e| format!("compile_htcl_module: loading {path}: {e}"))?;
+
+    // Parse the flattened source once, then build the same set
+    // of auxiliary tables vw-cli's runner uses. Enum-prelude and
+    // overload-dispatcher emission both consult these — skipping
+    // them means user procs referencing an enum namespace (e.g.
+    // `proc Property::as_nested`) or a monomorphized generic
+    // repr (e.g. `dict_string_Property::repr`) reach Tcl before
+    // the namespace exists and error with `unknown namespace`.
+    let parsed = vw_htcl::parser::parse(&program.source);
+    let mut _ignored: Vec<vw_htcl::ValidatorDiagnostic> = Vec::new();
+    let enum_decl_table =
+        vw_htcl::build_enum_decl_table(&parsed.document, &mut _ignored);
+    let type_decl_table =
+        vw_htcl::build_type_decl_table(&parsed.document, &mut _ignored);
+    let type_decl_names: std::collections::HashSet<String> =
+        type_decl_table.keys().cloned().collect();
+    let (_full_sigs, overload_table) =
+        vw_htcl::build_signature_table_with_overloads(
+            &parsed.document,
+            &type_decl_names,
+            &mut _ignored,
+        );
+    let table = vw_htcl::signature_table(&parsed.document);
+
+    let mut out = String::new();
+    // Preludes first — namespace/proc definitions the lowered
+    // commands below depend on. Order matches vw-cli's runner:
+    // primitives create root type namespaces, enum preludes
+    // create per-enum namespaces + variant constructors, and
+    // overload dispatchers create the switch-arm procs.
+    //
+    // All three emissions are idempotent (Tcl `namespace eval X
+    // {}` on an existing X is a no-op, `proc` redefinition
+    // replaces). Safe to re-ship even when design.htcl already
+    // installed the same preludes at startup.
+    for p in vw_htcl::emit_primitive_prelude() {
+        out.push_str(&p);
+        out.push('\n');
+    }
+    for ed in enum_decl_table.values() {
+        let prelude = vw_htcl::emit_enum_prelude(ed);
+        if !prelude.trim().is_empty() {
+            out.push_str(&prelude);
+            out.push('\n');
+        }
+    }
+    for info in overload_table.values() {
+        let dispatcher = vw_htcl::emit_dispatcher(info);
+        if !dispatcher.trim().is_empty() {
+            out.push_str(&dispatcher);
+            out.push('\n');
+        }
+    }
+
+    // Now the lowered user commands. Same per-statement lowering
+    // vw-cli does (minus putr rewrites and origin markers — this
+    // path never fires from an interactive `putr` and the caller
+    // already has an origin frame from `vw::configure_ip`).
+    //
+    // Critically: proc declarations for overload specializations
+    // get lowered under a MANGLED internal name (e.g.
+    // `Property::as_nested::v_Property::Scalar`) so the
+    // dispatchers emitted above can route to the right variant.
+    // Without this, both overloads of `Property::as_nested`
+    // land at the same unmangled name and the second definition
+    // silently shadows the first via Tcl proc redefinition —
+    // which produces `called on Scalar value` errors when the
+    // dispatcher expects the mangled variants to exist.
+    //
+    // Perf: use the `_with_putr_and_index` / `_with_name_and_index`
+    // variants and pass a PRE-BUILT `LineIndex`. The non-`_index`
+    // variants rebuild a LineIndex per call — an O(source_size)
+    // newline scan. For a 16 MB / 13k-statement compile that was
+    // O(stmts × source_size) quadratic and dominated wall-clock
+    // at ~100s. With a shared index the loop is O(stmts × avg
+    // command body) which finishes in a couple of seconds.
+    let line_index = vw_htcl::LineIndex::new(&program.source);
+    let empty_putr: std::collections::HashMap<vw_htcl::span::Span, String> =
+        std::collections::HashMap::new();
+    for stmt in &parsed.document.stmts {
+        let vw_htcl::ast::Stmt::Command(cmd) = stmt else {
+            continue;
+        };
+        let lowered = match overload_specialization_mangle(cmd, &overload_table)
+        {
+            Some(mangled) => {
+                let vw_htcl::CommandKind::Proc(proc) = &cmd.kind else {
+                    unreachable!(
+                        "overload_specialization_mangle already \
+                             validated this is a Proc"
+                    )
+                };
+                vw_htcl::lower_proc_decl_with_name_and_index(
+                    proc,
+                    &program.source,
+                    &table,
+                    Some(&mangled),
+                    &empty_putr,
+                    &line_index,
+                )
+            }
+            None => vw_htcl::lower_command_with_putr_and_index(
+                cmd,
+                &program.source,
+                &table,
+                &empty_putr,
+                &line_index,
+            ),
+        };
+        // `extern::name` → `::name` so wrapper bodies that forward
+        // via `extern::` reach Vivado as bare native names — same
+        // rewrite vw-cli applies before shipping to the backend.
+        let tcl = vw_htcl::rewrite_externs(&lowered).text;
+        if !tcl.trim().is_empty() {
+            out.push_str(&tcl);
+            out.push('\n');
+        }
+    }
+
+    // Persist the cache: compiled Tcl + a manifest listing every
+    // loaded file's path + mtime + a hash of the preload set.
+    // Next invocation short-circuits if all mtimes match AND the
+    // preload hash matches (same set of files already-loaded).
+    // Silent on write errors — cache misses on next run are
+    // annoying but not incorrect.
+    let _ = std::fs::create_dir_all(target_dir.as_std_path());
+    let _ = std::fs::write(cache_tcl.as_std_path(), &out);
+    let _ = write_compile_manifest(
+        cache_manifest.as_std_path(),
+        &program,
+        &preloaded_snapshot,
+    );
+
+    Ok(Value::String(out))
+}
+
+/// Manifest file format (plain text):
+/// ```text
+/// preload-hash <u64>
+/// <mtime-ns> <path>
+/// <mtime-ns> <path>
+/// ...
+/// ```
+/// One line per loaded file. `preload-hash` is FNV-1a over the
+/// sorted list of preload paths so a caller-side change to
+/// what's already-loaded invalidates the cache too.
+fn write_compile_manifest(
+    manifest_path: &std::path::Path,
+    program: &vw_htcl::LoadedProgram,
+    preloaded: &std::collections::HashMap<
+        std::path::PathBuf,
+        std::time::SystemTime,
+    >,
+) -> std::io::Result<()> {
+    use std::fmt::Write;
+    let mut body = String::new();
+    let ph = preload_fingerprint(preloaded);
+    writeln!(body, "preload-hash {ph}").ok();
+    for f in &program.files {
+        let Some(mtime) = f.mtime else { continue };
+        let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        writeln!(body, "{} {}", dur.as_nanos(), f.path.display()).ok();
+    }
+    std::fs::write(manifest_path, body)
+}
+
+/// Try to serve a compile from the cache. Returns `Some(tcl)` iff
+/// - the manifest exists,
+/// - every listed file's current mtime matches the recorded one,
+/// - AND the recorded preload-hash matches the current one.
+///
+/// Any mismatch (or missing file, or unreadable cache) → `None`,
+/// and the caller falls through to a fresh compile.
+fn try_load_cached_compile(
+    manifest_path: &std::path::Path,
+    cache_path: &std::path::Path,
+    preloaded: &std::collections::HashMap<
+        std::path::PathBuf,
+        std::time::SystemTime,
+    >,
+) -> Option<String> {
+    let manifest = std::fs::read_to_string(manifest_path).ok()?;
+    let mut lines = manifest.lines();
+    let ph_line = lines.next()?;
+    let ph_str = ph_line.strip_prefix("preload-hash ")?;
+    let stored_ph: u64 = ph_str.parse().ok()?;
+    if stored_ph != preload_fingerprint(preloaded) {
+        return None;
+    }
+    for line in lines {
+        let mut parts = line.splitn(2, ' ');
+        let stored_ns: u128 = parts.next()?.parse().ok()?;
+        let path = std::path::Path::new(parts.next()?);
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta.modified().ok()?;
+        let current_ns =
+            mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+        if current_ns != stored_ns {
+            return None;
+        }
+    }
+    // All checks pass — serve the cached Tcl.
+    std::fs::read_to_string(cache_path).ok()
+}
+
+/// FNV-1a over the sorted preload path set. Deliberately ignores
+/// mtimes — the file-mtime check above already covers content
+/// changes for preloaded files; this fingerprint only detects
+/// changes to WHICH files are preloaded (a different caller state).
+fn preload_fingerprint(
+    preloaded: &std::collections::HashMap<
+        std::path::PathBuf,
+        std::time::SystemTime,
+    >,
+) -> u64 {
+    let mut paths: Vec<&std::path::Path> =
+        preloaded.keys().map(|p| p.as_path()).collect();
+    paths.sort();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in paths {
+        for b in p.to_string_lossy().as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // Separator so `/a/b` + `/c` doesn't collide with `/a` + `/b/c`.
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// `ip_needs_update` — inputs `{checkpoint: <abs path>}`; output
+/// is a JSON bool. Compares the checkpoint's sidecar manifest
+/// against the current fingerprint of every `.htcl` file under
+/// `<ws>/ip/`. `true` when the checkpoint or manifest is missing
+/// or the fingerprints disagree.
+///
+/// Not variant-scoped: the ip/ tree defines its own inputs
+/// (BD parameters, IP configs) which don't currently vary by
+/// variant. If that changes, thread `active_variant` through
+/// here and into `vw_lib::ip_source_fingerprint`.
+fn ip_needs_update(
+    workspace_root: Option<&std::path::Path>,
+    args: Value,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let checkpoint = extract_checkpoint_arg(&args, "ip_needs_update")?;
+    let needs = vw_lib::ip_needs_update(&ws, std::path::Path::new(&checkpoint))
+        .map_err(|e| format!("checking IP checkpoint freshness: {e}"))?;
+    Ok(Value::Bool(needs))
+}
+
+/// `ip_mark_checkpoint` — inputs `{checkpoint: <abs path>}`;
+/// output is a JSON null. Writes the sidecar manifest recording
+/// the current `<ws>/ip/**/*.htcl` fingerprint next to the
+/// checkpoint. Called by `vw::configure_ip` immediately after
+/// `vivado_cmd::write_checkpoint`.
+fn ip_mark_checkpoint(
+    workspace_root: Option<&std::path::Path>,
+    args: Value,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let checkpoint = extract_checkpoint_arg(&args, "ip_mark_checkpoint")?;
+    vw_lib::write_ip_checkpoint_manifest(
+        &ws,
+        std::path::Path::new(&checkpoint),
+    )
+    .map_err(|e| format!("writing IP checkpoint manifest: {e}"))?;
+    Ok(Value::Null)
+}
+
+/// Silent [`vw_htcl::loader::LoadObserver`] — the RPC path has no
+/// progress bar or CLI channel to talk to. Every callback stays
+/// at the default no-op impl.
+struct NoopLoadObserver;
+impl vw_htcl::loader::LoadObserver for NoopLoadObserver {}
+
+/// Mirror of `vw-cli`'s `overload_specialization_mangle` and
+/// `vw-repl/src/lower.rs`'s equivalent. If `cmd` is a top-level
+/// `proc` whose name is an overload public name AND whose first
+/// arg annotation is a qualified enum variant, return the
+/// mangled internal name to emit it under. The dispatcher
+/// (produced by `emit_dispatcher`) routes calls to these mangled
+/// names by argument type. Skipping this in `compile_htcl_module`
+/// caused both overloads of a proc to collapse onto the same
+/// unmangled name — the second one silently shadowed the first
+/// via Tcl proc redefinition, and the dispatcher's runtime
+/// switch never found either specialization.
+fn overload_specialization_mangle(
+    cmd: &vw_htcl::Command,
+    overloads: &vw_htcl::OverloadTable,
+) -> Option<String> {
+    let vw_htcl::CommandKind::Proc(proc) = &cmd.kind else {
+        return None;
+    };
+    let name = proc.name.as_deref()?;
+    if !overloads.contains_key(name) {
+        return None;
+    }
+    let sig = proc.signature.as_ref()?;
+    let first = sig.args.first()?;
+    let vw_htcl::TypeExpr::Qualified { variant, .. } =
+        first.type_annotation.as_ref()?
+    else {
+        return None;
+    };
+    Some(vw_htcl::mangle_specialization(name, variant))
+}
+
+/// Shared arg extractor for the checkpoint-scoped RPC methods.
+/// Every one takes `{checkpoint: <abs path>}` and errors
+/// identically on missing/wrong-typed input — factoring keeps
+/// the message shape consistent across
+/// `synth_*` / `ip_*` handlers.
+fn extract_checkpoint_arg(
+    args: &Value,
+    method: &str,
+) -> Result<String, String> {
+    let obj = args.as_object().ok_or_else(|| {
+        format!(
+            "{method}: args must be an object with a `checkpoint` \
+             string field"
+        )
+    })?;
+    obj.get("checkpoint")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{method}: missing string `checkpoint`"))
+}
+
+/// `synth_mark_checkpoint` — inputs `{checkpoint: <abs path>}`;
+/// output is a JSON null. Writes the sidecar manifest recording
+/// the tracked source set's current fingerprint next to the
+/// checkpoint. Called by `vw::synth` immediately after
+/// `vivado_cmd::write_checkpoint` succeeds so the next invocation
+/// can compare fingerprints and skip resynthesis when the sources
+/// are unchanged.
+fn synth_mark_checkpoint(
+    workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
+    args: Value,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let obj = args.as_object().ok_or_else(|| {
+        "synth_mark_checkpoint: args must be an object with a \
+         `checkpoint` string field"
+            .to_string()
+    })?;
+    let checkpoint =
+        obj.get("checkpoint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "synth_mark_checkpoint: missing string `checkpoint`".to_string()
+            })?;
+    vw_lib::write_synth_checkpoint_manifest(
+        &ws,
+        std::path::Path::new(checkpoint),
+        active_variant,
+    )
+    .map_err(|e| format!("writing checkpoint manifest: {e}"))?;
+    Ok(Value::Null)
+}
+
+/// `synth_needs_update` — inputs `{checkpoint: <abs path>}`; output
+/// is a JSON bool. Delegates to [`vw_lib::synth_needs_update`],
+/// which stats the checkpoint against the tracked source set
+/// (design VHDL, IP wrappers, synth XDC, workspace htcl,
+/// vw.toml, vw.lock). Missing checkpoint → `true`; any source
+/// strictly newer than the checkpoint → `true`; otherwise `false`.
+///
+/// The active variant is threaded through so a variant-specific
+/// design surface (which vw::synth already respects via
+/// `vhdl_design_sources`) is used for the mtime scan too —
+/// otherwise a variant-owned file change might invalidate a
+/// checkpoint that doesn't actually include it.
+fn synth_needs_update(
+    workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
+    args: Value,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let obj = args.as_object().ok_or_else(|| {
+        "synth_needs_update: args must be an object with a `checkpoint` \
+         string field"
+            .to_string()
+    })?;
+    let checkpoint =
+        obj.get("checkpoint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "synth_needs_update: missing string `checkpoint`".to_string()
+            })?;
+    let needs = vw_lib::synth_needs_update(
+        &ws,
+        std::path::Path::new(checkpoint),
+        active_variant,
+    )
+    .map_err(|e| format!("checking checkpoint freshness: {e}"))?;
+    Ok(Value::Bool(needs))
 }
 
 /// `vhdl_dependency_sources` — return every transitive-dep VHDL

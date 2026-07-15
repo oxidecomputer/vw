@@ -2350,6 +2350,332 @@ fn walk_htcl_tests(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Enumerate every `.htcl` file under `<workspace_dir>` recursively,
+/// excluding hidden dirs (`.git`, `.vw`), the build-artifact `target/`
+/// dir, and vendored deps (`~/.vw/deps/` isn't under a workspace but
+/// callers should never point us there anyway).
+///
+/// Broader than [`list_htcl_tests`] (which is `test/**/*.htcl` only)
+/// — this walks the whole workspace so `synth_needs_update` can
+/// invalidate a checkpoint when ANY authored htcl changes (the
+/// entry-file `design.htcl`, per-IP `ip/*.htcl`, whatever the user
+/// writes). Sorted for determinism.
+pub fn list_workspace_htcl_files(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    walk_workspace_htcl(workspace_dir.as_std_path(), &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn walk_workspace_htcl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).map_err(|e| VwError::FileSystem {
+        message: format!(
+            "Failed to read workspace directory {}: {e}",
+            dir.display()
+        ),
+    })? {
+        let entry = entry.map_err(|e| VwError::FileSystem {
+            message: format!("Failed to read directory entry: {e}"),
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip hidden dirs (.git, .vw, .vscode, etc.) and the
+        // build-artifact `target/` tree. A user's checked-in
+        // sources never live in either.
+        if name_str.starts_with('.') || name_str == "target" {
+            continue;
+        }
+        if path.is_file() {
+            if path.extension().and_then(|s| s.to_str()) == Some("htcl") {
+                out.push(path);
+            }
+        } else if path.is_dir() {
+            walk_workspace_htcl(&path, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Enumerate every tracked source file for the synth checkpoint,
+/// in the fixed order fingerprint computation depends on.
+///
+/// Tracked source scope — matches what [`vw::synth`] actually
+/// reads, plus a few coarse-grained triggers:
+/// - VHDL design under `<ws>/hdl/**` (variant-filtered).
+/// - IP wrappers under `<ws>/target/ip/**`.
+/// - Synth-scoped XDCs under `<ws>/constraints/synth/**`.
+/// - Every `.htcl` under `<ws>` (excludes hidden dirs + `target/`)
+///   — captures edits to `design.htcl`, `ip/*.htcl`, and any
+///   local htcl libs.
+/// - Every dep-published VHDL file (from
+///   `vhdl_dependency_sources_ext(exclude_sim_only=true)`, same
+///   surface `vw::synth` feeds `read_vhdl`). Includes git deps
+///   (materialized in `~/.vw/deps/<name>-<sha>`, content locked
+///   by commit) and path deps (files change in place).
+/// - `<ws>/vw.toml` — variant / target-part / deps-list changes
+///   should re-trigger synth.
+/// - `<ws>/vw.lock` — captures dep-version bumps that alter
+///   which cache-dir a name resolves to.
+///
+/// Missing files pass through as-is; the fingerprint hasher
+/// distinguishes "file present with content X" from "file
+/// absent" by only folding present files into the digest and
+/// including the sorted list of paths as part of the mix.
+fn synth_source_paths(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let mut sources: Vec<PathBuf> = Vec::new();
+    sources.extend(vhdl_design_sources_for_variant(
+        workspace_dir,
+        active_variant,
+    )?);
+    sources.extend(vhdl_ip_sources(workspace_dir)?);
+    sources.extend(design_synth_constraints(workspace_dir)?);
+    sources.extend(list_workspace_htcl_files(workspace_dir)?);
+    // Dependency VHDL — same surface `vw::synth` feeds into
+    // `read_vhdl`. Matters for path deps (whose files change
+    // in place, invisible to vw.lock) and belt-and-braces for
+    // git deps (content is locked by commit, but hashing the
+    // materialized files means a torn `.vw/deps` extraction
+    // or a manual edit invalidates too).
+    if let Ok(dep_sources) =
+        vhdl_dependency_sources_ext(workspace_dir, false, true)
+    {
+        sources.extend(dep_sources.into_iter().map(|s| s.path));
+    }
+    sources.push(workspace_dir.join("vw.toml").into_std_path_buf());
+    sources.push(workspace_dir.join("vw.lock").into_std_path_buf());
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
+/// FNV-1a 64-bit hash. Stable across Rust versions (unlike
+/// `std::hash::DefaultHasher`, which the language reserves the
+/// right to change), fast, and good enough for cache-invalidation
+/// use. Not cryptographic — collisions here just mean a false
+/// "up-to-date" and a stale checkpoint, but the search space is
+/// dozens to hundreds of files.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    fnv1a_64_extend(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+fn fnv1a_64_extend(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Combined fingerprint over the contents + relative paths of a
+/// list of source files. Mtime-independent, so tool-regenerated
+/// files (IP wrappers rewritten identically each run) don't
+/// spuriously invalidate a fresh checkpoint. Missing files are
+/// folded in with a marker byte so a source appearing /
+/// disappearing changes the digest. Shared engine for every
+/// checkpoint kind — synth, IP configure, and future
+/// checkpoints just supply their own path list.
+fn fingerprint_paths(workspace_dir: &Utf8Path, paths: &[PathBuf]) -> u64 {
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    for path in paths {
+        // Fold the path (relative to workspace root when possible,
+        // else absolute) so renames register as changes even when
+        // content is identical.
+        let rel = path
+            .strip_prefix(workspace_dir.as_std_path())
+            .unwrap_or(path);
+        digest = fnv1a_64_extend(digest, rel.to_string_lossy().as_bytes());
+        match fs::read(path) {
+            Ok(content) => {
+                // Marker byte `0x01` for "file present"; then the
+                // file's own content hash mixed into the running
+                // digest. Hashing the per-file hash (rather than
+                // the full content stream) keeps this branch small.
+                digest = fnv1a_64_extend(digest, &[0x01]);
+                let file_hash = fnv1a_64(&content);
+                digest = fnv1a_64_extend(digest, &file_hash.to_le_bytes());
+            }
+            Err(_) => {
+                // Marker byte `0x00` for "file absent". Consistent
+                // with the "missing = separate state from empty"
+                // rule so `vw.lock` present-and-empty ≠ absent.
+                digest = fnv1a_64_extend(digest, &[0x00]);
+            }
+        }
+    }
+    digest
+}
+
+/// Combined fingerprint over the synth source set. Backs
+/// [`synth_needs_update`] and [`write_synth_checkpoint_manifest`].
+pub fn synth_source_fingerprint(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<u64> {
+    let paths = synth_source_paths(workspace_dir, active_variant)?;
+    Ok(fingerprint_paths(workspace_dir, &paths))
+}
+
+/// Manifest sidecar path — sits next to the checkpoint under
+/// `<checkpoint>.manifest`. Small plain-text file (single u64 in
+/// decimal). Kept alongside the checkpoint so `rm -rf target/`
+/// wipes both together and there's never a stale manifest
+/// pointing at a deleted checkpoint.
+fn checkpoint_manifest_path(checkpoint: &Path) -> PathBuf {
+    let mut name = checkpoint.file_name().unwrap_or_default().to_os_string();
+    name.push(".manifest");
+    checkpoint.with_file_name(name)
+}
+
+/// Write a manifest sidecar recording `fingerprint` next to
+/// `checkpoint`. Shared by `write_synth_checkpoint_manifest` /
+/// `write_ip_checkpoint_manifest` so every checkpoint kind uses
+/// the same on-disk format.
+fn write_checkpoint_manifest_with_fingerprint(
+    checkpoint: &Path,
+    fingerprint: u64,
+) -> Result<()> {
+    let manifest = checkpoint_manifest_path(checkpoint);
+    fs::write(&manifest, format!("{fingerprint}\n")).map_err(|e| {
+        VwError::FileSystem {
+            message: format!(
+                "Failed to write checkpoint manifest {}: {e}",
+                manifest.display()
+            ),
+        }
+    })
+}
+
+/// Compare `current_fingerprint` against the manifest sidecar
+/// next to `checkpoint`. Returns `true` when the checkpoint is
+/// missing, the manifest is missing / unparseable, or the
+/// fingerprints disagree. Shared by every `*_needs_update` fn.
+fn checkpoint_needs_update_with_fingerprint(
+    checkpoint: &Path,
+    current_fingerprint: u64,
+) -> bool {
+    if !checkpoint.exists() {
+        return true;
+    }
+    let manifest = checkpoint_manifest_path(checkpoint);
+    let Ok(stored) = fs::read_to_string(&manifest) else {
+        return true;
+    };
+    let Ok(stored_fp) = stored.trim().parse::<u64>() else {
+        return true;
+    };
+    stored_fp != current_fingerprint
+}
+
+/// Write the manifest sidecar for a freshly-produced synth
+/// checkpoint. Records the current source fingerprint so
+/// [`synth_needs_update`] can decide freshness by content
+/// comparison rather than mtime.
+///
+/// Called from `vw::synth` immediately after
+/// `vivado_cmd::write_checkpoint` completes.
+pub fn write_synth_checkpoint_manifest(
+    workspace_dir: &Utf8Path,
+    checkpoint: &Path,
+    active_variant: Option<&str>,
+) -> Result<()> {
+    let fp = synth_source_fingerprint(workspace_dir, active_variant)?;
+    write_checkpoint_manifest_with_fingerprint(checkpoint, fp)
+}
+
+/// Returns `true` when either
+/// - the checkpoint file is missing, or
+/// - its manifest sidecar is missing / unreadable / stores a
+///   fingerprint different from the tracked source set's current
+///   fingerprint.
+///
+/// Content-hash based (not mtime): identical `make_wrapper`
+/// output with a shifted mtime does NOT invalidate the checkpoint,
+/// which is the whole point — the wrapper is regenerated on every
+/// design.htcl run but its stripped-header body is stable when
+/// the source `.bd` hasn't changed.
+pub fn synth_needs_update(
+    workspace_dir: &Utf8Path,
+    checkpoint: &Path,
+    active_variant: Option<&str>,
+) -> Result<bool> {
+    let current_fp = synth_source_fingerprint(workspace_dir, active_variant)?;
+    Ok(checkpoint_needs_update_with_fingerprint(
+        checkpoint, current_fp,
+    ))
+}
+
+// ---------------------------------------------------------------------
+// IP configuration checkpoint — a per-workspace cache scoped to the
+// entry `ip/module.htcl` (and everything it srcs). Backs
+// `vw::configure_ip` in the htcl vw module.
+//
+// Source scope: every `.htcl` under `<ws>/ip/`. This is intentionally
+// tighter than the synth scope — `ip::configure` produces BDs / XCI
+// IPs / wrappers whose input surface is defined entirely by the ip/
+// tree. If the user's ip/ htcl changes (adding an IP, tweaking
+// a configure_* parameter), the checkpoint invalidates. If the
+// user's design.htcl changes, it doesn't — that only matters for
+// the downstream synth step, which has its own checkpoint.
+// ---------------------------------------------------------------------
+
+/// Enumerate every `.htcl` file under `<workspace_dir>/ip/`,
+/// recursively, sorted. Empty vec when `ip/` doesn't exist yet.
+/// Skips hidden dirs (`.git`, `.vw`) and `target/` for the same
+/// reason [`list_workspace_htcl_files`] does — those aren't
+/// authored sources.
+pub fn list_ip_htcl_files(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    let ip_dir = workspace_dir.join("ip");
+    if !ip_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    walk_workspace_htcl(ip_dir.as_std_path(), &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// Combined fingerprint over the IP source set (every `.htcl`
+/// under `<ws>/ip/`). Backs [`ip_needs_update`] and
+/// [`write_ip_checkpoint_manifest`].
+pub fn ip_source_fingerprint(workspace_dir: &Utf8Path) -> Result<u64> {
+    let paths = list_ip_htcl_files(workspace_dir)?;
+    Ok(fingerprint_paths(workspace_dir, &paths))
+}
+
+/// Write the manifest sidecar for a freshly-produced IP
+/// checkpoint. Called from `vw::configure_ip` after
+/// `vivado_cmd::write_checkpoint`.
+pub fn write_ip_checkpoint_manifest(
+    workspace_dir: &Utf8Path,
+    checkpoint: &Path,
+) -> Result<()> {
+    let fp = ip_source_fingerprint(workspace_dir)?;
+    write_checkpoint_manifest_with_fingerprint(checkpoint, fp)
+}
+
+/// Returns `true` when the IP checkpoint at `checkpoint` is
+/// missing, its manifest is missing / unreadable, or the
+/// fingerprint stored in the manifest differs from the current
+/// `<ws>/ip/**/*.htcl` fingerprint.
+///
+/// Mirrors [`synth_needs_update`] but with a tighter source
+/// scope — only the `ip/` tree contributes.
+pub fn ip_needs_update(
+    workspace_dir: &Utf8Path,
+    checkpoint: &Path,
+) -> Result<bool> {
+    let current_fp = ip_source_fingerprint(workspace_dir)?;
+    Ok(checkpoint_needs_update_with_fingerprint(
+        checkpoint, current_fp,
+    ))
+}
+
 pub struct RecordProcessor {
     pub vhdl_std: VhdlStandard,
     pub symbols: HashMap<String, VwSymbol>,
@@ -5576,5 +5902,211 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             names.iter().filter(|n| n.as_str() == "top.vhd").count() == 1,
             "expected exactly one top.vhd (vpk120's), got {names:?}",
         );
+    }
+
+    /// Minimal workspace scaffold for `synth_needs_update` tests:
+    /// a `vw.toml`, empty `vw.lock`, one hdl file, one synth XDC,
+    /// and one workspace htcl file. Returned as `Utf8PathBuf` so
+    /// the caller can hand it to the enumerator directly.
+    fn make_synth_ws(tmp: &tempfile::TempDir) -> Utf8PathBuf {
+        let ws = tmp.path().to_path_buf();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"snws\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(ws.join("vw.lock"), "{}\n").unwrap();
+        let hdl = ws.join("hdl");
+        std::fs::create_dir_all(&hdl).unwrap();
+        std::fs::write(hdl.join("top.vhd"), "-- vhdl\n").unwrap();
+        let xdc = ws.join("constraints").join("synth");
+        std::fs::create_dir_all(&xdc).unwrap();
+        std::fs::write(xdc.join("timing.xdc"), "# xdc\n").unwrap();
+        std::fs::write(ws.join("design.htcl"), "# htcl\n").unwrap();
+        Utf8PathBuf::from_path_buf(ws).unwrap()
+    }
+
+    /// A missing checkpoint file is always stale — the whole point
+    /// of the cache-check is to gate a first-time synth on this
+    /// condition.
+    #[test]
+    fn synth_needs_update_true_when_checkpoint_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_synth_ws(&tmp);
+        let cp = ws.join("target/synth/top.dcp");
+        assert!(synth_needs_update(&ws, cp.as_std_path(), None).unwrap());
+    }
+
+    /// Checkpoint present but no manifest → stale (either
+    /// pre-manifest era or a manually-copied checkpoint from
+    /// another workspace). Forces the next synth to write both,
+    /// which is the safe recovery path.
+    #[test]
+    fn synth_needs_update_true_when_manifest_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_synth_ws(&tmp);
+        let cp = ws.join("target/synth/top.dcp");
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "").unwrap();
+        assert!(synth_needs_update(&ws, cp.as_std_path(), None).unwrap());
+    }
+
+    /// Manifest matches current fingerprint → fresh. Simulates
+    /// the post-`vw::synth` state on an unchanged tree — no
+    /// resynthesis required.
+    #[test]
+    fn synth_needs_update_false_when_manifest_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_synth_ws(&tmp);
+        let cp = ws.join("target/synth/top.dcp");
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "").unwrap();
+        write_synth_checkpoint_manifest(&ws, cp.as_std_path(), None).unwrap();
+        assert!(!synth_needs_update(&ws, cp.as_std_path(), None).unwrap());
+    }
+
+    /// After a checkpoint+manifest pair, rewriting a source with
+    /// NEW bytes invalidates the fingerprint. This is the primary
+    /// invalidation path — a real edit to a tracked file.
+    #[test]
+    fn synth_needs_update_true_when_source_content_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_synth_ws(&tmp);
+        let cp = ws.join("target/synth/top.dcp");
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "").unwrap();
+        write_synth_checkpoint_manifest(&ws, cp.as_std_path(), None).unwrap();
+        std::fs::write(ws.join("hdl/top.vhd"), "-- vhdl updated\n").unwrap();
+        assert!(synth_needs_update(&ws, cp.as_std_path(), None).unwrap());
+    }
+
+    /// The regression this whole switch to content hashing fixes:
+    /// rewriting a tracked file with IDENTICAL bytes must NOT
+    /// invalidate the manifest. Simulates `make_wrapper`
+    /// regenerating `target/ip/*/wrapper.vhd` on every design.htcl
+    /// run — same stripped-header body, fresh mtime.
+    #[test]
+    fn synth_needs_update_false_after_identical_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_synth_ws(&tmp);
+        let cp = ws.join("target/synth/top.dcp");
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "").unwrap();
+        write_synth_checkpoint_manifest(&ws, cp.as_std_path(), None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Overwrite with the same bytes the fixture wrote. Fresh
+        // mtime, unchanged content. Under the old mtime-based
+        // check this returned `true` (stale); under content
+        // hashing it stays `false`.
+        std::fs::write(ws.join("hdl/top.vhd"), "-- vhdl\n").unwrap();
+        assert!(!synth_needs_update(&ws, cp.as_std_path(), None).unwrap());
+    }
+
+    /// Editing a workspace `.htcl` invalidates the manifest.
+    /// Exercises `list_workspace_htcl_files` — a source
+    /// enumerator distinct from the VHDL / XDC paths.
+    #[test]
+    fn synth_needs_update_true_when_htcl_content_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_synth_ws(&tmp);
+        let cp = ws.join("target/synth/top.dcp");
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "").unwrap();
+        write_synth_checkpoint_manifest(&ws, cp.as_std_path(), None).unwrap();
+        std::fs::write(ws.join("design.htcl"), "# htcl updated\n").unwrap();
+        assert!(synth_needs_update(&ws, cp.as_std_path(), None).unwrap());
+    }
+
+    /// Minimal workspace scaffold for `ip_needs_update` tests:
+    /// a `vw.toml` and an `ip/module.htcl` (+ one submodule so
+    /// the recursive walk has something to cover).
+    fn make_ip_ws(tmp: &tempfile::TempDir) -> Utf8PathBuf {
+        let ws = tmp.path().to_path_buf();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"ipws\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let ip = ws.join("ip");
+        std::fs::create_dir_all(&ip).unwrap();
+        std::fs::write(
+            ip.join("module.htcl"),
+            "namespace eval ip { proc configure {} unit {} }\n",
+        )
+        .unwrap();
+        std::fs::write(ip.join("cips.htcl"), "# cips\n").unwrap();
+        Utf8PathBuf::from_path_buf(ws).unwrap()
+    }
+
+    /// Missing checkpoint → stale. Same first-time-synth rule
+    /// applied to the IP scope.
+    #[test]
+    fn ip_needs_update_true_when_checkpoint_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_ip_ws(&tmp);
+        let cp = ws.join("target/ip/ip.dcp");
+        assert!(ip_needs_update(&ws, cp.as_std_path()).unwrap());
+    }
+
+    /// Fresh manifest → not stale. Verifies the write+check
+    /// round-trip on the IP scope.
+    #[test]
+    fn ip_needs_update_false_when_manifest_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_ip_ws(&tmp);
+        let cp = ws.join("target/ip/ip.dcp");
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "").unwrap();
+        write_ip_checkpoint_manifest(&ws, cp.as_std_path()).unwrap();
+        assert!(!ip_needs_update(&ws, cp.as_std_path()).unwrap());
+    }
+
+    /// Editing any `.htcl` under `<ws>/ip/` invalidates. Key
+    /// test — this is the invalidation trigger the user actually
+    /// controls (adding an IP, tweaking a configure_* parameter).
+    #[test]
+    fn ip_needs_update_true_when_ip_htcl_content_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_ip_ws(&tmp);
+        let cp = ws.join("target/ip/ip.dcp");
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "").unwrap();
+        write_ip_checkpoint_manifest(&ws, cp.as_std_path()).unwrap();
+        std::fs::write(ws.join("ip/cips.htcl"), "# cips updated\n").unwrap();
+        assert!(ip_needs_update(&ws, cp.as_std_path()).unwrap());
+    }
+
+    /// Editing a workspace htcl OUTSIDE ip/ (e.g. design.htcl)
+    /// must NOT invalidate the IP checkpoint. IP fingerprint scope
+    /// is intentionally narrower than the synth one — the point
+    /// is that changing wiring in design.htcl shouldn't re-run
+    /// all the expensive `create_ip` calls.
+    #[test]
+    fn ip_needs_update_false_when_non_ip_htcl_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_ip_ws(&tmp);
+        std::fs::write(ws.join("design.htcl"), "# design\n").unwrap();
+        let cp = ws.join("target/ip/ip.dcp");
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "").unwrap();
+        write_ip_checkpoint_manifest(&ws, cp.as_std_path()).unwrap();
+        std::fs::write(ws.join("design.htcl"), "# design updated\n").unwrap();
+        assert!(!ip_needs_update(&ws, cp.as_std_path()).unwrap());
+    }
+
+    /// The regression parallel to the synth case: rewriting an
+    /// `ip/*.htcl` with IDENTICAL bytes must not invalidate.
+    /// Content-hash based, not mtime.
+    #[test]
+    fn ip_needs_update_false_after_identical_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_ip_ws(&tmp);
+        let cp = ws.join("target/ip/ip.dcp");
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "").unwrap();
+        write_ip_checkpoint_manifest(&ws, cp.as_std_path()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(ws.join("ip/cips.htcl"), "# cips\n").unwrap();
+        assert!(!ip_needs_update(&ws, cp.as_std_path()).unwrap());
     }
 }

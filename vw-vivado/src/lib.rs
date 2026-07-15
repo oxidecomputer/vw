@@ -16,7 +16,10 @@ mod rpc;
 pub mod stream;
 mod worker;
 
-pub use handlers::{make_handler, make_handler_with_variant};
+pub use handlers::{
+    make_handler, make_handler_with_preloaded, make_handler_with_variant,
+    PreloadedPaths, SharedPreload,
+};
 pub use raw_log::raw_log_path_for_workspace;
 pub use rpc::{FnHandler, RpcHandler};
 pub use stream::{

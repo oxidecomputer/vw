@@ -2931,6 +2931,7 @@ dependencies = [
  "tokio",
  "tracing",
  "vw-eda",
+ "vw-htcl",
  "vw-lib",
 ]
 

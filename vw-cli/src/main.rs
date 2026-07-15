@@ -2291,9 +2291,25 @@ async fn run_htcl(
         Some(ws) => resolve_workspace_selection(ws, part, variant)?,
         None => (None, None),
     };
-    let rpc_handler = vw_vivado::make_handler_with_variant(
+    // Seed the RPC handler's preload map with everything the
+    // entry-file load pulled in. `vw run` is single-shot — no
+    // batches commit after this — so the initial population IS
+    // the final state. `compile_htcl_module` (called from
+    // `vw::configure_ip` if the user's htcl invokes it) then
+    // skips re-shipping files whose procs are already installed.
+    let preload: vw_vivado::SharedPreload = {
+        let mut m = std::collections::HashMap::new();
+        for f in &program.files {
+            if let Some(t) = f.mtime {
+                m.insert(f.path.clone(), t);
+            }
+        }
+        std::sync::Arc::new(std::sync::RwLock::new(m))
+    };
+    let rpc_handler = vw_vivado::make_handler_with_preloaded(
         rpc_workspace_root.clone(),
         active_variant,
+        preload,
     );
     // Raw byte-log: `<workspace>/target/logs/vivado-<ts>.log`.
     // Failure to create the directory demotes to no-log rather than

@@ -9,6 +9,7 @@ description = "Vivado EDA backend: spawns a long-lived Vivado worker and drives 
 [dependencies]
 vw-eda = { path = "../vw-eda" }
 vw-lib = { path = "../vw-lib" }
+vw-htcl = { path = "../vw-htcl" }
 camino.workspace = true
 serde.workspace = true
 serde_json.workspace = true
