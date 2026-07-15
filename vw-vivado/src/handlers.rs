@@ -52,6 +52,13 @@
 //!   `ip::configure` proc (typically a batch of expensive
 //!   `create_ip` / `make_wrapper` calls) is skipped when the
 //!   IP tree hasn't changed since the last checkpoint.
+//! - `place_needs_update` / `place_mark_checkpoint` — same
+//!   shape again but scoped to the place stage. Fingerprint
+//!   covers `<ws>/constraints/place/**` plus the upstream synth
+//!   DCP file (which proxies for "everything synth depended
+//!   on" — if any synth-scope source changed, synth re-ran
+//!   and the DCP is fresh, invalidating place). Backs
+//!   `vw::place`.
 //! - `compile_htcl_module` — parses + lowers an htcl module (any
 //!   `src`-shaped path resolved against the workspace root) and
 //!   returns the concatenated Tcl. `vw::configure_ip` uses this
@@ -208,6 +215,8 @@ async fn dispatch(
         }
         "ip_needs_update" => ip_needs_update(workspace_root, args),
         "ip_mark_checkpoint" => ip_mark_checkpoint(workspace_root, args),
+        "place_needs_update" => place_needs_update(workspace_root, args),
+        "place_mark_checkpoint" => place_mark_checkpoint(workspace_root, args),
         "compile_htcl_module" => {
             compile_htcl_module(workspace_root, args, preloaded).await
         }
@@ -645,6 +654,72 @@ fn ip_mark_checkpoint(
     )
     .map_err(|e| format!("writing IP checkpoint manifest: {e}"))?;
     Ok(Value::Null)
+}
+
+/// `place_needs_update` — inputs
+/// `{checkpoint: <place-dcp>, synth_checkpoint: <synth-dcp>}`;
+/// output is a JSON bool. Compares the place checkpoint's
+/// sidecar manifest against the current fingerprint of every
+/// place-scoped XDC under `<ws>/constraints/place/**` PLUS the
+/// synth DCP file (which proxies for "everything synth
+/// depended on"). `true` when the checkpoint / manifest is
+/// missing or the fingerprints disagree.
+fn place_needs_update(
+    workspace_root: Option<&std::path::Path>,
+    args: Value,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let checkpoint = extract_checkpoint_arg(&args, "place_needs_update")?;
+    let synth_checkpoint =
+        extract_synth_checkpoint_arg(&args, "place_needs_update")?;
+    let needs = vw_lib::place_needs_update(
+        &ws,
+        std::path::Path::new(&checkpoint),
+        std::path::Path::new(&synth_checkpoint),
+    )
+    .map_err(|e| format!("checking place checkpoint freshness: {e}"))?;
+    Ok(Value::Bool(needs))
+}
+
+/// `place_mark_checkpoint` — inputs
+/// `{checkpoint: <place-dcp>, synth_checkpoint: <synth-dcp>}`;
+/// output is a JSON null. Writes the sidecar manifest recording
+/// the current place-scope fingerprint. Called by `vw::place`
+/// after `vivado_cmd::write_checkpoint`.
+fn place_mark_checkpoint(
+    workspace_root: Option<&std::path::Path>,
+    args: Value,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let checkpoint = extract_checkpoint_arg(&args, "place_mark_checkpoint")?;
+    let synth_checkpoint =
+        extract_synth_checkpoint_arg(&args, "place_mark_checkpoint")?;
+    vw_lib::write_place_checkpoint_manifest(
+        &ws,
+        std::path::Path::new(&checkpoint),
+        std::path::Path::new(&synth_checkpoint),
+    )
+    .map_err(|e| format!("writing place checkpoint manifest: {e}"))?;
+    Ok(Value::Null)
+}
+
+/// Sibling of [`extract_checkpoint_arg`] for the `synth_checkpoint`
+/// slot on place-stage RPC methods. Kept as a distinct helper so
+/// the error message names the exact missing key.
+fn extract_synth_checkpoint_arg(
+    args: &Value,
+    method: &str,
+) -> Result<String, String> {
+    let obj = args.as_object().ok_or_else(|| {
+        format!(
+            "{method}: args must be an object with a `synth_checkpoint` \
+             string field"
+        )
+    })?;
+    obj.get("synth_checkpoint")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{method}: missing string `synth_checkpoint`"))
 }
 
 /// Silent [`vw_htcl::loader::LoadObserver`] — the RPC path has no

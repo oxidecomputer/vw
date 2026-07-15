@@ -2290,6 +2290,16 @@ fn find_constraint_files_impl(
 /// compile into their own VHDL library (`ip` by convention). The
 /// caller decides the library assignment.
 ///
+/// **Excludes** `target/ip/bd/**` and `target/ip/xci/**` — the
+/// block-design and standalone-IP cache directories populated
+/// by `vw::configure_ip`. Those `.vhd` files are the outputs of
+/// `generate_target` / `synth_ip` on saved designs and are
+/// already registered with the Vivado project via `read_bd` /
+/// `read_ip` on the restore path; re-adding them through
+/// `read_vhdl` conflicts (Vivado emits `[filemgmt 20-1440]
+/// already exists in the project as a part of sub-design file`
+/// CRITICAL WARNINGs).
+///
 /// Empty vec when `target/ip/` doesn't exist yet — a fresh
 /// workspace hasn't run `vw::make_wrapper` for anything.
 pub fn vhdl_ip_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
@@ -2297,8 +2307,18 @@ pub fn vhdl_ip_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
     if !ip_dir.exists() {
         return Ok(Vec::new());
     }
+    let bd_cache = ip_dir.join("bd");
+    let xci_cache = ip_dir.join("xci");
     let mut files =
         find_vhdl_files(ip_dir.as_std_path(), /*recursive=*/ true, &[])?;
+    // Drop anything under either cache subtree — see doc note.
+    // `starts_with` on the canonical prefix filters every
+    // nested path (`bd/cips/synth/cips.vhd`, `xci/primary_clock/
+    // primary_clock.vhd`, etc.).
+    files.retain(|p| {
+        !p.starts_with(bd_cache.as_std_path())
+            && !p.starts_with(xci_cache.as_std_path())
+    });
     files.sort();
     Ok(files)
 }
@@ -2607,6 +2627,73 @@ pub fn synth_needs_update(
     let current_fp = synth_source_fingerprint(workspace_dir, active_variant)?;
     Ok(checkpoint_needs_update_with_fingerprint(
         checkpoint, current_fp,
+    ))
+}
+
+// ---------------------------------------------------------------------
+// Place checkpoint — a per-workspace cache scoped to the place stage.
+// Backs `vw::place` in the htcl vw module.
+//
+// Source scope is narrower than synth's: place XDCs under
+// `<ws>/constraints/place/**` PLUS the upstream synth checkpoint
+// file itself. The synth DCP acts as a proxy for "everything synth
+// depended on" — if any synth-scope source changed, synth re-ran
+// and produced a fresh DCP, invalidating the place fingerprint.
+// This avoids duplicating the synth source enumeration here.
+// ---------------------------------------------------------------------
+
+/// Path list feeding [`place_source_fingerprint`]. Sorted +
+/// deduped. Missing files pass through — the fingerprint's
+/// present/absent marker byte covers the "checkpoint doesn't
+/// exist yet" case correctly.
+fn place_source_paths(
+    workspace_dir: &Utf8Path,
+    synth_checkpoint: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut sources: Vec<PathBuf> = Vec::new();
+    sources.extend(design_place_constraints(workspace_dir)?);
+    sources.push(synth_checkpoint.to_path_buf());
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
+/// Combined fingerprint over the place source set (place XDCs +
+/// the upstream synth checkpoint file). Backs
+/// [`place_needs_update`] and [`write_place_checkpoint_manifest`].
+pub fn place_source_fingerprint(
+    workspace_dir: &Utf8Path,
+    synth_checkpoint: &Path,
+) -> Result<u64> {
+    let paths = place_source_paths(workspace_dir, synth_checkpoint)?;
+    Ok(fingerprint_paths(workspace_dir, &paths))
+}
+
+/// Write the manifest sidecar for a freshly-produced place
+/// checkpoint. Called from `vw::place` after
+/// `vivado_cmd::write_checkpoint` completes.
+pub fn write_place_checkpoint_manifest(
+    workspace_dir: &Utf8Path,
+    place_checkpoint: &Path,
+    synth_checkpoint: &Path,
+) -> Result<()> {
+    let fp = place_source_fingerprint(workspace_dir, synth_checkpoint)?;
+    write_checkpoint_manifest_with_fingerprint(place_checkpoint, fp)
+}
+
+/// Returns `true` when the place checkpoint OR its manifest is
+/// missing, OR the fingerprint stored in the manifest differs
+/// from the current one. Mirrors [`synth_needs_update`] with a
+/// tighter source scope (place XDCs + the synth DCP proxy).
+pub fn place_needs_update(
+    workspace_dir: &Utf8Path,
+    place_checkpoint: &Path,
+    synth_checkpoint: &Path,
+) -> Result<bool> {
+    let current_fp = place_source_fingerprint(workspace_dir, synth_checkpoint)?;
+    Ok(checkpoint_needs_update_with_fingerprint(
+        place_checkpoint,
+        current_fp,
     ))
 }
 
@@ -5726,6 +5813,51 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         assert!(names.contains(&"cips".to_string()));
     }
 
+    /// Regression: `target/ip/bd/**` and `target/ip/xci/**` are
+    /// the cache directories populated by `vw::configure_ip`; the
+    /// `.vhd` files under them are already registered with the
+    /// Vivado project via `read_bd` / `read_ip`, so
+    /// `vhdl_ip_sources` must NOT list them (otherwise `synth`'s
+    /// `read_vhdl` conflicts with the sub-design registration and
+    /// Vivado emits `[filemgmt 20-1440]` CRITICAL WARNINGs).
+    #[test]
+    fn vhdl_ip_sources_excludes_bd_and_xci_cache_subtrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let ip = ws.join("target/ip");
+        // Legit wrappers.
+        std::fs::create_dir_all(ip.join("cips")).unwrap();
+        std::fs::create_dir_all(ip.join("dcmac")).unwrap();
+        std::fs::write(ip.join("cips/wrapper.vhd"), "").unwrap();
+        std::fs::write(ip.join("dcmac/wrapper.vhd"), "").unwrap();
+        // Cached BD outputs — should all be filtered out.
+        std::fs::create_dir_all(ip.join("bd/cips/synth")).unwrap();
+        std::fs::create_dir_all(ip.join("bd/cips/sim")).unwrap();
+        std::fs::create_dir_all(ip.join("bd/dcmac/synth")).unwrap();
+        std::fs::write(ip.join("bd/cips/synth/cips.vhd"), "").unwrap();
+        std::fs::write(ip.join("bd/cips/sim/cips.vhd"), "").unwrap();
+        std::fs::write(ip.join("bd/dcmac/synth/dcmac.vhd"), "").unwrap();
+        // Cached XCI outputs — should also be filtered.
+        std::fs::create_dir_all(ip.join("xci/primary_clock")).unwrap();
+        std::fs::write(ip.join("xci/primary_clock/primary_clock.vhd"), "")
+            .unwrap();
+
+        let sources = vhdl_ip_sources(&ws).unwrap();
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        for p in &sources {
+            let s = p.to_string_lossy();
+            assert!(
+                !s.contains("/target/ip/bd/"),
+                "bd cache file leaked into ip_sources: {s}"
+            );
+            assert!(
+                !s.contains("/target/ip/xci/"),
+                "xci cache file leaked into ip_sources: {s}"
+            );
+            assert!(s.ends_with("wrapper.vhd"), "unexpected file: {s}");
+        }
+    }
+
     #[test]
     fn vhdl_design_sources_walks_recursive_and_sorts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6108,5 +6240,146 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(ws.join("ip/cips.htcl"), "# cips\n").unwrap();
         assert!(!ip_needs_update(&ws, cp.as_std_path()).unwrap());
+    }
+
+    /// Minimal workspace scaffold for `place_needs_update` tests:
+    /// a `vw.toml`, one place-scoped XDC, and a stand-in synth DCP
+    /// that the fingerprint folds in as a proxy for "everything
+    /// synth depended on".
+    fn make_place_ws(
+        tmp: &tempfile::TempDir,
+    ) -> (Utf8PathBuf, PathBuf, PathBuf) {
+        let ws = tmp.path().to_path_buf();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"plws\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let xdc = ws.join("constraints").join("place");
+        std::fs::create_dir_all(&xdc).unwrap();
+        std::fs::write(xdc.join("place.xdc"), "# place xdc\n").unwrap();
+        let synth_dcp = ws.join("target/synth/top.dcp");
+        std::fs::create_dir_all(synth_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&synth_dcp, "").unwrap();
+        let place_dcp = ws.join("target/place/top.dcp");
+        (
+            Utf8PathBuf::from_path_buf(ws).unwrap(),
+            place_dcp,
+            synth_dcp,
+        )
+    }
+
+    /// Missing checkpoint → stale. Same first-place rule the
+    /// synth/ip caches use.
+    #[test]
+    fn place_needs_update_true_when_checkpoint_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, place_dcp, synth_dcp) = make_place_ws(&tmp);
+        assert!(place_needs_update(
+            &ws,
+            place_dcp.as_path(),
+            synth_dcp.as_path()
+        )
+        .unwrap());
+    }
+
+    /// Fresh manifest → not stale. Verifies the write+check
+    /// round-trip on the place scope (place XDCs + synth DCP).
+    #[test]
+    fn place_needs_update_false_when_manifest_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, place_dcp, synth_dcp) = make_place_ws(&tmp);
+        std::fs::create_dir_all(place_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&place_dcp, "").unwrap();
+        write_place_checkpoint_manifest(
+            &ws,
+            place_dcp.as_path(),
+            synth_dcp.as_path(),
+        )
+        .unwrap();
+        assert!(!place_needs_update(
+            &ws,
+            place_dcp.as_path(),
+            synth_dcp.as_path()
+        )
+        .unwrap());
+    }
+
+    /// Editing a place XDC invalidates. Trigger the user
+    /// controls most directly (tweak a place constraint,
+    /// re-place should fire).
+    #[test]
+    fn place_needs_update_true_when_place_xdc_content_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, place_dcp, synth_dcp) = make_place_ws(&tmp);
+        std::fs::create_dir_all(place_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&place_dcp, "").unwrap();
+        write_place_checkpoint_manifest(
+            &ws,
+            place_dcp.as_path(),
+            synth_dcp.as_path(),
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("constraints/place/place.xdc"),
+            "# place xdc updated\n",
+        )
+        .unwrap();
+        assert!(place_needs_update(
+            &ws,
+            place_dcp.as_path(),
+            synth_dcp.as_path()
+        )
+        .unwrap());
+    }
+
+    /// Synth re-ran → synth DCP content changed → place
+    /// invalidates. The synth DCP is intentionally folded into
+    /// the place fingerprint as a proxy for "everything synth
+    /// depended on".
+    #[test]
+    fn place_needs_update_true_when_synth_checkpoint_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, place_dcp, synth_dcp) = make_place_ws(&tmp);
+        std::fs::create_dir_all(place_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&place_dcp, "").unwrap();
+        write_place_checkpoint_manifest(
+            &ws,
+            place_dcp.as_path(),
+            synth_dcp.as_path(),
+        )
+        .unwrap();
+        std::fs::write(&synth_dcp, "different bytes").unwrap();
+        assert!(place_needs_update(
+            &ws,
+            place_dcp.as_path(),
+            synth_dcp.as_path()
+        )
+        .unwrap());
+    }
+
+    /// Non-place workspace file changes must NOT invalidate the
+    /// place cache (design.htcl, hdl/, etc. are captured by the
+    /// synth stage; place scope is narrower).
+    #[test]
+    fn place_needs_update_false_when_non_place_htcl_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, place_dcp, synth_dcp) = make_place_ws(&tmp);
+        std::fs::write(ws.join("design.htcl"), "# design\n").unwrap();
+        std::fs::create_dir_all(place_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&place_dcp, "").unwrap();
+        write_place_checkpoint_manifest(
+            &ws,
+            place_dcp.as_path(),
+            synth_dcp.as_path(),
+        )
+        .unwrap();
+        std::fs::write(ws.join("design.htcl"), "# design updated\n").unwrap();
+        assert!(!place_needs_update(
+            &ws,
+            place_dcp.as_path(),
+            synth_dcp.as_path()
+        )
+        .unwrap());
     }
 }
