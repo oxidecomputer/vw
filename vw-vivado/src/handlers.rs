@@ -69,6 +69,12 @@
 //!   on" — if any synth-scope source changed, synth re-ran
 //!   and the DCP is fresh, invalidating place). Backs
 //!   `vw::place`.
+//! - `route_needs_update` / `route_mark_checkpoint` — one stage
+//!   down from place. Fingerprint covers
+//!   `<ws>/constraints/route/**` plus the upstream place DCP
+//!   file (proxy chain: any synth-scope change → synth re-ran →
+//!   place re-ran → place DCP fresh → route invalidates). Backs
+//!   `vw::route`.
 //! - `compile_htcl_module` — parses + lowers an htcl module (any
 //!   `src`-shaped path resolved against the workspace root) and
 //!   returns the concatenated Tcl. `vw::configure_ip` uses this
@@ -266,6 +272,8 @@ async fn dispatch(
         }
         "place_needs_update" => place_needs_update(workspace_root, args),
         "place_mark_checkpoint" => place_mark_checkpoint(workspace_root, args),
+        "route_needs_update" => route_needs_update(workspace_root, args),
+        "route_mark_checkpoint" => route_mark_checkpoint(workspace_root, args),
         "compile_htcl_module" => {
             compile_htcl_module(workspace_root, args, preloaded).await
         }
@@ -765,6 +773,71 @@ fn extract_synth_checkpoint_arg(
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("{method}: missing string `synth_checkpoint`"))
+}
+
+/// `route_needs_update` — inputs
+/// `{checkpoint: <route-dcp>, place_checkpoint: <place-dcp>}`;
+/// output is a JSON bool. Compares the route checkpoint's
+/// sidecar manifest against the current fingerprint of every
+/// route-scoped XDC under `<ws>/constraints/route/**` PLUS the
+/// place DCP file (which proxies for "everything place depended
+/// on"). `true` when the checkpoint / manifest is missing or the
+/// fingerprints disagree.
+fn route_needs_update(
+    workspace_root: Option<&std::path::Path>,
+    args: Value,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let checkpoint = extract_checkpoint_arg(&args, "route_needs_update")?;
+    let place_checkpoint =
+        extract_place_checkpoint_arg(&args, "route_needs_update")?;
+    let needs = vw_lib::route_needs_update(
+        &ws,
+        std::path::Path::new(&checkpoint),
+        std::path::Path::new(&place_checkpoint),
+    )
+    .map_err(|e| format!("checking route checkpoint freshness: {e}"))?;
+    Ok(Value::Bool(needs))
+}
+
+/// `route_mark_checkpoint` — inputs
+/// `{checkpoint: <route-dcp>, place_checkpoint: <place-dcp>}`;
+/// output is a JSON null. Writes the sidecar manifest recording
+/// the current route-scope fingerprint. Called by `vw::route`
+/// after `vivado_cmd::write_checkpoint`.
+fn route_mark_checkpoint(
+    workspace_root: Option<&std::path::Path>,
+    args: Value,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    let checkpoint = extract_checkpoint_arg(&args, "route_mark_checkpoint")?;
+    let place_checkpoint =
+        extract_place_checkpoint_arg(&args, "route_mark_checkpoint")?;
+    vw_lib::write_route_checkpoint_manifest(
+        &ws,
+        std::path::Path::new(&checkpoint),
+        std::path::Path::new(&place_checkpoint),
+    )
+    .map_err(|e| format!("writing route checkpoint manifest: {e}"))?;
+    Ok(Value::Null)
+}
+
+/// Sibling of [`extract_synth_checkpoint_arg`] for the
+/// `place_checkpoint` slot on route-stage RPC methods.
+fn extract_place_checkpoint_arg(
+    args: &Value,
+    method: &str,
+) -> Result<String, String> {
+    let obj = args.as_object().ok_or_else(|| {
+        format!(
+            "{method}: args must be an object with a `place_checkpoint` \
+             string field"
+        )
+    })?;
+    obj.get("place_checkpoint")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{method}: missing string `place_checkpoint`"))
 }
 
 /// Silent [`vw_htcl::loader::LoadObserver`] — the RPC path has no

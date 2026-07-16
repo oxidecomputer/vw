@@ -2709,6 +2709,71 @@ pub fn place_needs_update(
 }
 
 // ---------------------------------------------------------------------
+// Route checkpoint helpers
+//
+// Same shape as the place helpers above but one stage down: route
+// XDCs (`<ws>/constraints/route/**`) PLUS the upstream *place*
+// DCP file. The place DCP acts as the "everything place depended
+// on" proxy — if place re-ran, its DCP is fresh and the route
+// fingerprint invalidates automatically. Same reason place folds
+// in the synth DCP.
+// ---------------------------------------------------------------------
+
+/// Path list feeding [`route_source_fingerprint`]. Sorted + deduped.
+/// Missing files pass through — the fingerprint's present/absent
+/// marker byte covers the "checkpoint doesn't exist yet" case.
+fn route_source_paths(
+    workspace_dir: &Utf8Path,
+    place_checkpoint: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut sources: Vec<PathBuf> = Vec::new();
+    sources.extend(design_route_constraints(workspace_dir)?);
+    sources.push(place_checkpoint.to_path_buf());
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
+/// Combined fingerprint over the route source set (route XDCs +
+/// the upstream place checkpoint file). Backs
+/// [`route_needs_update`] and [`write_route_checkpoint_manifest`].
+pub fn route_source_fingerprint(
+    workspace_dir: &Utf8Path,
+    place_checkpoint: &Path,
+) -> Result<u64> {
+    let paths = route_source_paths(workspace_dir, place_checkpoint)?;
+    Ok(fingerprint_paths(workspace_dir, &paths))
+}
+
+/// Write the manifest sidecar for a freshly-produced route
+/// checkpoint. Called from `vw::route` after
+/// `vivado_cmd::write_checkpoint` completes.
+pub fn write_route_checkpoint_manifest(
+    workspace_dir: &Utf8Path,
+    route_checkpoint: &Path,
+    place_checkpoint: &Path,
+) -> Result<()> {
+    let fp = route_source_fingerprint(workspace_dir, place_checkpoint)?;
+    write_checkpoint_manifest_with_fingerprint(route_checkpoint, fp)
+}
+
+/// Returns `true` when the route checkpoint OR its manifest is
+/// missing, OR the fingerprint stored in the manifest differs
+/// from the current one. Mirrors [`place_needs_update`] with the
+/// route source scope (route XDCs + the place DCP proxy).
+pub fn route_needs_update(
+    workspace_dir: &Utf8Path,
+    route_checkpoint: &Path,
+    place_checkpoint: &Path,
+) -> Result<bool> {
+    let current_fp = route_source_fingerprint(workspace_dir, place_checkpoint)?;
+    Ok(checkpoint_needs_update_with_fingerprint(
+        route_checkpoint,
+        current_fp,
+    ))
+}
+
+// ---------------------------------------------------------------------
 // IP configuration checkpoint — a per-workspace cache scoped to the
 // entry `ip/module.htcl` (and everything it srcs). Backs
 // `vw::configure_ip` in the htcl vw module.
@@ -6613,6 +6678,150 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             place_dcp.as_path(),
             synth_dcp.as_path()
+        )
+        .unwrap());
+    }
+
+    /// Minimal workspace scaffold for `route_needs_update` tests:
+    /// a `vw.toml`, one route-scoped XDC, and a stand-in place DCP
+    /// that the fingerprint folds in as a proxy for "everything
+    /// place depended on".
+    fn make_route_ws(
+        tmp: &tempfile::TempDir,
+    ) -> (Utf8PathBuf, PathBuf, PathBuf) {
+        let ws = tmp.path().to_path_buf();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"rtws\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let xdc = ws.join("constraints").join("route");
+        std::fs::create_dir_all(&xdc).unwrap();
+        std::fs::write(xdc.join("route.xdc"), "# route xdc\n").unwrap();
+        let place_dcp = ws.join("target/place/top.dcp");
+        std::fs::create_dir_all(place_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&place_dcp, "").unwrap();
+        let route_dcp = ws.join("target/route/top.dcp");
+        (
+            Utf8PathBuf::from_path_buf(ws).unwrap(),
+            route_dcp,
+            place_dcp,
+        )
+    }
+
+    /// Missing checkpoint → stale. Same first-place rule the
+    /// place / synth caches use.
+    #[test]
+    fn route_needs_update_true_when_checkpoint_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, route_dcp, place_dcp) = make_route_ws(&tmp);
+        assert!(route_needs_update(
+            &ws,
+            route_dcp.as_path(),
+            place_dcp.as_path()
+        )
+        .unwrap());
+    }
+
+    /// Fresh manifest → not stale. Verifies the write+check
+    /// round-trip on the route scope (route XDCs + place DCP).
+    #[test]
+    fn route_needs_update_false_when_manifest_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, route_dcp, place_dcp) = make_route_ws(&tmp);
+        std::fs::create_dir_all(route_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&route_dcp, "").unwrap();
+        write_route_checkpoint_manifest(
+            &ws,
+            route_dcp.as_path(),
+            place_dcp.as_path(),
+        )
+        .unwrap();
+        assert!(!route_needs_update(
+            &ws,
+            route_dcp.as_path(),
+            place_dcp.as_path()
+        )
+        .unwrap());
+    }
+
+    /// Editing a route XDC invalidates. Trigger the user
+    /// controls most directly (tweak a route constraint,
+    /// re-route should fire).
+    #[test]
+    fn route_needs_update_true_when_route_xdc_content_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, route_dcp, place_dcp) = make_route_ws(&tmp);
+        std::fs::create_dir_all(route_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&route_dcp, "").unwrap();
+        write_route_checkpoint_manifest(
+            &ws,
+            route_dcp.as_path(),
+            place_dcp.as_path(),
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("constraints/route/route.xdc"),
+            "# route xdc updated\n",
+        )
+        .unwrap();
+        assert!(route_needs_update(
+            &ws,
+            route_dcp.as_path(),
+            place_dcp.as_path()
+        )
+        .unwrap());
+    }
+
+    /// Place re-ran → place DCP content changed → route
+    /// invalidates. The place DCP is intentionally folded into
+    /// the route fingerprint as a proxy for "everything place
+    /// depended on".
+    #[test]
+    fn route_needs_update_true_when_place_checkpoint_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, route_dcp, place_dcp) = make_route_ws(&tmp);
+        std::fs::create_dir_all(route_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&route_dcp, "").unwrap();
+        write_route_checkpoint_manifest(
+            &ws,
+            route_dcp.as_path(),
+            place_dcp.as_path(),
+        )
+        .unwrap();
+        std::fs::write(&place_dcp, "different bytes").unwrap();
+        assert!(route_needs_update(
+            &ws,
+            route_dcp.as_path(),
+            place_dcp.as_path()
+        )
+        .unwrap());
+    }
+
+    /// Non-route workspace file changes must NOT invalidate the
+    /// route cache — synth / place XDC edits belong to those
+    /// stages (and reach route via the DCP-proxy chain).
+    #[test]
+    fn route_needs_update_false_when_non_route_xdc_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, route_dcp, place_dcp) = make_route_ws(&tmp);
+        let place_xdc_dir = ws.join("constraints").join("place");
+        std::fs::create_dir_all(&place_xdc_dir).unwrap();
+        std::fs::write(place_xdc_dir.join("place.xdc"), "# place\n").unwrap();
+        std::fs::create_dir_all(route_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&route_dcp, "").unwrap();
+        write_route_checkpoint_manifest(
+            &ws,
+            route_dcp.as_path(),
+            place_dcp.as_path(),
+        )
+        .unwrap();
+        std::fs::write(place_xdc_dir.join("place.xdc"), "# place updated\n")
+            .unwrap();
+        assert!(!route_needs_update(
+            &ws,
+            route_dcp.as_path(),
+            place_dcp.as_path()
         )
         .unwrap());
     }
