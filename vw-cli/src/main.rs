@@ -2359,10 +2359,18 @@ async fn run_htcl(
         }
         std::sync::Arc::new(std::sync::RwLock::new(m))
     };
-    let rpc_handler = vw_vivado::make_handler_with_preloaded(
+    // Shared CRITICAL WARNING counter. Bumped by the stream sink
+    // below on each `Severity::CriticalWarning` chunk; read via
+    // the `critical_warning_count` RPC by `vw::synth` / `vw::place`
+    // to gate checkpoint writes on a CW-clean phase. Cloned into
+    // the handler and the sink so both sides see the same atomic.
+    let cw_count: vw_vivado::SharedCriticalWarningCount =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rpc_handler = vw_vivado::make_handler_full(
         rpc_workspace_root.clone(),
         active_variant,
         preload,
+        cw_count.clone(),
     );
     // Raw byte-log: `<workspace>/target/logs/vivado-<ts>.log`.
     // Failure to create the directory demotes to no-log rather than
@@ -2438,12 +2446,21 @@ async fn run_htcl(
         let origin = std::sync::Arc::clone(&current_origin);
         let acc = std::sync::Arc::clone(&block_acc);
         let worst = std::sync::Arc::clone(&worst_severity);
+        let cw = std::sync::Arc::clone(&cw_count);
         backend.set_stdout_sink(move |kind, chunk: &str| {
             let cur_origin = origin.lock().ok().and_then(|g| g.clone());
             worst.fetch_max(
                 severity_as_u8(vw_vivado::severity_of(kind)),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            // Bump the CW counter exposed via the
+            // `critical_warning_count` RPC. Only count exact
+            // CriticalWarning (not Error) — htcl checkpoint gates
+            // want CWs specifically; errors already abort the
+            // eval before the checkpoint-write branch is reached.
+            if matches!(kind, vw_vivado::StreamKind::CriticalWarning) {
+                cw.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let blocks = acc
                 .lock()
                 .map(|mut a| a.push(kind, chunk))

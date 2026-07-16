@@ -8,6 +8,13 @@
 //!
 //! Methods:
 //! - `workspace_root` — the discovered `vw.toml` parent dir.
+//! - `critical_warning_count` — session-scoped monotonic count of
+//!   CRITICAL WARNING chunks the stream sink has classified so far.
+//!   `vw::synth` / `vw::place` snapshot this before + after each
+//!   phase to decide whether to persist a checkpoint (a CW delta
+//!   means the artifact would poison the next warm run). Vivado's
+//!   own `get_msg_config -count -severity` doesn't see CWs from
+//!   opt/place/phys_opt sub-processes, so we track them ourselves.
 //! - `diff_files` — read two files and return a unified diff of
 //!   their contents. Used by `test::assert_file_eq` to render a
 //!   readable failure message instead of a two-line "files differ"
@@ -108,6 +115,18 @@ pub type PreloadedPaths = HashMap<PathBuf, SystemTime>;
 /// end of the initial load.
 pub type SharedPreload = Arc<RwLock<PreloadedPaths>>;
 
+/// Session-scoped monotonic counter of CRITICAL WARNING (and
+/// higher) chunks the stream classifier has seen. Vivado's own
+/// `get_msg_config -count -severity "CRITICAL WARNING"` doesn't
+/// see CWs emitted from sub-processes launched inside `opt_design`
+/// / `place_design` / `phys_opt_design` (documented gotcha), so
+/// htcl procs like `vw::synth` and `vw::place` need OUR counter
+/// to decide whether to persist a checkpoint. Owned by whichever
+/// call site sets up the stream sink (vw-cli / vw-repl); the RPC
+/// handler holds the same Arc so `vw::critical_warning_count`
+/// reads see the latest value with no message-passing.
+pub type SharedCriticalWarningCount = Arc<std::sync::atomic::AtomicU64>;
+
 /// Build the FnHandler used by every Vivado spawn. `workspace_root`
 /// is the workspace-root path to serve for `vw::workspace_root`;
 /// pass `None` when the caller couldn't discover one (the RPC
@@ -130,15 +149,35 @@ pub fn make_handler_with_variant(
     make_handler_with_preloaded(workspace_root, active_variant, preloaded)
 }
 
-/// Full-detail constructor: carries the shared preload map that
-/// [`compile_htcl_module`] consults. Callers who want on-demand
-/// htcl loading to skip files already shipped to this Vivado
-/// session should clone the returned map's Arc, hold onto it,
-/// and update it after every successful load.
+/// Convenience over [`make_handler_full`] that allocates a fresh
+/// (unshared) CW counter. Suitable for callers that don't need to
+/// read the counter themselves (e.g. `vw test` — where each test
+/// spawns its own worker and only cares about eval results, not
+/// CW-gated checkpoint decisions).
 pub fn make_handler_with_preloaded(
     workspace_root: Option<PathBuf>,
     active_variant: Option<String>,
     preloaded: SharedPreload,
+) -> Arc<dyn RpcHandler> {
+    let cw = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    make_handler_full(workspace_root, active_variant, preloaded, cw)
+}
+
+/// Full-detail constructor: carries every shared piece of state
+/// the RPC surface needs. `preloaded` is the "already loaded in
+/// this Vivado session" map [`compile_htcl_module`] consults —
+/// callers who want on-demand htcl loading to skip files already
+/// shipped to this Vivado session should clone the returned map's
+/// Arc, hold onto it, and update it after every successful load.
+/// `cw_count` is the session's monotonic CRITICAL WARNING counter
+/// — callers that own the stream sink should clone this Arc and
+/// bump it on every `Severity::CriticalWarning` chunk, and htcl
+/// procs read it via the `critical_warning_count` RPC.
+pub fn make_handler_full(
+    workspace_root: Option<PathBuf>,
+    active_variant: Option<String>,
+    preloaded: SharedPreload,
+    cw_count: SharedCriticalWarningCount,
 ) -> Arc<dyn RpcHandler> {
     let workspace_root = workspace_root.map(Arc::new);
     let active_variant = active_variant.map(Arc::new);
@@ -146,6 +185,7 @@ pub fn make_handler_with_preloaded(
         let ws = workspace_root.clone();
         let av = active_variant.clone();
         let pl = preloaded.clone();
+        let cw = cw_count.clone();
         async move {
             dispatch(
                 &method,
@@ -153,6 +193,7 @@ pub fn make_handler_with_preloaded(
                 ws.as_deref().map(|p| p.as_ref()),
                 av.as_deref().map(|s| s.as_str()),
                 &pl,
+                &cw,
             )
             .await
         }
@@ -165,6 +206,7 @@ async fn dispatch(
     workspace_root: Option<&std::path::Path>,
     active_variant: Option<&str>,
     preloaded: &SharedPreload,
+    cw_count: &SharedCriticalWarningCount,
 ) -> Result<Value, String> {
     match method {
         "workspace_root" => workspace_root
@@ -174,6 +216,9 @@ async fn dispatch(
                  parent chain"
                     .to_string()
             }),
+        "critical_warning_count" => Ok(Value::from(
+            cw_count.load(std::sync::atomic::Ordering::Relaxed),
+        )),
         "active_variant" => {
             Ok(active_variant_value(workspace_root, active_variant))
         }

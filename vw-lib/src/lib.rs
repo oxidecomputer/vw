@@ -2930,10 +2930,11 @@ pub fn prepare_vw_project_dir(
     let legacy_cache_removed = cleanup_legacy_ip_cache(workspace_dir);
     let mut wiped_project = None;
     if project_needs_wipe(workspace_dir, project_dir.as_std_path(), name)?
-        && project_dir.exists() {
-            fs::remove_dir_all(project_dir.as_std_path())?;
-            wiped_project = Some(project_dir.clone());
-        }
+        && project_dir.exists()
+    {
+        fs::remove_dir_all(project_dir.as_std_path())?;
+        wiped_project = Some(project_dir.clone());
+    }
     fs::create_dir_all(project_dir.as_std_path())?;
     Ok(PreparedProjectDir {
         project_dir,

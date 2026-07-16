@@ -3568,10 +3568,21 @@ async fn worker_task(
     // Arc's other end and updates the map after every
     // `session.commit()` from `session.loaded_paths()`. See the
     // `SharedPreload` docs in vw-vivado.
-    let rpc_handler = vw_vivado::make_handler_with_preloaded(
+    //
+    // Also carries a session-scoped CW counter. The sink below
+    // bumps it on every `Severity::CriticalWarning` chunk, and
+    // `vw::synth` / `vw::place` read it via
+    // `vw::critical_warning_count` to gate their checkpoint
+    // writes on a CW-clean phase. Same wiring as `vw run` — the
+    // REPL must not diverge or the exact same htcl session would
+    // persist a checkpoint here that `vw run` would refuse.
+    let cw_count: vw_vivado::SharedCriticalWarningCount =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rpc_handler = vw_vivado::make_handler_full(
         rpc_workspace_root,
         active_variant,
         preload,
+        cw_count.clone(),
     );
     let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
         verbose,
@@ -3603,7 +3614,16 @@ async fn worker_task(
     // lines harvested from the PTY) flows through unchanged so
     // the UI can colour them appropriately.
     let stdout_tx = tx.clone();
+    let cw = cw_count.clone();
     backend.set_stdout_sink(move |kind, chunk: &str| {
+        // Bump the CW counter exposed via the
+        // `critical_warning_count` RPC. Only exact
+        // CriticalWarning — errors already halt eval before any
+        // htcl checkpoint-write branch runs, so counting them
+        // here would double-report.
+        if matches!(kind, vw_vivado::StreamKind::CriticalWarning) {
+            cw.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = stdout_tx.send(WorkerEvent::Stream {
             kind,
             data: chunk.to_string(),

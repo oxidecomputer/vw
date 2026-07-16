@@ -167,6 +167,20 @@ proc ::vw::stream_stdout {id data} {
     flush $protocol_sock
 }
 
+## `pending_response_id` / `pending_response_sent` — main-loop
+## deadman for the "request in, no response out" case. The
+## dispatch handler sets `pending_response_id` before invoking
+## the per-op branch, and every `send_ok`/`send_err` clears it.
+## If the main loop exits `::vw::dispatch` with an unclosed id
+## (e.g. `interp cancel -unwind` from a Ctrl-C during `place_design`
+## blew through the eval-branch's `catch` without letting the
+## `send_err` branch run), the loop synthesises a fallback error
+## response so the vw Rust worker's `read_response_for(id).await`
+## unblocks instead of hanging the whole session. Without this
+## guard, the REPL stays stuck at `vivado: running` forever.
+variable ::vw::pending_response_id 0
+variable ::vw::pending_response_sent 0
+
 proc ::vw::send_ok {id result} {
     variable protocol_sock
     set j_result [::vw::json_string $result]
@@ -175,6 +189,9 @@ proc ::vw::send_ok {id result} {
     ::vw::real_puts $protocol_sock \
         "{\"id\":$id,\"ok\":true,\"result\":$j_result}"
     flush $protocol_sock
+    if {$::vw::pending_response_id == $id} {
+        set ::vw::pending_response_sent 1
+    }
 }
 
 proc ::vw::send_err {id message {code ""} {info ""}} {
@@ -190,6 +207,9 @@ proc ::vw::send_err {id message {code ""} {info ""}} {
     ::vw::real_puts $protocol_sock \
         "{\"id\":$id,\"ok\":false,\"error\":{$fields}}"
     flush $protocol_sock
+    if {$::vw::pending_response_id == $id} {
+        set ::vw::pending_response_sent 1
+    }
 }
 
 # ---------- shim-initiated RPC ----------
@@ -1349,6 +1369,12 @@ proc ::vw::dispatch {line} {
     }
     set id [dict get $req id]
     set op [dict get $req op]
+    # Arm the main-loop deadman as soon as we've committed to a
+    # specific id — from here on, if this dispatch doesn't reach
+    # a `send_ok` / `send_err`, the main loop synthesises an
+    # error response for `id` so the client never blocks.
+    set ::vw::pending_response_id $id
+    set ::vw::pending_response_sent 0
     switch -- $op {
         eval {
             if {![dict exists $req tcl]} {
@@ -1438,7 +1464,32 @@ while {1} {
     catch {::vw::install_all_context_wrappers}
 catch {::vw::install_set_property_recorder}
 catch {::vw::install_proc_body_wrap}
-    ::vw::dispatch $line
+    # Arm the response deadman. `::vw::dispatch` sets
+    # `pending_response_id` as soon as it parses the request id;
+    # `send_ok` / `send_err` clear `pending_response_sent`. Wrap
+    # the dispatch in `catch` so an `interp cancel -unwind`
+    # ripping through the eval-branch's own `catch` doesn't kill
+    # the main loop — we synthesise a fallback error response
+    # and keep serving requests. See the `pending_response_*`
+    # variable docs.
+    set ::vw::pending_response_id 0
+    set ::vw::pending_response_sent 0
+    catch {::vw::dispatch $line} dispatch_result dispatch_opts
+    set dispatch_rc [dict get $dispatch_opts -code]
+    # Restore capturing to a sane state — the eval-branch always
+    # clears it, but if `catch` unwound before the clear line ran
+    # it might still be 1 and would misroute the next eval's puts.
+    set ::vw::capturing 0
+    if {$::vw::pending_response_id != 0 && !$::vw::pending_response_sent} {
+        set fallback_msg "shim dispatch aborted without sending a response"
+        if {$dispatch_rc != 0} {
+            append fallback_msg " (rc=$dispatch_rc): $dispatch_result"
+        } else {
+            append fallback_msg " (dispatch returned but did not send)"
+        }
+        ::vw::log "deadman firing for id=$::vw::pending_response_id: $fallback_msg"
+        ::vw::send_err $::vw::pending_response_id $fallback_msg
+    }
 }
 
 close $sock

@@ -324,6 +324,28 @@ pub struct VivadoBackend {
     /// shim never emits a nested BEGIN before its outer READY.
     building_pty_context: Vec<String>,
     _shim_dir: TempDir,
+    /// Latched when we detect the shim has been torn down (via
+    /// the `Vivado%` prompt landing in the PTY during an eval —
+    /// see the shim-died detector in `read_response_for`).
+    /// Once set, every subsequent `eval` returns a fast-fail
+    /// error instead of writing the request into an orphaned
+    /// socket that nobody will ever read. Cleared when the
+    /// shim is successfully respawned via
+    /// [`Self::respawn_shim`].
+    shim_dead: bool,
+    /// Absolute path of the shim `.tcl` file inside `_shim_dir`.
+    /// Needed by [`Self::respawn_shim`] to write
+    /// `source <path>\n` back to Vivado's interactive PTY prompt
+    /// after Ctrl-C's `interp cancel -unwind` blew the shim's
+    /// dispatch loop out from under us. Vivado keeps the same
+    /// `VW_PROTOCOL_ADDR` env var across shim `source`s, so the
+    /// respawn re-connects to the listener below.
+    shim_path: PathBuf,
+    /// Held-open listener so [`Self::respawn_shim`] can accept a
+    /// second connection on the same port. Original spawn takes
+    /// the first accept; if that shim dies to a cancel, the
+    /// re-sourced shim connects again here.
+    listener: Option<TcpListener>,
     _scratch_dir: Option<TempDir>,
 }
 
@@ -430,7 +452,9 @@ impl VivadoBackend {
         let (pty_tx, pty_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let stdout_pump = spawn_stdout_pump(reader, pty_tx, raw_log);
 
-        // Wait for the shim to connect.
+        // Wait for the shim to connect. Borrow `&mut listener` so
+        // it stays alive for [`Self::respawn_shim`] to re-accept
+        // on the same port after a cancel-induced shim teardown.
         let accept_result =
             tokio::time::timeout(SHIM_CONNECT_TIMEOUT, listener.accept()).await;
         let stream = match accept_result {
@@ -503,6 +527,9 @@ impl VivadoBackend {
             building_pty_context: Vec::new(),
             _shim_dir: shim_dir,
             _scratch_dir: scratch_dir,
+            shim_dead: false,
+            shim_path: shim_path.clone(),
+            listener: Some(listener),
         };
         // Auto-create (or reopen) the Vivado project if the caller
         // specified one. Runs BEFORE we return to the caller so the
@@ -777,6 +804,68 @@ impl VivadoBackend {
                         pty_line.len(),
                         &pty_line,
                     );
+                    // Shim-died detector. When Vivado catches Ctrl-C
+                    // during a long C++ command (`place_design`,
+                    // `phys_opt_design`, ...), its signal handler
+                    // does `interp cancel -unwind` — and -unwind
+                    // rips through EVERYTHING, including the shim's
+                    // `while {1}` dispatch loop AND the `source`
+                    // that loaded it. Vivado then drops to its
+                    // interactive `Vivado%` prompt with no shim
+                    // running, so our protocol socket is orphaned:
+                    // no response will ever come for this id, and
+                    // `read_response_for` would hang forever.
+                    //
+                    // Vivado announces the shim-source unwind with a
+                    // very specific `[Common 17-344] 'source' was
+                    // cancelled` line — precise (per-command
+                    // cancellation like `'opt_design' was cancelled`
+                    // is a different scope; only `'source'` means
+                    // the shim's own `source $shim_path` was
+                    // unwound). Match on that substring rather
+                    // than on the `Vivado% ` prompt itself — the
+                    // prompt has no trailing newline, so the
+                    // line-buffered PTY pump never delivers it
+                    // to us.
+                    if pty_line.contains("'source' was cancelled")
+                    {
+                        // Shim died. Try to re-establish it in
+                        // place — Vivado's C++ state (project,
+                        // IP catalog, loaded designs) survives
+                        // an `interp cancel -unwind`, only the
+                        // Tcl-level shim/user state is lost.
+                        // Fast respawn keeps the Vivado process
+                        // warm (avoids the ~minutes-long
+                        // startup) at the cost of user Tcl
+                        // bindings needing to be reloaded.
+                        self.shim_dead = true;
+                        let respawn = self.respawn_shim().await;
+                        let recovery = match respawn {
+                            Ok(()) => "shim was respawned; \
+                                Vivado process + project state \
+                                preserved, but Tcl-level proc \
+                                bindings and session vars are \
+                                gone — re-source your entry \
+                                htcl to restore them",
+                            Err(_) => "shim respawn failed; \
+                                session is unusable — exit vw \
+                                and re-launch (`:exit` in the \
+                                REPL, then `vw repl` / `vw run` \
+                                again)",
+                        };
+                        return Err(BackendError::Tcl {
+                            message: format!(
+                                "vivado shim was torn down by \
+                                 Ctrl-C cancellation (Vivado's \
+                                 `interp cancel -unwind` blew \
+                                 through the shim's dispatch \
+                                 loop). {recovery}."
+                            ),
+                            code: Some("VW_SHIM_DEAD".to_string()),
+                            info: None,
+                            stdout: std::mem::take(&mut accumulated),
+                        });
+                    }
                     self.handle_pty_line_during_eval(
                         &pty_line,
                         &mut accumulated,
@@ -1065,6 +1154,115 @@ impl VivadoBackend {
     /// in-flight eval — so marker BEGIN/END events pop the stack
     /// coherently and error messages carry the failed eval's
     /// frames when they reach the REPL sink.
+    /// Recover from a cancelled-shim state. Called by
+    /// [`Self::read_response_for`] when it sees the `Vivado%`
+    /// prompt in the PTY — that means Vivado's SIGINT handler
+    /// did `interp cancel -unwind` and the shim's dispatch loop
+    /// unwound all the way through the `source` that loaded it,
+    /// dropping Vivado back to interactive Tcl.
+    ///
+    /// Recovery steps:
+    ///   1. Drop the orphaned protocol socket + its reader task.
+    ///   2. Write `source <shim_path>\n` to the PTY master —
+    ///      Vivado's interactive prompt sees it and re-runs the
+    ///      shim. `VW_PROTOCOL_ADDR` is still set in the child
+    ///      env, so the re-sourced shim connects back on the
+    ///      same listener.
+    ///   3. Accept the new connection (with the same connect
+    ///      timeout as the initial spawn) and rewire
+    ///      [`Self::proto_read`] / [`Self::proto_write`].
+    ///   4. Clear [`Self::shim_dead`] so subsequent evals can
+    ///      run.
+    ///
+    /// Post-condition: Vivado is warm — project, IP catalog,
+    /// C++-level state all survive — but every Tcl-level user
+    /// binding (proc definitions from htcl `src`, `set` vars,
+    /// namespace state) is gone. Callers that had lowered
+    /// procs into the session need to reload them.
+    ///
+    /// Returns `Ok(())` on successful respawn. On failure
+    /// leaves `shim_dead` latched so future evals fast-fail
+    /// with a clear error.
+    async fn respawn_shim(&mut self) -> Result<(), BackendError> {
+        // Cancel the old reader task so it doesn't fight the
+        // new one when the old socket goes away.
+        if let Some(handle) = self._proto_read_task.take() {
+            handle.abort();
+        }
+        // Drop the old socket ends — closing our side lets any
+        // buffered writes from the dead shim get discarded, and
+        // the listener stays open on the same port for accept.
+        // We can't literally "close" via `drop` here because
+        // `proto_write` is not Option; replace it below when we
+        // wire up the new stream.
+        // Write the `source` line to the PTY. `_master.take_writer()`
+        // returns a `Box<dyn Write>`; each call gives a fresh
+        // handle so we can grab one just for this write.
+        let mut writer = self._master.take_writer().map_err(|e| {
+            BackendError::Worker(format!(
+                "respawn_shim: cannot obtain PTY writer: {e}"
+            ))
+        })?;
+        let source_cmd = format!("source {}\n", self.shim_path.display());
+        use std::io::Write as _;
+        writer.write_all(source_cmd.as_bytes()).map_err(|e| {
+            BackendError::Worker(format!("respawn_shim: PTY write failed: {e}"))
+        })?;
+        writer.flush().map_err(|e| {
+            BackendError::Worker(format!("respawn_shim: PTY flush failed: {e}"))
+        })?;
+        drop(writer);
+        // Await the new shim's connection on the retained
+        // listener.
+        let listener = self.listener.as_ref().ok_or_else(|| {
+            BackendError::Worker(
+                "respawn_shim: no listener retained (backend was \
+                 constructed without one)"
+                    .into(),
+            )
+        })?;
+        let accept_result =
+            tokio::time::timeout(SHIM_CONNECT_TIMEOUT, listener.accept()).await;
+        let stream = match accept_result {
+            Ok(Ok((s, _peer))) => s,
+            Ok(Err(e)) => return Err(BackendError::Io(e)),
+            Err(_) => {
+                return Err(BackendError::Worker(
+                    "respawn_shim: timed out waiting for re-sourced \
+                     shim to connect back"
+                        .into(),
+                ));
+            }
+        };
+        stream.set_nodelay(true).map_err(BackendError::Io)?;
+        let (read_half, write_half) = stream.into_split();
+        let (proto_tx, proto_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut proto_buf = BufReader::new(read_half);
+        let task = tokio::spawn(async move {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match proto_buf.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if proto_tx.send(Ok(line.clone())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = proto_tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+        self.proto_read = proto_rx;
+        self.proto_write = write_half;
+        self._proto_read_task = Some(task);
+        self.shim_dead = false;
+        Ok(())
+    }
+
     async fn settle_late_pty_after_err(&mut self) {
         use std::time::{Duration, Instant};
         let mut sink_void = String::new();
@@ -1257,6 +1455,25 @@ impl EdaBackend for VivadoBackend {
     }
 
     async fn eval(&mut self, tcl: &str) -> Result<EvalOutput, BackendError> {
+        if self.shim_dead {
+            // Fast-fail after a prior eval detected the shim was
+            // torn down by cancellation — writing to the orphaned
+            // socket would either buffer silently or block, and
+            // reading a response would hang forever. Surface the
+            // same message the initial detection did so every
+            // subsequent eval says the same clear thing.
+            return Err(BackendError::Tcl {
+                message: "vivado shim is dead (torn down by an \
+                    earlier Ctrl-C cancellation). The session \
+                    cannot recover — exit vw and re-launch \
+                    (`:exit` in the REPL, then `vw repl` / \
+                    `vw run` again)."
+                    .to_string(),
+                code: Some("VW_SHIM_DEAD".to_string()),
+                info: None,
+                stdout: String::new(),
+            });
+        }
         self.drain_pty_between_evals();
         let id = self.alloc_id();
         let req = Request {
