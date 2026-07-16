@@ -218,6 +218,23 @@ pub struct AutoProject {
     /// Full Vivado part specifier
     /// (e.g. `xcvm3358-vsvh1747-2M-e-S`).
     pub part: String,
+    /// `None` → `create_project -in_memory` (the legacy path,
+    /// kept for `vw test` isolation — persisted state would
+    /// cross-contaminate parallel `@test(dedicated-eda)` runs
+    /// and dirty the workspace with test scratch).
+    ///
+    /// `Some(dir)` → on-disk Vivado project at
+    /// `<dir>/<name>/<name>.xpr`. If that `.xpr` already exists
+    /// the spawn bootstrap runs `open_project` (warm path); if
+    /// it doesn't exist we `create_project -name <name> -dir
+    /// <dir>` + immediately `set_property source_mgmt_mode
+    /// None [current_project]` so Vivado's auto-scan doesn't
+    /// swallow out-of-fileset files like `vw::make_wrapper`'s
+    /// `target/ip/<ip>/wrapper.vhd` into `xil_defaultlib`.
+    /// Callers are responsible for staleness invalidation (see
+    /// `vw_lib::project_needs_wipe`) — the worker takes whatever
+    /// state is on disk as-is.
+    pub persist_dir: Option<PathBuf>,
 }
 
 /// Vivado [`EdaBackend`] implementation.
@@ -487,27 +504,113 @@ impl VivadoBackend {
             _shim_dir: shim_dir,
             _scratch_dir: scratch_dir,
         };
-        // Auto-create the in-memory project if the caller specified
-        // one. Runs BEFORE we return to the caller so the first
-        // user eval sees an existing project — `ip::check` /
-        // `get_ipdefs` / etc. work without special-casing. `vw` is
-        // a VHDL-first tool: force TARGET_LANGUAGE to VHDL so IP
-        // wrappers emit `<name>_wrapper.vhd` (default is Verilog,
-        // which silently generates `.v` files and downstream tools
-        // like `vw::make_wrapper` that hunt for `.vhd` fail with
-        // an unhelpful "no wrapper found" message).
+        // Auto-create (or reopen) the Vivado project if the caller
+        // specified one. Runs BEFORE we return to the caller so the
+        // first user eval sees an existing project — `ip::check` /
+        // `get_ipdefs` / etc. work without special-casing.
+        //
+        // Three branches keyed on `persist_dir`:
+        //   * `None` → legacy `create_project -in_memory`. Kept for
+        //     `vw test` isolation.
+        //   * `Some(dir)` with an existing `<dir>/<name>/<name>.xpr`
+        //     → `open_project` (warm path — Vivado restores the
+        //     full BD/XCI/`ipshared` graph without us hand-
+        //     serializing it). If Vivado rejects the file (version
+        //     mismatch, truncated write, etc.) we log a warning,
+        //     wipe the dir, and fall through to the fresh-create
+        //     branch in the same session so users don't have to
+        //     intervene manually.
+        //   * `Some(dir)` otherwise → `create_project -name <n>
+        //     -dir <dir>`. Immediately follow with
+        //     `set_property source_mgmt_mode None
+        //     [current_project]`: default is `All`, which would
+        //     auto-import every `.vhd` Vivado finds under the
+        //     project dir into `xil_defaultlib` — including
+        //     `vw::make_wrapper`'s out-of-fileset
+        //     `target/ip/<ip>/wrapper.vhd` files. That fights the
+        //     "deliberately do NOT `-import`" model make_wrapper
+        //     relies on.
+        //
+        // All branches then force `TARGET_LANGUAGE VHDL` — `vw` is
+        // VHDL-first, and the default Verilog would silently emit
+        // `_wrapper.v` files that downstream tools looking for
+        // `.vhd` fail on with an unhelpful "no wrapper found".
         if let Some(ap) = &config.auto_project {
             use vw_eda::EdaBackend as _;
-            let tcl = format!(
-                "create_project -in_memory -name {{{name}}} -part {{{part}}}\n\
-                 set_property TARGET_LANGUAGE VHDL [current_project]",
-                name = ap.name,
-                part = ap.part,
-            );
+            let tcl = match &ap.persist_dir {
+                None => format!(
+                    "create_project -in_memory -name {{{name}}} \
+                     -part {{{part}}}\n\
+                     set_property TARGET_LANGUAGE VHDL [current_project]",
+                    name = ap.name,
+                    part = ap.part,
+                ),
+                Some(dir) => {
+                    // Vivado's `create_project -dir D -name N`
+                    // places `N.xpr` + `N.srcs` + `N.cache` +
+                    // `N.hw` + `N.ip_user_files` + `N.gen`
+                    // DIRECTLY under D — flat, not nested in
+                    // `D/N/`. Nesting is what we want (clean
+                    // `remove_dir_all` on invalidation, doesn't
+                    // fight sibling artifacts), so we pass `D/N`
+                    // as the `-dir` argument and let Vivado
+                    // scatter its per-project files inside that.
+                    let per_name = dir.join(&ap.name);
+                    let xpr = per_name.join(format!("{}.xpr", ap.name));
+                    if xpr.exists() {
+                        // Warm path. On failure we `catch` and fall
+                        // through to a fresh create in the same eval
+                        // so the session stays usable even if the
+                        // on-disk project got corrupted.
+                        //
+                        // Intentionally NO `set_property
+                        // source_mgmt_mode None`: the earlier
+                        // migration set it defensively to keep
+                        // `vw::make_wrapper`'s workspace-side
+                        // wrapper (`target/ip/<ip>/wrapper.vhd`)
+                        // from being auto-imported into
+                        // `xil_defaultlib`, but that's already
+                        // prevented by `-import false` in
+                        // `vw::make_wrapper` itself. With `None`,
+                        // Vivado also stops adding IP-generated
+                        // RTL under `.gen/sources_1/ip/<ip>/synth/`
+                        // to the synth fileset, so `synth_design`
+                        // fails to find `entity xil_defaultlib.<ip>`
+                        // — regressing top-level IPs like
+                        // `primary_clock`.
+                        format!(
+                            "if {{[catch {{open_project {{{xpr}}}}} err]}} {{\n  \
+                             puts \"WARNING: open_project failed ({xpr}): \
+                             $err — recreating\"\n  \
+                             file delete -force {{{per_name}}}\n  \
+                             file mkdir {{{per_name}}}\n  \
+                             create_project -name {{{name}}} -part {{{part}}} \
+                             -dir {{{per_name}}}\n  \
+                             }}\n\
+                             set_property TARGET_LANGUAGE VHDL [current_project]",
+                            xpr = xpr.display(),
+                            per_name = per_name.display(),
+                            name = ap.name,
+                            part = ap.part,
+                        )
+                    } else {
+                        format!(
+                            "file mkdir {{{per_name}}}\n\
+                             create_project -name {{{name}}} -part {{{part}}} \
+                             -dir {{{per_name}}}\n\
+                             set_property TARGET_LANGUAGE VHDL [current_project]",
+                            per_name = per_name.display(),
+                            name = ap.name,
+                            part = ap.part,
+                        )
+                    }
+                }
+            };
             backend.eval(&tcl).await.map_err(|e| {
                 BackendError::Worker(format!(
-                    "auto-creating in-memory project (name={}, part={}): {e}",
-                    ap.name, ap.part,
+                    "auto-creating Vivado project (name={}, part={}, \
+                     persist_dir={:?}): {e}",
+                    ap.name, ap.part, ap.persist_dir,
                 ))
             })?;
         }

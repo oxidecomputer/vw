@@ -455,6 +455,10 @@ async fn run_dedicated_bucket(
                     .map(|p| p.name.clone())
                     .unwrap_or_else(|| "vw_test".to_string()),
                 part: variant.part.clone(),
+                // `vw test` never persists — parallel `@test(dedicated-eda)`
+                // workers would trip over a shared on-disk project, and
+                // test scratch has no business dirtying `<ws>/target/`.
+                persist_dir: None,
             })
         } else if let Some(p) = &test.target_part_override {
             Some(vw_vivado::AutoProject {
@@ -463,6 +467,7 @@ async fn run_dedicated_bucket(
                     .map(|p| p.name.clone())
                     .unwrap_or_else(|| "vw_test".to_string()),
                 part: p.clone(),
+                persist_dir: None,
             })
         } else {
             ws_default.clone()
@@ -718,6 +723,9 @@ fn workspace_auto_project(
         return Ok(selected.map(|v| vw_vivado::AutoProject {
             name: cfg.workspace.name.clone(),
             part: v.part.clone(),
+            // See sibling site above: `vw test` intentionally never
+            // persists the Vivado project.
+            persist_dir: None,
         }));
     }
     if variant.is_some() {
@@ -735,6 +743,7 @@ fn workspace_auto_project(
     Ok(selected.map(|p| vw_vivado::AutoProject {
         name: cfg.workspace.name.clone(),
         part: p.to_string(),
+        persist_dir: None,
     }))
 }
 

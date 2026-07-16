@@ -2290,15 +2290,23 @@ fn find_constraint_files_impl(
 /// compile into their own VHDL library (`ip` by convention). The
 /// caller decides the library assignment.
 ///
-/// **Excludes** `target/ip/bd/**` and `target/ip/xci/**` — the
-/// block-design and standalone-IP cache directories populated
-/// by `vw::configure_ip`. Those `.vhd` files are the outputs of
-/// `generate_target` / `synth_ip` on saved designs and are
-/// already registered with the Vivado project via `read_bd` /
-/// `read_ip` on the restore path; re-adding them through
-/// `read_vhdl` conflicts (Vivado emits `[filemgmt 20-1440]
-/// already exists in the project as a part of sub-design file`
-/// CRITICAL WARNINGs).
+/// **Excludes**:
+/// - `target/ip/bd/**` and `target/ip/xci/**` — legacy caches
+///   from the old custom BD/XCI save-restore path (retained as
+///   an exclusion for now to survive workspaces that still have
+///   those dirs on disk; the caches themselves are deleted at
+///   session start — see the migration cleanup in `vw run` /
+///   `vw repl`).
+/// - `target/vw-project/**` — defensive. The on-disk Vivado
+///   project (see `vw_project_dir`) sits SIBLING to `target/ip/`,
+///   so this walker's root at `target/ip/` shouldn't ever
+///   traverse it — but keep the filter as an invariant guard
+///   for future walker refactors and to document intent.
+///
+/// The excluded content lands in the Vivado project via
+/// `read_bd`/`read_ip`/`synth_ip` — re-adding through
+/// `read_vhdl` would trigger `[filemgmt 20-1440] already exists
+/// in the project as a part of sub-design file` CRITICAL WARNINGs.
 ///
 /// Empty vec when `target/ip/` doesn't exist yet — a fresh
 /// workspace hasn't run `vw::make_wrapper` for anything.
@@ -2309,15 +2317,18 @@ pub fn vhdl_ip_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
     }
     let bd_cache = ip_dir.join("bd");
     let xci_cache = ip_dir.join("xci");
+    let vw_project = workspace_dir.join("target").join("vw-project");
     let mut files =
         find_vhdl_files(ip_dir.as_std_path(), /*recursive=*/ true, &[])?;
-    // Drop anything under either cache subtree — see doc note.
-    // `starts_with` on the canonical prefix filters every
+    // `starts_with` on each canonical prefix filters every
     // nested path (`bd/cips/synth/cips.vhd`, `xci/primary_clock/
-    // primary_clock.vhd`, etc.).
+    // primary_clock.vhd`, and defensively any hypothetical
+    // `vw-project/...` VHDL that a future walker refactor might
+    // reach).
     files.retain(|p| {
         !p.starts_with(bd_cache.as_std_path())
             && !p.starts_with(xci_cache.as_std_path())
+            && !p.starts_with(vw_project.as_std_path())
     });
     files.sort();
     Ok(files)
@@ -2553,9 +2564,9 @@ fn checkpoint_manifest_path(checkpoint: &Path) -> PathBuf {
 }
 
 /// Write a manifest sidecar recording `fingerprint` next to
-/// `checkpoint`. Shared by `write_synth_checkpoint_manifest` /
-/// `write_ip_checkpoint_manifest` so every checkpoint kind uses
-/// the same on-disk format.
+/// `checkpoint`. Shared by `write_synth_checkpoint_manifest`,
+/// `write_place_checkpoint_manifest`, and `write_project_manifest`
+/// so every checkpoint kind uses the same on-disk format.
 fn write_checkpoint_manifest_with_fingerprint(
     checkpoint: &Path,
     fingerprint: u64,
@@ -2727,40 +2738,208 @@ pub fn list_ip_htcl_files(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Combined fingerprint over the IP source set (every `.htcl`
-/// under `<ws>/ip/`). Backs [`ip_needs_update`] and
-/// [`write_ip_checkpoint_manifest`].
-pub fn ip_source_fingerprint(workspace_dir: &Utf8Path) -> Result<u64> {
-    let paths = list_ip_htcl_files(workspace_dir)?;
+// ---------------------------------------------------------------------
+// On-disk Vivado project — vw manages a persistent Vivado project at
+// `<ws>/target/vw-project/<name>/` so BD/IP state survives across
+// sessions via Vivado's native `save_project`/`open_project`
+// machinery (instead of hand-serializing BD .bd files, XCI dirs,
+// ipshared/, etc.). See `~/.claude/plans/abundant-petting-lecun.md`.
+//
+// Fingerprint scope: `<ws>/ip/**/*.htcl` + `<ws>/vw.toml`. Any
+// substantive edit to those invalidates the on-disk project —
+// wiped + recreated on the next spawn, then `ip::configure` re-runs
+// and `vw::mark_project_configured` writes a fresh manifest.
+// ---------------------------------------------------------------------
+
+/// Absolute path of the on-disk Vivado project directory vw
+/// manages. The `.xpr` itself lives at
+/// `<returned_path>/<project_name>/<project_name>.xpr` (Vivado's
+/// `create_project -dir` convention — it always nests one level
+/// deep under the given dir).
+pub fn vw_project_dir(workspace_dir: &Utf8Path) -> Utf8PathBuf {
+    workspace_dir.join("target").join("vw-project")
+}
+
+/// Path list feeding [`project_source_fingerprint`]. Sorted +
+/// deduped. Every `.htcl` under `<ws>/ip/` plus `<ws>/vw.toml`.
+/// A missing `vw.toml` folds in as the "absent" marker via
+/// [`fingerprint_paths`]'s present/absent handling, so an empty
+/// or missing workspace still hashes deterministically.
+fn project_source_paths(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    let mut sources = list_ip_htcl_files(workspace_dir)?;
+    sources.push(workspace_dir.join("vw.toml").into_std_path_buf());
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
+/// Combined fingerprint over the on-disk-project source set.
+/// Backs [`project_needs_wipe`] and [`write_project_manifest`].
+pub fn project_source_fingerprint(workspace_dir: &Utf8Path) -> Result<u64> {
+    let paths = project_source_paths(workspace_dir)?;
     Ok(fingerprint_paths(workspace_dir, &paths))
 }
 
-/// Write the manifest sidecar for a freshly-produced IP
-/// checkpoint. Called from `vw::configure_ip` after
-/// `vivado_cmd::write_checkpoint`.
-pub fn write_ip_checkpoint_manifest(
-    workspace_dir: &Utf8Path,
-    checkpoint: &Path,
-) -> Result<()> {
-    let fp = ip_source_fingerprint(workspace_dir)?;
-    write_checkpoint_manifest_with_fingerprint(checkpoint, fp)
+/// Absolute path of the `.xpr` inside the on-disk project dir.
+/// Vivado's `create_project -dir <D> -name <N>` produces
+/// `<D>/<N>/<N>.xpr`. All manifest / checkpoint plumbing uses
+/// this path as the "checkpoint" argument to the shared helpers
+/// (`write_checkpoint_manifest_with_fingerprint`,
+/// `checkpoint_needs_update_with_fingerprint`), which append
+/// `.manifest` to derive the sidecar path
+/// (`<D>/<N>/<N>.xpr.manifest`).
+pub fn vw_project_xpr(project_dir: &Path, name: &str) -> PathBuf {
+    project_dir.join(name).join(format!("{name}.xpr"))
 }
 
-/// Returns `true` when the IP checkpoint at `checkpoint` is
-/// missing, its manifest is missing / unreadable, or the
-/// fingerprint stored in the manifest differs from the current
-/// `<ws>/ip/**/*.htcl` fingerprint.
+/// Write the manifest sidecar for a freshly-configured on-disk
+/// project. Called from `vw::configure_ip` (via the
+/// `mark_project_configured` RPC) after `save_project` completes.
 ///
-/// Mirrors [`synth_needs_update`] but with a tighter source
-/// scope — only the `ip/` tree contributes.
-pub fn ip_needs_update(
+/// Invariant: manifest presence means "the project at this dir
+/// was successfully configured with these sources' fingerprint."
+/// `project_needs_wipe` relies on this — never write the manifest
+/// before `save_project` succeeds.
+pub fn write_project_manifest(
     workspace_dir: &Utf8Path,
-    checkpoint: &Path,
+    project_dir: &Path,
+    name: &str,
+) -> Result<()> {
+    let fp = project_source_fingerprint(workspace_dir)?;
+    write_checkpoint_manifest_with_fingerprint(
+        &vw_project_xpr(project_dir, name),
+        fp,
+    )
+}
+
+/// Returns `true` when the on-disk project at `<project_dir>/<name>/`
+/// should be wiped + recreated:
+/// - the `.xpr` is missing, OR
+/// - the manifest sidecar is missing / unreadable, OR
+/// - the stored fingerprint differs from the current one.
+///
+/// Called by `vw run` / `vw repl` before spawning Vivado (see
+/// `vw-cli/src/main.rs` / `vw-repl/src/app.rs`); when it returns
+/// true, the caller `remove_dir_all(project_dir)` before passing
+/// `persist_dir: Some(project_dir)` to `AutoProject`.
+pub fn project_needs_wipe(
+    workspace_dir: &Utf8Path,
+    project_dir: &Path,
+    name: &str,
 ) -> Result<bool> {
-    let current_fp = ip_source_fingerprint(workspace_dir)?;
+    let current_fp = project_source_fingerprint(workspace_dir)?;
     Ok(checkpoint_needs_update_with_fingerprint(
-        checkpoint, current_fp,
+        &vw_project_xpr(project_dir, name),
+        current_fp,
     ))
+}
+
+/// Idempotent one-shot cleanup of the legacy IP-cache artifacts
+/// that lived under `<ws>/target/ip/` before the on-disk Vivado
+/// project migration:
+///   `<ws>/target/ip/bd/`
+///   `<ws>/target/ip/xci/`
+///   `<ws>/target/ip/.ip-cache`
+///   `<ws>/target/ip/.ip-cache.manifest`
+///
+/// Called by `vw run` / `vw repl` at bootstrap; on first
+/// on-disk-mode session it wipes stale bytes and returns the
+/// count. On subsequent sessions it's a no-op (returns 0).
+///
+/// Deliberately does NOT touch `<ws>/target/ip/<ip>/wrapper.vhd`
+/// — those are `vw::make_wrapper` outputs still consumed by
+/// `vw::synth`, and their `<ip>` sibling dirs may still be
+/// populated by the on-disk project's `generate_target` outputs.
+pub fn cleanup_legacy_ip_cache(workspace_dir: &Utf8Path) -> usize {
+    let ip_dir = workspace_dir.join("target").join("ip");
+    let targets = [
+        ip_dir.join("bd"),
+        ip_dir.join("xci"),
+        ip_dir.join(".ip-cache"),
+        ip_dir.join(".ip-cache.manifest"),
+    ];
+    let mut removed = 0;
+    for t in targets {
+        let p = t.as_std_path();
+        if !p.exists() {
+            continue;
+        }
+        let ok = if p.is_dir() {
+            fs::remove_dir_all(p).is_ok()
+        } else {
+            fs::remove_file(p).is_ok()
+        };
+        if ok {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Outcome of [`prepare_vw_project_dir`]. The caller decides how
+/// to surface the messages (`tracing::info!`, REPL banner, etc.);
+/// vw-lib itself intentionally doesn't do user-facing IO.
+#[derive(Debug, Clone)]
+pub struct PreparedProjectDir {
+    /// Absolute path of `<ws>/target/vw-project/`, ready to pass
+    /// as `AutoProject::persist_dir = Some(...)`.
+    pub project_dir: Utf8PathBuf,
+    /// Number of legacy `<ws>/target/ip/{bd,xci,.ip-cache*}`
+    /// entries removed by the one-shot Phase 6 migration cleanup.
+    pub legacy_cache_removed: usize,
+    /// `Some(path)` iff the persist dir existed AND
+    /// [`project_needs_wipe`] returned true, so we wiped it before
+    /// returning. The caller can log this as the reason for the
+    /// fresh recreate that Vivado is about to do.
+    ///
+    /// We wipe `<ws>/target/vw-project/` in its entirety (not
+    /// just the per-`name` subdir): historically bugs have
+    /// caused Vivado to scatter flat siblings like
+    /// `<persist>/<name>.xpr`, `<persist>/<name>.srcs` alongside
+    /// the nested `<persist>/<name>/` — a full-dir wipe reliably
+    /// sweeps any layout drift instead of leaving cross-version
+    /// clutter behind.
+    pub wiped_project: Option<Utf8PathBuf>,
+}
+
+/// Bootstrap the on-disk Vivado project dir for a workspace and
+/// return its absolute path, ready to pass as
+/// `AutoProject::persist_dir = Some(...)`.
+///
+/// Does three things in order (all idempotent):
+///
+/// 1. Silently clean up legacy `target/ip/{bd,xci,.ip-cache*}`
+///    artifacts from the pre-migration IP cache
+///    ([`cleanup_legacy_ip_cache`]).
+/// 2. Consult [`project_needs_wipe`]; if the `.xpr` is missing,
+///    the manifest sidecar is missing, or the fingerprint is
+///    stale, `remove_dir_all(<project_dir>/<name>)` so the worker
+///    takes the fresh-create branch instead of `open_project` on
+///    stale bytes.
+/// 3. `create_dir_all(<project_dir>)` so Vivado's later
+///    `create_project -dir` has a real parent.
+///
+/// Everything worth reporting to the user (legacy-cleanup counts,
+/// wipe reason) lands in the returned [`PreparedProjectDir`] for
+/// the caller to log.
+pub fn prepare_vw_project_dir(
+    workspace_dir: &Utf8Path,
+    name: &str,
+) -> Result<PreparedProjectDir> {
+    let project_dir = vw_project_dir(workspace_dir);
+    let legacy_cache_removed = cleanup_legacy_ip_cache(workspace_dir);
+    let mut wiped_project = None;
+    if project_needs_wipe(workspace_dir, project_dir.as_std_path(), name)?
+        && project_dir.exists() {
+            fs::remove_dir_all(project_dir.as_std_path())?;
+            wiped_project = Some(project_dir.clone());
+        }
+    fs::create_dir_all(project_dir.as_std_path())?;
+    Ok(PreparedProjectDir {
+        project_dir,
+        legacy_cache_removed,
+        wiped_project,
+    })
 }
 
 pub struct RecordProcessor {
@@ -5813,15 +5992,22 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         assert!(names.contains(&"cips".to_string()));
     }
 
-    /// Regression: `target/ip/bd/**` and `target/ip/xci/**` are
-    /// the cache directories populated by `vw::configure_ip`; the
-    /// `.vhd` files under them are already registered with the
-    /// Vivado project via `read_bd` / `read_ip`, so
-    /// `vhdl_ip_sources` must NOT list them (otherwise `synth`'s
-    /// `read_vhdl` conflicts with the sub-design registration and
-    /// Vivado emits `[filemgmt 20-1440]` CRITICAL WARNINGs).
+    /// Regression: `target/ip/bd/**`, `target/ip/xci/**`, and
+    /// `target/vw-project/**` are the (legacy + on-disk) Vivado
+    /// cache trees. The `.vhd` files under them are registered
+    /// with the Vivado project via `read_bd` / `read_ip` /
+    /// `synth_ip`, so `vhdl_ip_sources` must NOT list them
+    /// (otherwise `synth`'s `read_vhdl` conflicts with the
+    /// sub-design registration and Vivado emits `[filemgmt
+    /// 20-1440]` CRITICAL WARNINGs).
+    ///
+    /// `target/vw-project/` is a sibling of `target/ip/` so the
+    /// current walker rooted at `target/ip/` doesn't actually
+    /// descend into it — the assertion here documents the
+    /// invariant so a future walker refactor (rooting higher up,
+    /// at `target/` for example) doesn't silently regress.
     #[test]
-    fn vhdl_ip_sources_excludes_bd_and_xci_cache_subtrees() {
+    fn vhdl_ip_sources_excludes_vivado_cache_subtrees() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let ip = ws.join("target/ip");
@@ -5830,17 +6016,23 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         std::fs::create_dir_all(ip.join("dcmac")).unwrap();
         std::fs::write(ip.join("cips/wrapper.vhd"), "").unwrap();
         std::fs::write(ip.join("dcmac/wrapper.vhd"), "").unwrap();
-        // Cached BD outputs — should all be filtered out.
+        // Legacy BD cache outputs — filter out.
         std::fs::create_dir_all(ip.join("bd/cips/synth")).unwrap();
         std::fs::create_dir_all(ip.join("bd/cips/sim")).unwrap();
         std::fs::create_dir_all(ip.join("bd/dcmac/synth")).unwrap();
         std::fs::write(ip.join("bd/cips/synth/cips.vhd"), "").unwrap();
         std::fs::write(ip.join("bd/cips/sim/cips.vhd"), "").unwrap();
         std::fs::write(ip.join("bd/dcmac/synth/dcmac.vhd"), "").unwrap();
-        // Cached XCI outputs — should also be filtered.
+        // Legacy XCI cache outputs — filter out.
         std::fs::create_dir_all(ip.join("xci/primary_clock")).unwrap();
         std::fs::write(ip.join("xci/primary_clock/primary_clock.vhd"), "")
             .unwrap();
+        // On-disk Vivado project sibling — invariant guard.
+        let vw_proj_gen = ws.join(
+            "target/vw-project/metroid/metroid.gen/sources_1/bd/cips/synth",
+        );
+        std::fs::create_dir_all(&vw_proj_gen).unwrap();
+        std::fs::write(vw_proj_gen.join("cips.vhd"), "").unwrap();
 
         let sources = vhdl_ip_sources(&ws).unwrap();
         assert_eq!(sources.len(), 2, "{sources:?}");
@@ -5853,6 +6045,10 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
             assert!(
                 !s.contains("/target/ip/xci/"),
                 "xci cache file leaked into ip_sources: {s}"
+            );
+            assert!(
+                !s.contains("/target/vw-project/"),
+                "vw-project file leaked into ip_sources: {s}"
             );
             assert!(s.ends_with("wrapper.vhd"), "unexpected file: {s}");
         }
@@ -6149,14 +6345,14 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(synth_needs_update(&ws, cp.as_std_path(), None).unwrap());
     }
 
-    /// Minimal workspace scaffold for `ip_needs_update` tests:
+    /// Minimal workspace scaffold for `project_needs_wipe` tests:
     /// a `vw.toml` and an `ip/module.htcl` (+ one submodule so
     /// the recursive walk has something to cover).
-    fn make_ip_ws(tmp: &tempfile::TempDir) -> Utf8PathBuf {
+    fn make_project_ws(tmp: &tempfile::TempDir) -> Utf8PathBuf {
         let ws = tmp.path().to_path_buf();
         std::fs::write(
             ws.join("vw.toml"),
-            "[workspace]\nname = \"ipws\"\nversion = \"0.1.0\"\n",
+            "[workspace]\nname = \"prws\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         let ip = ws.join("ip");
@@ -6170,76 +6366,113 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         Utf8PathBuf::from_path_buf(ws).unwrap()
     }
 
-    /// Missing checkpoint → stale. Same first-time-synth rule
-    /// applied to the IP scope.
-    #[test]
-    fn ip_needs_update_true_when_checkpoint_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = make_ip_ws(&tmp);
-        let cp = ws.join("target/ip/ip.dcp");
-        assert!(ip_needs_update(&ws, cp.as_std_path()).unwrap());
+    /// Materialize `<project_dir>/<name>/<name>.xpr` as an empty
+    /// placeholder — `project_needs_wipe` short-circuits when
+    /// the `.xpr` is missing, so tests that want to exercise the
+    /// manifest branch need one present.
+    fn touch_placeholder_xpr(ws: &Utf8Path, name: &str) -> PathBuf {
+        let project_dir = vw_project_dir(ws);
+        let inner = project_dir.join(name);
+        std::fs::create_dir_all(inner.as_std_path()).unwrap();
+        let xpr = inner.join(format!("{name}.xpr"));
+        std::fs::write(xpr.as_std_path(), "").unwrap();
+        project_dir.into_std_path_buf()
     }
 
-    /// Fresh manifest → not stale. Verifies the write+check
-    /// round-trip on the IP scope.
+    /// Missing `.xpr` → always needs wipe (first-time-project
+    /// bootstrap). The manifest presence is irrelevant when the
+    /// `.xpr` isn't there — nothing to open.
     #[test]
-    fn ip_needs_update_false_when_manifest_matches() {
+    fn project_needs_wipe_true_when_xpr_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let ws = make_ip_ws(&tmp);
-        let cp = ws.join("target/ip/ip.dcp");
-        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
-        std::fs::write(&cp, "").unwrap();
-        write_ip_checkpoint_manifest(&ws, cp.as_std_path()).unwrap();
-        assert!(!ip_needs_update(&ws, cp.as_std_path()).unwrap());
+        let ws = make_project_ws(&tmp);
+        let project_dir = vw_project_dir(&ws);
+        assert!(
+            project_needs_wipe(&ws, project_dir.as_std_path(), "prws").unwrap()
+        );
+    }
+
+    /// `.xpr` present but manifest missing → wipe. This is the
+    /// "someone deleted the sidecar" or "pre-manifest-era
+    /// project" recovery path.
+    #[test]
+    fn project_needs_wipe_true_when_manifest_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_project_ws(&tmp);
+        let project_dir = touch_placeholder_xpr(&ws, "prws");
+        assert!(project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+    }
+
+    /// Fresh manifest matching current fingerprint → do NOT
+    /// wipe. Simulates the post-`vw::configure_ip` state on an
+    /// unchanged tree.
+    #[test]
+    fn project_needs_wipe_false_when_manifest_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_project_ws(&tmp);
+        let project_dir = touch_placeholder_xpr(&ws, "prws");
+        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        assert!(!project_needs_wipe(&ws, &project_dir, "prws").unwrap());
     }
 
     /// Editing any `.htcl` under `<ws>/ip/` invalidates. Key
-    /// test — this is the invalidation trigger the user actually
+    /// test — the invalidation trigger the user actually
     /// controls (adding an IP, tweaking a configure_* parameter).
     #[test]
-    fn ip_needs_update_true_when_ip_htcl_content_changes() {
+    fn project_needs_wipe_true_when_ip_htcl_content_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let ws = make_ip_ws(&tmp);
-        let cp = ws.join("target/ip/ip.dcp");
-        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
-        std::fs::write(&cp, "").unwrap();
-        write_ip_checkpoint_manifest(&ws, cp.as_std_path()).unwrap();
+        let ws = make_project_ws(&tmp);
+        let project_dir = touch_placeholder_xpr(&ws, "prws");
+        write_project_manifest(&ws, &project_dir, "prws").unwrap();
         std::fs::write(ws.join("ip/cips.htcl"), "# cips updated\n").unwrap();
-        assert!(ip_needs_update(&ws, cp.as_std_path()).unwrap());
+        assert!(project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+    }
+
+    /// Editing `vw.toml` (target-part, deps list, etc.) also
+    /// invalidates — those changes usually mean the project
+    /// itself needs a fresh `create_project -part ...`.
+    #[test]
+    fn project_needs_wipe_true_when_vw_toml_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_project_ws(&tmp);
+        let project_dir = touch_placeholder_xpr(&ws, "prws");
+        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"prws\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        assert!(project_needs_wipe(&ws, &project_dir, "prws").unwrap());
     }
 
     /// Editing a workspace htcl OUTSIDE ip/ (e.g. design.htcl)
-    /// must NOT invalidate the IP checkpoint. IP fingerprint scope
-    /// is intentionally narrower than the synth one — the point
-    /// is that changing wiring in design.htcl shouldn't re-run
-    /// all the expensive `create_ip` calls.
+    /// must NOT invalidate the on-disk project. Design-level
+    /// changes are the synth checkpoint's concern; the project
+    /// scope stays narrow so we don't nuke the expensive BD/IP
+    /// state on every design edit.
     #[test]
-    fn ip_needs_update_false_when_non_ip_htcl_changes() {
+    fn project_needs_wipe_false_when_non_ip_htcl_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let ws = make_ip_ws(&tmp);
+        let ws = make_project_ws(&tmp);
         std::fs::write(ws.join("design.htcl"), "# design\n").unwrap();
-        let cp = ws.join("target/ip/ip.dcp");
-        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
-        std::fs::write(&cp, "").unwrap();
-        write_ip_checkpoint_manifest(&ws, cp.as_std_path()).unwrap();
+        let project_dir = touch_placeholder_xpr(&ws, "prws");
+        write_project_manifest(&ws, &project_dir, "prws").unwrap();
         std::fs::write(ws.join("design.htcl"), "# design updated\n").unwrap();
-        assert!(!ip_needs_update(&ws, cp.as_std_path()).unwrap());
+        assert!(!project_needs_wipe(&ws, &project_dir, "prws").unwrap());
     }
 
     /// The regression parallel to the synth case: rewriting an
     /// `ip/*.htcl` with IDENTICAL bytes must not invalidate.
     /// Content-hash based, not mtime.
     #[test]
-    fn ip_needs_update_false_after_identical_rewrite() {
+    fn project_needs_wipe_false_after_identical_rewrite() {
         let tmp = tempfile::tempdir().unwrap();
-        let ws = make_ip_ws(&tmp);
-        let cp = ws.join("target/ip/ip.dcp");
-        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
-        std::fs::write(&cp, "").unwrap();
-        write_ip_checkpoint_manifest(&ws, cp.as_std_path()).unwrap();
+        let ws = make_project_ws(&tmp);
+        let project_dir = touch_placeholder_xpr(&ws, "prws");
+        write_project_manifest(&ws, &project_dir, "prws").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(ws.join("ip/cips.htcl"), "# cips\n").unwrap();
-        assert!(!ip_needs_update(&ws, cp.as_std_path()).unwrap());
+        assert!(!project_needs_wipe(&ws, &project_dir, "prws").unwrap());
     }
 
     /// Minimal workspace scaffold for `place_needs_update` tests:

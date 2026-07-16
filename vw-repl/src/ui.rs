@@ -438,17 +438,21 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         // Indigo when Vivado is sitting idle, ready for input —
         // the "you can interact" steady state.
         WorkerStatusView::Ready => (" vivado: ready ", Color::Rgb(75, 0, 130)),
-        // Orange whenever Vivado is anything but ready — starting
-        // up, mid-eval, or dead. Catches the eye so the user
-        // notices they can't (yet, or any longer) drive the
-        // session.
+        // Orange for transient / busy states — starting up or
+        // mid-eval. Catches the eye so the user notices they
+        // can't (yet, or currently) drive the session, but
+        // signals "wait" rather than "broken".
         WorkerStatusView::Starting => {
             (" vivado: starting ", Color::Rgb(255, 140, 0))
         }
         WorkerStatusView::Running => {
             (" vivado: running ", Color::Rgb(255, 140, 0))
         }
-        WorkerStatusView::Down => (" vivado: down ", Color::Rgb(255, 140, 0)),
+        // Red for `down` — distinct from the orange busy states
+        // so the user can immediately tell the difference between
+        // "wait a moment" and "the worker died, `:restart` to
+        // recover". Sharing orange with `running` hid this.
+        WorkerStatusView::Down => (" vivado: down ", Color::Rgb(200, 30, 30)),
     };
     let hint = if app.reverse_search().is_some() {
         "Esc cancel · Enter accept · Ctrl-R older".to_string()

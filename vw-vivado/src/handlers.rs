@@ -46,12 +46,15 @@
 //!   freshly-produced checkpoint. Called after
 //!   `vivado_cmd::write_checkpoint` so the next invocation can
 //!   compare fingerprints and skip resynth on unchanged sources.
-//! - `ip_needs_update` / `ip_mark_checkpoint` — same shape as
-//!   the synth pair, but the fingerprint covers only
-//!   `<ws>/ip/**/*.htcl`. Backs `vw::configure_ip` so the
-//!   `ip::configure` proc (typically a batch of expensive
-//!   `create_ip` / `make_wrapper` calls) is skipped when the
-//!   IP tree hasn't changed since the last checkpoint.
+//! - `mark_project_configured` — records that the on-disk Vivado
+//!   project at `<ws>/target/vw-project/<name>/` has been
+//!   successfully configured against the current
+//!   `<ws>/ip/**/*.htcl` + `vw.toml` fingerprint. Called by
+//!   `vw::configure_ip` after `ip::configure` + `save_project`
+//!   complete. The freshness check itself runs Rust-side before
+//!   spawning Vivado (see `vw_lib::project_needs_wipe`), so there
+//!   is no matching `project_needs_update` RPC — invalidation
+//!   happens once per session, not per htcl call.
 //! - `place_needs_update` / `place_mark_checkpoint` — same
 //!   shape again but scoped to the place stage. Fingerprint
 //!   covers `<ws>/constraints/place/**` plus the upstream synth
@@ -213,8 +216,9 @@ async fn dispatch(
         "synth_mark_checkpoint" => {
             synth_mark_checkpoint(workspace_root, active_variant, args)
         }
-        "ip_needs_update" => ip_needs_update(workspace_root, args),
-        "ip_mark_checkpoint" => ip_mark_checkpoint(workspace_root, args),
+        "mark_project_configured" => {
+            mark_project_configured(workspace_root, args)
+        }
         "place_needs_update" => place_needs_update(workspace_root, args),
         "place_mark_checkpoint" => place_mark_checkpoint(workspace_root, args),
         "compile_htcl_module" => {
@@ -616,43 +620,39 @@ fn preload_fingerprint(
     h
 }
 
-/// `ip_needs_update` — inputs `{checkpoint: <abs path>}`; output
-/// is a JSON bool. Compares the checkpoint's sidecar manifest
-/// against the current fingerprint of every `.htcl` file under
-/// `<ws>/ip/`. `true` when the checkpoint or manifest is missing
-/// or the fingerprints disagree.
-///
-/// Not variant-scoped: the ip/ tree defines its own inputs
-/// (BD parameters, IP configs) which don't currently vary by
-/// variant. If that changes, thread `active_variant` through
-/// here and into `vw_lib::ip_source_fingerprint`.
-fn ip_needs_update(
-    workspace_root: Option<&std::path::Path>,
-    args: Value,
-) -> Result<Value, String> {
-    let ws = workspace_root_or_error(workspace_root)?;
-    let checkpoint = extract_checkpoint_arg(&args, "ip_needs_update")?;
-    let needs = vw_lib::ip_needs_update(&ws, std::path::Path::new(&checkpoint))
-        .map_err(|e| format!("checking IP checkpoint freshness: {e}"))?;
-    Ok(Value::Bool(needs))
-}
-
-/// `ip_mark_checkpoint` — inputs `{checkpoint: <abs path>}`;
+/// `mark_project_configured` — inputs `{name: <project-name>}`;
 /// output is a JSON null. Writes the sidecar manifest recording
-/// the current `<ws>/ip/**/*.htcl` fingerprint next to the
-/// checkpoint. Called by `vw::configure_ip` immediately after
-/// `vivado_cmd::write_checkpoint`.
-fn ip_mark_checkpoint(
+/// the current `<ws>/ip/**/*.htcl` + `vw.toml` fingerprint next
+/// to the on-disk Vivado project's `.xpr` at
+/// `<ws>/target/vw-project/<name>/<name>.xpr.manifest`. Called
+/// by `vw::configure_ip` after `ip::configure` and `save_project`
+/// both succeed.
+///
+/// The `name` arg is what Vivado's `[current_project]` returns —
+/// canonically the workspace name that seeded [`AutoProject`].
+/// We take it as an arg rather than deriving it here so htcl
+/// stays authoritative about the project name (and there's no
+/// silent divergence if the workspace ever ships multiple named
+/// projects). The freshness *check* runs Rust-side once per
+/// session before Vivado spawns (see `vw_lib::project_needs_wipe`
+/// consumed from `vw-cli` / `vw-repl`), so there is intentionally
+/// no matching `project_needs_update` RPC.
+fn mark_project_configured(
     workspace_root: Option<&std::path::Path>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
-    let checkpoint = extract_checkpoint_arg(&args, "ip_mark_checkpoint")?;
-    vw_lib::write_ip_checkpoint_manifest(
-        &ws,
-        std::path::Path::new(&checkpoint),
-    )
-    .map_err(|e| format!("writing IP checkpoint manifest: {e}"))?;
+    let obj = args.as_object().ok_or_else(|| {
+        "mark_project_configured: args must be an object with a `name` \
+         string field"
+            .to_string()
+    })?;
+    let name = obj.get("name").and_then(Value::as_str).ok_or_else(|| {
+        "mark_project_configured: missing string `name` field".to_string()
+    })?;
+    let project_dir = vw_lib::vw_project_dir(&ws);
+    vw_lib::write_project_manifest(&ws, project_dir.as_std_path(), name)
+        .map_err(|e| format!("writing project manifest: {e}"))?;
     Ok(Value::Null)
 }
 

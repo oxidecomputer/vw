@@ -76,6 +76,42 @@ fn compute_collapse_state(text: &str, mode: CollapseMode) -> Option<bool> {
     }
 }
 
+/// Split a tagged-diagnostic message into `(leading, trailing)`.
+///
+/// A "tagged diagnostic line" has the shape
+/// `<LEVEL>: [<DESIGNATOR>] <MESSAGE>` — e.g.
+/// `ERROR: [Common 17-107] Cannot change read-only property …`
+/// or `CRITICAL WARNING: [Project 1-486] Could not resolve …`.
+/// Vivado (and our own eval-error renderer) sometimes appends
+/// wrapped continuations, a `    Resolution: …` hint, or a
+/// backtrace on the following lines — all valuable, but bulky.
+///
+/// `leading` is the tagged first line (returned even when the
+/// message is a single line, in which case `trailing` is `None`).
+/// `trailing` is everything after the first line, trailing
+/// newlines stripped; `None` when the message is a single line
+/// or the tail is whitespace-only.
+///
+/// Downstream, `leading` pushes as its OWN scrollback entry so
+/// it stays at full brightness — one-liner, non-collapsible,
+/// eye-catching gutter — while `trailing` pushes separately and
+/// can auto-collapse / dim like any other multi-line entry.
+/// This is the fix for the "critical error line got dimmed and
+/// blended into the surrounding chatter" bug.
+fn split_leading_diagnostic(text: &str) -> (String, Option<String>) {
+    match text.split_once('\n') {
+        Some((head, tail)) => {
+            let tail = tail.trim_end_matches('\n');
+            if tail.trim().is_empty() {
+                (head.to_string(), None)
+            } else {
+                (head.to_string(), Some(tail.to_string()))
+            }
+        }
+        None => (text.to_string(), None),
+    }
+}
+
 /// Split a diagnostic's rendered text into `(body, stack)` at the
 /// first line that looks like a stack frame — `  at <path>:<line>`.
 /// The body is everything before that line (message + any wrapped
@@ -3184,27 +3220,54 @@ impl App {
         text: String,
         is_critical_warning: bool,
     ) {
-        if !is_critical_warning {
-            self.push(kind, text);
-            return;
-        }
-        // CW path: mirror `push`'s tab expansion + collapse-state
-        // logic (single source of truth would be nicer but the
-        // needed customization is tiny), then set the flag.
-        let text = if text.contains('\t') {
-            text.replace('\t', "    ")
+        // Split the tagged first line off. For any diagnostic —
+        // ERROR / CRITICAL WARNING / WARNING — the leading
+        // `<LEVEL>: [<designator>] <message>` line MUST stay
+        // full-brightness and never dim-collapse, or a real
+        // problem in the middle of dozens of INFO lines
+        // disappears. Trailing content (Resolution hints,
+        // continuations) is fine to auto-collapse — that's what
+        // `split_leading_diagnostic` gives us. Notice / Stdout
+        // kinds don't tag their leading line, so the split just
+        // returns `(text, None)` and the entry pushes as before.
+        let (leading, trailing) = split_leading_diagnostic(&text);
+        let leading = if leading.contains('\t') {
+            leading.replace('\t', "    ")
         } else {
-            text
+            leading
         };
-        let collapse_state = compute_collapse_state(&text, self.collapse_mode);
+        // The leading line pushes as its own entry with
+        // `collapse_state = None` (via the <2-lines branch of
+        // `compute_collapse_state`) so it renders at full
+        // brightness. Only CW entries carry the flag — this is
+        // what feeds the diagnostics-finder's `Critical` filter.
+        let leading_collapse =
+            compute_collapse_state(&leading, self.collapse_mode);
         self.scrollback.push(ScrollbackEntry {
             kind,
-            text,
+            text: leading,
             started_at: None,
             completed_at: None,
-            collapse_state,
-            is_critical_warning: true,
+            collapse_state: leading_collapse,
+            is_critical_warning,
         });
+        if let Some(trailing) = trailing {
+            let trailing = if trailing.contains('\t') {
+                trailing.replace('\t', "    ")
+            } else {
+                trailing
+            };
+            let collapse_state =
+                compute_collapse_state(&trailing, self.collapse_mode);
+            self.scrollback.push(ScrollbackEntry {
+                kind: ScrollbackKind::Chatter,
+                text: trailing,
+                started_at: None,
+                completed_at: None,
+                collapse_state,
+                is_critical_warning: false,
+            });
+        }
     }
 
     /// Push a NONE-severity block: the accumulated non-diagnostic
@@ -3688,7 +3751,14 @@ fn render_eval_error(
     for frame in &frames {
         push_frame(app, frame);
     }
-    app.push(ScrollbackKind::Error, message.trim().to_string());
+    // Split `ERROR: [X] Msg\n    Resolution: …` so the tagged
+    // first line pushes as its own single-line entry (full
+    // brightness, no `▼` dimming) — see `split_leading_diagnostic`.
+    let (leading, trailing) = split_leading_diagnostic(message.trim());
+    app.push(ScrollbackKind::Error, leading);
+    if let Some(trailing) = trailing {
+        app.push(ScrollbackKind::Chatter, trailing);
+    }
     if let Some(code) = code.filter(|s| !s.is_empty() && s != "NONE") {
         app.push(ScrollbackKind::Notice, format!("({code})"));
     }
@@ -3871,10 +3941,12 @@ fn resolve_worker_selection(
         else {
             return Ok((None, None));
         };
+        let persist_dir = prepare_repl_persist_dir(ws, &ws_info.name);
         return Ok((
             Some(vw_vivado::AutoProject {
                 name: ws_info.name.clone(),
                 part: v.part.clone(),
+                persist_dir,
             }),
             Some(v.name.clone()),
         ));
@@ -3882,13 +3954,61 @@ fn resolve_worker_selection(
     let selected = ws_info
         .select_target_part(part)
         .map_err(|e| e.to_string())?;
+    let persist_dir = prepare_repl_persist_dir(ws, &ws_info.name);
     Ok((
         selected.map(|p| vw_vivado::AutoProject {
             name: ws_info.name.clone(),
             part: p.to_string(),
+            persist_dir: persist_dir.clone(),
         }),
         None,
     ))
+}
+
+/// REPL sibling of `vw-cli::prepare_persist_dir`. Same behavior:
+/// runs Phase-6 legacy IP-cache cleanup + Phase-3 staleness wipe,
+/// returns `Some(<ws>/target/vw-project)` for the worker to
+/// `open_project`/`create_project -dir` into, or `None` if the
+/// bootstrap fails (falling back to in-memory).
+///
+/// Kept mirrored (not shared through a common crate) for the same
+/// reason `resolve_worker_selection` is duplicated: `vw-repl`
+/// doesn't take a cross-crate dep on `vw-cli`.
+fn prepare_repl_persist_dir(
+    ws: &camino::Utf8Path,
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    match vw_lib::prepare_vw_project_dir(ws, name) {
+        Ok(prep) => {
+            if prep.legacy_cache_removed > 0 {
+                tracing::info!(
+                    "removed {} legacy IP cache entr{y} under \
+                     {ws}/target/ip — replaced by on-disk Vivado project",
+                    prep.legacy_cache_removed,
+                    y = if prep.legacy_cache_removed == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                );
+            }
+            if let Some(wiped) = &prep.wiped_project {
+                tracing::info!(
+                    "wiped stale Vivado project at {wiped} \
+                     (source fingerprint changed or manifest missing)"
+                );
+            }
+            Some(prep.project_dir.into_std_path_buf())
+        }
+        Err(e) => {
+            tracing::warn!(
+                "failed to prepare on-disk Vivado project dir under \
+                 {ws}/target/vw-project ({e}); falling back to in-memory \
+                 project (state won't persist across sessions)"
+            );
+            None
+        }
+    }
 }
 
 fn lookup_proc_doc_comments<'a>(

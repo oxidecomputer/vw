@@ -1455,10 +1455,12 @@ pub(crate) fn resolve_workspace_selection(
         let Some(v) = selected else {
             return Ok((None, None));
         };
+        let persist_dir = prepare_persist_dir(ws, &ws_info.name)?;
         Ok((
             Some(vw_vivado::AutoProject {
                 name: ws_info.name.clone(),
                 part: v.part.clone(),
+                persist_dir,
             }),
             Some(v.name.clone()),
         ))
@@ -1466,13 +1468,64 @@ pub(crate) fn resolve_workspace_selection(
         let selected = ws_info
             .select_target_part(part)
             .map_err(|e| e.to_string())?;
+        let persist_dir = prepare_persist_dir(ws, &ws_info.name)?;
         Ok((
             selected.map(|p| vw_vivado::AutoProject {
                 name: ws_info.name.clone(),
                 part: p.to_string(),
+                persist_dir: persist_dir.clone(),
             }),
             None,
         ))
+    }
+}
+
+/// Shared bootstrap for the on-disk Vivado project dir used by
+/// `vw run` and `vw repl`. Runs the one-shot legacy IP-cache
+/// cleanup + staleness wipe, then returns
+/// `Some(<ws>/target/vw-project)` on success.
+///
+/// A failure here is not fatal — we log the reason and fall back
+/// to `persist_dir: None` (in-memory project), so the user still
+/// gets a working session. That covers e.g. a read-only workspace
+/// or the `target/` dir being held by another process.
+fn prepare_persist_dir(
+    ws: &camino::Utf8Path,
+    name: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    match vw_lib::prepare_vw_project_dir(ws, name) {
+        Ok(prep) => {
+            if prep.legacy_cache_removed > 0 {
+                eprintln!(
+                    "{} removed {} legacy IP cache entr{y} under \
+                     {ws}/target/ip — replaced by on-disk Vivado project",
+                    "info:".cyan(),
+                    prep.legacy_cache_removed,
+                    y = if prep.legacy_cache_removed == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                );
+            }
+            if let Some(wiped) = &prep.wiped_project {
+                eprintln!(
+                    "{} wiped stale Vivado project at {wiped} \
+                     (source fingerprint changed or manifest missing)",
+                    "info:".cyan(),
+                );
+            }
+            Ok(Some(prep.project_dir.into_std_path_buf()))
+        }
+        Err(e) => {
+            eprintln!(
+                "{} failed to prepare on-disk Vivado project dir under \
+                 {ws}/target/vw-project ({e}); falling back to in-memory \
+                 project (state won't persist across sessions)",
+                "warning:".bright_yellow(),
+            );
+            Ok(None)
+        }
     }
 }
 

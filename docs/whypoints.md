@@ -5,10 +5,12 @@ Why HTCL
 1. Structured, documented discoverable interface.
 2. Catch common programming errors at analysis time.
 
+The H stands for holomorphic, meaning this type of TCL captures the whole
+shape of a tool's interface.
 
 ## Notes
 
-1. Documentation versus enginerring reality
+1. Documentation versus engineering reality
   - There is always a detla between Xilinix product guides and the configuation
     surface reality.
   - DCMAC `tx_data_out_*` is an example of this. It's not mentioned anywhere in
