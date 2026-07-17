@@ -365,16 +365,49 @@ impl VivadoBackend {
             .await
             .map_err(BackendError::Io)?;
 
-        let (cwd, scratch_dir) = match &config.working_dir {
-            Some(dir) => (dir.clone(), None),
-            None => {
-                let tmp = tempfile::Builder::new()
-                    .prefix("vw-vivado-cwd-")
-                    .tempdir()
-                    .map_err(BackendError::Io)?;
-                (tmp.path().to_path_buf(), Some(tmp))
-            }
-        };
+        // cwd resolution order:
+        //   1. Explicit `config.working_dir` — caller override,
+        //      used verbatim.
+        //   2. Persisted on-disk project's own dir
+        //      (`<persist>/<name>`) — when `auto_project` sets
+        //      `persist_dir`. This anchors Vivado's runtime path
+        //      resolution to the project's own location, which
+        //      eliminates `[Vivado 12-13650] IP file has been moved
+        //      from its original location` warnings the OOC
+        //      child-synth of `synth_ip` was firing when cwd sat
+        //      in a sibling tempdir. Any incidental files Vivado
+        //      writes to cwd (vivado.jou, vivado.log, .Xil/,
+        //      webtalk.log) land inside the project dir under
+        //      `<ws>/target/vw-project/<name>/` — which is
+        //      `.gitignore`d by design, so the cluttering is
+        //      isolated to a machine-local dir.
+        //   3. Fresh tempdir — the `vw test` and legacy
+        //      `-in_memory` paths (`persist_dir = None`) keep
+        //      full isolation because they intentionally have no
+        //      on-disk project home.
+        let (cwd, scratch_dir) =
+            match (&config.working_dir, &config.auto_project) {
+                (Some(dir), _) => (dir.clone(), None),
+                (None, Some(ap)) if ap.persist_dir.is_some() => {
+                    let persist = ap.persist_dir.as_ref().unwrap();
+                    let project_cwd = persist.join(&ap.name);
+                    // `prepare_vw_project_dir` (caller-side) already
+                    // ensures `<persist>` exists and is wiped-on-stale,
+                    // but the per-name subdir may not exist yet on a
+                    // cold create path — Vivado spawns before
+                    // `create_project -dir <persist>/<name>` runs.
+                    std::fs::create_dir_all(&project_cwd)
+                        .map_err(BackendError::Io)?;
+                    (project_cwd, None)
+                }
+                (None, _) => {
+                    let tmp = tempfile::Builder::new()
+                        .prefix("vw-vivado-cwd-")
+                        .tempdir()
+                        .map_err(BackendError::Io)?;
+                    (tmp.path().to_path_buf(), Some(tmp))
+                }
+            };
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
