@@ -47,6 +47,7 @@ use crate::visitor::walk_design_file;
 
 pub mod mapping;
 pub mod nvc_helpers;
+pub mod parts;
 pub mod sim;
 pub mod visitor;
 
@@ -1150,7 +1151,11 @@ pub fn extract_hostname_from_repo_url(repo_url: &str) -> Result<String> {
 // ============================================================================
 
 /// Initialize a new workspace with the given name.
-pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
+pub fn init_workspace(
+    workspace_dir: &Utf8Path,
+    name: String,
+    target_part: Option<String>,
+) -> Result<()> {
     let config_path = workspace_dir.join("vw.toml");
     if config_path.exists() {
         return Err(VwError::Config {
@@ -1158,13 +1163,22 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
         });
     }
 
+    let target_parts = target_part
+        .map(|part| {
+            vec![TargetPart {
+                part,
+                default: true,
+            }]
+        })
+        .unwrap_or_default();
+
     let config = WorkspaceConfig {
         workspace: WorkspaceInfo {
             name,
             version: "0.1.0".to_string(),
-            target_parts: Vec::new(),
+            target_parts,
             variants: Vec::new(),
-            top: None,
+            top: Some("top".to_string()),
         },
         dependencies: HashMap::new(),
         test_dependencies: HashMap::new(),
@@ -1173,6 +1187,35 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
     };
 
     save_workspace_config(workspace_dir, &config)?;
+    scaffold_top_vhd(workspace_dir)?;
+    Ok(())
+}
+
+/// Scaffold a minimal `hdl/top.vhd` alongside a fresh `vw.toml` so
+/// `vw run` and the analyzer have something to elaborate against
+/// out of the box.
+fn scaffold_top_vhd(workspace_dir: &Utf8Path) -> Result<()> {
+    let hdl_dir = workspace_dir.join("hdl");
+    std::fs::create_dir_all(&hdl_dir).map_err(|e| VwError::Config {
+        message: format!("failed to create {hdl_dir}: {e}"),
+    })?;
+    let top_path = hdl_dir.join("top.vhd");
+    if top_path.exists() {
+        return Ok(());
+    }
+    let contents = "\
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity top is
+  port (
+    clk: in std_logic
+  );
+end top;
+";
+    std::fs::write(&top_path, contents).map_err(|e| VwError::Config {
+        message: format!("failed to write {top_path}: {e}"),
+    })?;
     Ok(())
 }
 

@@ -341,9 +341,14 @@ fn definition_in_braced_bodies<'a>(
         // populate — the shifted CmdSubst.span carries the
         // absolute offset `populate_cmd_subst_parts` needs to shift
         // its reparsed interior into place.
+        // Braced bodies are Tcl scripts — `\n` terminates a
+        // command. Sibling comment in `hover_in_braced_bodies`
+        // (hover.rs) has the full story; the historical
+        // `Mode::BracketBody` glued all lines into one command
+        // and made every non-head call invisible to goto.
         let (mut stmts, mut errs) = crate::parser::parse_fragment(
             value.as_str(),
-            crate::parser::Mode::BracketBody,
+            crate::parser::Mode::Toplevel,
         );
         let delta = text_span.start;
         for s in &mut stmts {

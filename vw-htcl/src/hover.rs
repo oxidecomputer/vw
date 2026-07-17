@@ -609,9 +609,17 @@ fn hover_in_braced_bodies<'a>(
         // `set cell [vivado_cmd::create_bd_cell …]` inside an
         // `if {$bd} { … }` branch has an empty CmdSubst body and
         // the transient walker can't reach the call.
+        //
+        // Braced bodies are Tcl scripts — `\n` terminates a
+        // command. That's `Mode::Toplevel`. Historically this
+        // used `Mode::BracketBody` (for `[ … ]` substitutions
+        // where the whole content is ONE command), which
+        // glued every line of the body into a single flat
+        // command and made every non-head word (i.e. every
+        // call after the first) invisible to hover.
         let (mut stmts, mut errs) = crate::parser::parse_fragment(
             value.as_str(),
-            crate::parser::Mode::BracketBody,
+            crate::parser::Mode::Toplevel,
         );
         let delta = text_span.start;
         for s in &mut stmts {
@@ -687,10 +695,12 @@ fn hover_in_stmts_transient<'a>(
                     else {
                         continue;
                     };
+                    // Nested braced body — same "script mode"
+                    // reasoning as the outer reparse above.
                     let (mut inner, mut inner_errs) =
                         crate::parser::parse_fragment(
                             value.as_str(),
-                            crate::parser::Mode::BracketBody,
+                            crate::parser::Mode::Toplevel,
                         );
                     let delta = text_span.start;
                     for s in &mut inner {
@@ -1168,10 +1178,91 @@ proc p {} {
         }
     }
 
-    /// `[NAME]` inside a `##` block renders as a CallSite hover on
-    /// the referenced proc — same as if the cursor were on a live
-    /// call. Lets the reader hover the reference and see the
-    /// target's signature.
+    /// Repro for a bug reported against `~/src/htcl/vw/module.htcl`:
+    /// hover on `log::info` sitting inside `if { … } { body }`
+    /// after a `\`-continued `vivado_cmd::set_msg_config` returned
+    /// None. Root cause was `hover_in_braced_bodies` reparsing the
+    /// braced body in `Mode::BracketBody` — that mode treats `\n`
+    /// as whitespace (correct for `[ … ]` substitution, wrong for
+    /// script bodies), so every line of the body glued together
+    /// into one command whose head resolved fine but whose
+    /// subsequent calls (`log::info`, `synth_ip`) became word
+    /// arguments and were invisible to hover. Fixed by switching
+    /// the reparse to `Mode::Toplevel`. Uses qualified names to
+    /// mirror the exact shape of the reporting file.
+    #[test]
+    fn hover_on_qualified_call_inside_if_body_after_backslash_continued_prev() {
+        let src = "\
+namespace eval log {
+  proc info {} { return 0 }
+}
+namespace eval vivado_cmd {
+  proc set_msg_config {} { return 0 }
+  proc synth_ip {} { return 0 }
+}
+proc caller {} {
+  if {1 > 0} {
+    vivado_cmd::set_msg_config \\
+      -id \"abc\" \\
+      -suppress true
+    log::info -id 1 \\
+      -msg \"hi\"
+    vivado_cmd::synth_ip -objects x
+  }
+}
+";
+        let parsed = crate::parser::parse(src);
+        let pos = src.find("log::info -id 1").unwrap() as u32 + 2;
+        let target = hover_at(&parsed.document, src, pos)
+            .expect("expected hover to resolve log::info inside if-body");
+        match target {
+            HoverTarget::CallSite { proc_name, .. } => {
+                assert_eq!(proc_name, "log::info");
+            }
+            other => panic!("expected CallSite, got {other:?}"),
+        }
+    }
+
+    /// Sibling of the if-body test above: same qualified-call +
+    /// backslash-continuation shape but WITHOUT the enclosing
+    /// `if { … }`. Confirms the pattern already worked at top
+    /// level (a proc body parses in `Mode::Toplevel`) — the
+    /// regression was specific to reparsed braced bodies.
+    #[test]
+    fn hover_on_qualified_call_after_backslash_continued_prev_command() {
+        let src = "\
+namespace eval log {
+  proc info {} { return 0 }
+}
+namespace eval vivado_cmd {
+  proc set_msg_config {} { return 0 }
+  proc synth_ip {} { return 0 }
+}
+proc caller {} {
+  vivado_cmd::set_msg_config \\
+    -id \"abc\" \\
+    -suppress true
+  log::info -id 1 \\
+    -msg \"hi\"
+  vivado_cmd::synth_ip -objects x
+}
+";
+        let parsed = crate::parser::parse(src);
+        let pos = src.find("log::info -id 1").unwrap() as u32 + 2;
+        let target = hover_at(&parsed.document, src, pos)
+            .expect("expected hover to resolve log::info call");
+        match target {
+            HoverTarget::CallSite { proc_name, .. } => {
+                assert_eq!(proc_name, "log::info");
+            }
+            other => panic!("expected CallSite, got {other:?}"),
+        }
+    }
+
+    /// `[NAME]` inside a `##` block renders as a CallSite hover
+    /// on the referenced proc — same as if the cursor were on a
+    /// live call. Lets the reader hover the reference and see
+    /// the target's signature.
     #[test]
     fn doc_ref_hovers_as_target_call_site() {
         let src = "\

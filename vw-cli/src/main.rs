@@ -19,6 +19,7 @@ use vw_lib::{
 
 mod htcl_test;
 mod parallel_load;
+mod part_picker;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CliVhdlStandard {
@@ -92,6 +93,13 @@ enum Commands {
     Init {
         #[arg(help = "Workspace name")]
         name: String,
+        #[arg(
+            long,
+            help = "Vivado part id, e.g. xcvp1202-vsva2785-2MP-e-S. \
+                    If omitted and stdout is a tty, an interactive picker \
+                    is launched against the current Vivado install."
+        )]
+        part: Option<String>,
     },
     #[command(about = "Update workspace dependencies")]
     Update,
@@ -443,8 +451,11 @@ async fn main() {
         });
 
     match cli.command {
-        Commands::Init { name } => {
-            if let Err(e) = init_workspace(&cwd, name.clone()) {
+        Commands::Init { name, part } => {
+            let target_part = resolve_init_target_part(part);
+            if let Err(e) =
+                init_workspace(&cwd, name.clone(), target_part.clone())
+            {
                 eprintln!("{} {e}", "error:".bright_red());
                 process::exit(1);
             }
@@ -453,6 +464,13 @@ async fn main() {
                 "✓".bright_green(),
                 name.cyan()
             );
+            match &target_part {
+                Some(p) => println!("  target part: {}", p.cyan()),
+                None => println!(
+                    "  {} target-parts is empty; edit vw.toml or re-run `vw init` with --part when ready.",
+                    "note:".yellow()
+                ),
+            }
         }
         Commands::Update => {
             let access_creds =
@@ -941,6 +959,63 @@ async fn main() {
                 }
             }
         },
+    }
+}
+
+/// Decide what part to seed a new workspace's `target-parts` with.
+///
+/// Explicit `--part <p>` on the command line always wins. Otherwise
+/// launch the interactive picker when stdout is a tty and a Vivado
+/// install can be located; on non-tty, no-Vivado, or user cancel
+/// (Esc), fall back to `None` and print a hint so `vw init` still
+/// succeeds and the user can hand-edit `vw.toml` later.
+fn resolve_init_target_part(explicit: Option<String>) -> Option<String> {
+    if let Some(part) = explicit {
+        return Some(part);
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        eprintln!(
+            "{} `vw init` running non-interactively without `--part`; \
+             workspace will have empty target-parts.",
+            "note:".yellow()
+        );
+        return None;
+    }
+    let Some(install) = vw_lib::parts::find_vivado_install() else {
+        eprintln!(
+            "{} could not locate Vivado (`which vivado`, $XILINX_VIVADO); \
+             workspace will have empty target-parts. Re-run with `--part` \
+             once Vivado is on PATH.",
+            "note:".yellow()
+        );
+        return None;
+    };
+    let parts = vw_lib::parts::enumerate_parts(&install);
+    if parts.is_empty() {
+        eprintln!(
+            "{} Vivado install at {install} contains no plaintext parts \
+             catalog; workspace will have empty target-parts.",
+            "note:".yellow()
+        );
+        return None;
+    }
+    match part_picker::pick_part(&parts) {
+        Ok(Some(id)) => Some(id),
+        Ok(None) => {
+            eprintln!(
+                "{} no part picked; workspace will have empty target-parts.",
+                "note:".yellow()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "{} part picker failed: {e}; workspace will have empty target-parts.",
+                "warning:".yellow()
+            );
+            None
+        }
     }
 }
 

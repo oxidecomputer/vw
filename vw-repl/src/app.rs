@@ -2508,6 +2508,13 @@ impl App {
 
         self.history.append(&text);
         self.push(ScrollbackKind::Input, text.clone());
+        // User-typed inputs stay expanded by default — auto-collapse
+        // is a "wall of script output" convenience, not what the
+        // user wants right after they just typed a command and are
+        // waiting to see its output.
+        if let Some(entry) = self.scrollback.last_mut() {
+            entry.group_collapsed = false;
+        }
 
         if let Some(cmd) = trimmed.strip_prefix(':') {
             self.run_meta_command(cmd).await;

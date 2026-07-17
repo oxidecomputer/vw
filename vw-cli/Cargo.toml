@@ -30,3 +30,5 @@ petgraph.workspace = true
 futures.workspace = true
 indicatif.workspace = true
 serde_json.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
