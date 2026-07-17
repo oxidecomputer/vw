@@ -8,6 +8,14 @@
 //!
 //! Methods:
 //! - `workspace_root` — the discovered `vw.toml` parent dir.
+//! - `top` — resolved top-entity name for the current session.
+//!   Precedence: active variant's `top` field wins, then the
+//!   workspace-level `top`. Returns the empty string when
+//!   neither is configured so htcl callers can branch on
+//!   `[vw::top]` without try/catch. Consumed by `vw::synth`
+//!   (as the fallback when the caller omits `-top`) and by
+//!   `vw::_resolve_top` (used by `vw::place` / `vw::route` /
+//!   `vw::report`).
 //! - `critical_warning_count` — session-scoped monotonic count of
 //!   CRITICAL WARNING chunks the stream sink has classified so far.
 //!   `vw::synth` / `vw::place` snapshot this before + after each
@@ -228,6 +236,7 @@ async fn dispatch(
         "active_variant" => {
             Ok(active_variant_value(workspace_root, active_variant))
         }
+        "top" => Ok(top_value(workspace_root, active_variant)),
         "project_name" => project_name_value(workspace_root),
         "diff_files" => diff_files(args),
         "vhdl_dependency_sources" => {
@@ -1103,6 +1112,54 @@ fn active_variant_value(
         .and_then(workspace_default_variant_name)
         .unwrap_or_default();
     Value::String(name)
+}
+
+/// `top` — return the resolved top-entity name for the current
+/// session, as a JSON string. Empty string when nothing is
+/// configured (neither the active variant nor the workspace-level
+/// `[workspace] top` field is set) — callers branch on that
+/// without needing try/catch.
+///
+/// Variant resolution mirrors `active_variant_value`: the CLI's
+/// `--variant <name>` selector wins, then the workspace default
+/// variant (via `default = true` on `[[workspace.variants]]`).
+/// The resolved variant name feeds
+/// [`vw_lib::WorkspaceInfo::resolve_top`], which prefers the
+/// per-variant `top` when set and falls back to the
+/// workspace-level `top` otherwise.
+///
+/// Errors are swallowed here (returned as empty string) for the
+/// same reason as `active_variant_value` — a broken vw.toml has
+/// already been diagnosed by the check machinery; the RPC path
+/// shouldn't double-report.
+fn top_value(
+    workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
+) -> Value {
+    let Some(ws) = workspace_root
+        .and_then(|p| camino::Utf8PathBuf::from_path_buf(p.to_path_buf()).ok())
+    else {
+        return Value::String(String::new());
+    };
+    let Ok(cfg) = vw_lib::load_workspace_config(&ws) else {
+        return Value::String(String::new());
+    };
+    // Prefer the CLI-selected variant; fall back to the workspace
+    // default variant's name (matching how `active_variant` picks).
+    let variant_name: Option<String> = match active_variant {
+        Some(n) => Some(n.to_string()),
+        None => cfg
+            .workspace
+            .default_variant()
+            .ok()
+            .flatten()
+            .map(|v| v.name.clone()),
+    };
+    Value::String(
+        cfg.workspace
+            .resolve_top(variant_name.as_deref())
+            .unwrap_or_default(),
+    )
 }
 
 /// `vhdl_ip_sources` — return every generated IP wrapper under

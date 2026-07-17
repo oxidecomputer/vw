@@ -258,6 +258,22 @@ pub struct WorkspaceInfo {
     /// `--variant <name>` flag selects a non-default entry.
     #[serde(default)]
     pub variants: Vec<Variant>,
+    /// Project-scope: default top-entity name. Consumed by
+    /// `vw::synth` (as the fallback when `-top` isn't passed) and
+    /// by `vw::_resolve_top` (used by `vw::place` / `vw::route` /
+    /// `vw::report` to derive the DCP / report paths).
+    ///
+    /// A variant with its own `top` overrides this — see
+    /// [`Variant::top`]. When neither this nor the active
+    /// variant's `top` is set, callers fall back to fileset TOP /
+    /// current_design NAME / an explicit `-top` from the user.
+    ///
+    /// Typical usage: a workspace with a single top-level entity
+    /// sets this once at project scope. Multi-variant workspaces
+    /// with per-board tops (e.g. `top_vpk120` / `top_metro`) set
+    /// it per-variant instead.
+    #[serde(default)]
+    pub top: Option<String>,
 }
 
 /// One entry in a workspace's `[[target-parts]]` list.
@@ -332,6 +348,12 @@ pub struct Variant {
     /// don't match any variant's exclusive set are always shared.
     #[serde(default)]
     pub exclusive: Vec<String>,
+    /// Per-variant top-entity name. Overrides
+    /// [`WorkspaceInfo::top`] when this variant is active.
+    /// The typical multi-variant shape is
+    /// `top_<variant-name>` — one wrapper per board.
+    #[serde(default)]
+    pub top: Option<String>,
 }
 
 /// Errors surfaced when validating or selecting a variant from a
@@ -478,6 +500,29 @@ impl WorkspaceInfo {
             .ok_or_else(|| VariantSelectError::NoMatch {
                 query: q.to_string(),
             })
+    }
+
+    /// Resolve the top-entity name for the given active variant.
+    /// Precedence: variant's `top` (when a variant is active and
+    /// sets one) wins over the workspace-level `top`. Returns
+    /// `None` when neither is configured — callers (`vw::synth`
+    /// via the `top` RPC + `vw::top` proc) then decide whether to
+    /// error or fall back to other sources like the fileset TOP
+    /// property.
+    ///
+    /// `active_variant`: the variant name the caller resolved
+    /// (typically via `select_variant`). Pass `None` for
+    /// no-variant workspaces or when the caller hasn't picked
+    /// one yet.
+    pub fn resolve_top(&self, active_variant: Option<&str>) -> Option<String> {
+        if let Some(vname) = active_variant {
+            if let Some(v) = self.variants.iter().find(|v| v.name == vname) {
+                if let Some(t) = &v.top {
+                    return Some(t.clone());
+                }
+            }
+        }
+        self.top.clone()
     }
 }
 
@@ -1119,6 +1164,7 @@ pub fn init_workspace(workspace_dir: &Utf8Path, name: String) -> Result<()> {
             version: "0.1.0".to_string(),
             target_parts: Vec::new(),
             variants: Vec::new(),
+            top: None,
         },
         dependencies: HashMap::new(),
         test_dependencies: HashMap::new(),
@@ -1353,6 +1399,7 @@ pub async fn add_dependency_with_token(
                     version: "0.1.0".to_string(),
                     target_parts: Vec::new(),
                     variants: Vec::new(),
+                    top: None,
                 },
                 dependencies: HashMap::new(),
                 test_dependencies: HashMap::new(),
@@ -5383,6 +5430,79 @@ mod dependency_source_tests {
             cfg.workspace.select_variant(Some("vpk")),
             Err(VariantSelectError::NoMatch { .. }),
         ));
+    }
+
+    #[test]
+    fn resolve_top_variant_overrides_workspace() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+            top = "workspace_default_top"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+            default = true
+            top = "top_vpk120"
+
+            [[workspace.variants]]
+            name = "metro"
+            part = "xcvp1202-vsva2785-3HP-e-S"
+            # no per-variant top → falls back to workspace top
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.workspace.resolve_top(Some("vpk120")).as_deref(),
+            Some("top_vpk120"),
+        );
+        assert_eq!(
+            cfg.workspace.resolve_top(Some("metro")).as_deref(),
+            Some("workspace_default_top"),
+        );
+        assert_eq!(
+            cfg.workspace.resolve_top(None).as_deref(),
+            Some("workspace_default_top"),
+        );
+    }
+
+    #[test]
+    fn resolve_top_none_when_unset_everywhere() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.workspace.resolve_top(Some("vpk120")).is_none());
+        assert!(cfg.workspace.resolve_top(None).is_none());
+    }
+
+    #[test]
+    fn resolve_top_unknown_variant_falls_back_to_workspace() {
+        let toml = r#"
+            [workspace]
+            name = "x"
+            version = "0.1.0"
+            top = "workspace_top"
+
+            [[workspace.variants]]
+            name = "vpk120"
+            part = "xcvp1202-vsva2785-2MHP-e-S"
+            top = "top_vpk120"
+        "#;
+        let cfg: WorkspaceConfig = toml::from_str(toml).unwrap();
+        // A variant name not in the list falls through to workspace-level.
+        // (In practice select_variant would error before this, but the
+        // resolver must not panic on unknown names.)
+        assert_eq!(
+            cfg.workspace.resolve_top(Some("ghost")).as_deref(),
+            Some("workspace_top"),
+        );
     }
 
     #[test]
