@@ -54,6 +54,17 @@ pub struct DiagItem {
     /// content, so a query for a function name in the trace still
     /// finds the top-level warning.
     pub full: String,
+    /// Scrollback index of the [`ScrollbackKind::Input`] entry
+    /// this diagnostic was emitted under, or `None` when the
+    /// diagnostic predates any input (startup notices, e.g.
+    /// `vivado ready`). Used by the picker to group results by
+    /// the command that produced them.
+    pub parent_input_idx: Option<usize>,
+    /// Single-line preview of the parent input's text —
+    /// captured at snapshot time so the picker's header rows
+    /// don't need to walk back into the App's scrollback. `None`
+    /// when `parent_input_idx` is `None`.
+    pub parent_preview: Option<String>,
 }
 
 /// Scored entry after applying the current query + kind filters.
@@ -100,12 +111,19 @@ impl DiagnosticPicker {
                 if preview.is_empty() && e.text.is_empty() {
                     return None;
                 }
+                let parent_preview = e.parent_input_idx.and_then(|pidx| {
+                    scrollback.get(pidx).map(|p| {
+                        p.text.lines().next().unwrap_or("").to_string()
+                    })
+                });
                 Some(DiagItem {
                     scrollback_idx: idx,
                     kind: e.kind,
                     is_critical_warning: e.is_critical_warning,
                     preview,
                     full: e.text.clone(),
+                    parent_input_idx: e.parent_input_idx,
+                    parent_preview,
                 })
             })
             .collect();
@@ -458,67 +476,99 @@ fn draw_result_list(f: &mut Frame, picker: &DiagnosticPicker, area: Rect) {
     let max_preview_width = (list_area.width as usize)
         .saturating_sub(6 /* kind badge + space */);
 
-    let items: Vec<ListItem> = picker
-        .results
-        .iter()
-        .filter_map(|s| picker.items.get(s.item_idx))
-        .enumerate()
-        .map(|(row_idx, it)| {
-            // Badge: distinguish critical warnings from plain
-            // errors even though they share ScrollbackKind::Error
-            // — the whole point of the Critical filter is that
-            // the two are semantically distinct.
-            let (badge_str, badge_style) = match it.kind {
-                ScrollbackKind::Error if it.is_critical_warning => (
-                    "C ",
-                    Style::default()
-                        .fg(Color::Rgb(255, 90, 90))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ScrollbackKind::Error => (
-                    "E ",
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ScrollbackKind::Warning => (
-                    "W ",
-                    Style::default()
-                        .fg(Color::Rgb(255, 140, 0))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ScrollbackKind::Notice => (
-                    "i ",
-                    Style::default()
-                        .fg(Color::Gray)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                _ => ("? ", Style::default()),
+    // Results grouped by parent input. Walk results in order,
+    // emit a header row whenever the parent_input_idx changes,
+    // then emit the item row itself. Track selected_visual_row
+    // so ratatui's list highlight lands on the actual item (not
+    // a header) even though `picker.selected` indexes into
+    // `picker.results`.
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut selected_visual_row: usize = 0;
+    let mut prev_parent: Option<Option<usize>> = None;
+    for (row_idx, s) in picker.results.iter().enumerate() {
+        let Some(it) = picker.items.get(s.item_idx) else {
+            continue;
+        };
+        // Group header — emitted when the parent changes vs the
+        // previous item. `Some(None)` (rendered as "before any
+        // command") differs from an actual command's group, so
+        // we key on the Option<Option<usize>> pair.
+        if prev_parent != Some(it.parent_input_idx) {
+            let header_text = match (&it.parent_preview, it.parent_input_idx) {
+                (Some(preview), _) => preview.clone(),
+                (None, _) => "(before any command)".to_string(),
             };
-            let preview = truncate_chars(&it.preview, max_preview_width);
-            let is_selected = row_idx == picker.selected;
-            let preview_style = if is_selected {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    "▼ ".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    header_text,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])));
+            prev_parent = Some(it.parent_input_idx);
+        }
+        // Item row. Indented 2 cells to visually nest under the
+        // group header.
+        let (badge_str, badge_style) = match it.kind {
+            ScrollbackKind::Error if it.is_critical_warning => (
+                "C ",
                 Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let row_style = if is_selected {
-                Style::default().bg(Color::Rgb(40, 40, 60))
-            } else {
+                    .fg(Color::Rgb(255, 90, 90))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            ScrollbackKind::Error => (
+                "E ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            ScrollbackKind::Warning => (
+                "W ",
                 Style::default()
-            };
-            let spans = vec![
-                Span::styled(badge_str.to_string(), badge_style),
-                Span::styled(preview, preview_style),
-            ];
-            ListItem::new(Line::from(spans)).style(row_style)
-        })
-        .collect();
+                    .fg(Color::Rgb(255, 140, 0))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            ScrollbackKind::Notice => (
+                "i ",
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            _ => ("? ", Style::default()),
+        };
+        // 2-cell indent for nesting under the group header;
+        // room in the preview budget shrinks accordingly.
+        let preview_budget = max_preview_width.saturating_sub(2);
+        let preview = truncate_chars(&it.preview, preview_budget);
+        let is_selected = row_idx == picker.selected;
+        let preview_style = if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let row_style = if is_selected {
+            Style::default().bg(Color::Rgb(40, 40, 60))
+        } else {
+            Style::default()
+        };
+        if is_selected {
+            selected_visual_row = items.len();
+        }
+        let spans = vec![
+            Span::raw("  "),
+            Span::styled(badge_str.to_string(), badge_style),
+            Span::styled(preview, preview_style),
+        ];
+        items.push(ListItem::new(Line::from(spans)).style(row_style));
+    }
 
     let mut list_state = ListState::default();
-    list_state.select(Some(picker.selected));
+    list_state.select(Some(selected_visual_row));
     let list = List::new(items)
         .highlight_style(Style::default().bg(Color::Rgb(40, 40, 60)));
     f.render_stateful_widget(list, list_area, &mut list_state);
@@ -567,6 +617,10 @@ mod tests {
             completed_at: None,
             collapse_state: None,
             is_critical_warning: false,
+            parent_input_idx: None,
+            group_collapsed: false,
+            error_child_count: 0,
+            warning_child_count: 0,
         }
     }
 
@@ -578,6 +632,10 @@ mod tests {
             completed_at: None,
             collapse_state: None,
             is_critical_warning: true,
+            parent_input_idx: None,
+            group_collapsed: false,
+            error_child_count: 0,
+            warning_child_count: 0,
         }
     }
 

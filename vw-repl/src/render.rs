@@ -84,7 +84,31 @@ pub fn entry_lines_windowed(
     let orange = Color::Rgb(255, 140, 0);
     let (kind_prefix_str, prefix_style) = kind_prefix(entry.kind, orange);
     let marker_style = Style::default().fg(Color::DarkGray);
-    let has_marker = entry.collapse_state == Some(false);
+    // Marker column shows the group / block collapse affordance:
+    //
+    //   * Input entries always get a marker (▶ collapsed / ▼
+    //     expanded) — every command groups its output, so the
+    //     affordance is always available.
+    //   * Non-Input entries only get the marker when they're
+    //     themselves an expanded collapsible block
+    //     (collapse_state == Some(false)) — the intra-entry
+    //     "this multi-line body can be collapsed" case.
+    let has_marker = matches!(entry.kind, ScrollbackKind::Input)
+        || entry.collapse_state == Some(false);
+    // Which glyph goes in the marker column. For Input rows we
+    // key off `group_collapsed`; for expanded non-Input blocks
+    // it's always `▼` (`▶` collapsed non-Input blocks are
+    // handled entirely by `collapsible_lines` above and never
+    // reach this branch).
+    let marker_glyph = if matches!(entry.kind, ScrollbackKind::Input) {
+        if entry.group_collapsed {
+            "▶ "
+        } else {
+            "▼ "
+        }
+    } else {
+        "▼ "
+    };
     // Continuation rows get an indent matching row 0's total prefix
     // width so text stays visually aligned across a wrapped entry.
     let cont_indent = if has_marker { "    " } else { "  " };
@@ -164,7 +188,8 @@ pub fn entry_lines_windowed(
         let mut spans: Vec<Span<'static>> = Vec::new();
         if i == 0 {
             if has_marker {
-                spans.push(Span::styled("▼ ".to_string(), marker_style));
+                spans
+                    .push(Span::styled(marker_glyph.to_string(), marker_style));
             }
             spans.push(Span::styled(kind_prefix_str.to_string(), prefix_style));
         } else {
@@ -186,14 +211,64 @@ pub fn entry_lines_windowed(
             spans.push(Span::styled(line.to_string(), body_style));
         }
         if i == 0 {
-            if let Some((label, label_style)) = timer.as_ref() {
+            // Severity badges on Input rows: `✗` (red bold) when
+            // the group's children include any Error / CW, and
+            // `⚠` (orange bold, same glyph the Warning gutter
+            // uses) when they include any plain Warning. Both
+            // can render together; each shows a count when >1.
+            // Placement is between the input text and the timer
+            // so the far-right timer position stays stable.
+            let mut badges: Vec<(String, Style)> = Vec::new();
+            if matches!(entry.kind, ScrollbackKind::Input) {
+                if entry.error_child_count > 0 {
+                    let text = if entry.error_child_count > 1 {
+                        format!("✗ {}", entry.error_child_count)
+                    } else {
+                        "✗".to_string()
+                    };
+                    badges.push((
+                        text,
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if entry.warning_child_count > 0 {
+                    let text = if entry.warning_child_count > 1 {
+                        format!("⚠ {}", entry.warning_child_count)
+                    } else {
+                        "⚠".to_string()
+                    };
+                    badges.push((
+                        text,
+                        Style::default()
+                            .fg(orange)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            let timer_ref = timer.as_ref();
+            if timer_ref.is_some() || !badges.is_empty() {
                 let used: usize =
                     spans.iter().map(|s| display_cells(&s.content)).sum();
-                let label_w = display_cells(label);
-                if (used + label_w + 1) as u16 <= area_width {
-                    let pad = area_width as usize - used - label_w;
+                // Each badge contributes its glyph width + a
+                // trailing space to separate it from the next
+                // element.
+                let badges_w: usize =
+                    badges.iter().map(|(t, _)| display_cells(t) + 1).sum();
+                let timer_w =
+                    timer_ref.map(|(l, _)| display_cells(l)).unwrap_or(0);
+                let total_right = badges_w + timer_w;
+                if (used + total_right + 1) as u16 <= area_width {
+                    let pad = area_width as usize - used - total_right;
                     spans.push(Span::raw(" ".repeat(pad)));
-                    spans.push(Span::styled(label.clone(), *label_style));
+                    for (btext, bstyle) in badges {
+                        spans.push(Span::styled(btext, bstyle));
+                        spans.push(Span::raw(" "));
+                    }
+                    if let Some((label, label_style)) = timer_ref {
+                        spans.push(Span::styled(label.clone(), *label_style));
+                    }
                 }
             }
         }
@@ -206,7 +281,8 @@ pub fn entry_lines_windowed(
         if window.start == 0 && window.end > 0 {
             let mut blank_spans: Vec<Span<'static>> = Vec::new();
             if has_marker {
-                blank_spans.push(Span::styled("▼ ".to_string(), marker_style));
+                blank_spans
+                    .push(Span::styled(marker_glyph.to_string(), marker_style));
             }
             blank_spans
                 .push(Span::styled(kind_prefix_str.to_string(), prefix_style));
@@ -391,7 +467,12 @@ pub fn count_wrapped_rows(entry: &ScrollbackEntry, width: u16) -> u32 {
     //   - collapsed (Some(true)): handled by the `▶` placeholder
     //     branch below.
     //   - non-collapsible (None): 2 cells ("kind_prefix").
-    let prefix_width: usize = if entry.collapse_state == Some(false) {
+    // Mirror the has-marker rule in `entry_lines_windowed`: Input
+    // entries always carry the group-collapse marker; other entries
+    // carry a marker only when they're expanded collapsibles.
+    let prefix_width: usize = if matches!(entry.kind, ScrollbackKind::Input)
+        || entry.collapse_state == Some(false)
+    {
         4
     } else {
         2
@@ -605,6 +686,10 @@ mod tests {
             completed_at: None,
             collapse_state: None,
             is_critical_warning: false,
+            parent_input_idx: None,
+            group_collapsed: false,
+            error_child_count: 0,
+            warning_child_count: 0,
         }
     }
 

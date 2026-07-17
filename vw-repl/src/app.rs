@@ -251,6 +251,43 @@ pub struct ScrollbackEntry {
     /// don't know severity (Input echoes, Result returns,
     /// synthetic Notices).
     pub is_critical_warning: bool,
+    /// Index in `scrollback` of the [`ScrollbackKind::Input`]
+    /// entry this row belongs to, or `None` when the row
+    /// predates any input (startup notices) or IS itself an
+    /// Input. Set once at push time — the "current input" is
+    /// the last `Input` pushed, and every subsequent
+    /// non-`Input` entry inherits that idx as its parent.
+    ///
+    /// Drives the Mathematica-style "collapse everything under
+    /// this command" grouping. Renderer skips rows whose
+    /// parent's `group_collapsed` is `true`; diagnostic search
+    /// uses this to group results by command AND to expand the
+    /// parent group when the user jumps to a hidden result.
+    pub parent_input_idx: Option<usize>,
+    /// Only meaningful for [`ScrollbackKind::Input`] entries.
+    /// When `true`, every subsequent entry whose
+    /// `parent_input_idx` points at this input is hidden from
+    /// the renderer and skipped by mouse / diagnostic-jump
+    /// math. Toggled by Shift-click on the Input row itself.
+    /// Defaults to `false` — a freshly-pushed command shows its
+    /// output live.
+    pub group_collapsed: bool,
+    /// Only meaningful for [`ScrollbackKind::Input`] entries.
+    /// Number of `Error` / `CriticalWarning` children currently
+    /// attributed to this input's group. Renderer shows a red
+    /// `✗` badge on the collapsed Input row when this is >0,
+    /// so users can see something went wrong without expanding.
+    /// Bumped by `push` / `push_diag` when they attribute a
+    /// child to a parent input; never decremented (a scrollback
+    /// entry is never re-classified after push).
+    pub error_child_count: u32,
+    /// Only meaningful for [`ScrollbackKind::Input`] entries.
+    /// Sibling of [`error_child_count`] for `Warning` children.
+    /// Renderer shows an orange `⚠` badge — same glyph and
+    /// color as the [`ScrollbackKind::Warning`] gutter — on
+    /// the collapsed Input row when this is >0, so users can
+    /// see there are non-fatal issues without expanding.
+    pub warning_child_count: u32,
 }
 
 /// Drag-selection over scrollback rows. Coordinates are `(row, col)`
@@ -484,6 +521,15 @@ pub struct App {
     /// Loaded from `<workspace>/.vw/repl.toml` at startup and
     /// consulted by [`compute_collapse_state`] on every `push`.
     collapse_mode: CollapseMode,
+    /// Index in `scrollback` of the most recently pushed
+    /// [`ScrollbackKind::Input`] entry, or `None` when no user
+    /// input has been submitted yet (startup notices only).
+    /// Every non-Input push after an Input records this index
+    /// as its `parent_input_idx`, forming a
+    /// Mathematica-notebook-style group under each command.
+    /// Renderer + click handler use these parent pointers to
+    /// hide / reveal a whole group as a unit.
+    current_input_idx: Option<usize>,
 }
 
 enum WorkerState {
@@ -809,6 +855,7 @@ impl App {
             pending_eval_index: 0,
             exit: false,
             collapse_mode,
+            current_input_idx: None,
         }
     }
 
@@ -1613,6 +1660,20 @@ impl App {
         if idx >= self.scrollback.len() {
             return;
         }
+        // Expand the containing input group if it's collapsed.
+        // Without this, jumping to a diagnostic scrolls to a row
+        // that renders as 0 rows (child of a collapsed group), so
+        // the marker lands on empty space and the user sees
+        // nothing near the target. Expanding first makes the
+        // target row actually visible.
+        let parent_idx = self.scrollback[idx].parent_input_idx;
+        if let Some(pidx) = parent_idx {
+            if let Some(parent) = self.scrollback.get_mut(pidx) {
+                if matches!(parent.kind, ScrollbackKind::Input) {
+                    parent.group_collapsed = false;
+                }
+            }
+        }
         self.marker_entry = Some(idx);
         self.pending_jump = Some(idx);
         self.scrollback_follow = false;
@@ -1888,10 +1949,36 @@ impl App {
                     // expanded block still works because the
                     // anchor/cursor pair diverges as soon as the
                     // first Drag event fires.
-                    if mouse.modifiers.contains(KeyModifiers::SHIFT)
-                        && sel.anchor == sel.cursor
-                        && self.toggle_collapsible_at(sel.anchor.0)
-                    {
+                    // Two gestures for toggling a collapsible /
+                    // input group:
+                    //
+                    // 1. Shift-click on the row body — works on
+                    //    terminals that forward Shift+mouse to
+                    //    the app. Many (iTerm2, GNOME Terminal,
+                    //    macOS Terminal.app) reserve Shift+click
+                    //    for their OWN text-selection override
+                    //    and swallow the event before the app
+                    //    ever sees it — those events never reach
+                    //    here.
+                    //
+                    // 2. Plain click on the marker column (0-1)
+                    //    of the row that carries the ▶/▼ glyph
+                    //    — works everywhere, no modifier fights,
+                    //    matches the "click the arrow" gesture
+                    //    file explorers and Vivado's own GUI
+                    //    use. Guarded by `same` (no drag) so
+                    //    starting a text selection near the left
+                    //    edge doesn't accidentally toggle.
+                    let same = sel.anchor == sel.cursor;
+                    let shift_toggle =
+                        mouse.modifiers.contains(KeyModifiers::SHIFT)
+                            && same
+                            && self.toggle_collapsible_at(sel.anchor.0);
+                    let marker_toggle = !shift_toggle
+                        && same
+                        && sel.anchor.1 < 2
+                        && self.toggle_collapsible_at(sel.anchor.0);
+                    if shift_toggle || marker_toggle {
                         return;
                     }
                     self.copy_selection_to_clipboard(sel);
@@ -1916,22 +2003,50 @@ impl App {
     /// scrollback sizes we care about.
     fn toggle_collapsible_at(&mut self, wrapped_row: usize) -> bool {
         let width = self.scrollback_area.map(|a| a.width).unwrap_or(0);
+        // First pass: figure out which entry index owns
+        // `wrapped_row`. Row math mirrors what
+        // `ui::compute_visible_counts` does — hidden children of
+        // a collapsed group contribute 0 rows, so a shift-click
+        // near the top of scrollback lands on the right entry
+        // regardless of what's collapsed above it.
         let mut cursor: usize = 0;
-        for entry in self.scrollback.iter_mut() {
-            let rows = crate::render::count_wrapped_rows(entry, width) as usize;
+        let mut hit: Option<usize> = None;
+        for (idx, entry) in self.scrollback.iter().enumerate() {
+            let hidden = entry
+                .parent_input_idx
+                .and_then(|p| self.scrollback.get(p))
+                .map(|p| p.group_collapsed)
+                .unwrap_or(false);
+            let rows = if hidden {
+                0
+            } else {
+                crate::render::count_wrapped_rows(entry, width) as usize
+            };
             let end = cursor.saturating_add(rows);
             if (cursor..end).contains(&wrapped_row) {
-                match entry.collapse_state {
-                    Some(expanded) => {
-                        entry.collapse_state = Some(!expanded);
-                        return true;
-                    }
-                    None => return false,
-                }
+                hit = Some(idx);
+                break;
             }
             cursor = end;
         }
-        false
+        let Some(idx) = hit else { return false };
+        let target = &mut self.scrollback[idx];
+        // Two toggle behaviors:
+        //   * Input rows: flip the whole group's visibility
+        //     via `group_collapsed`.
+        //   * Non-Input collapsible blocks: flip the entry's
+        //     own multi-line body via `collapse_state`.
+        if matches!(target.kind, ScrollbackKind::Input) {
+            target.group_collapsed = !target.group_collapsed;
+            return true;
+        }
+        match target.collapse_state {
+            Some(expanded) => {
+                target.collapse_state = Some(!expanded);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Translate a screen cell `(col, row)` inside the scrollback
@@ -3204,7 +3319,42 @@ impl App {
             completed_at: None,
             collapse_state,
             is_critical_warning: false,
+            parent_input_idx: if matches!(kind, ScrollbackKind::Input) {
+                None
+            } else {
+                self.current_input_idx
+            },
+            group_collapsed: matches!(kind, ScrollbackKind::Input),
+            error_child_count: 0,
+            warning_child_count: 0,
         });
+        if matches!(kind, ScrollbackKind::Input) {
+            self.current_input_idx = Some(self.scrollback.len() - 1);
+        }
+        // Bump the parent input's severity tally so the
+        // collapsed header can render ✗ / ⚠ badges without
+        // expanding. Only the two "actionable" kinds count —
+        // Notices, Stdout, Result, Chatter don't warrant a
+        // header badge.
+        match kind {
+            ScrollbackKind::Error => {
+                if let Some(pidx) = self.current_input_idx {
+                    if let Some(p) = self.scrollback.get_mut(pidx) {
+                        p.error_child_count =
+                            p.error_child_count.saturating_add(1);
+                    }
+                }
+            }
+            ScrollbackKind::Warning => {
+                if let Some(pidx) = self.current_input_idx {
+                    if let Some(p) = self.scrollback.get_mut(pidx) {
+                        p.warning_child_count =
+                            p.warning_child_count.saturating_add(1);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Push a diagnostic that came from the Vivado stream, tagging
@@ -3250,7 +3400,53 @@ impl App {
             completed_at: None,
             collapse_state: leading_collapse,
             is_critical_warning,
+            // Diagnostics always belong to the currently
+            // executing input group. `kind` here is never
+            // `Input` — the classifier routes Input echoes
+            // through the plain `push` path.
+            parent_input_idx: self.current_input_idx,
+            group_collapsed: false,
+            error_child_count: 0,
+            warning_child_count: 0,
         });
+        // Bump the parent input's severity tally. push_diag is
+        // the only path that flags is_critical_warning, so the
+        // Error / CW check has to live here alongside the
+        // `push`-side check (the two deliberately don't share
+        // code — push_diag has its own leading/trailing split).
+        // CRITICAL WARNINGs count as errors — same red gutter,
+        // same ✗ badge — matching how the diagnostics finder
+        // buckets them.
+        match kind {
+            ScrollbackKind::Error => {
+                if let Some(pidx) = self.current_input_idx {
+                    if let Some(p) = self.scrollback.get_mut(pidx) {
+                        p.error_child_count =
+                            p.error_child_count.saturating_add(1);
+                    }
+                }
+            }
+            ScrollbackKind::Warning => {
+                if let Some(pidx) = self.current_input_idx {
+                    if let Some(p) = self.scrollback.get_mut(pidx) {
+                        p.warning_child_count =
+                            p.warning_child_count.saturating_add(1);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if is_critical_warning && !matches!(kind, ScrollbackKind::Error) {
+            // Belt-and-suspenders: CriticalWarning severity
+            // always classifies to `Error` kind at the stream
+            // level, but keep the flag path independent so a
+            // future rerouting doesn't silently drop the badge.
+            if let Some(pidx) = self.current_input_idx {
+                if let Some(p) = self.scrollback.get_mut(pidx) {
+                    p.error_child_count = p.error_child_count.saturating_add(1);
+                }
+            }
+        }
         if let Some(trailing) = trailing {
             let trailing = if trailing.contains('\t') {
                 trailing.replace('\t', "    ")
@@ -3266,6 +3462,14 @@ impl App {
                 completed_at: None,
                 collapse_state,
                 is_critical_warning: false,
+                // Trailing content attaches to the diagnostic
+                // just pushed above, which is a child of the
+                // current input group — so this belongs to the
+                // same group.
+                parent_input_idx: self.current_input_idx,
+                group_collapsed: false,
+                error_child_count: 0,
+                warning_child_count: 0,
             });
         }
     }
@@ -3316,6 +3520,13 @@ impl App {
             completed_at: None,
             collapse_state,
             is_critical_warning: false,
+            // Stack traces always attach to the just-emitted
+            // diagnostic; that diagnostic is a child of the
+            // current input group, so the trace belongs there too.
+            parent_input_idx: self.current_input_idx,
+            group_collapsed: false,
+            error_child_count: 0,
+            warning_child_count: 0,
         });
     }
 

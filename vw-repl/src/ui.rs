@@ -72,6 +72,34 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// Per-entry wrapped-row counts, with hidden children of a
+/// collapsed input group forced to 0. The renderer + viewport
+/// math treat count=0 entries as if they weren't in the buffer
+/// (the "skip above viewport" branch triggers immediately; the
+/// windowed-slicer sees an empty range and returns nothing), so
+/// this cleanly hides them without special-casing every consumer.
+///
+/// Kept as a small `ui`-local helper rather than pushed down into
+/// `render::count_wrapped_rows` because visibility is a
+/// cross-entry property (each row needs its PARENT'S state) and
+/// pushing it down would force the signature to accept the
+/// whole scrollback slice.
+fn compute_visible_counts(app: &App, width: u16) -> Vec<u32> {
+    let sb = app.scrollback();
+    sb.iter()
+        .map(|entry| {
+            if let Some(parent_idx) = entry.parent_input_idx {
+                if let Some(parent) = sb.get(parent_idx) {
+                    if parent.group_collapsed {
+                        return 0;
+                    }
+                }
+            }
+            crate::render::count_wrapped_rows(entry, width)
+        })
+        .collect()
+}
+
 fn input_height(app: &App) -> u16 {
     // Start at a 5-line minimum so the user has room to draft a
     // multi-statement entry without the input box flickering taller
@@ -101,11 +129,13 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     // recount. This costs a second pass ONLY on frames where the
     // scrollbar is visible — the common overflow-free case pays
     // just one pass.
-    let counts_full: Vec<u32> = app
-        .scrollback()
-        .iter()
-        .map(|e| crate::render::count_wrapped_rows(e, area.width))
-        .collect();
+    // Row counts, zeroed for entries whose parent input's group is
+    // collapsed. `count_wrapped_rows` itself doesn't know about
+    // grouping (it only sees one entry at a time), so the visibility
+    // filter lives here. Result: hidden children contribute 0 rows
+    // to the scrollback total AND consume 0 rows in the viewport
+    // math downstream, exactly as if they weren't in the buffer.
+    let counts_full: Vec<u32> = compute_visible_counts(app, area.width);
     let total_full: u32 =
         counts_full.iter().fold(0u32, |a, b| a.saturating_add(*b));
     let needs_scrollbar = total_full > area.height as u32;
@@ -122,11 +152,7 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
             width: area.width - 1,
             ..area
         };
-        let cs: Vec<u32> = app
-            .scrollback()
-            .iter()
-            .map(|e| crate::render::count_wrapped_rows(e, narrower.width))
-            .collect();
+        let cs: Vec<u32> = compute_visible_counts(app, narrower.width);
         let t: u32 = cs.iter().fold(0u32, |a, b| a.saturating_add(*b));
         (narrower, cs, t)
     } else {
@@ -195,6 +221,22 @@ fn draw_scrollback(f: &mut Frame, area: Rect, app: &mut App) {
     {
         let scrollback = app.scrollback();
         for (entry, &count) in scrollback.iter().zip(counts.iter()) {
+            // Hidden entries — a child of a collapsed input group,
+            // per `compute_visible_counts` — get count=0. Skip
+            // them explicitly: the `entry_end <= viewport_start`
+            // branch below only triggers when we've already
+            // walked past `viewport_start`, so a count=0 entry
+            // sitting INSIDE the viewport (accumulated <
+            // viewport_start hasn't happened yet) would otherwise
+            // slip past both guards and call
+            // `entry_lines_windowed`, which doesn't know about
+            // visibility and would happily render the entry's
+            // real content. That would defeat the whole
+            // group-collapse and put the ▶ marker on an Input
+            // that visually still expands.
+            if count == 0 {
+                continue;
+            }
             let entry_end = accumulated.saturating_add(count);
             if entry_end <= viewport_start {
                 // Entirely above viewport — count its rows toward
