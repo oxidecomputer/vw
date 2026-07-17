@@ -2076,8 +2076,25 @@ impl App {
         let Some(area) = self.scrollback_area else {
             return;
         };
+        // Skip children of collapsed input groups when building
+        // the flat list — same visibility rule
+        // `ui::compute_visible_counts` uses. Selection row
+        // indices are in VISIBLE-row space (that's what the
+        // renderer draws and what mouse cell → row math
+        // produces), so if this build path included hidden
+        // entries the row indices would map to the wrong lines
+        // and the clipboard would get chunks of hidden output
+        // instead of what the user selected.
         let mut flat: Vec<ratatui::text::Line<'static>> = Vec::new();
         for entry in &self.scrollback {
+            let hidden = entry
+                .parent_input_idx
+                .and_then(|p| self.scrollback.get(p))
+                .map(|p| p.group_collapsed)
+                .unwrap_or(false);
+            if hidden {
+                continue;
+            }
             for line in crate::render::entry_lines(entry, area.width) {
                 flat.push(line);
             }
