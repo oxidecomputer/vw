@@ -144,11 +144,6 @@ enum Commands {
         list: bool,
         #[arg(
             long,
-            help = "Enable recursive search when looking for testbenches"
-        )]
-        recurse: bool,
-        #[arg(
-            long,
             value_delimiter = ',',
             help = "Ignore directories matching these names (comma-separated or use multiple times)"
         )]
@@ -648,7 +643,6 @@ async fn main() {
             testbench,
             std,
             list,
-            recurse,
             ignore,
             runtime_flags,
             build_rust,
@@ -668,7 +662,7 @@ async fn main() {
                         vw_lib::sim::find_mist_configs(&bench_dir)
                             .unwrap_or_default();
 
-                    match list_testbenches(&bench_dir, &ignore_set, recurse) {
+                    match list_testbenches(&bench_dir, &ignore_set, true) {
                         Ok(testbenches) => {
                             if testbenches.is_empty() && mist_configs.is_empty()
                             {
@@ -709,7 +703,7 @@ async fn main() {
                     &cwd,
                     testbench_name.clone(),
                     std.into(),
-                    recurse,
+                    true,
                     &runtime_flags,
                     build_rust,
                     scaffold,
