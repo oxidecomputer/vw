@@ -2944,6 +2944,12 @@ pub fn prepare_vw_project_dir(
     })
 }
 
+/// Per-bench output directory under the workspace `target/`, holding a
+/// testbench run's artifacts (waveform, Xyce `.prn`, generated plots).
+pub fn bench_output_dir(workspace_dir: &Utf8Path, name: &str) -> Utf8PathBuf {
+    workspace_dir.join("target").join("bench").join(name)
+}
+
 /// Workspace-relative locations for anodizer artifacts.
 const ANODIZER_BUILD_SUBDIR: &str = "target/anodizer/build";
 const ANODIZER_GEN_SUBDIR: &str = "target/anodizer/gen";
@@ -3172,12 +3178,15 @@ pub async fn run_testbench(
         None
     };
 
-    // Run NVC simulation
+    // Run NVC simulation, writing the waveform into the per-bench output dir.
+    let bench_out = bench_output_dir(workspace_dir, &testbench_name);
+    fs::create_dir_all(&bench_out)?;
     run_nvc_sim(
         vhdl_std,
         BUILD_DIR,
         "work",
         &testbench_name,
+        bench_out.as_str(),
         rust_lib_path,
         &runtime_flags.to_vec(),
         false,

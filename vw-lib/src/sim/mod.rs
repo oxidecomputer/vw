@@ -166,6 +166,15 @@ pub async fn run_analog_test(
         build_bridge_library(bench_dir.as_std_path(), name).await?;
     let bridge_lib_str = bridge_lib.to_string_lossy().to_string();
 
+    // Per-bench output directory under target/. The Xyce bridge writes its
+    // `.prn` straight here (via rust_cosim::output_dir() -> Xyce's `-o` flag),
+    // so nothing is copied out of the source tree afterward.
+    let output_dir = crate::bench_output_dir(workspace_dir, name);
+    fs::create_dir_all(&output_dir)?;
+    let output_dir_abs = output_dir
+        .canonicalize_utf8()
+        .unwrap_or_else(|_| output_dir.clone());
+
     // Run co-simulation
     run_nvc_cosim(
         vhdl_std,
@@ -173,14 +182,12 @@ pub async fn run_analog_test(
         "work",
         entity_name,
         &bridge_lib_str,
+        output_dir_abs.as_str(),
         false,
     )
     .await?;
 
-    // Collect output
-    let output_dir = bench_dir.as_std_path().join("output");
-    fs::create_dir_all(&output_dir)?;
-
+    // Xyce has written <netlist>.prn into output_dir; generate plots from it.
     let netlist_path = bench_dir.as_std_path().join(&mist_config.netlist);
     let prn_name = netlist_path
         .file_name()
@@ -188,28 +195,16 @@ pub async fn run_analog_test(
         .to_string_lossy()
         .to_string()
         + ".prn";
-    let prn_source = netlist_path.with_extension(
-        netlist_path
-            .extension()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-            + ".prn",
-    );
 
-    if prn_source.exists() {
-        let prn_dest = output_dir.join(&prn_name);
-        fs::copy(&prn_source, &prn_dest)?;
-    }
-
-    // Auto-generate plots
     #[cfg(feature = "plot")]
     {
-        let prn_path = output_dir.join(&prn_name);
+        let prn_path = output_dir.as_std_path().join(&prn_name);
         if prn_path.exists() {
-            if let Err(e) =
-                plot::generate_plots(&netlist_path, &prn_path, &output_dir)
-            {
+            if let Err(e) = plot::generate_plots(
+                &netlist_path,
+                &prn_path,
+                output_dir.as_std_path(),
+            ) {
                 eprintln!("Warning: plot generation failed: {e}");
             }
         }

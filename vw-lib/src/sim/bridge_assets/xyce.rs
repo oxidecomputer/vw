@@ -46,8 +46,8 @@ impl Xyce {
             return Err("xyce_open returned null".into());
         }
 
-        // Set working directory to the netlist's parent directory so that
-        // relative file references (e.g., TABLE("main.dat")) resolve correctly.
+        // Keep Xyce's working directory at the netlist's parent so relative
+        // file references (e.g., TABLE("main.dat")) resolve correctly.
         if let Some(parent) = netlist_path.parent() {
             let dir = CString::new(parent.to_str().unwrap()).unwrap();
             unsafe { xyce_set_working_directory(&mut ptr, dir.as_ptr()) };
@@ -60,10 +60,22 @@ impl Xyce {
         let prog = CString::new("Xyce").unwrap();
         let netlist_c = CString::new(netlist).unwrap();
 
-        let mut argv: Vec<*mut c_char> = vec![
-            prog.as_ptr() as *mut c_char,
-            netlist_c.as_ptr() as *mut c_char,
-        ];
+        // When the harness (vw) specifies an output directory, direct Xyce's
+        // output files there via `-o <dir>/<netlist-filename>` rather than
+        // letting them land next to the netlist. CStrings must outlive
+        // `xyce_initialize`, so bind them in this scope.
+        let dash_o = CString::new("-o").unwrap();
+        let out_base_c = rust_cosim::output_dir().and_then(|dir| {
+            let base = dir.join(netlist_path.file_name()?);
+            CString::new(base.to_str()?).ok()
+        });
+
+        let mut argv: Vec<*mut c_char> = vec![prog.as_ptr() as *mut c_char];
+        if let Some(out_base_c) = out_base_c.as_ref() {
+            argv.push(dash_o.as_ptr() as *mut c_char);
+            argv.push(out_base_c.as_ptr() as *mut c_char);
+        }
+        argv.push(netlist_c.as_ptr() as *mut c_char);
 
         let status =
             unsafe { xyce_initialize(&mut ptr, argv.len() as c_int, argv.as_mut_ptr()) };

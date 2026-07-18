@@ -138,11 +138,13 @@ pub async fn run_nvc_elab(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_nvc_sim(
     std: VhdlStandard,
     build_dir: &str,
     lib_name: &str,
     testbench_name: &String,
+    wave_dir: &str,
     rust_lib_path: Option<String>,
     runtime_flags: &Vec<String>,
     capture_output: bool,
@@ -157,7 +159,7 @@ pub async fn run_nvc_sim(
 
     args.push("--dump-arrays".to_string());
     args.push("--format=fst".to_string());
-    args.push(format!("--wave={testbench_name}.fst"));
+    args.push(format!("--wave={wave_dir}/{testbench_name}.fst"));
 
     let envs = match rust_lib_path {
         Some(path) => {
@@ -200,6 +202,7 @@ pub async fn run_nvc_cosim(
     lib_name: &str,
     entity_name: &str,
     bridge_lib_path: &str,
+    output_dir: &str,
     capture_output: bool,
 ) -> Result<Option<(Vec<u8>, Vec<u8>)>, VwError> {
     let mut args = get_base_nvc_cmd_args(std, build_dir, lib_name);
@@ -210,6 +213,9 @@ pub async fn run_nvc_cosim(
     let envs = vec![
         ("GPI_USERS".to_string(), bridge_lib_path.to_string()),
         ("COCOTB_RUST_MODE".to_string(), "1".to_string()),
+        // Tells the bench where to write artifacts (Xyce `.prn`, etc.) via
+        // `rust_cosim::output_dir()`. Contract string == rust_cosim OUTPUT_DIR_ENV.
+        ("RUST_COSIM_OUTPUT_DIR".to_string(), output_dir.to_string()),
     ];
 
     if capture_output {

@@ -732,8 +732,9 @@ async fn main() {
                                 testbench_name
                             );
                             println!(
-                                "Waveform saved to: {}",
-                                format!("{testbench_name}.fst").cyan()
+                                "Outputs saved to: {}",
+                                format!("target/bench/{testbench_name}/")
+                                    .cyan()
                             );
                         }
                     }
