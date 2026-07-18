@@ -19,7 +19,7 @@
 //! let workspace_dir = Utf8Path::new(".");
 //!
 //! // Initialize a new workspace
-//! init_workspace(workspace_dir, "my_project".to_string())?;
+//! init_workspace(workspace_dir, "my_project".to_string(), None)?;
 //!
 //! // Update dependencies
 //! update_workspace(workspace_dir).await?;
@@ -1254,12 +1254,6 @@ pub async fn update_workspace_with_token(
         dependencies: HashMap::new(),
     };
 
-    let mut vhdl_ls_config = VhdlLsConfig {
-        standard: None,
-        libraries: HashMap::new(),
-        lint: None,
-    };
-
     let mut update_info = Vec::new();
 
     // Fetch both regular and test dependencies. Same lockfile
@@ -1281,7 +1275,7 @@ pub async fn update_workspace_with_token(
         // for git deps (downloaded if missing), or the declared
         // filesystem path for local deps. Local deps don't get a lock
         // entry — there's no commit to pin.
-        let dep_path = match &dep.source {
+        let _dep_path = match &dep.source {
             DependencySource::Git {
                 repo,
                 branch,
@@ -1353,35 +1347,31 @@ pub async fn update_workspace_with_token(
                 path.clone()
             }
         };
-
-        // VHDL libraries: same treatment regardless of source. Local
-        // deps' file paths are kept absolute (they aren't relative to
-        // the per-user cache); git deps stay portable.
-        let vhdl_files =
-            find_vhdl_files(&dep_path, dep.recursive, &dep.exclude)?;
-        if !vhdl_files.is_empty() {
-            let files = if dep.is_local() {
-                vhdl_files
-            } else {
-                vhdl_files.into_iter().map(make_path_portable).collect()
-            };
-            vhdl_ls_config.libraries.insert(
-                name.clone(),
-                VhdlLsLibrary {
-                    files,
-                    exclude: None,
-                    is_third_party: None,
-                },
-            );
-        }
     }
 
     write_lock_file(workspace_dir, &lock_file)?;
-    write_vhdl_ls_config(workspace_dir, &vhdl_ls_config)?;
+    warn_stale_vhdl_ls_toml(workspace_dir);
 
     Ok(UpdateResult {
         dependencies: update_info,
     })
+}
+
+/// One-time migration nudge on `vw update`: if the workspace still
+/// has a `vhdl_ls.toml` sitting at its root, print a warning to
+/// stderr. vw no longer writes or reads that file — both the sim
+/// path and `vw-analyzer` compute their VHDL config in memory from
+/// live workspace state.
+fn warn_stale_vhdl_ls_toml(workspace_dir: &Utf8Path) {
+    let path = workspace_dir.join("vhdl_ls.toml");
+    if path.exists() {
+        eprintln!(
+            "warning: {path} is no longer consumed by vw; the LSP \
+             and sim paths render config in memory. Remove the file \
+             or ignore it — any user-added libraries there won't be \
+             picked up."
+        );
+    }
 }
 
 /// Add a new dependency to the workspace configuration.
@@ -3490,7 +3480,7 @@ pub async fn run_testbench(
         .await;
     }
 
-    let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
+    let vhdl_ls_config = render_vhdl_ls_config(workspace_dir, None)?;
     let mut processor = RecordProcessor::new(vhdl_std);
     let mut cache = FileCache::new();
 
@@ -3733,27 +3723,244 @@ pub fn sort_files_by_dependencies(
     Ok(())
 }
 
-pub fn load_existing_vhdl_ls_config(
+/// Build a `VhdlLsConfig` in memory from the workspace's live
+/// enumeration — no disk I/O against `<ws>/vhdl_ls.toml`.
+///
+/// Populated libraries:
+/// - `defaultlib` = design VHDL under `<ws>/hdl/**` (variant-filtered).
+/// - `ip` = IP wrappers under `<ws>/target/ip/<name>/wrapper.vhd`
+///   (Vivado cache subtrees are excluded by `vhdl_ip_sources`).
+/// - `xil_defaultlib` = Vivado-generated BD RTL under
+///   `<ws>/target/vw-project/**/*.gen/sources_1/bd/**/*.vhd`,
+///   present only when the on-disk Vivado project exists.
+/// - one library per dep name (hyphens→underscores via
+///   `library_name_for_dep`), sourced from
+///   `vhdl_dependency_sources_ext`.
+///
+/// The sim and LSP layers both consume this instead of parsing
+/// `vhdl_ls.toml`; the file is no longer authoritative.
+pub fn render_vhdl_ls_config(
     workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
 ) -> Result<VhdlLsConfig> {
-    let config_path = workspace_dir.join("vhdl_ls.toml");
-    if config_path.exists() {
-        let config_content = fs::read_to_string(&config_path).map_err(|e| {
-            VwError::FileSystem {
-                message: format!("Failed to read existing vhdl_ls.toml: {e}"),
-            }
-        })?;
+    let mut libraries: HashMap<String, VhdlLsLibrary> = HashMap::new();
 
-        let config: VhdlLsConfig = toml::from_str(&config_content)?;
-
-        Ok(config)
-    } else {
-        Ok(VhdlLsConfig {
-            standard: None,
-            libraries: HashMap::new(),
-            lint: None,
-        })
+    // `active_variant = None` in a variant-mode workspace means
+    // "the workspace's default variant". Unioning across every
+    // variant instead would put both `top-vpk120.vhd` AND
+    // `top-metro.vhd` in `defaultlib`, and vhdl_lang would report
+    // duplicate-entity / cross-variant unresolved references as
+    // workspace-wide diagnostics — polluting the LSP outline with
+    // the inactive variant's broken references.
+    let resolved_variant =
+        resolve_active_variant(workspace_dir, active_variant);
+    let design_files = vhdl_design_sources_for_variant(
+        workspace_dir,
+        resolved_variant.as_deref(),
+    )?;
+    if !design_files.is_empty() {
+        libraries.insert(
+            "defaultlib".to_string(),
+            VhdlLsLibrary {
+                files: design_files,
+                exclude: None,
+                is_third_party: None,
+            },
+        );
     }
+
+    let ip_files = vhdl_ip_sources(workspace_dir)?;
+    if !ip_files.is_empty() {
+        libraries.insert(
+            "ip".to_string(),
+            VhdlLsLibrary {
+                files: ip_files,
+                exclude: None,
+                is_third_party: None,
+            },
+        );
+    }
+
+    let bd_rtl = vivado_generated_sources(workspace_dir)?;
+    if !bd_rtl.is_empty() {
+        libraries.insert(
+            "xil_defaultlib".to_string(),
+            VhdlLsLibrary {
+                files: bd_rtl,
+                exclude: None,
+                // Suppresses lint noise on Xilinx-generated RTL,
+                // matching how vhdl_ls treats vendor deps.
+                is_third_party: Some(true),
+            },
+        );
+    }
+
+    let dep_sources = vhdl_dependency_sources_ext(workspace_dir, true, false)?;
+    for src in dep_sources {
+        libraries
+            .entry(src.library)
+            .or_insert_with(|| VhdlLsLibrary {
+                files: Vec::new(),
+                exclude: None,
+                is_third_party: Some(true),
+            })
+            .files
+            .push(src.path);
+    }
+
+    Ok(VhdlLsConfig {
+        // VHDL 2019 is vw's baseline (mode views etc. show up in
+        // every non-legacy workspace we support). Without this
+        // vhdl_lang defaults to 2008 and bails out on view syntax
+        // partway through the source, which drops entire packages
+        // from library visibility and shows up as `No primary
+        // unit '<name>' within library 'defaultlib'` in the LSP.
+        standard: Some("2019".to_string()),
+        libraries,
+        lint: None,
+    })
+}
+
+/// Same as [`render_vhdl_ls_config`] but converts to the
+/// `vhdl_lang::Config` shape the LSP-embed path wants. Round-trips
+/// through TOML because `vhdl_lang::LibraryConfig` fields are
+/// private and no builder API is exposed.
+pub fn render_vhdl_lang_config(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<vhdl_lang::Config> {
+    let ls_config = render_vhdl_ls_config(workspace_dir, active_variant)?;
+    let toml_str = toml::to_string(&ls_config)?;
+    vhdl_lang::Config::from_str(&toml_str, workspace_dir.as_std_path()).map_err(
+        |e| VwError::Config {
+            message: format!("vhdl_lang config parse failed: {e}"),
+        },
+    )
+}
+
+/// Resolve which variant the LSP renderer should filter to.
+///
+/// Precedence:
+/// 1. Caller-supplied `active_variant` (e.g. sim invocation).
+/// 2. `VW_ACTIVE_VARIANT` env var — the LSP-side selector: users
+///    launch `helix` (or a shell) with the var set to switch
+///    which board's tree is analyzed. Empty / whitespace-only
+///    values are ignored so `unset` and `export FOO=""` behave
+///    identically.
+/// 3. Workspace's `default = true` variant — the natural fallback
+///    (matches `vw run` semantics).
+/// 4. `None` — workspace has no variants; caller does no
+///    filtering.
+fn resolve_active_variant(
+    workspace_dir: &Utf8Path,
+    caller_supplied: Option<&str>,
+) -> Option<String> {
+    if let Some(v) = caller_supplied {
+        return Some(v.to_string());
+    }
+    if let Ok(env) = std::env::var("VW_ACTIVE_VARIANT") {
+        let trimmed = env.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let cfg = load_workspace_config(workspace_dir).ok()?;
+    if cfg.workspace.variants.is_empty() {
+        return None;
+    }
+    cfg.workspace
+        .default_variant()
+        .ok()
+        .flatten()
+        .map(|v| v.name.clone())
+}
+
+/// Walk `<ws>/target/vw-project/*/*.gen/sources_1/**/*.{vhd,vhdl}`,
+/// keeping only the files vhdl_lang can meaningfully analyze from
+/// Vivado's output tree.
+///
+/// The unfiltered tree has three inclusion hazards:
+/// - **Sim/synth duplicates.** Every BD gets a `bd/<name>/synth/<name>.vhd`
+///   AND a `bd/<name>/sim/<name>.vhd`, both declaring `entity <name> is`.
+///   Including both fires vhdl_lang's duplicate-declaration path plus
+///   thousands of Xilinx-specific attribute errors from the sim
+///   variant (`entity txr0` alone contributed 614 errors on metroid).
+/// - **`ipshared/` shared IP bundles.** Xilinx-provided reusable
+///   function sets (`*_rfs.vhd`) use vendor extensions and error out
+///   under vhdl_lang.
+/// - **`*_sim_netlist.vhdl`.** Post-synth flattened netlists that
+///   redeclare the same entity name as the corresponding `_stub`.
+///
+/// Kept: `bd/*/hdl/*_wrapper.vhd`, `bd/*/synth/**/*.{vhd,vhdl}`,
+/// `bd/*/ip/**/synth/**/*.{vhd,vhdl}`, `ip/*/*_stub.{vhd,vhdl}`.
+fn vivado_generated_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    let project_root = workspace_dir.join("target/vw-project");
+    if !project_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(project_root.as_std_path()) else {
+        return Ok(Vec::new());
+    };
+    for entry in entries.flatten() {
+        let dir_path = entry.path();
+        let Some(name) = dir_path.file_name() else {
+            continue;
+        };
+        let gen_dir = format!("{}.gen", name.to_string_lossy());
+        let sources_1 = dir_path.join(gen_dir).join("sources_1");
+        if !sources_1.is_dir() {
+            continue;
+        }
+        let mut all = Vec::new();
+        find_vhdl_files_impl(&sources_1, &mut all, true)?;
+        for path in all {
+            if keep_vivado_generated_path(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Filter predicate for [`vivado_generated_sources`]. Only files
+/// the user's own code can name are retained; the deeper
+/// synthesis-time entities user code never references directly are
+/// dropped so vhdl_lang doesn't parse them at all.
+///
+/// User code references BD components as `<name>_wrapper` (the
+/// entity in `bd/<name>/hdl/<name>_wrapper.vhd`) — that wrapper
+/// wraps `bd/<name>/synth/<name>.vhd` internally through a
+/// component declaration, and the component isn't part of the LSP
+/// resolution surface. Include the wrapper, skip the synth entity.
+/// Same reasoning drops `bd/<name>/ip/**` sub-IP wrappers and every
+/// `ipshared/` bundle: they're compiled by Vivado but never
+/// mentioned by user-authored VHDL. XCI IPs like `primary_clock`
+/// have the same shape one level up — `ip/<name>/<name>_stub.vhdl`
+/// declares the entity user code names.
+fn keep_vivado_generated_path(path: &Path) -> bool {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    // BD subtree: only the top-level `hdl/<name>_wrapper.vhd`.
+    if let Some(bd_rel) = s
+        .split("/sources_1/bd/")
+        .nth(1)
+        .and_then(|rel| rel.split_once('/'))
+    {
+        let sub_path = bd_rel.1;
+        return sub_path.starts_with("hdl/") && name.ends_with("_wrapper.vhd");
+    }
+    // XCI IP subtree: only `<name>_stub.{vhd,vhdl}`.
+    if s.contains("/sources_1/ip/") {
+        return name.ends_with("_stub.vhd") || name.ends_with("_stub.vhdl");
+    }
+    // Unknown subtree under `sources_1/` — keep by default so
+    // future Vivado output shapes aren't silently dropped.
+    true
 }
 
 // ============================================================================
@@ -4846,29 +5053,6 @@ fn write_lock_file(
 
     fs::write(&lock_path, toml_content).map_err(|e| VwError::FileSystem {
         message: format!("Failed to write vw.lock file: {e}"),
-    })?;
-
-    Ok(())
-}
-
-fn write_vhdl_ls_config(
-    workspace_dir: &Utf8Path,
-    managed_config: &VhdlLsConfig,
-) -> Result<()> {
-    let mut existing_config = load_existing_vhdl_ls_config(workspace_dir)?;
-
-    // Remove any existing managed dependencies and add the new ones
-    for (name, library) in &managed_config.libraries {
-        existing_config
-            .libraries
-            .insert(name.clone(), library.clone());
-    }
-
-    let toml_content = toml::to_string_pretty(&existing_config)?;
-    let config_path = workspace_dir.join("vhdl_ls.toml");
-
-    fs::write(&config_path, toml_content).map_err(|e| VwError::FileSystem {
-        message: format!("Failed to write vhdl_ls.toml file: {e}"),
     })?;
 
     Ok(())
@@ -6281,6 +6465,96 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
             );
             assert!(s.ends_with("wrapper.vhd"), "unexpected file: {s}");
         }
+    }
+
+    // `render_vhdl_ls_config` composes design + wrappers + BD RTL
+    // + deps into a single VhdlLsConfig. Confirms every source
+    // lands in the right library.
+    #[test]
+    fn render_vhdl_ls_config_populates_expected_libraries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        // Design source.
+        std::fs::create_dir_all(ws.join("hdl")).unwrap();
+        std::fs::write(ws.join("hdl/top.vhd"), "").unwrap();
+        // Empty vw.toml so workspace enumeration succeeds
+        // without complaining about missing config.
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n[dependencies]\n\
+             [test-dependencies]\n",
+        )
+        .unwrap();
+        // IP wrapper.
+        std::fs::create_dir_all(ws.join("target/ip/dcmac")).unwrap();
+        std::fs::write(ws.join("target/ip/dcmac/wrapper.vhd"), "").unwrap();
+        // BD-generated RTL — only top-level wrappers survive the
+        // walker's filter (see `keep_vivado_generated_path`).
+        let bd_root = ws.join(
+            "target/vw-project/scratch/scratch.gen/sources_1/bd/dcmac/hdl",
+        );
+        std::fs::create_dir_all(&bd_root).unwrap();
+        std::fs::write(bd_root.join("dcmac_wrapper.vhd"), "").unwrap();
+
+        let cfg = render_vhdl_ls_config(&ws, None).unwrap();
+
+        assert!(
+            cfg.libraries.contains_key("defaultlib"),
+            "missing defaultlib: {:?}",
+            cfg.libraries.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            cfg.libraries.contains_key("ip"),
+            "missing ip: {:?}",
+            cfg.libraries.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            cfg.libraries.contains_key("xil_defaultlib"),
+            "missing xil_defaultlib: {:?}",
+            cfg.libraries.keys().collect::<Vec<_>>()
+        );
+
+        let xil = &cfg.libraries["xil_defaultlib"];
+        assert_eq!(xil.files.len(), 1);
+        assert!(
+            xil.files[0]
+                .to_string_lossy()
+                .ends_with("dcmac_wrapper.vhd"),
+            "unexpected xil_defaultlib path: {:?}",
+            xil.files[0]
+        );
+        assert_eq!(xil.is_third_party, Some(true));
+
+        let ip = &cfg.libraries["ip"];
+        assert_eq!(ip.files.len(), 1);
+        assert!(ip.files[0].to_string_lossy().ends_with("wrapper.vhd"));
+
+        let design = &cfg.libraries["defaultlib"];
+        assert_eq!(design.files.len(), 1);
+        assert!(design.files[0].to_string_lossy().ends_with("top.vhd"));
+    }
+
+    /// The renderer must produce output that vhdl_lang's TOML
+    /// parser can consume — this pins the contract that a
+    /// round-trip through `Config::from_str` succeeds.
+    #[test]
+    fn render_vhdl_lang_config_round_trips_through_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n[dependencies]\n\
+             [test-dependencies]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.join("hdl")).unwrap();
+        std::fs::write(ws.join("hdl/top.vhd"), "").unwrap();
+        let cfg = render_vhdl_lang_config(&ws, None).unwrap();
+        // The lang config should carry the same library we
+        // populated in the LS config; iterate files to confirm.
+        // vhdl_lang's Config has no public library iterator, so
+        // the round-trip succeeding is itself the check.
+        drop(cfg);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use camino::Utf8Path;
 
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_cosim, run_nvc_elab};
 use crate::{
-    analyze_ext_libraries, find_referenced_files, load_existing_vhdl_ls_config,
+    analyze_ext_libraries, find_referenced_files, render_vhdl_ls_config,
     sort_files_by_dependencies, FileCache, MistConfig, RecordProcessor,
     ToolsConfig, VhdlStandard, VwError,
 };
@@ -107,7 +107,7 @@ pub async fn run_analog_test(
     _tools: &Option<ToolsConfig>,
     vhdl_std: VhdlStandard,
 ) -> crate::Result<()> {
-    let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
+    let vhdl_ls_config = render_vhdl_ls_config(workspace_dir, None)?;
     let mut processor = RecordProcessor::new(vhdl_std);
     let mut cache = FileCache::new();
 

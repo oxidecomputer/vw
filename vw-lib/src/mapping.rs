@@ -199,8 +199,21 @@ impl Visitor for VwSymbolFinder {
                 None
             };
 
-            // figure out its expression
-            let expr = decl.expression.as_ref().map(|span| span.item.clone());
+            // figure out its expression. VHDL 2019 widened the
+            // initializer to a `ConditionalExpression`; we only
+            // ever consumed the simple form here (record-field
+            // defaults etc.), so unwrap `Simple` and drop
+            // conditional forms as if the constant had no
+            // initializer.
+            let expr =
+                decl.expression.as_ref().and_then(|span| match &span.item {
+                    vhdl_lang::ast::ConditionalExpression::Simple(e) => {
+                        Some(e.clone())
+                    }
+                    vhdl_lang::ast::ConditionalExpression::Conditional(_) => {
+                        None
+                    }
+                });
             let type_name = decl.subtype_indication.type_mark.item.clone();
 
             self.symbols.push(VwSymbol::new(

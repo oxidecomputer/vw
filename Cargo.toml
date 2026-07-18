@@ -50,3 +50,11 @@ indicatif = "0.17"
 similar = { version = "2.6", features = ["inline"] }
 ipxact = { path = "/home/ry/src/ipe/crates/ipxact" }
 #ipxact = { git = "https://github.com/oxidecomputer/ipe", branch = "ry/init" }
+
+# Embedded VHDL LSP. Path deps while our
+# `new_with_config` / `set_config` patches are in flight against
+# rust_hdl/master; drop to crates.io once merged.
+vhdl_lang = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/embed-api" }
+vhdl_ls = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/embed-api" }
+#vhdl_lang = { path = "/home/ry/src/rust_hdl/vhdl_lang" }
+#vhdl_ls = { path = "/home/ry/src/rust_hdl/vhdl_ls" }

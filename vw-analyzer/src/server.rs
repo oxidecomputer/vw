@@ -34,8 +34,10 @@ pub struct Analyzer {
 
 impl Analyzer {
     pub fn new(client: Client) -> Self {
-        let backends: Vec<Arc<dyn LanguageBackend>> =
-            vec![Arc::new(HtclBackend::new())];
+        let backends: Vec<Arc<dyn LanguageBackend>> = vec![
+            Arc::new(HtclBackend::new()),
+            Arc::new(crate::VhdlBackend::new(client.clone())),
+        ];
         Self {
             client,
             backends,
@@ -67,6 +69,14 @@ impl Analyzer {
         let Some(backend) = self.backend_for(&uri) else {
             return;
         };
+        if backend.pushes_diagnostics() {
+            // Backend already published diagnostics inside
+            // `set_text` via its own outbound RPC. Skipping the
+            // pull path avoids racing with (and empty-clobbering)
+            // that side-channel publish. See
+            // `LanguageBackend::pushes_diagnostics` docs.
+            return;
+        }
         let client = self.client.clone();
         let progress_seq = self.progress_seq.clone();
         let uri_task = uri.clone();
@@ -257,6 +267,57 @@ impl LanguageServer for Analyzer {
 
     async fn initialized(&self, _: InitializedParams) {
         info!("vw-analyzer initialized");
+        // Dynamically register `workspace/didChangeWatchedFiles`
+        // for the paths any backend cares about. We don't declare
+        // static capability at `initialize` time because dynamic
+        // registration lets each backend pick its own patterns —
+        // today the VHDL backend needs `vw.toml`, `vw.lock`, and
+        // `ip/**/*.htcl` to reflect `vw update` and IP-config
+        // edits back into the wrapped `vhdl_ls::VHDLServer`.
+        //
+        // Registration failures (client that doesn't advertise
+        // dynamic registration, or refuses this specific one) are
+        // logged and swallowed — the LSP still runs, just without
+        // the reactive config-reload path.
+        let watchers = vec![
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/vw.toml".into()),
+                kind: None,
+            },
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/vw.lock".into()),
+                kind: None,
+            },
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/ip/**/*.htcl".into()),
+                kind: None,
+            },
+        ];
+        let registration = Registration {
+            id: "vw-analyzer-watched-files".into(),
+            method: "workspace/didChangeWatchedFiles".into(),
+            register_options: serde_json::to_value(
+                DidChangeWatchedFilesRegistrationOptions { watchers },
+            )
+            .ok(),
+        };
+        if let Err(e) =
+            self.client.register_capability(vec![registration]).await
+        {
+            info!(
+                "vw-analyzer: dynamic watched-files registration \
+                 failed ({e}); config reactivity disabled"
+            );
+        }
+    }
+
+    async fn did_change_watched_files(
+        &self,
+        params: DidChangeWatchedFilesParams,
+    ) {
+        for backend in &self.backends {
+            backend.did_change_watched_files(&params).await;
+        }
     }
 
     async fn did_change_workspace_folders(

@@ -14,8 +14,9 @@
 
 use async_trait::async_trait;
 use tower_lsp::lsp_types::{
-    CompletionItem, Diagnostic, DocumentSymbol, Hover, Location, Position,
-    SignatureHelp, SymbolInformation, Url, WorkspaceEdit,
+    CompletionItem, Diagnostic, DidChangeWatchedFilesParams, DocumentSymbol,
+    Hover, Location, Position, SignatureHelp, SymbolInformation, Url,
+    WorkspaceEdit,
 };
 
 #[async_trait]
@@ -56,6 +57,26 @@ pub trait LanguageBackend: Send + Sync {
     /// indexer's commit notification.
     async fn wait_for_reindex(&self, _uri: &Url) {}
 
+    /// Whether this backend publishes diagnostics itself (via a
+    /// side channel — e.g. an embedded `vhdl_ls::VHDLServer`
+    /// bridged into the LSP `Client` through a custom
+    /// `RpcChannel`).
+    ///
+    /// The default `false` matches the `HtclBackend` model:
+    /// diagnostics are pulled through
+    /// [`LanguageBackend::diagnostics`] after every text edit and
+    /// the LSP server-side plumbing publishes them to the client.
+    ///
+    /// Backends that return `true` are trusted to have already
+    /// fired `textDocument/publishDiagnostics` before their async
+    /// LSP-notification handlers return; the outer server will
+    /// not call `diagnostics()` after `set_text` for those URIs
+    /// and will not clobber the freshly-pushed diagnostics with a
+    /// pull-based empty vec.
+    fn pushes_diagnostics(&self) -> bool {
+        false
+    }
+
     /// Editor-supplied workspace roots (from LSP `rootUri` /
     /// `workspaceFolders`, plus updates via
     /// `didChangeWorkspaceFolders`). Backends may use them as
@@ -65,6 +86,23 @@ pub trait LanguageBackend: Send + Sync {
     /// the same deps as the editor's root. Default impl is a no-op
     /// because most backends won't care.
     async fn set_workspace_roots(&self, _roots: Vec<std::path::PathBuf>) {}
+
+    /// The editor observed one of the paths this backend registered
+    /// as a "watched file" changing on disk. Called from
+    /// [`LanguageServer::did_change_watched_files`]. Backends that
+    /// don't register watched-file patterns can leave the default
+    /// no-op in place.
+    ///
+    /// Used by the VHDL backend to re-render its `vhdl_lang::Config`
+    /// whenever the workspace's `vw.toml`, `vw.lock`, or
+    /// `ip/**/*.htcl` layout shifts (e.g. a shell-side `vw update`
+    /// completes): the workspace's `VHDLServer` gets `set_config`'d
+    /// with the fresh enumeration, no editor restart required.
+    async fn did_change_watched_files(
+        &self,
+        _params: &DidChangeWatchedFilesParams,
+    ) {
+    }
 
     /// Forget any state for `uri`.
     async fn close(&self, uri: &Url);

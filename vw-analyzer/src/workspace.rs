@@ -305,7 +305,7 @@ fn collect_sibling_workspaces(
 }
 
 /// Walk up from `start`'s parent directory looking for a `vw.toml`.
-fn find_workspace_dir(start: &Path) -> Option<Utf8PathBuf> {
+pub(crate) fn find_workspace_dir(start: &Path) -> Option<Utf8PathBuf> {
     let mut cur = start.parent()?.to_path_buf();
     loop {
         if cur.join("vw.toml").exists() {

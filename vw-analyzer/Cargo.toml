@@ -21,6 +21,8 @@ async-trait.workspace = true
 tower-lsp.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+vhdl_lang.workspace = true
+vhdl_ls.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
