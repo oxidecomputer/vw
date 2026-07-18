@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "vw-core",
     "vw-lib",
     "vw-cli",
     "vw-htcl",
@@ -58,3 +59,12 @@ vhdl_lang = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/e
 vhdl_ls = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/embed-api" }
 #vhdl_lang = { path = "/home/ry/src/rust_hdl/vhdl_lang" }
 #vhdl_ls = { path = "/home/ry/src/rust_hdl/vhdl_ls" }
+
+# Local development overrides: build the workspace against the in-tree anodizer
+# checkout, and resolve anodizer's `vw-core` git dependency to this workspace's
+# own member. Drop once anodizer and vw are cross-published/pinned.
+[patch."https://github.com/oxidecomputer/anodizer"]
+anodizer = { path = "/home/ry/src/anodizer/anodizer" }
+
+[patch."https://github.com/oxidecomputer/vw/"]
+vw-core = { path = "vw-core" }

@@ -118,6 +118,7 @@ pub async fn run_analog_test(
         &vhdl_ls_config,
         &mut processor,
         vhdl_std,
+        crate::BUILD_DIR,
         &mut cache,
     )
     .await?;

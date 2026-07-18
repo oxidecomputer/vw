@@ -11,7 +11,7 @@ use std::process;
 
 use vw_eda::EdaBackend;
 use vw_lib::{
-    add_dependency_with_token, clear_cache, generate_deps_tcl,
+    add_dependency_with_token, clear_cache, ensure_anodized, generate_deps_tcl,
     get_access_credentials_for_repo, get_access_credentials_for_workspace,
     init_workspace, list_dependencies, list_testbenches, remove_dependency,
     run_testbench, update_workspace_with_token, VersionInfo, VhdlStandard,
@@ -699,6 +699,14 @@ async fn main() {
                 }
             } else if let Some(testbench_name) = testbench {
                 println!("Running testbench: {}", testbench_name.cyan());
+                // Regenerate anodizer structs whenever any tagged VHDL records
+                // are stale, so the testbench (and its Rust library, if built)
+                // pick up current definitions. This is a no-op when nothing is
+                // tagged for serialization or the sources are unchanged.
+                if let Err(e) = ensure_anodized(&cwd, std.into(), None).await {
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
                 match run_testbench(
                     &cwd,
                     testbench_name.clone(),

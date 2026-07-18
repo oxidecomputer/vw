@@ -33,6 +33,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "anodizer"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "clap",
+ "colored",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "tokio",
+ "vhdl_lang",
+ "vw-core",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2929,6 +2945,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vw-core"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "petgraph",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "vhdl_lang",
+]
+
+[[package]]
 name = "vw-eda"
 version = "0.1.0"
 dependencies = [
@@ -2982,6 +3012,7 @@ dependencies = [
 name = "vw-lib"
 version = "0.1.0"
 dependencies = [
+ "anodizer",
  "camino",
  "dirs 5.0.1",
  "git2",
@@ -3002,6 +3033,7 @@ dependencies = [
  "toml",
  "url",
  "vhdl_lang",
+ "vw-core",
 ]
 
 [[package]]
