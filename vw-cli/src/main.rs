@@ -227,6 +227,17 @@ enum Commands {
                     (WARNING / ERROR / CRITICAL always include the stack)"
         )]
         info_with_stack: bool,
+        #[arg(
+            long = "bunyan",
+            help = "Emit newline-delimited bunyan JSON log records on \
+                    stdout instead of the human-readable stream, for \
+                    piping into `looker` in CI. Vivado INFO → bunyan \
+                    info (30), WARNING → warn (40), CRITICAL WARNING and \
+                    ERROR → error (50). Non-diagnostic noise is omitted \
+                    unless `--log-level=debug`. vw's own status lines \
+                    stay on stderr, so stdout is pure JSON."
+        )]
+        bunyan: bool,
     },
     #[command(about = "Launch the vw analyzer LSP server on stdio")]
     Analyzer,
@@ -744,6 +755,7 @@ async fn main() {
             variant,
             log_level,
             info_with_stack,
+            bunyan,
         } => {
             let resolved = match file {
                 Some(f) => f,
@@ -762,6 +774,7 @@ async fn main() {
                 variant.as_deref(),
                 log_level.into(),
                 info_with_stack,
+                bunyan,
             )
             .await
             {
@@ -2112,42 +2125,15 @@ fn render_chunk(
 ) {
     use colored::Colorize;
     use std::io::Write;
-    // Drop a single trailing newline so the per-message layout
-    // doesn't insert a blank gap. The shim's `puts` already
-    // preserves user-side newlines inside the message.
-    let trimmed = chunk.trim_end_matches('\n');
-    if trimmed.is_empty() {
+    // Drop a single trailing newline, resolve stack frames to real
+    // htcl source, and tag traceless warnings/errors with the current
+    // origin. Shared with the bunyan emitter via this helper so both
+    // surfaces show identical, source-resolved message text.
+    let tagged =
+        resolve_diagnostic_text(kind, chunk, proc_table, origin, input_file);
+    if tagged.is_empty() {
         return;
     }
-    let resolved = vw_repl::resolve_stack_frames_with(
-        trimmed,
-        |name| proc_table.get(name).cloned(),
-        input_file,
-    );
-    // Tag traceless warnings/errors with the currently-executing
-    // statement's origin.
-    let tagged = match kind {
-        vw_vivado::StreamKind::Warning | vw_vivado::StreamKind::Error
-            if !resolved.contains("\n  at ") =>
-        {
-            match origin {
-                Some(o) => {
-                    let path = o
-                        .file
-                        .as_deref()
-                        .map(vw_repl::display_path)
-                        .unwrap_or_else(|| {
-                            input_file
-                                .map(vw_repl::display_path)
-                                .unwrap_or_else(|| "<input>".into())
-                        });
-                    format!("{resolved}\n  at {path}:{}", o.line)
-                }
-                None => resolved,
-            }
-        }
-        _ => resolved,
-    };
     let prefix = match kind {
         vw_vivado::StreamKind::Error
         | vw_vivado::StreamKind::CriticalWarning => "✗ ",
@@ -2205,6 +2191,190 @@ fn render_chunk(
         let _ = writeln!(out, "{styled_prefix}{styled_line}");
     }
     let _ = out.flush();
+}
+
+/// Resolve a diagnostic chunk's `at <input>:N in ::proc` frames back to
+/// real htcl source and tag traceless warnings/errors with the current
+/// origin. Shared by the human renderer ([`render_chunk`]) and the
+/// bunyan emitter ([`emit_bunyan_block`]) so both surfaces show
+/// identical, source-resolved text. Trims a single trailing newline;
+/// returns `""` for an otherwise-empty chunk.
+fn resolve_diagnostic_text(
+    kind: vw_vivado::StreamKind,
+    chunk: &str,
+    proc_table: &std::collections::HashMap<String, vw_repl::ProcLocation>,
+    origin: Option<&vw_repl::Origin>,
+    input_file: Option<&std::path::Path>,
+) -> String {
+    let trimmed = chunk.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let resolved = vw_repl::resolve_stack_frames_with(
+        trimmed,
+        |name| proc_table.get(name).cloned(),
+        input_file,
+    );
+    // Tag traceless warnings/errors with the currently-executing
+    // statement's origin — Vivado's C++ IP-Flow paths bypass
+    // `::common::send_msg_id` and arrive without an `at …` frame.
+    match kind {
+        vw_vivado::StreamKind::Warning | vw_vivado::StreamKind::Error
+            if !resolved.contains("\n  at ") =>
+        {
+            match origin {
+                Some(o) => {
+                    let path = o
+                        .file
+                        .as_deref()
+                        .map(vw_repl::display_path)
+                        .unwrap_or_else(|| {
+                            input_file
+                                .map(vw_repl::display_path)
+                                .unwrap_or_else(|| "<input>".into())
+                        });
+                    format!("{resolved}\n  at {path}:{}", o.line)
+                }
+                None => resolved,
+            }
+        }
+        _ => resolved,
+    }
+}
+
+/// Emit one classified [`vw_vivado::Block`] as a bunyan JSON record on
+/// stdout (the `--bunyan` path). Diagnostic blocks map their severity to
+/// a bunyan level and honor the `--log-level` filter exactly like the
+/// human renderer; non-diagnostic NONE blocks only enter the structured
+/// stream at the `--log-level=debug` escape hatch (they always remain in
+/// the raw `vivado-*.log`). Filtered-out blocks are a no-op.
+fn emit_bunyan_block(
+    block: &vw_vivado::Block,
+    log_level: vw_vivado::LogLevel,
+    proc_table: &std::collections::HashMap<String, vw_repl::ProcLocation>,
+    origin: Option<&vw_repl::Origin>,
+    input_file: Option<&std::path::Path>,
+    hostname: &str,
+    pid: u32,
+) {
+    match block {
+        vw_vivado::Block::Diagnostic { severity, lines } => {
+            if !log_level.allows(*severity) {
+                return;
+            }
+            let kind = vw_vivado::stream_kind_for(*severity);
+            let joined = lines.join("\n");
+            let msg = resolve_diagnostic_text(
+                kind, &joined, proc_table, origin, input_file,
+            );
+            if msg.is_empty() {
+                return;
+            }
+            emit_bunyan_line(
+                bunyan_level_for(*severity),
+                "vivado",
+                Some(bunyan_severity_label(*severity)),
+                &msg,
+                hostname,
+                pid,
+            );
+        }
+        vw_vivado::Block::None { lines } => {
+            if !matches!(log_level, vw_vivado::LogLevel::Debug) {
+                return;
+            }
+            let msg = lines.join("\n");
+            if msg.trim().is_empty() {
+                return;
+            }
+            emit_bunyan_line(
+                bunyan_level_for(vw_vivado::Severity::None),
+                "vivado",
+                Some(bunyan_severity_label(vw_vivado::Severity::None)),
+                &msg,
+                hostname,
+                pid,
+            );
+        }
+    }
+}
+
+/// Write a single newline-delimited bunyan record to stdout. `serde_json`
+/// handles all escaping, so an embedded quote or newline in `msg` can't
+/// break the one-object-per-line protocol looker parses. Every required
+/// bunyan field is present (`v`, `name`, `hostname`, `pid`, `level`,
+/// `time`, `msg`); the original Vivado severity rides along in a
+/// non-standard `severity` field so a viewer can still distinguish
+/// CRITICAL WARNING from ERROR (both collapse to level 50).
+fn emit_bunyan_line(
+    level: u8,
+    component: &str,
+    severity: Option<&str>,
+    msg: &str,
+    hostname: &str,
+    pid: u32,
+) {
+    use std::io::Write;
+    let time =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let record =
+        bunyan_record(level, component, severity, msg, hostname, pid, &time);
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{record}");
+    let _ = out.flush();
+}
+
+/// Build the bunyan record value. Pure (timestamp injected) so the field
+/// set and JSON escaping are unit-testable without touching stdout or the
+/// clock. `emit_bunyan_line` wraps it with `chrono::Utc::now()`.
+fn bunyan_record(
+    level: u8,
+    component: &str,
+    severity: Option<&str>,
+    msg: &str,
+    hostname: &str,
+    pid: u32,
+    time: &str,
+) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "v": 0,
+        "name": "vw",
+        "hostname": hostname,
+        "pid": pid,
+        "level": level,
+        "component": component,
+        "time": time,
+        "msg": msg,
+    });
+    if let Some(sev) = severity {
+        record["severity"] = serde_json::Value::from(sev);
+    }
+    record
+}
+
+/// Map a Vivado [`vw_vivado::Severity`] to a bunyan numeric level:
+/// INFO → 30, WARNING → 40, CRITICAL WARNING and ERROR → 50, and
+/// non-diagnostic NONE → 20 (debug).
+fn bunyan_level_for(severity: vw_vivado::Severity) -> u8 {
+    match severity {
+        vw_vivado::Severity::None => 20,
+        vw_vivado::Severity::Info => 30,
+        vw_vivado::Severity::Warning => 40,
+        vw_vivado::Severity::CriticalWarning | vw_vivado::Severity::Error => 50,
+    }
+}
+
+/// The original Vivado severity as a stable lowercase label, preserved in
+/// the bunyan `severity` field since CRITICAL WARNING and ERROR share
+/// level 50.
+fn bunyan_severity_label(severity: vw_vivado::Severity) -> &'static str {
+    match severity {
+        vw_vivado::Severity::None => "none",
+        vw_vivado::Severity::Info => "info",
+        vw_vivado::Severity::Warning => "warning",
+        vw_vivado::Severity::CriticalWarning => "critical-warning",
+        vw_vivado::Severity::Error => "error",
+    }
 }
 
 async fn ship_generic_reprs(
@@ -2265,6 +2435,7 @@ async fn run_htcl(
     variant: Option<&str>,
     log_level: vw_vivado::LogLevel,
     info_with_stack: bool,
+    bunyan: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Under the hood the block renderer decides what to show; the
     // backend's `verbose` toggle still gates the unclassified PTY
@@ -2504,6 +2675,11 @@ async fn run_htcl(
     let worst_severity = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
         severity_as_u8(vw_vivado::Severity::None),
     ));
+    // Static bunyan record fields (`hostname`, `pid`), resolved once and
+    // shared with the stdout sink and the trailing-flush below. Only
+    // consulted under `--bunyan`; cheap enough to compute either way.
+    let bunyan_host = gethostname::gethostname().to_string_lossy().into_owned();
+    let bunyan_pid = std::process::id();
     {
         let procs = std::sync::Arc::clone(&proc_table);
         let input_file = std::sync::Arc::clone(&input_file_for_stack);
@@ -2511,6 +2687,7 @@ async fn run_htcl(
         let acc = std::sync::Arc::clone(&block_acc);
         let worst = std::sync::Arc::clone(&worst_severity);
         let cw = std::sync::Arc::clone(&cw_count);
+        let host = bunyan_host.clone();
         backend.set_stdout_sink(move |kind, chunk: &str| {
             let cur_origin = origin.lock().ok().and_then(|g| g.clone());
             worst.fetch_max(
@@ -2530,13 +2707,25 @@ async fn run_htcl(
                 .map(|mut a| a.push(kind, chunk))
                 .unwrap_or_default();
             for block in blocks {
-                render_block(
-                    &block,
-                    log_level,
-                    &procs,
-                    cur_origin.as_ref(),
-                    Some(input_file.as_path()),
-                );
+                if bunyan {
+                    emit_bunyan_block(
+                        &block,
+                        log_level,
+                        &procs,
+                        cur_origin.as_ref(),
+                        Some(input_file.as_path()),
+                        &host,
+                        bunyan_pid,
+                    );
+                } else {
+                    render_block(
+                        &block,
+                        log_level,
+                        &procs,
+                        cur_origin.as_ref(),
+                        Some(input_file.as_path()),
+                    );
+                }
             }
         });
     }
@@ -2728,7 +2917,21 @@ async fn run_htcl(
                 // not already empty AND the source command wasn't a
                 // set binding.
                 if !out.value.is_empty() && !is_set_binding {
-                    println!("{}", out.value);
+                    if bunyan {
+                        // Eval return values are results, not
+                        // diagnostics — surface them at bunyan info so
+                        // stdout stays a pure JSON stream for looker.
+                        emit_bunyan_line(
+                            30,
+                            "result",
+                            None,
+                            &out.value,
+                            &bunyan_host,
+                            bunyan_pid,
+                        );
+                    } else {
+                        println!("{}", out.value);
+                    }
                 }
             }
             Err(vw_eda::BackendError::Tcl { message, .. }) => {
@@ -2751,13 +2954,25 @@ async fn run_htcl(
     let trailing = block_acc.lock().map(|mut a| a.flush()).unwrap_or_default();
     let cur_origin = current_origin.lock().ok().and_then(|g| g.clone());
     for block in trailing {
-        render_block(
-            &block,
-            log_level,
-            &proc_table,
-            cur_origin.as_ref(),
-            Some(input_file_for_stack.as_path()),
-        );
+        if bunyan {
+            emit_bunyan_block(
+                &block,
+                log_level,
+                &proc_table,
+                cur_origin.as_ref(),
+                Some(input_file_for_stack.as_path()),
+                &bunyan_host,
+                bunyan_pid,
+            );
+        } else {
+            render_block(
+                &block,
+                log_level,
+                &proc_table,
+                cur_origin.as_ref(),
+                Some(input_file_for_stack.as_path()),
+            );
+        }
     }
     // Severity-driven exit code. If ANY chunk classified as
     // CRITICAL WARNING or ERROR during the session, propagate a
@@ -2778,4 +2993,74 @@ async fn run_htcl(
         return Err(format!("session emitted at least one {label}").into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bunyan_tests {
+    use super::*;
+
+    /// The severity→level mapping is the crux of `--bunyan`: INFO→30,
+    /// WARNING→40, CRITICAL WARNING and ERROR both →50 (error), and
+    /// non-diagnostic noise →20 (debug).
+    #[test]
+    fn severity_maps_to_requested_bunyan_levels() {
+        assert_eq!(bunyan_level_for(vw_vivado::Severity::Info), 30);
+        assert_eq!(bunyan_level_for(vw_vivado::Severity::Warning), 40);
+        assert_eq!(bunyan_level_for(vw_vivado::Severity::CriticalWarning), 50);
+        assert_eq!(bunyan_level_for(vw_vivado::Severity::Error), 50);
+        assert_eq!(bunyan_level_for(vw_vivado::Severity::None), 20);
+    }
+
+    /// Every required bunyan field (per looker's `BunyanEntry`) must be
+    /// present with the right type, the record must be a single line, and
+    /// quotes/newlines in the message must survive JSON escaping.
+    #[test]
+    fn record_is_single_line_json_with_all_required_fields() {
+        let rec = bunyan_record(
+            50,
+            "vivado",
+            Some("critical-warning"),
+            "CRITICAL WARNING: [Vivado 12-4739] a \"quoted\" bit\n  at x.htcl:3",
+            "host1",
+            1234,
+            "2026-07-19T00:00:00.000Z",
+        );
+        let line = rec.to_string();
+        assert!(!line.contains('\n'), "a record must serialize to one line");
+
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        // Required fields looker rejects a record for missing.
+        assert_eq!(v["v"], 0);
+        assert_eq!(v["name"], "vw");
+        assert_eq!(v["hostname"], "host1");
+        assert_eq!(v["pid"], 1234);
+        assert_eq!(v["level"], 50);
+        assert_eq!(v["time"], "2026-07-19T00:00:00.000Z");
+        assert!(v["msg"].is_string());
+        // Original severity preserved so CW is distinguishable from ERROR.
+        assert_eq!(v["severity"], "critical-warning");
+        assert_eq!(v["component"], "vivado");
+        // Escaping round-trips the embedded quote and newline.
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains('"') && msg.contains('\n'));
+    }
+
+    /// An info record with no `severity` (the eval-result echo path) still
+    /// carries every required field and omits the optional `severity`.
+    #[test]
+    fn result_record_omits_optional_severity() {
+        let rec = bunyan_record(
+            30,
+            "result",
+            None,
+            "ok",
+            "h",
+            7,
+            "2026-07-19T00:00:00.000Z",
+        );
+        assert!(rec.get("severity").is_none());
+        assert_eq!(rec["level"], 30);
+        assert_eq!(rec["component"], "result");
+        assert_eq!(rec["v"], 0);
+    }
 }

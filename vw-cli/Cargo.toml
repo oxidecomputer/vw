@@ -36,3 +36,7 @@ crossterm.workspace = true
 # `vw bench` failure blocks are readable.
 rustc-demangle = "0.1"
 cpp_demangle = "0.4"
+# `vw run --bunyan`: structured bunyan-format log records (RFC3339 timestamps
+# via chrono, `hostname` field via gethostname) for the looker CI viewer.
+chrono = "0.4"
+gethostname = "1.1"

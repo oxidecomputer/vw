@@ -2920,11 +2920,13 @@ name = "vw"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "chrono",
  "clap",
  "colored",
  "cpp_demangle",
  "crossterm",
  "futures",
+ "gethostname",
  "indicatif",
  "petgraph",
  "ratatui",
