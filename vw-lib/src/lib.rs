@@ -54,7 +54,7 @@ pub use vw_core::{mapping, nvc_helpers, visitor};
 /// Workspace-relative directory for vw's own testbench simulation build (the
 /// nvc `work` + dependency libraries). Kept under `target/` so all generated
 /// output lives there. (anodizer's separate build is `target/anodizer/build`.)
-const BUILD_DIR: &str = "target/sim";
+pub const BUILD_DIR: &str = "target/sim";
 
 // ============================================================================
 // Configuration Structures
@@ -3013,6 +3013,20 @@ pub async fn ensure_anodized(
 }
 
 /// Run a testbench using NVC simulator.
+#[allow(clippy::too_many_arguments)]
+/// True when `dir` holds a Cargo.toml that declares a `[package]` — i.e. a
+/// buildable crate (a cosim testbench driver), as opposed to a
+/// `[workspace]`-only manifest like the top-level `bench/Cargo.toml`.
+fn dir_is_rust_crate(dir: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(dir.join("Cargo.toml")) else {
+        return false;
+    };
+    toml::from_str::<toml::Value>(&contents)
+        .map(|v| v.get("package").is_some())
+        .unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_testbench(
     workspace_dir: &Utf8Path,
     testbench_name: String,
@@ -3021,6 +3035,7 @@ pub async fn run_testbench(
     runtime_flags: &[String],
     build_rust: bool,
     scaffold: bool,
+    build_dir: &str,
 ) -> Result<()> {
     // Check for mixed-signal test (mist.toml in bench/<name>/)
     let bench_test_dir = workspace_dir.join("bench").join(&testbench_name);
@@ -3049,6 +3064,7 @@ pub async fn run_testbench(
             &mist_config,
             &ws_config.tools,
             vhdl_std,
+            build_dir,
         )
         .await;
     }
@@ -3057,14 +3073,14 @@ pub async fn run_testbench(
     let mut processor = RecordProcessor::new(vhdl_std);
     let mut cache = FileCache::new();
 
-    fs::create_dir_all(BUILD_DIR)?;
+    fs::create_dir_all(build_dir)?;
 
     // First, analyze all non-defaultlib libraries
     analyze_ext_libraries(
         &vhdl_ls_config,
         &mut processor,
         vhdl_std,
-        BUILD_DIR,
+        build_dir,
         &mut cache,
     )
     .await?;
@@ -3162,18 +3178,20 @@ pub async fn run_testbench(
 
     files.push(testbench_file.to_string_lossy().to_string());
 
-    run_nvc_analysis(vhdl_std, BUILD_DIR, "work", &files, false).await?;
+    run_nvc_analysis(vhdl_std, build_dir, "work", &files, false).await?;
 
-    run_nvc_elab(vhdl_std, BUILD_DIR, "work", &testbench_name, false).await?;
+    run_nvc_elab(vhdl_std, build_dir, "work", &testbench_name, false).await?;
 
-    // A testbench whose directory is a Rust crate is a cosim bench: its DUT
+    // A testbench whose directory is a Rust *crate* is a cosim bench: its DUT
     // inputs are driven by that Rust driver, so it must be loaded or the
     // inputs float and numeric_std floods with metavalue warnings. Build and
-    // load it automatically (even without an explicit `--build-rust`); a
-    // pure-VHDL testbench (no `Cargo.toml`) is unaffected.
+    // load it automatically (even without an explicit `--build-rust`). A
+    // pure-VHDL testbench sitting directly in `bench/` is *not* — its parent
+    // `Cargo.toml` is the bench `[workspace]` manifest (no `[package]`), so we
+    // must check for a real crate rather than any `Cargo.toml`.
     let is_cosim_bench = testbench_file
         .parent()
-        .map(|dir| dir.join("Cargo.toml").exists())
+        .map(dir_is_rust_crate)
         .unwrap_or(false);
     let rust_lib_path = if build_rust || is_cosim_bench {
         Some(
@@ -3191,7 +3209,7 @@ pub async fn run_testbench(
     fs::create_dir_all(&bench_out)?;
     run_nvc_sim(
         vhdl_std,
-        BUILD_DIR,
+        build_dir,
         "work",
         &testbench_name,
         bench_out.as_str(),

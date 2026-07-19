@@ -5,21 +5,22 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
-use std::collections::HashSet;
 use std::fmt;
 use std::process;
 
 use vw_eda::EdaBackend;
 use vw_lib::{
-    add_dependency_with_token, clear_cache, ensure_anodized, generate_deps_tcl,
+    add_dependency_with_token, clear_cache, generate_deps_tcl,
     get_access_credentials_for_repo, get_access_credentials_for_workspace,
-    init_workspace, list_dependencies, list_testbenches, remove_dependency,
-    run_testbench, update_workspace_with_token, VersionInfo, VhdlStandard,
+    init_workspace, list_dependencies, remove_dependency, run_testbench,
+    update_workspace_with_token, VersionInfo, VhdlStandard,
 };
 
+mod bench_runner;
 mod htcl_test;
 mod parallel_load;
 mod part_picker;
+mod test_ui;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CliVhdlStandard {
@@ -134,14 +135,26 @@ enum Commands {
     List,
     #[command(about = "Generate deps.tcl file with all dependency VHDL files")]
     DepsToTcl,
-    #[command(about = "Run VHDL testbench using NVC")]
+    #[command(
+        about = "Run VHDL/cosim testbenches with NVC — all in parallel, nextest-style"
+    )]
     Bench {
-        #[arg(help = "Name of the testbench entity to run")]
+        #[arg(
+            help = "Filter to testbenches whose name contains this substring; omit to run all"
+        )]
         testbench: Option<String>,
         #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
         std: CliVhdlStandard,
-        #[arg(long, help = "List all available testbenches")]
+        #[arg(
+            long,
+            help = "List matching testbenches instead of running them"
+        )]
         list: bool,
+        #[arg(
+            long,
+            help = "Maximum number of testbenches to run concurrently (default: CPU count)"
+        )]
+        concurrency: Option<usize>,
         #[arg(
             long,
             value_delimiter = ',',
@@ -151,15 +164,10 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
-            help = "Runtime flags to pass to NVC (comma-separated or use multiple times)",
-            requires = "testbench"
+            help = "Runtime flags to pass to NVC (comma-separated or use multiple times)"
         )]
         runtime_flags: Vec<String>,
-        #[arg(
-            long,
-            help = "Build Rust library for testbench before running",
-            requires = "testbench"
-        )]
+        #[arg(long, help = "Build Rust library for testbench before running")]
         build_rust: bool,
         #[arg(
             long,
@@ -167,6 +175,12 @@ enum Commands {
             requires = "testbench"
         )]
         scaffold: bool,
+        /// Internal: run exactly one testbench into this isolated nvc build
+        /// dir. Used by the parallel runner to fan out per-bench; when set,
+        /// `testbench` is an exact name (not a filter) and anodization is
+        /// assumed already done.
+        #[arg(long, hide = true, requires = "testbench")]
+        build_dir: Option<String>,
     },
     #[command(about = "Run an htcl script against a Vivado worker. \
                      With no file, discovers `<workspace>/design.htcl`.")]
@@ -643,112 +657,84 @@ async fn main() {
             testbench,
             std,
             list,
+            concurrency,
             ignore,
             runtime_flags,
             build_rust,
             scaffold,
+            build_dir,
         } => {
-            if list {
-                let bench_dir = cwd.join("bench");
-                if !bench_dir.exists() {
-                    println!("No bench dir found in {:}", bench_dir.as_str());
-                } else {
-                    let mut ignore_set: HashSet<String> = HashSet::new();
-                    for ignore_pattern in ignore {
-                        ignore_set.insert(ignore_pattern);
-                    }
-
-                    let mist_configs =
-                        vw_lib::sim::find_mist_configs(&bench_dir)
-                            .unwrap_or_default();
-
-                    match list_testbenches(&bench_dir, &ignore_set, true) {
-                        Ok(testbenches) => {
-                            if testbenches.is_empty() && mist_configs.is_empty()
-                            {
-                                println!(
-                                    "No testbenches found in bench directory"
-                                );
-                            } else {
-                                println!("Available testbenches:");
-                                for (name, config) in &mist_configs {
-                                    println!(
-                                        "  {} - {} (mixed-signal: {})",
-                                        name.cyan(),
-                                        config.entity.bright_black(),
-                                        config.netlist.bright_black()
-                                    );
-                                }
-                                for tb in testbenches {
-                                    println!(
-                                        "  {} - {}",
-                                        tb.name.cyan(),
-                                        tb.path
-                                            .display()
-                                            .to_string()
-                                            .bright_black()
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("{} {e}", "error:".bright_red());
-                            process::exit(1);
-                        }
-                    }
-                }
-            } else if let Some(testbench_name) = testbench {
-                println!("Running testbench: {}", testbench_name.cyan());
-                // Regenerate anodizer structs whenever any tagged VHDL records
-                // are stale, so the testbench (and its Rust library, if built)
-                // pick up current definitions. This is a no-op when nothing is
-                // tagged for serialization or the sources are unchanged.
-                if let Err(e) = ensure_anodized(&cwd, std.into(), None).await {
-                    eprintln!("{} {e}", "error:".bright_red());
-                    process::exit(1);
-                }
-                match run_testbench(
+            if let Some(bd) = build_dir {
+                // Internal single-exec mode — the parallel runner fans out one
+                // subprocess per bench into an isolated build dir. Run exactly
+                // `testbench`; anodization was already done by the runner. This
+                // process's stdout/stderr is captured by the runner and shown
+                // only if the bench fails.
+                let name =
+                    testbench.expect("--build-dir requires a testbench name");
+                println!("Running testbench: {}", name.cyan());
+                if let Err(e) = run_testbench(
                     &cwd,
-                    testbench_name.clone(),
+                    name,
                     std.into(),
                     true,
                     &runtime_flags,
                     build_rust,
                     scaffold,
+                    &bd,
                 )
                 .await
                 {
-                    Ok(()) => {
-                        if scaffold {
-                            println!(
-                                "{} Scaffolding generated for '{}'",
-                                "✓".bright_green(),
-                                testbench_name
-                            );
-                        } else {
-                            println!(
-                                "{} Testbench '{}' completed successfully!",
-                                "✓".bright_green(),
-                                testbench_name
-                            );
-                            println!(
-                                "Outputs saved to: {}",
-                                format!("target/bench/{testbench_name}/")
-                                    .cyan()
-                            );
-                        }
-                    }
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
+            } else if scaffold {
+                // Scaffolding is a single-bench, no-simulation operation.
+                let name =
+                    testbench.expect("--scaffold requires a testbench name");
+                match run_testbench(
+                    &cwd,
+                    name.clone(),
+                    std.into(),
+                    true,
+                    &runtime_flags,
+                    build_rust,
+                    true,
+                    vw_lib::BUILD_DIR,
+                )
+                .await
+                {
+                    Ok(()) => println!(
+                        "{} Scaffolding generated for '{}'",
+                        "✓".bright_green(),
+                        name
+                    ),
                     Err(e) => {
                         eprintln!("{} {e}", "error:".bright_red());
                         process::exit(1);
                     }
                 }
             } else {
-                eprintln!(
-                    "{} Must specify testbench name or use --list",
-                    "error:".bright_red()
-                );
-                process::exit(1);
+                // Parallel nextest-style runner: no positional runs every
+                // testbench; a positional filters by name substring.
+                let conc = concurrency.unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                });
+                if let Err(e) = bench_runner::run_benches(
+                    &cwd,
+                    testbench.as_deref(),
+                    list,
+                    conc,
+                    std.into(),
+                    &ignore,
+                )
+                .await
+                {
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
             }
         }
         Commands::Run {

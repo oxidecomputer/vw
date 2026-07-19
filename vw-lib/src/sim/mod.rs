@@ -106,19 +106,20 @@ pub async fn run_analog_test(
     mist_config: &MistConfig,
     _tools: &Option<ToolsConfig>,
     vhdl_std: VhdlStandard,
+    build_dir: &str,
 ) -> crate::Result<()> {
     let vhdl_ls_config = render_vhdl_ls_config(workspace_dir, None)?;
     let mut processor = RecordProcessor::new(vhdl_std);
     let mut cache = FileCache::new();
 
-    fs::create_dir_all(crate::BUILD_DIR)?;
+    fs::create_dir_all(build_dir)?;
 
     // Analyze external libraries
     analyze_ext_libraries(
         &vhdl_ls_config,
         &mut processor,
         vhdl_std,
-        crate::BUILD_DIR,
+        build_dir,
         &mut cache,
     )
     .await?;
@@ -157,9 +158,8 @@ pub async fn run_analog_test(
     files.push(entity_file.to_string_lossy().to_string());
 
     // Compile VHDL
-    run_nvc_analysis(vhdl_std, crate::BUILD_DIR, "work", &files, false).await?;
-    run_nvc_elab(vhdl_std, crate::BUILD_DIR, "work", entity_name, false)
-        .await?;
+    run_nvc_analysis(vhdl_std, build_dir, "work", &files, false).await?;
+    run_nvc_elab(vhdl_std, build_dir, "work", entity_name, false).await?;
 
     // Build the bridge crate
     let bridge_lib =
@@ -178,7 +178,7 @@ pub async fn run_analog_test(
     // Run co-simulation
     run_nvc_cosim(
         vhdl_std,
-        crate::BUILD_DIR,
+        build_dir,
         "work",
         entity_name,
         &bridge_lib_str,

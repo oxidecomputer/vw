@@ -28,6 +28,8 @@ use colored::*;
 use vw_eda::EdaBackend;
 
 use crate::load_htcl_program_for_test;
+use crate::test_ui::NextestPanel;
+use indicatif::ProgressBar;
 
 /// Entry point wired from `main.rs::Commands::Test`.
 #[allow(clippy::too_many_arguments)]
@@ -84,16 +86,15 @@ pub async fn run_htcl_tests(
     let (shared, dedicated): (Vec<_>, Vec<_>) =
         all_tests.into_iter().partition(|t| !t.dedicated);
 
-    println!(
-        "\nrunning {} tests",
-        (shared.len() + dedicated.len()).to_string().bold()
-    );
+    let panel =
+        NextestPanel::new((shared.len() + dedicated.len()) as u64, "tests");
 
     if !shared.is_empty() {
         run_shared_bucket(
             &ws,
             shared,
             &mut summary,
+            &panel,
             part,
             variant,
             log_level,
@@ -107,6 +108,7 @@ pub async fn run_htcl_tests(
             dedicated,
             test_threads,
             &mut summary,
+            &panel,
             part,
             variant,
             log_level,
@@ -115,6 +117,7 @@ pub async fn run_htcl_tests(
         .await?;
     }
 
+    panel.clear();
     print_summary(&summary, overall_start.elapsed());
     if summary.failed > 0 {
         std::process::exit(1);
@@ -339,10 +342,12 @@ fn extract_target_from_test_attr(attr: &vw_htcl::Attribute) -> Option<String> {
 
 /// Run all shared-bucket tests in ONE Vivado session. First-file
 /// setup lands once, then each proc-invocation is a separate eval.
+#[allow(clippy::too_many_arguments)]
 async fn run_shared_bucket(
     ws: &Utf8Path,
     tests: Vec<TestCase>,
     summary: &mut RunSummary,
+    panel: &NextestPanel,
     part: Option<&str>,
     variant: Option<&str>,
     log_level: vw_vivado::LogLevel,
@@ -357,14 +362,6 @@ async fn run_shared_bucket(
     // workspace default (or the CLI's `--part` / `--variant`
     // selector if the user passed one).
     let auto_project = workspace_auto_project(ws, part, variant)?;
-    // Show the first test's name up front with a "starting vivado"
-    // status so the run doesn't look hung during the ~10-30s
-    // Vivado boot. `run_one_test` overwrites this line as soon as
-    // it fires its own "running" line.
-    if let Some(first) = tests.first() {
-        let label = format!("{}::{}", first.display_path, first.name);
-        print_status_line("starting vivado", &label);
-    }
     let active_variant = resolve_active_variant_name(ws, variant)?;
     let mut backend = spawn_backend(
         ws,
@@ -378,14 +375,10 @@ async fn run_shared_bucket(
     let mut shipped: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
     for test in tests {
-        run_one_test(
-            &mut backend,
-            &test,
-            summary,
-            &mut shipped,
-            /*display_shipped=*/ true,
-        )
-        .await;
+        let label = format!("{}::{}", test.display_path, test.name);
+        let row = panel.start(&label);
+        run_one_test(&mut backend, &test, summary, &mut shipped, panel, &row)
+            .await;
     }
     // Detach shutdown — see `run_dedicated_bucket` for the
     // rationale; here it saves the summary block from a 10s
@@ -404,6 +397,7 @@ async fn run_dedicated_bucket(
     tests: Vec<TestCase>,
     test_threads: usize,
     summary: &mut RunSummary,
+    panel: &NextestPanel,
     part: Option<&str>,
     variant: Option<&str>,
     log_level: vw_vivado::LogLevel,
@@ -477,7 +471,7 @@ async fn run_dedicated_bucket(
         // test). Overwritten by run_one_test's "running" once
         // spawn returns.
         let label = format!("{}::{}", test.display_path, test.name);
-        print_status_line("starting vivado", &label);
+        let row = panel.start(&label);
         // Per-test variant precedence: `@test(dedicated-eda variant=…)`
         // wins over the CLI `--variant`, which in turn wins over the
         // workspace default. Only meaningful when the workspace is
@@ -498,14 +492,8 @@ async fn run_dedicated_bucket(
         .await?;
         let mut shipped: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
-        run_one_test(
-            &mut backend,
-            &test,
-            summary,
-            &mut shipped,
-            /*display_shipped=*/ false,
-        )
-        .await;
+        run_one_test(&mut backend, &test, summary, &mut shipped, panel, &row)
+            .await;
         // Detach shutdown. Vivado's tear-down is a 10s-bounded
         // graceful-exit dance (see VivadoBackend::shutdown), and
         // for an in-memory test session nothing about that wait is
@@ -528,30 +516,22 @@ async fn run_one_test(
     test: &TestCase,
     summary: &mut RunSummary,
     shipped: &mut std::collections::HashSet<PathBuf>,
-    _display_shipped: bool,
+    panel: &NextestPanel,
+    row: &ProgressBar,
 ) {
     let started = Instant::now();
     let label = format!("{}::{}", test.display_path, test.name);
-    // Live "RUN" line — on a TTY we print with `\r` (no newline)
-    // and overwrite in place when the test finishes; on non-TTY
-    // we suppress it entirely so log files stay linear. Same
-    // convention nextest uses. Vivado boot takes ~10-30s per
-    // shared bucket, so without this the runner looks hung until
-    // the first PASS/FAIL prints.
-    print_running_line(&label);
     // Ship setup once per file per session. Any error during setup
     // is a hard-fail — subsequent tests in the same file would
     // observe a broken state, so we bail on the whole file.
     if shipped.insert(test.file_path.clone()) {
         for line in &test.setup_tcl {
             if let Err(e) = backend.eval(line).await {
-                let elapsed = format_secs(started.elapsed().as_secs_f64());
-                clear_running_line();
-                println!(
-                    " {} [{}] {} — setup error",
-                    "FAIL".red().bold(),
-                    elapsed.red(),
-                    label,
+                panel.finish(
+                    row,
+                    &format!("{label} — setup error"),
+                    false,
+                    started.elapsed().as_secs_f64(),
                 );
                 summary.failed += 1;
                 summary.failures.push(TestFailure {
@@ -565,20 +545,11 @@ async fn run_one_test(
     // Actually invoke the test proc.
     match backend.eval(&test.name).await {
         Ok(_) => {
-            let elapsed = format_secs(started.elapsed().as_secs_f64());
-            clear_running_line();
-            println!(
-                " {} [{}] {}",
-                "PASS".green().bold(),
-                elapsed.green(),
-                label,
-            );
+            panel.finish(row, &label, true, started.elapsed().as_secs_f64());
             summary.passed += 1;
         }
         Err(e) => {
-            let elapsed = format_secs(started.elapsed().as_secs_f64());
-            clear_running_line();
-            println!(" {} [{}] {}", "FAIL".red().bold(), elapsed.red(), label,);
+            panel.finish(row, &label, false, started.elapsed().as_secs_f64());
             summary.failed += 1;
             summary.failures.push(TestFailure {
                 display: label,
@@ -588,51 +559,8 @@ async fn run_one_test(
     }
 }
 
-/// Print the "currently running" line for `label`, overwriting
-/// itself on the next `clear_running_line`. No-op on non-TTY —
-/// the label would just fill the log with cursor-return sequences
-/// that get rendered as literal `\r`.
-fn print_running_line(label: &str) {
-    print_status_line("running", label);
-}
-
-/// Same shape as [`print_running_line`] but with a caller-chosen
-/// status word. Used to show `starting vivado` up front while the
-/// backend boots (~10-30s) so the runner doesn't look hung on
-/// dedicated-eda tests before their first eval.
-fn print_status_line(status: &str, label: &str) {
-    use std::io::{IsTerminal, Write};
-    let mut out = std::io::stdout();
-    if !out.is_terminal() {
-        return;
-    }
-    // Pad status to a consistent width so successive re-renders
-    // ("starting vivado" → "running") overwrite cleanly without
-    // trailing chars leaking through.
-    let _ = write!(
-        out,
-        "\r {} [ {:16} ] {}",
-        "RUN ".cyan().bold(),
-        status.cyan(),
-        label,
-    );
-    let _ = out.flush();
-}
-
-fn clear_running_line() {
-    use std::io::{IsTerminal, Write};
-    let mut out = std::io::stdout();
-    if !out.is_terminal() {
-        return;
-    }
-    // Overwrite the RUN line with spaces then \r back to column 0,
-    // so the PASS/FAIL println that follows lands at the start of
-    // the line. 120 cols is enough for any reasonable test name +
-    // decoration; longer names truncate the RUN line in place,
-    // which is fine because it's transient.
-    let _ = write!(out, "\r{}\r", " ".repeat(120));
-    let _ = out.flush();
-}
+// The RUN/PASS/FAIL line machinery lives in `crate::test_ui`, shared
+// with the `vw bench` runner so the two look identical.
 
 async fn spawn_backend(
     ws: &Utf8Path,
@@ -770,17 +698,7 @@ fn print_summary(summary: &RunSummary, elapsed: std::time::Duration) {
             print_failure_block(f);
         }
     }
-    let outcome = if summary.failed == 0 {
-        "ok".green().bold().to_string()
-    } else {
-        "FAILED".red().bold().to_string()
-    };
-    println!(
-        "\ntest result: {outcome}. {} passed; {} failed; finished in {}",
-        summary.passed.to_string().green(),
-        summary.failed.to_string().red(),
-        format_secs(elapsed.as_secs_f64()),
-    );
+    crate::test_ui::print_result_line(summary.passed, summary.failed, elapsed);
 }
 
 /// Print one failure block. Layout mirrors nextest's:
@@ -847,10 +765,6 @@ fn strip_message_prefix<'a>(info: &'a str, message: &str) -> &'a str {
     } else {
         info
     }
-}
-
-fn format_secs(secs: f64) -> String {
-    format!("{secs:>6.3}s")
 }
 
 #[cfg(test)]
