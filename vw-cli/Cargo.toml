@@ -32,3 +32,7 @@ indicatif.workspace = true
 serde_json.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+# Demangle Rust (v0/legacy) and C++ symbols in captured crash backtraces so
+# `vw bench` failure blocks are readable.
+rustc-demangle = "0.1"
+cpp_demangle = "0.4"

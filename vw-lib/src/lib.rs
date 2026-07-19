@@ -2270,6 +2270,28 @@ pub fn vhdl_ip_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Enumerate every VHDL source under `<workspace>/bench/` — the
+/// testbenches plus any shared bench code — skipping the `bench/target/`
+/// build tree. These join `defaultlib` so the LSP can resolve an opened
+/// testbench against the design it exercises (otherwise its `work.*`
+/// instantiations are all undefined), and so `run_testbench` sees shared
+/// bench code.
+pub fn vhdl_bench_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    let bench_dir = workspace_dir.join("bench");
+    if !bench_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let target = bench_dir.join("target");
+    let mut files = find_vhdl_files(
+        bench_dir.as_std_path(),
+        /*recursive=*/ true,
+        &[],
+    )?;
+    files.retain(|p| !p.starts_with(target.as_std_path()));
+    files.sort();
+    Ok(files)
+}
+
 /// Derive the VHDL library name a dep's sources compile into.
 /// Hyphens become underscores (Vivado's `xelab` and NVC both
 /// reject library names containing hyphens). Same rule
@@ -2969,7 +2991,7 @@ pub async fn ensure_anodized(
     vhdl_std: VhdlStandard,
     active_variant: Option<&str>,
 ) -> Result<()> {
-    let config = render_vhdl_ls_config(workspace_dir, active_variant)?;
+    let config = render_vhdl_ls_config(workspace_dir, active_variant, false)?;
 
     // Tagged records live in the design sources, i.e. `defaultlib`.
     let defaultlib_files = config
@@ -3069,7 +3091,7 @@ pub async fn run_testbench(
         .await;
     }
 
-    let vhdl_ls_config = render_vhdl_ls_config(workspace_dir, None)?;
+    let vhdl_ls_config = render_vhdl_ls_config(workspace_dir, None, false)?;
     let mut processor = RecordProcessor::new(vhdl_std);
     let mut cache = FileCache::new();
 
@@ -3241,6 +3263,7 @@ pub async fn run_testbench(
 pub fn render_vhdl_ls_config(
     workspace_dir: &Utf8Path,
     active_variant: Option<&str>,
+    include_bench: bool,
 ) -> Result<VhdlLsConfig> {
     let mut libraries: HashMap<String, VhdlLsLibrary> = HashMap::new();
 
@@ -3253,10 +3276,17 @@ pub fn render_vhdl_ls_config(
     // the inactive variant's broken references.
     let resolved_variant =
         resolve_active_variant(workspace_dir, active_variant);
-    let design_files = vhdl_design_sources_for_variant(
+    let mut design_files = vhdl_design_sources_for_variant(
         workspace_dir,
         resolved_variant.as_deref(),
     )?;
+    // The LSP puts testbenches in `defaultlib` so an opened tb resolves
+    // against `work.*`. The sim / anodize paths must NOT — they compile only
+    // the referenced design set and would choke on bench files that pull in
+    // external libs (e.g. VUnit) or on unrelated broken testbenches.
+    if include_bench {
+        design_files.extend(vhdl_bench_sources(workspace_dir)?);
+    }
     if !design_files.is_empty() {
         libraries.insert(
             "defaultlib".to_string(),
@@ -3328,7 +3358,8 @@ pub fn render_vhdl_lang_config(
     workspace_dir: &Utf8Path,
     active_variant: Option<&str>,
 ) -> Result<vhdl_lang::Config> {
-    let ls_config = render_vhdl_ls_config(workspace_dir, active_variant)?;
+    // The LSP wants testbenches resolvable, so it includes bench sources.
+    let ls_config = render_vhdl_ls_config(workspace_dir, active_variant, true)?;
     let toml_str = toml::to_string(&ls_config)?;
     vhdl_lang::Config::from_str(&toml_str, workspace_dir.as_std_path()).map_err(
         |e| VwError::Config {
@@ -5876,7 +5907,7 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         std::fs::create_dir_all(&bd_root).unwrap();
         std::fs::write(bd_root.join("dcmac_wrapper.vhd"), "").unwrap();
 
-        let cfg = render_vhdl_ls_config(&ws, None).unwrap();
+        let cfg = render_vhdl_ls_config(&ws, None, false).unwrap();
 
         assert!(
             cfg.libraries.contains_key("defaultlib"),

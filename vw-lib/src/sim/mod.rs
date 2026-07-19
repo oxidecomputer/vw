@@ -108,7 +108,7 @@ pub async fn run_analog_test(
     vhdl_std: VhdlStandard,
     build_dir: &str,
 ) -> crate::Result<()> {
-    let vhdl_ls_config = render_vhdl_ls_config(workspace_dir, None)?;
+    let vhdl_ls_config = render_vhdl_ls_config(workspace_dir, None, false)?;
     let mut processor = RecordProcessor::new(vhdl_std);
     let mut cache = FileCache::new();
 

@@ -176,20 +176,88 @@ fn discover_benches(
     Ok(names)
 }
 
-/// Failure block for one bench: the tail of its captured output, in the
-/// same visual frame `vw test` uses for HTCL failures.
+/// Failure block for one bench, in the same visual frame `vw test` uses:
+/// the key diagnostic lines surfaced up front, then a (demangled) tail of
+/// the captured output for context.
 fn print_bench_failure(f: &BenchResult) {
     let bar = "─".repeat(64);
     println!("{}", bar.red());
     println!(" {} {}", "✗".red().bold(), f.name.bold());
-    let trimmed = f.output.trim_end();
-    if !trimmed.is_empty() {
+
+    let lines: Vec<&str> = f.output.trim_end().lines().collect();
+
+    // The real reason (`** Fatal: …`, `panicked at …`, `error: …`) often
+    // sits far above the tail — pull those lines out and show them first.
+    let key: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| is_key_error_line(l))
+        .collect();
+    if !key.is_empty() {
+        println!("\n{}", "ERROR:".red().bold());
+        for l in &key {
+            println!("  {}", demangle_line(l).red());
+        }
+    }
+
+    if !lines.is_empty() {
         println!("\n{}", "OUTPUT (tail):".bright_black().bold());
-        let lines: Vec<&str> = trimmed.lines().collect();
         let start = lines.len().saturating_sub(40);
-        for line in &lines[start..] {
-            println!("  {line}");
+        for l in &lines[start..] {
+            println!("  {}", demangle_line(l));
         }
     }
     println!("{}\n", bar.red());
+}
+
+/// Lines worth pulling out of a long crash dump.
+fn is_key_error_line(line: &str) -> bool {
+    let l = line.trim_start();
+    l.starts_with("** Fatal:")
+        || l.starts_with("** Error:")
+        || l.starts_with("error:")
+        || l.contains("panicked at")
+        || l.contains("Caught signal")
+        || l.starts_with("Assertion")
+        || l.contains("TEST FAILED")
+}
+
+/// Demangle any Rust (`_R…`) or C++ (`_Z…`) symbols on a line so nvc
+/// backtraces are legible. Lines with no mangled tokens pass through
+/// untouched.
+fn demangle_line(line: &str) -> String {
+    if !line.contains("_R") && !line.contains("_Z") {
+        return line.to_string();
+    }
+    line.split(' ')
+        .map(|tok| {
+            if tok.starts_with("_R") || tok.starts_with("_Z") {
+                demangle_symbol(tok)
+            } else {
+                tok.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn demangle_symbol(sym: &str) -> String {
+    if sym.starts_with("_R") {
+        // Rust v0 — unambiguous. `{:#}` drops the disambiguator hash.
+        if let Ok(d) = rustc_demangle::try_demangle(sym) {
+            return format!("{d:#}");
+        }
+    } else if sym.starts_with("_Z") {
+        // C++ (Itanium) — with a fallback to legacy Rust `_ZN…` mangling.
+        if let Ok(s) = cpp_demangle::Symbol::new(sym) {
+            if let Ok(d) = s.demangle(&cpp_demangle::DemangleOptions::default())
+            {
+                return d;
+            }
+        }
+        if let Ok(d) = rustc_demangle::try_demangle(sym) {
+            return format!("{d:#}");
+        }
+    }
+    sym.to_string()
 }
