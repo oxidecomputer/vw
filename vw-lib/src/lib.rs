@@ -3166,8 +3166,16 @@ pub async fn run_testbench(
 
     run_nvc_elab(vhdl_std, BUILD_DIR, "work", &testbench_name, false).await?;
 
-    // Build Rust library if requested
-    let rust_lib_path = if build_rust {
+    // A testbench whose directory is a Rust crate is a cosim bench: its DUT
+    // inputs are driven by that Rust driver, so it must be loaded or the
+    // inputs float and numeric_std floods with metavalue warnings. Build and
+    // load it automatically (even without an explicit `--build-rust`); a
+    // pure-VHDL testbench (no `Cargo.toml`) is unaffected.
+    let is_cosim_bench = testbench_file
+        .parent()
+        .map(|dir| dir.join("Cargo.toml").exists())
+        .unwrap_or(false);
+    let rust_lib_path = if build_rust || is_cosim_bench {
         Some(
             build_rust_library(&bench_dir, &testbench_file)
                 .await?
