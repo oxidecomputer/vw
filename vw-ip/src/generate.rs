@@ -2936,10 +2936,9 @@ fn parse_quad_slot(name: &str) -> Option<(usize, String)> {
 fn parse_dir_channel(local: &str) -> Option<(&'static str, usize)> {
     let (dir, rest) = if let Some(r) = local.strip_prefix("RX") {
         ("RX", r)
-    } else if let Some(r) = local.strip_prefix("TX") {
-        ("TX", r)
     } else {
-        return None;
+        let r = local.strip_prefix("TX")?;
+        ("TX", r)
     };
     // Channel index has to be a run of digits terminating the local
     // name (`RX0`, `TX3`). Anything else disqualifies.
