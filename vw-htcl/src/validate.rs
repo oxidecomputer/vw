@@ -2589,6 +2589,23 @@ fn is_known_tcl_builtin(name: &str) -> bool {
     )
 }
 
+/// Compiler-emitted primitive-prelude procs: `<T>::<suffix>` for a
+/// primitive type `T` and a conversion suffix. `emit_primitive_prelude`
+/// (in `crate::repr`) ships a `namespace eval <T> { proc repr … }`
+/// block for each primitive at session start — they are NOT `src`d, so
+/// a direct call like `list::repr -v {…}` or `dict::repr -v $d` has no
+/// entry in the proc table and would otherwise trip the unknown-call
+/// check. Same rationale as `putr` in [`is_known_tcl_builtin`]: the
+/// analyzer has to know these exist. Keep the `(type, suffix)` sets in
+/// lockstep with `emit_primitive_prelude`.
+fn is_primitive_prelude_proc(name: &str) -> bool {
+    let Some((ns, leaf)) = name.rsplit_once("::") else {
+        return false;
+    };
+    matches!(ns, "string" | "int" | "bool" | "unit" | "list" | "dict")
+        && matches!(leaf, "repr" | "from" | "to" | "to_raw" | "from_raw")
+}
+
 /// Join a namespace prefix with a member name using Tcl's `::`
 /// separator. The empty prefix yields the bare name (used at the
 /// document root where there's no enclosing namespace).
@@ -2667,6 +2684,7 @@ fn validate_command(
             None
         };
         let should_flag = !is_known_tcl_builtin(call_name)
+            && !is_primitive_prelude_proc(call_name)
             && (uses_keyword || namespaced_match.is_some());
         if should_flag {
             // Prefer the exact namespaced match as the "did you
@@ -3604,6 +3622,25 @@ puts [get_thing X]
         // unknown-call error.
         let src = "string match -nocase pat str\n";
         assert!(diags(src).is_empty());
+    }
+
+    #[test]
+    fn primitive_prelude_reprs_are_not_undefined() {
+        // `list::repr` / `dict::repr` (and the other primitive
+        // conversion procs) ship via `emit_primitive_prelude`, not
+        // `src`, so their `-v` calls must NOT trip the unknown-call
+        // check. Regression guard for the `list::`/`dict::` errors.
+        let src = "\
+puts [list::repr -v {a b c}]
+puts [dict::repr -v {foo 1 bar 2}]
+puts [string::repr -v hi]
+puts [int::from -v 3]
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|e| !e.message.contains("undefined proc")),
+            "primitive prelude reprs should resolve, got: {d:?}",
+        );
     }
 
     #[test]
