@@ -1147,8 +1147,19 @@ pub async fn update_workspace_with_token(
                     ),
                         })?;
                 let dep_path = deps_dir.join(format!("{name}-{commit_sha}"));
-                let was_cached = dep_path.exists();
+                // A dir left behind by a PARTIAL/failed prior download
+                // (e.g. the cache dir was created but nothing copied
+                // into it) must not count as cached — otherwise the
+                // retry short-circuits and the broken cache sticks.
+                let was_cached = dep_path.exists()
+                    && fs::read_dir(&dep_path)
+                        .map(|mut d| d.next().is_some())
+                        .unwrap_or(false);
                 if !was_cached {
+                    // Clear any empty/partial leftover before retrying.
+                    if dep_path.exists() {
+                        let _ = fs::remove_dir_all(&dep_path);
+                    }
                     download_dependency(
                         repo,
                         &commit_sha,
@@ -4247,17 +4258,93 @@ async fn download_dependency(
         message: format!("Failed to create destination directory: {e}"),
     })?;
 
-    // Treat all src values as globs (handles files, directories, and patterns)
-    for src_path in &src_paths {
-        copy_vhdl_files_glob(
-            temp_dir.path(),
-            src_path,
-            dest_path,
-            recursive,
-            exclude,
-        )?;
+    if src_paths.is_empty() {
+        // Htcl module dependency: no VHDL `src` globs are declared, so
+        // the dep publishes its WHOLE module tree — `module.htcl` plus
+        // everything it `src`s and any shipped assets (e.g. a
+        // `vivado-shim.tcl`). Materialize the full checkout into the
+        // cache, preserving directory structure. Without this the
+        // VHDL-only copy below matches nothing and leaves the cache
+        // dir empty, so `src @<dep>` can't find `<dep>/module.htcl`.
+        copy_module_tree(temp_dir.path(), dest_path, exclude)?;
+    } else {
+        // VHDL source dependency: copy the declared `src` globs,
+        // filtered to VHDL and flattened relative to each prefix.
+        for src_path in &src_paths {
+            copy_vhdl_files_glob(
+                temp_dir.path(),
+                src_path,
+                dest_path,
+                recursive,
+                exclude,
+            )?;
+        }
     }
 
+    Ok(())
+}
+
+/// Copy an entire checked-out repo tree from `src_root` into `dest`,
+/// preserving directory structure. Used for htcl module dependencies
+/// (empty `src`), which publish their whole tree rather than a
+/// filtered set of VHDL sources — see the call site in
+/// [`download_dependency`]. Skips the `.git` metadata dir and honors
+/// structure-relative `exclude` globs.
+fn copy_module_tree(
+    src_root: &Path,
+    dest: &Path,
+    exclude: &[String],
+) -> Result<()> {
+    let exclude_patterns: Vec<glob::Pattern> = exclude
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+    copy_module_tree_impl(src_root, src_root, dest, &exclude_patterns)
+}
+
+fn copy_module_tree_impl(
+    root: &Path,
+    dir: &Path,
+    dest: &Path,
+    exclude: &[glob::Pattern],
+) -> Result<()> {
+    for entry in fs::read_dir(dir).map_err(|e| VwError::FileSystem {
+        message: format!("Failed to read directory {dir:?}: {e}"),
+    })? {
+        let entry = entry.map_err(|e| VwError::FileSystem {
+            message: format!("Failed to read directory entry: {e}"),
+        })?;
+        // Never materialize VCS metadata (at any depth — submodules
+        // carry their own `.git` file/dir).
+        if entry.file_name() == std::ffi::OsStr::new(".git") {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let rel_str = rel.to_string_lossy();
+        if exclude.iter().any(|p| p.matches(&rel_str)) {
+            continue;
+        }
+        if path.is_dir() {
+            copy_module_tree_impl(root, &path, dest, exclude)?;
+        } else if path.is_file() {
+            let dest_file = dest.join(rel);
+            if let Some(parent) = dest_file.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    VwError::FileSystem {
+                        message: format!(
+                            "Failed to create directory {parent:?}: {e}"
+                        ),
+                    }
+                })?;
+            }
+            fs::copy(&path, &dest_file).map_err(|e| VwError::FileSystem {
+                message: format!(
+                    "Failed to copy {path:?} to {dest_file:?}: {e}"
+                ),
+            })?;
+        }
+    }
     Ok(())
 }
 
