@@ -856,6 +856,32 @@ async fn main() {
                 );
                 return;
             }
+            // Transparently fetch missing dependencies before
+            // checking — the way `cargo check` fetches absent deps
+            // rather than erroring on an unresolved import. Cheap,
+            // offline no-op when everything is already cached; only
+            // reaches the network (via the `vw update` machinery) when
+            // a declared git dep isn't materialized (fresh checkout,
+            // `vw clear`, or a newly-added dep).
+            if let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) {
+                if !vw_lib::dependencies_present(&ws) {
+                    println!(
+                        "{} fetching missing dependencies…",
+                        "note:".bright_yellow()
+                    );
+                    let creds =
+                        get_access_credentials_for_workspace(&ws, false);
+                    if let Err(e) =
+                        update_workspace_with_token(&ws, creds).await
+                    {
+                        eprintln!(
+                            "{} failed to fetch dependencies: {e}",
+                            "error:".bright_red()
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
             let mut had_errors = false;
             // conflicts_with on the clap args guarantees at most
             // one non-Default source at a time. Map both flag

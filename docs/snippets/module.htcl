@@ -1,0 +1,20 @@
+src @clk-wizard
+
+set clkout [
+  clk_wizard::clkout
+    -requested_out_frequency {400,_,_,_,_,_,_}
+]
+
+set clk_cfg [
+  clk_wizard::configure
+    -prim_in_freq {250}
+    -prim_source No_buffer
+    -clkout $clkout
+    -use [
+      clk_wizard::use
+        -locked true
+        -reset true
+    ]
+]
+
+clk_wizard::create -name primary_clock -config $clk_cfg

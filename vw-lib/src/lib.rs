@@ -33,6 +33,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use camino::{Utf8Path, Utf8PathBuf};
+use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
@@ -771,7 +772,7 @@ pub struct LockFile {
     pub dependencies: HashMap<String, LockedDependency>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockedDependency {
     pub repo: String,
     pub commit: String,
@@ -1103,117 +1104,44 @@ pub async fn update_workspace_with_token(
     workspace_dir: &Utf8Path,
     credentials: Option<Credentials>,
 ) -> Result<UpdateResult> {
-    let config = load_workspace_config(workspace_dir)?;
-    let deps_dir = deps_directory()?;
+    // Resolve and fetch the WHOLE transitive dependency graph. Cargo
+    // model: the entry's `vw.lock` pins every dep — direct AND
+    // deps-of-deps — so a transitive import like `src @vivado-cmd` from
+    // inside `@clk-wizard` resolves without the consumer redeclaring
+    // it. Missing git deps are downloaded as the graph is built.
+    let creds = credentials
+        .as_ref()
+        .map(|c| (c.username.as_str(), c.password.as_str()));
+    let graph = build_dependency_graph(workspace_dir, true, creds).await?;
 
     let mut lock_file = LockFile {
         dependencies: HashMap::new(),
     };
-
     let mut update_info = Vec::new();
-
-    // Fetch both regular and test dependencies. Same lockfile
-    // section (locks are name → commit; there's no downstream code
-    // that cares whether a locked entry came from `[dependencies]`
-    // vs `[test-dependencies]`). VHDL libraries still get indexed
-    // for both, matching Cargo's model where dev-deps are visible
-    // to test builds.
-    for (name, dep) in config
-        .test_dependencies
-        .iter()
-        .chain(config.dependencies.iter())
-    {
-        let creds = credentials
-            .as_ref()
-            .map(|c| (c.username.as_str(), c.password.as_str()));
-
-        // Decide the on-disk location for this dep: cache directory
-        // for git deps (downloaded if missing), or the declared
-        // filesystem path for local deps. Local deps don't get a lock
-        // entry — there's no commit to pin.
-        let _dep_path = match &dep.source {
-            DependencySource::Git {
-                repo,
-                branch,
-                commit,
-                submodules,
-            } => {
-                let commit_sha =
-                    resolve_dependency_commit(repo, branch, commit, creds)
-                        .await
-                        .map_err(|e| VwError::Dependency {
-                            message: format!(
-                        "Failed to resolve commit for dependency '{name}': {e}"
-                    ),
-                        })?;
-                let dep_path = deps_dir.join(format!("{name}-{commit_sha}"));
-                // A dir left behind by a PARTIAL/failed prior download
-                // (e.g. the cache dir was created but nothing copied
-                // into it) must not count as cached — otherwise the
-                // retry short-circuits and the broken cache sticks.
-                let was_cached = dep_path.exists()
-                    && fs::read_dir(&dep_path)
-                        .map(|mut d| d.next().is_some())
-                        .unwrap_or(false);
-                if !was_cached {
-                    // Clear any empty/partial leftover before retrying.
-                    if dep_path.exists() {
-                        let _ = fs::remove_dir_all(&dep_path);
-                    }
-                    download_dependency(
-                        repo,
-                        &commit_sha,
-                        &dep.src,
-                        &dep_path,
-                        dep.recursive,
-                        &dep.exclude,
-                        *submodules,
-                        creds,
-                    )
-                    .await
-                    .map_err(|e| VwError::Dependency {
-                        message: format!(
-                            "Failed to download dependency '{name}': {e}"
-                        ),
-                    })?;
-                }
+    for idx in graph.node_indices() {
+        let node = &graph[idx];
+        let Some(name) = node.name.clone() else {
+            continue; // the entry workspace itself — not a dependency
+        };
+        match &node.locked {
+            // Git dep: record its pin in the entry lock.
+            Some(locked) => {
                 update_info.push(DependencyUpdateInfo {
                     name: name.clone(),
-                    commit: commit_sha.clone(),
-                    was_cached,
+                    commit: locked.commit.clone(),
+                    was_cached: node.was_cached,
                 });
-                lock_file.dependencies.insert(
-                    name.clone(),
-                    LockedDependency {
-                        repo: repo.clone(),
-                        commit: commit_sha.clone(),
-                        src: dep.src.clone(),
-                        path: PathBuf::from(format!("{name}-{commit_sha}")),
-                        recursive: dep.recursive,
-                        sim_only: dep.sim_only,
-                        submodules: *submodules,
-                        exclude: dep.exclude.clone(),
-                    },
-                );
-                dep_path
+                lock_file.dependencies.insert(name, locked.clone());
             }
-            DependencySource::Path { path } => {
-                if !path.exists() {
-                    return Err(VwError::Dependency {
-                        message: format!(
-                            "Local dependency '{name}' path does not exist: {}",
-                            path.display()
-                        ),
-                    });
-                }
+            // Path dep: no commit to pin, so no lock entry.
+            None => {
                 update_info.push(DependencyUpdateInfo {
-                    name: name.clone(),
+                    name,
                     commit: "local".into(),
                     was_cached: true,
                 });
-                path.clone()
             }
-        };
+        }
     }
 
     write_lock_file(workspace_dir, &lock_file)?;
@@ -1222,6 +1150,254 @@ pub async fn update_workspace_with_token(
     Ok(UpdateResult {
         dependencies: update_info,
     })
+}
+
+/// One workspace in the dependency graph built by
+/// [`build_dependency_graph`]: the entry, a git dep, or a path dep.
+#[derive(Debug, Clone)]
+struct DepGraphNode {
+    /// The dependency name this node was reached as; `None` for the
+    /// entry workspace (which nothing depends on).
+    name: Option<String>,
+    /// On-disk root — a git dep's cache dir, a path dep's source tree,
+    /// or the entry's own directory.
+    root: Utf8PathBuf,
+    /// Lock entry to record for a git dependency; `None` for the entry
+    /// and for path deps (no commit to pin).
+    locked: Option<LockedDependency>,
+    /// For a git dep: whether its cache dir was already present rather
+    /// than freshly downloaded. Always `true` for non-git nodes.
+    was_cached: bool,
+}
+
+/// Build the transitive dependency graph rooted at `entry`, downloading
+/// any missing git dependencies into the per-user cache as it walks.
+///
+/// petgraph gives cycle-safe traversal: a dev-dependency cycle (e.g.
+/// `vw` test-depends on `testlib`, which depends back on `vw`) collapses
+/// to a single shared node visited once, so the walk terminates. It
+/// also matches the Cargo resolution model the import resolver already
+/// assumes — the entry workspace pins the whole graph: the first time a
+/// dep name is seen (starting from the entry) fixes its node; a later
+/// occurrence of the same name only adds an edge, never a re-fetch.
+///
+/// Only the entry's `[test-dependencies]` are followed (when
+/// `include_test`); a transitive dep's dev-deps stay private to it,
+/// mirroring [`transitive_dep_cache_paths_with_test`].
+async fn build_dependency_graph(
+    entry: &Utf8Path,
+    include_test: bool,
+    credentials: Option<(&str, &str)>,
+) -> Result<DiGraph<DepGraphNode, ()>> {
+    let deps_dir = deps_directory()?;
+    let mut graph: DiGraph<DepGraphNode, ()> = DiGraph::new();
+    // First-seen (entry-wins) node per dep name; also the cycle guard.
+    let mut node_by_name: HashMap<String, NodeIndex> = HashMap::new();
+
+    let entry_root = entry
+        .canonicalize_utf8()
+        .unwrap_or_else(|_| entry.to_path_buf());
+    let entry_idx = graph.add_node(DepGraphNode {
+        name: None,
+        root: entry_root.clone(),
+        locked: None,
+        was_cached: true,
+    });
+
+    // Worklist of (parent node, workspace root, is_entry).
+    let mut queue = vec![(entry_idx, entry_root, true)];
+    while let Some((parent, ws, is_entry)) = queue.pop() {
+        let Ok(config) = load_workspace_config(&ws) else {
+            continue;
+        };
+        // The entry contributes its dev-deps too; transitive deps only
+        // propagate their regular `[dependencies]`.
+        let mut deps: Vec<(String, Dependency)> =
+            config.dependencies.into_iter().collect();
+        if is_entry && include_test {
+            deps.extend(config.test_dependencies);
+        }
+        for (name, dep) in deps {
+            // Entry-wins: a name already resolved keeps its node — just
+            // wire the edge so the graph stays complete — and is never
+            // re-fetched or re-queued (this is also the cycle guard).
+            if let Some(&existing) = node_by_name.get(&name) {
+                graph.update_edge(parent, existing, ());
+                continue;
+            }
+            let node = match &dep.source {
+                DependencySource::Git {
+                    repo,
+                    branch,
+                    commit,
+                    submodules,
+                } => {
+                    let sha = resolve_dependency_commit(
+                        repo,
+                        branch,
+                        commit,
+                        credentials,
+                    )
+                    .await
+                    .map_err(|e| VwError::Dependency {
+                        message: format!(
+                            "Failed to resolve commit for dependency \
+                             '{name}': {e}"
+                        ),
+                    })?;
+                    let root = deps_dir.join(format!("{name}-{sha}"));
+                    // A dir left by a PARTIAL/failed prior download
+                    // (created but empty) must not count as cached.
+                    let was_cached = root.exists()
+                        && fs::read_dir(&root)
+                            .map(|mut d| d.next().is_some())
+                            .unwrap_or(false);
+                    if !was_cached {
+                        if root.exists() {
+                            let _ = fs::remove_dir_all(&root);
+                        }
+                        download_dependency(
+                            repo,
+                            &sha,
+                            &dep.src,
+                            &root,
+                            dep.recursive,
+                            &dep.exclude,
+                            *submodules,
+                            credentials,
+                        )
+                        .await
+                        .map_err(|e| {
+                            VwError::Dependency {
+                                message: format!(
+                                "Failed to download dependency '{name}': {e}"
+                            ),
+                            }
+                        })?;
+                    }
+                    let root =
+                        Utf8PathBuf::from_path_buf(root).map_err(|p| {
+                            VwError::FileSystem {
+                                message: format!(
+                                    "dependency cache path is not UTF-8: {}",
+                                    p.display()
+                                ),
+                            }
+                        })?;
+                    DepGraphNode {
+                        name: Some(name.clone()),
+                        root,
+                        was_cached,
+                        locked: Some(LockedDependency {
+                            repo: repo.clone(),
+                            commit: sha.clone(),
+                            src: dep.src.clone(),
+                            path: PathBuf::from(format!("{name}-{sha}")),
+                            recursive: dep.recursive,
+                            sim_only: dep.sim_only,
+                            submodules: *submodules,
+                            exclude: dep.exclude.clone(),
+                        }),
+                    }
+                }
+                DependencySource::Path { .. } => {
+                    let Some(p) = dep.local_path() else {
+                        continue;
+                    };
+                    let root = resolve_local_dep_path(&ws, p);
+                    let root =
+                        Utf8PathBuf::from_path_buf(root).map_err(|p| {
+                            VwError::FileSystem {
+                                message: format!(
+                                    "path dependency is not UTF-8: {}",
+                                    p.display()
+                                ),
+                            }
+                        })?;
+                    DepGraphNode {
+                        name: Some(name.clone()),
+                        root,
+                        locked: None,
+                        was_cached: true,
+                    }
+                }
+            };
+            let root = node.root.clone();
+            // Recurse only into deps that are themselves htcl
+            // workspaces (a leaf dep is just files).
+            let recurse = root.join("vw.toml").exists();
+            let idx = graph.add_node(node);
+            node_by_name.insert(name, idx);
+            graph.add_edge(parent, idx, ());
+            if recurse {
+                queue.push((idx, root, false));
+            }
+        }
+    }
+    Ok(graph)
+}
+
+/// Whether every dependency in this workspace's transitive closure is
+/// already materialized. Cheap and fully offline — reads only
+/// `vw.toml`, `vw.lock`, and the cache dir, never the network — so it
+/// can gate `vw check` the way `cargo check` transparently fetches
+/// absent deps instead of face-planting on an unresolved `src @dep`.
+///
+/// Path deps need no cache, so a workspace with only path deps is
+/// always "present". Returns `false` when a declared git dep has no
+/// lock entry (added but never `vw update`d) or its cache dir is
+/// missing/empty (never fetched, or `vw clear`ed) — the signal that a
+/// fetch is needed. Both `[dependencies]` and `[test-dependencies]` are
+/// considered, matching what `vw update` materializes.
+pub fn dependencies_present(workspace_dir: &Utf8Path) -> bool {
+    let Ok(config) = load_workspace_config(workspace_dir) else {
+        // Missing/unreadable vw.toml — nothing we can assert is
+        // missing; let the check itself surface any real problem.
+        return true;
+    };
+    // (a) Every DECLARED git dep must have a lock entry. A dep freshly
+    // added to vw.toml but never `vw update`d won't appear in the
+    // transitive walk below (which reads the lock), so catch it here.
+    let declared_git: Vec<String> = config
+        .dependencies
+        .iter()
+        .chain(config.test_dependencies.iter())
+        .filter(|(_, d)| matches!(d.source, DependencySource::Git { .. }))
+        .map(|(n, _)| n.clone())
+        .collect();
+    if !declared_git.is_empty() {
+        match load_lock_file(workspace_dir) {
+            Ok(lock) => {
+                if declared_git
+                    .iter()
+                    .any(|n| !lock.dependencies.contains_key(n))
+                {
+                    return false;
+                }
+            }
+            Err(_) => return false, // git deps declared, no lock at all
+        }
+    }
+    // (b) Every dep in the transitive closure must be materialized on
+    // disk. `transitive_dep_cache_paths_with_test` walks the whole
+    // graph (direct + deps-of-deps, via each dep's bundled lock); a
+    // `vw clear`ed or partially-fetched cache dir counts as missing.
+    let Ok(paths) = transitive_dep_cache_paths_with_test(workspace_dir, true)
+    else {
+        return true;
+    };
+    for (_name, path) in paths {
+        // Path deps resolve to real source trees (always present); git
+        // deps resolve into the cache and may be absent or empty.
+        let present = path.exists()
+            && fs::read_dir(&path)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+        if !present {
+            return false;
+        }
+    }
+    true
 }
 
 /// One-time migration nudge on `vw update`: if the workspace still
@@ -3824,13 +4000,16 @@ pub fn dep_cache_paths_with_test(
     if let Ok(config) = load_workspace_config(workspace_dir) {
         for (name, dep) in config.dependencies {
             if let Some(path) = dep.local_path() {
-                out.insert(name, path.to_path_buf());
+                out.insert(name, resolve_local_dep_path(workspace_dir, path));
             }
         }
         if include_test {
             for (name, dep) in config.test_dependencies {
                 if let Some(path) = dep.local_path() {
-                    out.insert(name, path.to_path_buf());
+                    out.insert(
+                        name,
+                        resolve_local_dep_path(workspace_dir, path),
+                    );
                 }
             }
         }
@@ -3866,6 +4045,23 @@ fn resolve_dep_path(path: &Path) -> Result<PathBuf> {
     }
     let deps_dir = deps_directory()?;
     Ok(deps_dir.join(path))
+}
+
+/// Resolve a `path = "..."` dependency to an absolute, canonicalized
+/// root. Relative paths resolve against the workspace that DECLARES
+/// them (the same Cargo rule [`resolve_dep_source_path`] uses), so a
+/// dep buried in a transitive workspace — e.g. an in-tree `testlib`
+/// that declares `vw = ".."` — points at the real directory instead of
+/// leaking its literal `..` into the import resolver. Canonicalizing
+/// also lets the transitive walk dedup a circular dep (vw → testlib →
+/// vw) by real path rather than looping on `<vw>/testlib/..`.
+fn resolve_local_dep_path(workspace_dir: &Utf8Path, path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_dir.as_std_path().join(path)
+    };
+    abs.canonicalize().unwrap_or(abs)
 }
 
 /// Like [`dep_cache_paths`], but walks the dependency graph
@@ -3907,8 +4103,13 @@ pub fn transitive_dep_cache_paths_with_test(
     // `include_test`; everything queued after gets the normal
     // treatment.
     let mut first_iter = true;
-    let mut queue: Vec<PathBuf> =
-        vec![entry_workspace_dir.as_std_path().to_path_buf()];
+    // Canonicalize the entry so it dedups against the canonicalized
+    // dep roots `resolve_local_dep_path` produces — otherwise a
+    // circular local dep (vw → testlib → vw) reappears as
+    // `<vw>/testlib/..` and the walk never converges.
+    let entry = entry_workspace_dir.as_std_path().to_path_buf();
+    let entry = entry.canonicalize().unwrap_or(entry);
+    let mut queue: Vec<PathBuf> = vec![entry];
 
     while let Some(ws) = queue.pop() {
         if !visited.insert(ws.clone()) {

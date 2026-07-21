@@ -8,6 +8,8 @@ top = "top"
 part = "xcau25p-ffvb676-2-e"
 default = true
 
-[dependencies]
+[dependencies.clk-wizard]
+repo = "https://github.com/oxidecomputer/clk-wizard.htcl"
+branch = "main"
 
 [test-dependencies]
