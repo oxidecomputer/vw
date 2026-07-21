@@ -1,0 +1,13 @@
+[workspace]
+name = "."
+version = "0.1.0"
+variants = []
+top = "top"
+
+[[workspace.target-parts]]
+part = "xcau25p-ffvb676-2-e"
+default = true
+
+[dependencies]
+
+[test-dependencies]

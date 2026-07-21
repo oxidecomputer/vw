@@ -1,0 +1,24 @@
+enum PipelineDepth {
+  Four
+  Eight
+  Sixteen
+}
+
+enum FrequencyMhz {
+  F100,
+  F200,
+  F300
+}
+
+proc core {
+  ## How many pipelines the core should have
+  pipeline_depth: PipelineDepth
+
+  ## What frequency to run the core at
+  frequency: FrequencyMhz
+
+  ## Whether or not to include floating point support
+  floating_point: bool
+} {
+
+}
