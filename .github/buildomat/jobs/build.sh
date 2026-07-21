@@ -8,7 +8,8 @@
 #:   "/work/release/*",
 #: ]
 #: access_repos = [
-#:   "oxidecomputer/ipe"
+#:   "oxidecomputer/ipe",
+#:   "oxidecomputer/anodizer"
 #: ]
 #:
 #: [[publish]]

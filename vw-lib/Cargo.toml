@@ -10,7 +10,7 @@ categories = ["development-tools"]
 
 [dependencies]
 vw-core = { path = "../vw-core" }
-anodizer = { git = "https://github.com/oxidecomputer/anodizer" }
+anodizer.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

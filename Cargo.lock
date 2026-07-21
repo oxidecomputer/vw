@@ -35,6 +35,7 @@ dependencies = [
 [[package]]
 name = "anodizer"
 version = "0.1.0"
+source = "git+https://github.com/oxidecomputer/anodizer?branch=ry%2Fvw-restructure#43fbe290c08b2af04b708bd189b4f0fcddb9b400"
 dependencies = [
  "camino",
  "clap",
@@ -1323,6 +1324,7 @@ dependencies = [
 [[package]]
 name = "ipxact"
 version = "0.1.0"
+source = "git+https://github.com/oxidecomputer/ipe?branch=ry%2Finit#2f18277e5760dda1346162ff9250caebc797d06c"
 dependencies = [
  "quick-xml",
  "serde",
