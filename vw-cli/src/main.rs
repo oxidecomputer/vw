@@ -918,6 +918,50 @@ async fn main() {
                     }
                 }
             }
+            // VHDL static analysis (vhdl_ls) over the workspace's own
+            // HDL — the same checks the editor surfaces live, run in
+            // batch alongside the htcl check. A no-op for a pure-htcl
+            // workspace (nothing rendered into a VHDL library).
+            if let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) {
+                match vw_lib::check_vhdl(&ws, None) {
+                    Ok(diags) if !diags.is_empty() => {
+                        let cwd_owned = std::env::current_dir().ok();
+                        let cwd_ref = cwd_owned.as_deref();
+                        let (mut errs, mut warns) = (0usize, 0usize);
+                        for d in &diags {
+                            let label = match d.severity {
+                                vw_lib::VhdlSeverity::Error => {
+                                    errs += 1;
+                                    "error:".bright_red()
+                                }
+                                vw_lib::VhdlSeverity::Warning => {
+                                    warns += 1;
+                                    "warning:".yellow()
+                                }
+                                vw_lib::VhdlSeverity::Info => "info:".cyan(),
+                                vw_lib::VhdlSeverity::Hint => "hint:".cyan(),
+                            };
+                            let path = render_path(&d.file, cwd_ref);
+                            eprintln!(
+                                "{label} {path}:{}:{}: {}",
+                                d.line, d.column, d.message,
+                            );
+                        }
+                        eprintln!("VHDL: {errs} error(s), {warns} warning(s)");
+                        if errs > 0 {
+                            had_errors = true;
+                        }
+                    }
+                    Ok(_) => {} // no VHDL, or no findings
+                    Err(e) => {
+                        had_errors = true;
+                        eprintln!(
+                            "{} vhdl check failed: {e}",
+                            "error:".bright_red(),
+                        );
+                    }
+                }
+            }
             if had_errors {
                 process::exit(1);
             }

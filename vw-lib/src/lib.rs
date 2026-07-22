@@ -3555,6 +3555,121 @@ pub fn render_vhdl_lang_config(
     )
 }
 
+/// Severity of a [`VhdlDiagnostic`] — a `vw`-local mirror of
+/// `vhdl_lang::Severity` so callers don't need to depend on
+/// `vhdl_lang` themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VhdlSeverity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+/// A single vhdl_lang static-analysis finding, flattened for display.
+/// Line/column are 1-based and ready to print.
+#[derive(Debug, Clone)]
+pub struct VhdlDiagnostic {
+    pub file: PathBuf,
+    pub line: u32,
+    pub column: u32,
+    pub severity: VhdlSeverity,
+    pub message: String,
+}
+
+/// Run vhdl_lang static analysis over the workspace's VHDL — the same
+/// analysis `vw-analyzer` runs live in the editor, but in one batch —
+/// and return the non-suppressed findings that land in the workspace's
+/// OWN tree. Dependency libraries and the bundled VHDL standard library
+/// are analyzed for name resolution but their internal diagnostics are
+/// filtered out: the user can't fix those and they'd only be noise.
+/// Results are sorted by file, then position.
+///
+/// Cheap no-op returning an empty vec when the workspace renders no
+/// VHDL libraries — a pure-htcl workspace has no HDL to check, so we
+/// skip building the project (and parsing the standard library) too.
+pub fn check_vhdl(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<Vec<VhdlDiagnostic>> {
+    let ls_config = render_vhdl_ls_config(workspace_dir, active_variant, true)?;
+    if ls_config.libraries.values().all(|lib| lib.files.is_empty()) {
+        return Ok(Vec::new()); // no VHDL to analyze
+    }
+    let toml_str = toml::to_string(&ls_config)?;
+    let user_config =
+        vhdl_lang::Config::from_str(&toml_str, workspace_dir.as_std_path())
+            .map_err(|e| VwError::Config {
+                message: format!("vhdl_lang config parse failed: {e}"),
+            })?;
+
+    // Load the VHDL standard library (`std` / `ieee`) exactly the way
+    // the LSP does: `load_external_config` searches the installed
+    // `vhdl_libraries` dir (plus `$VHDL_LS_CONFIG` / `~/.vhdl_ls.toml`);
+    // the workspace's own libraries are then appended on top. Without
+    // `std`, vhdl_lang's type-graph construction panics on the
+    // universal-integer lookup — so if discovery finds nothing (no
+    // rust_hdl `vhdl_libraries` installed) we skip the VHDL check
+    // rather than crash. `vw check` still runs the htcl half.
+    let mut messages = vhdl_lang::NullMessages;
+    let mut config = vhdl_lang::Config::default();
+    config.load_external_config(&mut messages, None);
+    if !config.iter_libraries().any(|lib| lib.name() == "std") {
+        return Ok(Vec::new());
+    }
+    config.append(&user_config, &mut messages);
+
+    let severities = *config.severities();
+    let mut project = vhdl_lang::Project::from_config(config, &mut messages);
+
+    // Restrict findings to the workspace's own *source* tree: not deps
+    // under `~/.vw/deps`, not the bundled standard library, and not the
+    // `target/` build output. Generated RTL (Vivado IP wrappers, BD
+    // netlists) is still analyzed so the design's references resolve,
+    // but diagnostics INSIDE it are the tool's output, not the user's
+    // HDL — reporting them (e.g. an undeclared `UNISIM` in a generated
+    // wrapper) is just noise here.
+    let ws_root = workspace_dir
+        .as_std_path()
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.as_std_path().to_path_buf());
+    let ws_target = ws_root.join("target");
+
+    let mut out: Vec<VhdlDiagnostic> = project
+        .analyse()
+        .into_iter()
+        .filter_map(|d| {
+            let severity = severities[d.code]?; // `None` = suppressed
+            let file = d.pos.file_name();
+            let canon = file.canonicalize();
+            let path = canon.as_deref().unwrap_or(file);
+            if !path.starts_with(&ws_root) || path.starts_with(&ws_target) {
+                return None;
+            }
+            let start = d.pos.start();
+            Some(VhdlDiagnostic {
+                file: file.to_path_buf(),
+                line: start.line + 1,
+                column: start.character + 1,
+                severity: match severity {
+                    vhdl_lang::Severity::Error => VhdlSeverity::Error,
+                    vhdl_lang::Severity::Warning => VhdlSeverity::Warning,
+                    vhdl_lang::Severity::Info => VhdlSeverity::Info,
+                    vhdl_lang::Severity::Hint => VhdlSeverity::Hint,
+                },
+                message: d.message,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.line.cmp(&b.line))
+            .then(a.column.cmp(&b.column))
+    });
+    Ok(out)
+}
+
 /// Resolve which variant the LSP renderer should filter to.
 ///
 /// Precedence:
