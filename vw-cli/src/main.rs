@@ -920,45 +920,60 @@ async fn main() {
             }
             // VHDL static analysis (vhdl_ls) over the workspace's own
             // HDL — the same checks the editor surfaces live, run in
-            // batch alongside the htcl check. A no-op for a pure-htcl
-            // workspace (nothing rendered into a VHDL library).
+            // batch alongside the htcl check. Skipped entirely for a
+            // pure-htcl workspace (nothing rendered into a VHDL library).
             if let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) {
-                match vw_lib::check_vhdl(&ws, None) {
-                    Ok(diags) if !diags.is_empty() => {
-                        let cwd_owned = std::env::current_dir().ok();
-                        let cwd_ref = cwd_owned.as_deref();
-                        let (mut errs, mut warns) = (0usize, 0usize);
-                        for d in &diags {
-                            let label = match d.severity {
-                                vw_lib::VhdlSeverity::Error => {
-                                    errs += 1;
-                                    "error:".bright_red()
-                                }
-                                vw_lib::VhdlSeverity::Warning => {
-                                    warns += 1;
-                                    "warning:".yellow()
-                                }
-                                vw_lib::VhdlSeverity::Info => "info:".cyan(),
-                                vw_lib::VhdlSeverity::Hint => "hint:".cyan(),
-                            };
-                            let path = render_path(&d.file, cwd_ref);
+                if vw_lib::workspace_has_vhdl(&ws, None) {
+                    // Make sure the VHDL standard library is available —
+                    // fetched into the dep cache on first use so a
+                    // machine without a system rust_hdl install still
+                    // analyzes. On failure, fall back to vhdl_lang's
+                    // built-in search (`None`), which just skips VHDL if
+                    // nothing is found.
+                    let stdlib = vw_lib::ensure_vhdl_stdlib().await.ok();
+                    match vw_lib::check_vhdl(&ws, None, stdlib.as_deref()) {
+                        Ok(diags) if !diags.is_empty() => {
+                            let cwd_owned = std::env::current_dir().ok();
+                            let cwd_ref = cwd_owned.as_deref();
+                            let (mut errs, mut warns) = (0usize, 0usize);
+                            for d in &diags {
+                                let label = match d.severity {
+                                    vw_lib::VhdlSeverity::Error => {
+                                        errs += 1;
+                                        "error:".bright_red()
+                                    }
+                                    vw_lib::VhdlSeverity::Warning => {
+                                        warns += 1;
+                                        "warning:".yellow()
+                                    }
+                                    vw_lib::VhdlSeverity::Info => {
+                                        "info:".cyan()
+                                    }
+                                    vw_lib::VhdlSeverity::Hint => {
+                                        "hint:".cyan()
+                                    }
+                                };
+                                let path = render_path(&d.file, cwd_ref);
+                                eprintln!(
+                                    "{label} {path}:{}:{}: {}",
+                                    d.line, d.column, d.message,
+                                );
+                            }
                             eprintln!(
-                                "{label} {path}:{}:{}: {}",
-                                d.line, d.column, d.message,
+                                "VHDL: {errs} error(s), {warns} warning(s)"
+                            );
+                            if errs > 0 {
+                                had_errors = true;
+                            }
+                        }
+                        Ok(_) => {} // no VHDL, or no findings
+                        Err(e) => {
+                            had_errors = true;
+                            eprintln!(
+                                "{} vhdl check failed: {e}",
+                                "error:".bright_red(),
                             );
                         }
-                        eprintln!("VHDL: {errs} error(s), {warns} warning(s)");
-                        if errs > 0 {
-                            had_errors = true;
-                        }
-                    }
-                    Ok(_) => {} // no VHDL, or no findings
-                    Err(e) => {
-                        had_errors = true;
-                        eprintln!(
-                            "{} vhdl check failed: {e}",
-                            "error:".bright_red(),
-                        );
                     }
                 }
             }

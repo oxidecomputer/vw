@@ -133,11 +133,22 @@ impl VhdlBackend {
                 return None;
             }
         };
+        // Make sure the VHDL standard library is available — fetched
+        // into the dep cache on first use — and point vhdl_ls at it, so
+        // a machine without a system rust_hdl install still resolves
+        // `ieee` / `std`. `None` (fetch failed, offline + uncached)
+        // falls back to vhdl_ls's built-in search of installed
+        // locations.
+        let stdlib = vw_lib::ensure_vhdl_stdlib()
+            .await
+            .ok()
+            .map(|p| p.to_string());
         let handle = spawn_workspace_worker(
             ws.clone(),
             self.client.clone(),
             self.runtime.clone(),
             cfg,
+            stdlib,
         );
         map.insert(ws, handle.clone());
         Some(handle)
@@ -149,10 +160,18 @@ fn spawn_workspace_worker(
     client: Client,
     runtime: tokio::runtime::Handle,
     initial_config: vhdl_lang::Config,
+    stdlib_libraries_path: Option<String>,
 ) -> Arc<WorkspaceHandle> {
     let (tx, rx) = std::sync::mpsc::channel::<Message>();
     let thread = std::thread::spawn(move || {
-        workspace_thread(root, client, runtime, initial_config, rx);
+        workspace_thread(
+            root,
+            client,
+            runtime,
+            initial_config,
+            stdlib_libraries_path,
+            rx,
+        );
     });
     Arc::new(WorkspaceHandle {
         tx,
@@ -165,6 +184,7 @@ fn workspace_thread(
     client: Client,
     runtime: tokio::runtime::Handle,
     initial_config: vhdl_lang::Config,
+    stdlib_libraries_path: Option<String>,
     rx: std::sync::mpsc::Receiver<Message>,
 ) {
     let bridge = TowerLspRpc { client, runtime };
@@ -173,6 +193,9 @@ fn workspace_thread(
         rpc,
         vhdl_ls::VHDLServerSettings {
             non_project_file_handling: vhdl_ls::NonProjectFileHandling::Analyze,
+            // Point vhdl_ls at the stdlib vw fetched into the dep cache
+            // (`None` → its built-in search of installed locations).
+            libraries_path: stdlib_libraries_path,
             ..Default::default()
         },
         initial_config,

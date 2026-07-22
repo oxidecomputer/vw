@@ -1265,6 +1265,7 @@ async fn build_dependency_graph(
                             &dep.exclude,
                             *submodules,
                             credentials,
+                            None,
                         )
                         .await
                         .map_err(|e| {
@@ -3577,6 +3578,105 @@ pub struct VhdlDiagnostic {
     pub message: String,
 }
 
+/// Git source of the VHDL standard library (`std` / `ieee`).
+/// `vhdl_lang` needs these VHDL sources to build its type graph but
+/// doesn't bundle them — on a machine with no rust_hdl install, its
+/// `load_external_config` search comes up empty and analysis panics on
+/// the universal-integer lookup. Rather than vendoring the library, vw
+/// materializes it through the normal dependency cache
+/// (`~/.vw/deps/rust_hdl-<sha>/vhdl_libraries`) and hands vhdl_lang that
+/// path.
+///
+/// Tracks the default branch (`master`) — the only ref
+/// `download_dependency`'s shallow clone can fetch — resolved once at
+/// first download. The stdlib is the fixed VHDL standard, so tracking
+/// HEAD is safe and independent of the analyzer version; a cached copy
+/// is then reused forever with no further network. `vw clear` drops it
+/// and the next check re-fetches.
+const VHDL_STDLIB_REPO: &str = "https://github.com/vhdl-ls/rust_hdl";
+const VHDL_STDLIB_BRANCH: &str = "master";
+
+/// Path to an already-materialized rust_hdl `vhdl_libraries` dir in the
+/// dependency cache, if any. The stdlib is stable, so any cached copy
+/// is usable — checked with no network so it works offline.
+fn find_cached_vhdl_stdlib(deps_dir: &Path) -> Option<Utf8PathBuf> {
+    for entry in fs::read_dir(deps_dir).ok()?.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("rust_hdl-") {
+            continue;
+        }
+        let libs = entry.path().join("vhdl_libraries");
+        let present = libs.exists()
+            && fs::read_dir(&libs)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+        if present {
+            if let Ok(u) = Utf8PathBuf::from_path_buf(libs) {
+                return Some(u);
+            }
+        }
+    }
+    None
+}
+
+/// Ensure the VHDL standard library is present in the dependency cache
+/// and return the path to its `vhdl_libraries` dir — ready to hand to
+/// [`check_vhdl`] (and, through `load_external_config`, to `vhdl_lang`).
+///
+/// Reuses any cached copy without touching the network; otherwise
+/// downloads [`VHDL_STDLIB_REPO`] on first use through the same
+/// `download_dependency` machinery as any other git dependency.
+pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
+    let deps_dir = deps_directory()?;
+    if let Some(libs) = find_cached_vhdl_stdlib(&deps_dir) {
+        return Ok(libs);
+    }
+    let sha = resolve_dependency_commit(
+        VHDL_STDLIB_REPO,
+        &Some(VHDL_STDLIB_BRANCH.to_string()),
+        &None,
+        None,
+    )
+    .await?;
+    let dep_path = deps_dir.join(format!("rust_hdl-{sha}"));
+    let libs = dep_path.join("vhdl_libraries");
+    let present = libs.exists()
+        && fs::read_dir(&libs)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+    if !present {
+        if dep_path.exists() {
+            let _ = fs::remove_dir_all(&dep_path);
+        }
+        download_dependency(
+            VHDL_STDLIB_REPO,
+            &sha,
+            &[],
+            &dep_path,
+            false,
+            &[],
+            false,
+            None,
+            Some("vhdl_libraries"),
+        )
+        .await?;
+    }
+    Utf8PathBuf::from_path_buf(libs).map_err(|p| VwError::FileSystem {
+        message: format!("VHDL stdlib path is not UTF-8: {}", p.display()),
+    })
+}
+
+/// Cheap check for whether a workspace renders any VHDL. Gates the
+/// (stdlib-fetching) VHDL check so pure-htcl workspaces skip it — and
+/// its one-time network download — entirely.
+pub fn workspace_has_vhdl(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> bool {
+    render_vhdl_ls_config(workspace_dir, active_variant, true)
+        .map(|c| c.libraries.values().any(|lib| !lib.files.is_empty()))
+        .unwrap_or(false)
+}
+
 /// Run vhdl_lang static analysis over the workspace's VHDL — the same
 /// analysis `vw-analyzer` runs live in the editor, but in one batch —
 /// and return the non-suppressed findings that land in the workspace's
@@ -3591,6 +3691,7 @@ pub struct VhdlDiagnostic {
 pub fn check_vhdl(
     workspace_dir: &Utf8Path,
     active_variant: Option<&str>,
+    stdlib_libraries_path: Option<&Utf8Path>,
 ) -> Result<Vec<VhdlDiagnostic>> {
     let ls_config = render_vhdl_ls_config(workspace_dir, active_variant, true)?;
     if ls_config.libraries.values().all(|lib| lib.files.is_empty()) {
@@ -3603,17 +3704,21 @@ pub fn check_vhdl(
                 message: format!("vhdl_lang config parse failed: {e}"),
             })?;
 
-    // Load the VHDL standard library (`std` / `ieee`) exactly the way
-    // the LSP does: `load_external_config` searches the installed
-    // `vhdl_libraries` dir (plus `$VHDL_LS_CONFIG` / `~/.vhdl_ls.toml`);
-    // the workspace's own libraries are then appended on top. Without
-    // `std`, vhdl_lang's type-graph construction panics on the
-    // universal-integer lookup — so if discovery finds nothing (no
-    // rust_hdl `vhdl_libraries` installed) we skip the VHDL check
-    // rather than crash. `vw check` still runs the htcl half.
+    // Load the VHDL standard library (`std` / `ieee`) via
+    // `load_external_config`, then append the workspace's own libraries
+    // on top. `stdlib_libraries_path` points at a `vhdl_libraries` dir
+    // (vw fetches one into the dep cache — see `ensure_vhdl_stdlib`);
+    // `None` falls back to vhdl_lang's built-in search of installed
+    // locations. Without `std`, vhdl_lang's type-graph construction
+    // panics on the universal-integer lookup — so if it's still missing
+    // we skip the VHDL check rather than crash. `vw check` still runs
+    // the htcl half.
     let mut messages = vhdl_lang::NullMessages;
     let mut config = vhdl_lang::Config::default();
-    config.load_external_config(&mut messages, None);
+    config.load_external_config(
+        &mut messages,
+        stdlib_libraries_path.map(|p| p.to_string()),
+    );
     if !config.iter_libraries().any(|lib| lib.name() == "std") {
         return Ok(Vec::new());
     }
@@ -4418,6 +4523,11 @@ async fn download_dependency(
     exclude: &[String],
     submodules: bool,
     credentials: Option<(&str, &str)>, // (username, password)
+    // When `Some`, materialize ONLY this subdirectory of the checkout
+    // (structure-preserving, all file types) instead of the whole tree
+    // — lets us pull just `vhdl_libraries/` out of the large rust_hdl
+    // repo rather than caching its entire source.
+    subdir: Option<&str>,
 ) -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| VwError::FileSystem {
         message: format!("Failed to create temporary directory: {e}"),
@@ -4574,7 +4684,15 @@ async fn download_dependency(
         message: format!("Failed to create destination directory: {e}"),
     })?;
 
-    if src_paths.is_empty() {
+    if let Some(subdir) = subdir {
+        // Subtree dependency: copy just `<checkout>/<subdir>` into
+        // `<dest>/<subdir>`, preserving structure and every file type.
+        copy_module_tree(
+            &temp_dir.path().join(subdir),
+            &dest_path.join(subdir),
+            exclude,
+        )?;
+    } else if src_paths.is_empty() {
         // Htcl module dependency: no VHDL `src` globs are declared, so
         // the dep publishes its WHOLE module tree — `module.htcl` plus
         // everything it `src`s and any shipped assets (e.g. a
