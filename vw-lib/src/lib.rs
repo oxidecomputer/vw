@@ -3236,6 +3236,65 @@ fn dir_is_rust_crate(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Regenerate the cosim bridge scaffold (`Cargo.toml`, `build.rs`,
+/// generated sources) for every `bench/<name>/mist.toml` in the
+/// workspace, up front.
+///
+/// `bench/` is a single cargo workspace whose members include each
+/// mixed-signal bench crate, so a missing `bench/<name>/Cargo.toml`
+/// (e.g. after `git clean -fdx`, which wipes the generated scaffold)
+/// makes cargo fail to LOAD the workspace manifest — breaking
+/// `cargo build` for EVERY bench, not just the cosim ones. Scaffolding
+/// them all before any bench builds keeps the workspace valid; the
+/// mixed-signal benches themselves don't have to be run (or even
+/// discovered) for their crate to need to exist. `write_file` is
+/// content-aware, so unchanged scaffolds don't touch the tree.
+pub fn ensure_bench_scaffolds(workspace_dir: &Utf8Path) -> Result<()> {
+    let bench_dir = workspace_dir.join("bench");
+    let Ok(entries) = fs::read_dir(bench_dir.as_std_path()) else {
+        return Ok(()); // no bench dir → nothing to scaffold
+    };
+    let mut ws_config: Option<WorkspaceConfig> = None;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let mist_toml = dir.join("mist.toml");
+        if !dir.is_dir() || !mist_toml.exists() {
+            continue;
+        }
+        let mist_content =
+            fs::read_to_string(&mist_toml).map_err(|e| VwError::Config {
+                message: format!("Failed to read {}: {e}", mist_toml.display()),
+            })?;
+        let mist_config: MistConfig =
+            toml::from_str(&mist_content).map_err(|e| VwError::Config {
+                message: format!(
+                    "Failed to parse {}: {e}",
+                    mist_toml.display()
+                ),
+            })?;
+        // Load the workspace config lazily and once — only needed when
+        // there's at least one mixed-signal bench.
+        if ws_config.is_none() {
+            ws_config = Some(load_workspace_config(workspace_dir)?);
+        }
+        let bench_test_dir =
+            Utf8PathBuf::from_path_buf(dir.clone()).map_err(|p| {
+                VwError::FileSystem {
+                    message: format!(
+                        "bench path is not UTF-8: {}",
+                        p.display()
+                    ),
+                }
+            })?;
+        sim::scaffold(
+            &bench_test_dir,
+            &mist_config,
+            &ws_config.as_ref().unwrap().tools,
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_testbench(
     workspace_dir: &Utf8Path,
@@ -3267,6 +3326,15 @@ pub async fn run_testbench(
                 &ws_config.tools,
             );
         }
+        // Auto-scaffold before simulating so `vw bench` works straight
+        // from a clean checkout (`git clean -fdx` wipes the generated
+        // bridge crate — `Cargo.toml`, `build.rs`, generated sources —
+        // that `run_analog_test`'s `build_bridge_library` needs) without
+        // a manual `vw bench --scaffold <name>` pre-step. `scaffold`
+        // regenerates only the boilerplate (the user-owned `src/lib.rs`
+        // is left alone) and `write_file` is content-aware, so this is a
+        // cheap no-op when nothing changed.
+        sim::scaffold(&bench_test_dir, &mist_config, &ws_config.tools)?;
         return sim::run_analog_test(
             workspace_dir,
             &testbench_name,

@@ -109,7 +109,17 @@ fn expand_tilde(path: &str) -> String {
 }
 
 fn write_file(path: impl AsRef<Path>, content: &str) -> crate::Result<()> {
-    let mut f = fs::File::create(path.as_ref())?;
+    let path = path.as_ref();
+    // Content-aware: skip the write when the file already holds exactly
+    // this content. Scaffolding runs before every `vw bench` (so a
+    // clean checkout self-heals), and an unconditional truncate+write
+    // would bump the mtime of `Cargo.toml`/`build.rs`/generated sources
+    // every run — forcing cargo to rebuild the bridge crate each time.
+    // Leaving unchanged files untouched keeps the incremental build hot.
+    if fs::read_to_string(path).is_ok_and(|existing| existing == content) {
+        return Ok(());
+    }
+    let mut f = fs::File::create(path)?;
     f.write_all(content.as_bytes())?;
     Ok(())
 }

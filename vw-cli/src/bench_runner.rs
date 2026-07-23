@@ -70,6 +70,19 @@ pub async fn run_benches(
         std::process::exit(1);
     }
 
+    // Regenerate every mixed-signal bench's cosim scaffold up front.
+    // `bench/` is one cargo workspace whose members include each
+    // `bench/<name>` cosim crate; a missing generated
+    // `bench/<name>/Cargo.toml` (e.g. after `git clean -fdx`) makes
+    // cargo fail to LOAD the workspace manifest, so EVERY bench's rust
+    // build face-plants — not just the cosim ones. Doing this before the
+    // fan-out keeps the workspace valid; content-aware writes make it a
+    // no-op when nothing changed.
+    if let Err(e) = vw_lib::ensure_bench_scaffolds(&ws) {
+        eprintln!("{} bench scaffold failed: {e}", "error:".bright_red());
+        std::process::exit(1);
+    }
+
     let overall = Instant::now();
     let panel = Arc::new(NextestPanel::new(names.len() as u64, "testbenches"));
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
