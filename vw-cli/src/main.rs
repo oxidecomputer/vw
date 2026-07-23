@@ -675,6 +675,13 @@ async fn main() {
             scaffold,
             build_dir,
         } => {
+            // Self-heal a fresh checkout like `vw check`. Skip the
+            // internal `--build-dir` subprocess (the parent runner
+            // already fetched — re-fetching per bench would race) and
+            // `--list` (pure metadata, no deps needed).
+            if build_dir.is_none() && !list {
+                ensure_workspace_deps(&cwd).await;
+            }
             if let Some(bd) = build_dir {
                 // Internal single-exec mode — the parallel runner fans out one
                 // subprocess per bench into an isolated build dir. Run exactly
@@ -757,6 +764,9 @@ async fn main() {
             info_with_stack,
             bunyan,
         } => {
+            // Self-heal a fresh checkout: fetch missing deps the same
+            // way `vw check` does before resolving `src @dep` imports.
+            ensure_workspace_deps(&cwd).await;
             let resolved = match file {
                 Some(f) => f,
                 None => match discover_entry_file(&cwd) {
@@ -799,6 +809,9 @@ async fn main() {
             // Silent no-op when there's no workspace or no
             // `design.htcl` — the REPL still boots and the user
             // can `:load` something explicitly.
+            // Self-heal a fresh checkout: fetch missing deps the same
+            // way `vw check` does before the REPL resolves `src @dep`.
+            ensure_workspace_deps(&cwd).await;
             let resolved_load = initial_load.or_else(|| {
                 vw_lib::find_workspace_dir(cwd.as_std_path())
                     .and_then(|ws| vw_lib::find_design_file(&ws))
@@ -856,49 +869,10 @@ async fn main() {
                 );
                 return;
             }
-            // Transparently fetch missing dependencies before
-            // checking — the way `cargo check` fetches absent deps
-            // rather than erroring on an unresolved import. Cheap,
-            // offline no-op when everything is already cached; only
-            // reaches the network (via the `vw update` machinery) when
-            // a declared git dep isn't materialized (fresh checkout,
-            // `vw clear`, or a newly-added dep).
-            if let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) {
-                // If a dependency was switched `repo → path` in
-                // `vw.toml`, the old git pin lingers in `vw.lock` and
-                // (without this) would shadow the path dep at resolution
-                // time. Drop just those stale entries — surgically, so
-                // no other git dep gets re-resolved/bumped.
-                match vw_lib::prune_stale_path_deps_from_lock(&ws) {
-                    Ok(true) => println!(
-                        "{} updated vw.lock (a dependency changed to a \
-                         path dep)",
-                        "note:".bright_yellow(),
-                    ),
-                    Ok(false) => {}
-                    Err(e) => eprintln!(
-                        "{} could not update vw.lock: {e}",
-                        "warning:".yellow(),
-                    ),
-                }
-                if !vw_lib::dependencies_present(&ws) {
-                    println!(
-                        "{} fetching missing dependencies…",
-                        "note:".bright_yellow()
-                    );
-                    let creds =
-                        get_access_credentials_for_workspace(&ws, false);
-                    if let Err(e) =
-                        update_workspace_with_token(&ws, creds).await
-                    {
-                        eprintln!(
-                            "{} failed to fetch dependencies: {e}",
-                            "error:".bright_red()
-                        );
-                        process::exit(1);
-                    }
-                }
-            }
+            // Transparently fetch missing dependencies before checking
+            // — the way `cargo` fetches absent deps rather than erroring
+            // on an unresolved import. Shared with `run`/`bench`/`repl`.
+            ensure_workspace_deps(&cwd).await;
             let mut had_errors = false;
             // conflicts_with on the clap args guarantees at most
             // one non-Default source at a time. Map both flag
@@ -1478,6 +1452,46 @@ fn discover_sibling_vivado_cmd(start: &Utf8Path) -> Option<Utf8PathBuf> {
 ///
 /// A [`CliObserver`] is attached so the loader's progress prints in
 /// real time as `Sourcing …` / `Checking …` lines.
+/// Transparently fetch missing dependencies before a workspace op —
+/// the way `cargo` fetches absent deps rather than erroring on an
+/// unresolved import. Cheap, offline no-op when everything is already
+/// cached; only reaches the network (via the `vw update` machinery)
+/// when a declared git dep isn't materialized (fresh checkout,
+/// `vw clear`, or a newly-added dep). Also surgically prunes a stale
+/// git lock entry left by a `repo → path` switch. Exits the process on
+/// a fetch failure. Shared by `vw check` / `run` / `bench` / `repl` so
+/// they all self-heal a fresh checkout the same way.
+async fn ensure_workspace_deps(cwd: &Utf8Path) {
+    let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) else {
+        return;
+    };
+    // A `repo → path` switch in `vw.toml` leaves the old git pin in
+    // `vw.lock`, which would shadow the path dep at resolution time.
+    // Drop just those stale entries — surgically, so no other git dep
+    // gets re-resolved/bumped.
+    match vw_lib::prune_stale_path_deps_from_lock(&ws) {
+        Ok(true) => println!(
+            "{} updated vw.lock (a dependency changed to a path dep)",
+            "note:".bright_yellow(),
+        ),
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("{} could not update vw.lock: {e}", "warning:".yellow(),)
+        }
+    }
+    if !vw_lib::dependencies_present(&ws) {
+        println!("{} fetching missing dependencies…", "note:".bright_yellow());
+        let creds = get_access_credentials_for_workspace(&ws, false);
+        if let Err(e) = update_workspace_with_token(&ws, creds).await {
+            eprintln!(
+                "{} failed to fetch dependencies: {e}",
+                "error:".bright_red()
+            );
+            process::exit(1);
+        }
+    }
+}
+
 async fn load_htcl_program(
     entry: &Utf8Path,
 ) -> Result<vw_htcl::LoadedProgram, Box<dyn std::error::Error>> {
