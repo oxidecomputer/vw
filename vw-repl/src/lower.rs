@@ -935,6 +935,98 @@ mod tests {
         assert!(msg.contains("extern::"), "{msg}");
     }
 
+    /// Regression: a stack frame's line number must resolve to the
+    /// ACTUAL source line of the failing call, even when the proc body
+    /// mixes comments, a `\`-continued command, a multi-line `[ … ]`
+    /// substitution (which the lowering collapses to one line), and a
+    /// call nested inside an `if` block. The padding in
+    /// `lower_proc_decl_with_name_and_index` keeps Tcl's body-relative
+    /// line == source body line, and `ProcLocation::resolve_body_line`
+    /// depends on that. When the two drift, a Vivado error points at an
+    /// unrelated line (a comment 39 lines off, in the bug that
+    /// motivated this) instead of the call.
+    #[test]
+    fn stack_frame_line_survives_comments_brackets_and_nesting() {
+        let src = "\
+namespace eval demo {
+  proc thing {} unit {
+    # a comment
+    # another comment
+    set x [ helper \\
+      -a 1 \\
+      -b 2 ]
+    if {$x} {
+      # nested comment
+      boom
+    }
+  }
+}
+";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("demo.htcl");
+        std::fs::write(&path, src).unwrap();
+        let program =
+            vw_htcl::load_program(&path, &vw_htcl::Resolver::new()).unwrap();
+        let parsed = vw_htcl::parse(&program.source);
+        let line_index = vw_htcl::LineIndex::new(&program.source);
+        let table = vw_htcl::signature_table(&parsed.document);
+        let putr = vw_htcl::putr::rewrite(&program.source, &parsed.document);
+
+        let plocs = build_proc_locations(&parsed.document, &program, &path);
+        let loc = plocs.get("demo::thing").expect("proc location");
+
+        fn find<'a>(
+            stmts: &'a [vw_htcl::Stmt],
+            want: &str,
+        ) -> Option<&'a vw_htcl::Proc> {
+            for s in stmts {
+                let vw_htcl::Stmt::Command(c) = s else {
+                    continue;
+                };
+                match &c.kind {
+                    vw_htcl::CommandKind::Proc(p)
+                        if p.name.as_deref() == Some(want) =>
+                    {
+                        return Some(p)
+                    }
+                    vw_htcl::CommandKind::NamespaceEval(ns) => {
+                        if let Some(p) = find(&ns.body, want) {
+                            return Some(p);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let proc = find(&parsed.document.stmts, "thing").unwrap();
+        let lowered = vw_htcl::lower_proc_decl_with_name_and_index(
+            proc,
+            &program.source,
+            &table,
+            None,
+            &putr,
+            &line_index,
+        );
+        // Tcl reports body-relative lines; lowered line 0 is the
+        // `{ ::vw::kwargs …` line == Tcl body line 1, so the `boom`
+        // call at lowered index i is Tcl body line i + 1.
+        let idx = lowered
+            .lines()
+            .position(|l| l.trim() == "boom")
+            .expect("boom in shipped body");
+        let (_line, content) =
+            loc.resolve_body_line(idx as u32 + 1).expect("resolves");
+        assert_eq!(
+            content.trim(),
+            "boom",
+            "stack-frame line drifted: Tcl body line {} resolved to `{}`, \
+             not the `boom` call",
+            idx + 1,
+            content.trim(),
+        );
+    }
+
     #[test]
     fn extern_prefixed_call_is_accepted() {
         // The opt-out: `extern::create_project` is explicitly a

@@ -864,6 +864,23 @@ async fn main() {
             // a declared git dep isn't materialized (fresh checkout,
             // `vw clear`, or a newly-added dep).
             if let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) {
+                // If a dependency was switched `repo → path` in
+                // `vw.toml`, the old git pin lingers in `vw.lock` and
+                // (without this) would shadow the path dep at resolution
+                // time. Drop just those stale entries — surgically, so
+                // no other git dep gets re-resolved/bumped.
+                match vw_lib::prune_stale_path_deps_from_lock(&ws) {
+                    Ok(true) => println!(
+                        "{} updated vw.lock (a dependency changed to a \
+                         path dep)",
+                        "note:".bright_yellow(),
+                    ),
+                    Ok(false) => {}
+                    Err(e) => eprintln!(
+                        "{} could not update vw.lock: {e}",
+                        "warning:".yellow(),
+                    ),
+                }
                 if !vw_lib::dependencies_present(&ws) {
                     println!(
                         "{} fetching missing dependencies…",
@@ -931,7 +948,55 @@ async fn main() {
                     // built-in search (`None`), which just skips VHDL if
                     // nothing is found.
                     let stdlib = vw_lib::ensure_vhdl_stdlib().await.ok();
-                    match vw_lib::check_vhdl(&ws, None, stdlib.as_deref()) {
+                    let mut vhdl_result =
+                        vw_lib::check_vhdl(&ws, None, stdlib.as_deref());
+                    // A design that instantiates `entity ip.<x>` /
+                    // `entity xil_defaultlib.<x>` needs Vivado-generated
+                    // wrappers/stubs under `target/`. Whether the
+                    // SPECIFIC referenced entity is present can't be
+                    // judged from the library being non-empty — the BD
+                    // wrappers populate `xil_defaultlib` while a
+                    // standalone XCI IP's stub can still be missing — so
+                    // we let the analyzer be the judge: if it can't
+                    // resolve a unit within those libraries, generate the
+                    // IP in-process (configure_ip + generate_ip_targets)
+                    // and re-analyze. That pass is skip-gated and
+                    // `generate_target`-only, so it's cheap; and we only
+                    // reach it on a real resolution failure, never
+                    // speculatively. A generation that doesn't complete
+                    // cleanly isn't fatal — the re-analysis reports the
+                    // true remaining state.
+                    if matches!(&vhdl_result, Ok(diags)
+                        if diagnostics_need_ip_generation(diags))
+                    {
+                        println!(
+                            "{} generating IP for `ip`/`xil_defaultlib` \
+                             (vw::configure_ip)…",
+                            "note:".bright_yellow(),
+                        );
+                        if let Err(e) = ensure_ip_generated(
+                            &ws,
+                            None,
+                            None,
+                            // Terse: the check only cares about VHDL
+                            // resolution, so suppress the Vivado
+                            // firehose (NONE/INFO) and surface just
+                            // Warning/CriticalWarning/Error from the
+                            // IP-generation pass.
+                            vw_vivado::LogLevel::Warning,
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "{} IP generation did not complete \
+                                 cleanly: {e}",
+                                "warning:".yellow(),
+                            );
+                        }
+                        vhdl_result =
+                            vw_lib::check_vhdl(&ws, None, stdlib.as_deref());
+                    }
+                    match vhdl_result {
                         Ok(diags) if !diags.is_empty() => {
                             let cwd_owned = std::env::current_dir().ok();
                             let cwd_ref = cwd_owned.as_deref();
@@ -2132,13 +2197,14 @@ fn severity_as_u8(s: vw_vivado::Severity) -> u8 {
 /// - `Block::Diagnostic { severity, .. }` — passes through
 ///   [`render_chunk`] with the block joined back into a single
 ///   chunk, provided the severity clears `log_level`.
-/// - `Block::None { .. }` — at `LogLevel::Debug`, renders raw via
-///   the Stdout path so users see every byte Vivado emitted. At
-///   Info+, prints each line dimmed so users still know noise
-///   flowed through without it dominating the console. (The REPL's
-///   version of this path renders NONE blocks as a togglable
-///   collapsed placeholder — vw run's flat output can't collapse,
-///   so it dims instead.)
+/// - `Block::None { .. }` — non-diagnostic Vivado stdout (banners,
+///   `VHDL Output written …`, block-design `Slave segment …` chatter,
+///   a design's own `puts`/`putr`). At `LogLevel::Debug` it renders
+///   raw via the Stdout path (every byte). At `Info` it dims each
+///   line so users still see noise flowed through without it
+///   dominating. At `Warning`+ it's elided entirely — the caller
+///   explicitly asked for terse output (only Warning/Critical/Error),
+///   e.g. `vw check`'s IP pre-pass, where this stdout is pure barf.
 fn render_block(
     block: &vw_vivado::Block,
     log_level: vw_vivado::LogLevel,
@@ -2156,8 +2222,8 @@ fn render_block(
             let joined = lines.join("\n");
             render_chunk(kind, &joined, proc_table, origin, input_file);
         }
-        vw_vivado::Block::None { lines } => {
-            if matches!(log_level, vw_vivado::LogLevel::Debug) {
+        vw_vivado::Block::None { lines } => match log_level {
+            vw_vivado::LogLevel::Debug => {
                 // Raw pass-through — same style as if it hadn't been
                 // block-grouped at all.
                 let joined = lines.join("\n");
@@ -2168,7 +2234,9 @@ fn render_block(
                     origin,
                     input_file,
                 );
-            } else {
+            }
+            vw_vivado::LogLevel::Info => {
+                // Dim so users still see noise flowed through.
                 use std::io::Write;
                 let mut out = std::io::stdout().lock();
                 for line in lines {
@@ -2176,7 +2244,10 @@ fn render_block(
                 }
                 let _ = out.flush();
             }
-        }
+            // Warning/Critical/Error: terse — drop non-diagnostic
+            // output entirely.
+            _ => {}
+        },
     }
 }
 
@@ -2513,8 +2584,49 @@ fn overload_specialization_mangle(
     Some(vw_htcl::mangle_specialization(name, variant))
 }
 
+/// Thin loader wrapper: resolve the entry's `src` imports into one
+/// flattened program, then hand it to [`run_loaded_program`].
 async fn run_htcl(
     file: &camino::Utf8Path,
+    check_only: bool,
+    part: Option<&str>,
+    variant: Option<&str>,
+    log_level: vw_vivado::LogLevel,
+    info_with_stack: bool,
+    bunyan: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let program = load_htcl_program(file).await?;
+    run_loaded_program(
+        file,
+        &program,
+        check_only,
+        part,
+        variant,
+        log_level,
+        info_with_stack,
+        bunyan,
+    )
+    .await
+}
+
+/// Execute an already-loaded htcl program end to end: parse/validate
+/// gates, an optional check-only short-circuit, then spawn Vivado and
+/// run every command — RPC handler, prelude shipping, per-command
+/// lowering + eval, and severity-driven exit code.
+///
+/// Split out from [`run_htcl`] so `vw check`'s IP pre-pass can run an
+/// in-memory `src @vw` + `vw::configure_ip` program through the exact
+/// same Vivado machinery, without writing a file or shelling out to
+/// `vw run`.
+///
+/// `file` is the entry path — used for workspace discovery, the raw
+/// log location, and proc-trace labels; for the IP pre-pass it's a
+/// synthetic path inside the workspace whose on-disk source is never
+/// read (the program is already loaded/flattened).
+#[allow(clippy::too_many_arguments)]
+async fn run_loaded_program(
+    file: &camino::Utf8Path,
+    program: &vw_htcl::LoadedProgram,
     check_only: bool,
     part: Option<&str>,
     variant: Option<&str>,
@@ -2530,10 +2642,9 @@ async fn run_htcl(
     // path is the only source of non-diagnostic content — which the
     // renderer then dims or collapses.
     let verbose = matches!(log_level, vw_vivado::LogLevel::Debug);
-    let program = load_htcl_program(file).await?;
-    // Keep `program` alive — the stack-frame rewriting needs the
-    // LoadedProgram for body-span resolution. We borrow `source`
-    // from it instead of moving.
+    // Borrow `source` from the (caller-owned) program instead of
+    // moving; the stack-frame rewriting needs the LoadedProgram for
+    // body-span resolution.
     let source = program.source.clone();
     let parsed = vw_htcl::parse(&source);
     let line_index = vw_htcl::LineIndex::new(&source);
@@ -2733,7 +2844,7 @@ async fn run_htcl(
     let entry_std_path = std::path::Path::new(file.as_str()).to_path_buf();
     let proc_table = std::sync::Arc::new(vw_repl::build_proc_locations(
         &parsed.document,
-        &program,
+        program,
         &entry_std_path,
     ));
     let input_file_for_stack = std::sync::Arc::new(entry_std_path.clone());
@@ -3014,7 +3125,15 @@ async fn run_htcl(
                             &bunyan_host,
                             bunyan_pid,
                         );
-                    } else {
+                    } else if matches!(
+                        log_level,
+                        vw_vivado::LogLevel::Debug | vw_vivado::LogLevel::Info
+                    ) {
+                        // Echo a command's return value only at Info/
+                        // Debug. At Warning+ the caller asked for terse
+                        // output — e.g. `vw check`'s IP pre-pass, where
+                        // `vw::configure_ip`'s `null` return is pure
+                        // noise.
                         println!("{}", out.value);
                     }
                 }
@@ -3078,6 +3197,98 @@ async fn run_htcl(
         return Err(format!("session emitted at least one {label}").into());
     }
     Ok(())
+}
+
+/// True when a VHDL diagnostic set contains an error a Vivado IP pass
+/// could fix: an unresolved unit or missing library within the
+/// tool-generated `ip` / `xil_defaultlib` libraries. Keys off the
+/// library name in the analyzer's message — which only appears on a
+/// resolution failure (`No such library 'ip'`, `No primary unit
+/// 'primary_clock' within library 'xil_defaultlib'`) — rather than the
+/// emptiness of the rendered library: the BD wrappers populate
+/// `xil_defaultlib` even while a standalone XCI IP's stub is still
+/// absent, so emptiness is not a reliable signal.
+fn diagnostics_need_ip_generation(diags: &[vw_lib::VhdlDiagnostic]) -> bool {
+    diags.iter().any(|d| {
+        matches!(d.severity, vw_lib::VhdlSeverity::Error)
+            && (d.message.contains("library 'ip'")
+                || d.message.contains("library 'xil_defaultlib'"))
+    })
+}
+
+/// Run `src @vw` + `vw::configure_ip` in-process (spawning Vivado) so a
+/// subsequent VHDL check can resolve the design's generated `ip` /
+/// `xil_defaultlib` libraries.
+///
+/// Called by `vw check` only when
+/// [`vw_lib::workspace_needs_ip_generation`] reports the design
+/// references those libraries and their wrappers aren't already in
+/// `target/` — so a workspace whose IP is already generated never
+/// pays for a (multi-minute) Vivado run. The program is built and run
+/// entirely in-library: no temp file, no `vw run` sub-process.
+async fn ensure_ip_generated(
+    ws: &camino::Utf8Path,
+    part: Option<&str>,
+    variant: Option<&str>,
+    log_level: vw_vivado::LogLevel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Build the resolver exactly as `load_htcl_program` does so `@vw`
+    // — and `@vw`'s own transitive `src @vivado-cmd/…` imports —
+    // resolve. `configure_ip` is a normal (non-test) run, so
+    // test-dependencies stay out.
+    let mut resolver = vw_htcl::Resolver::new();
+    if let Ok(paths) = vw_lib::transitive_dep_cache_paths_with_test(ws, false) {
+        for (name, path) in paths {
+            resolver = resolver.with_dep(name, path);
+        }
+    }
+    // Cargo-parity self-reference so a workspace can `src @<self>/…`.
+    if let Ok(cfg) = vw_lib::load_workspace_config(ws) {
+        resolver = resolver.with_dep_if_absent(
+            cfg.workspace.name,
+            ws.as_std_path().to_path_buf(),
+        );
+    }
+    // Synthetic entry inside the workspace — never written to disk.
+    // Its parent (the workspace) is what `run_loaded_program` uses to
+    // discover the RPC workspace root; `@vw` resolves through the dep
+    // map above, not this path.
+    let entry = ws.join(".vw-configure-ip.htcl");
+    // `configure_ip -generate_targets false` makes block-design IPs
+    // check-ready (their `<ip>_wrapper` entities land in library `ip`
+    // via `make_wrapper`) WITHOUT the minutes-long
+    // `generate_target -name all` per BD — that generation only feeds
+    // synthesis, and the check resolves the wrapper's inner BD as an
+    // unbound `component`. `generate_ip_stubs` then writes the
+    // instantiation-template stubs for the standalone XCI IPs so
+    // `entity xil_defaultlib.<ip>` (e.g. a bare `clk_wizard` like
+    // `primary_clock`) also resolves. Neither step synthesizes.
+    let program = vw_htcl::load_program_source(
+        "src @vw\n\
+         vw::configure_ip -generate_targets false\n\
+         vw::generate_ip_stubs\n",
+        entry.as_std_path(),
+        &resolver,
+    )?;
+    let run_result = run_loaded_program(
+        &entry, &program, /*check_only=*/ false, part, variant, log_level,
+        /*info_with_stack=*/ false, /*bunyan=*/ false,
+    )
+    .await;
+    // Rewrite the just-generated `.vho` instantiation templates into
+    // black-box VHDL stubs. Done here (not in htcl) — a mechanical
+    // component→entity splice is far simpler in Rust than in Tcl. Run
+    // it even if the pre-pass reported a non-fatal error, since the
+    // templates may already be on disk.
+    if let Ok(n) = vw_lib::write_ip_stubs_from_templates(ws) {
+        if n > 0 {
+            println!(
+                "{} wrote {n} IP stub(s) for the VHDL check",
+                "note:".bright_yellow(),
+            );
+        }
+    }
+    run_result
 }
 
 #[cfg(test)]

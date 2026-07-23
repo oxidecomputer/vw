@@ -3900,6 +3900,165 @@ fn keep_vivado_generated_path(path: &Path) -> bool {
     true
 }
 
+/// Strip VHDL line comments (`-- …` to end of line) so a structural
+/// scan doesn't trip over the `.vho` template's banner lines (e.g.
+/// `------ Begin Cut here for COMPONENT Declaration`, which would
+/// otherwise look like a `component` token).
+fn strip_vhdl_line_comments(src: &str) -> String {
+    src.lines()
+        .map(|line| match line.find("--") {
+            Some(i) => &line[..i],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Rewrite the VHDL *component* declaration Vivado emits in an IP's
+/// `.vho` instantiation template into a standalone black-box *entity*
+/// plus an empty architecture. A component and an entity share
+/// generic/port syntax verbatim, so this is a mechanical splice — no
+/// port parsing — which keeps it robust to whatever types the IP's
+/// ports use. Returns `None` when no component declaration is found.
+///
+/// The result declares only the interface; the empty architecture is
+/// a black box. It's compiled into `xil_defaultlib` (per
+/// `vhdl_ls.toml`) so `entity xil_defaultlib.<ip>` resolves for the
+/// static check. It is NOT for synthesis — `vw::synth` uses the real
+/// IP netlist.
+fn vho_component_to_entity(vho: &str) -> Option<String> {
+    let clean = strip_vhdl_line_comments(vho);
+    let lower = clean.to_ascii_lowercase();
+
+    // Find the `component` keyword that OPENS the declaration — not the
+    // `end component` terminator. Scan for a `component` token whose
+    // preceding word isn't `end` and which sits on word boundaries.
+    let is_ident_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let decl = {
+        let bytes = lower.as_bytes();
+        let mut from = 0;
+        loop {
+            let rel = lower[from..].find("component")?;
+            let idx = from + rel;
+            let after = idx + "component".len();
+            let left_ok = idx == 0 || !is_ident_char(bytes[idx - 1]);
+            let right_ok =
+                bytes.get(after).map(|b| !is_ident_char(*b)).unwrap_or(true);
+            let prev_word_end =
+                lower[..idx].split_whitespace().last() != Some("end");
+            if left_ok && right_ok && prev_word_end {
+                break idx;
+            }
+            from = after;
+        }
+    };
+
+    // The IP/entity name is the first identifier after `component`.
+    let after_kw = decl + "component".len();
+    let rest = &clean[after_kw..];
+    let name_off = rest.find(|c: char| !c.is_whitespace())?;
+    let name_rest = &rest[name_off..];
+    let name_len = name_rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(name_rest.len());
+    let name = &name_rest[..name_len];
+    if name.is_empty() {
+        return None;
+    }
+
+    // Body = generics/ports between the name and `end component`.
+    let body_start = after_kw + name_off + name_len;
+    let term_rel = lower[body_start..].find("end component")?;
+    let mut body = clean[body_start..body_start + term_rel].trim();
+    // VHDL-2008 allows `component NAME is`; drop a leading `is` so we
+    // don't emit `entity NAME is is …`.
+    if body.len() >= 2
+        && body[..2].eq_ignore_ascii_case("is")
+        && body[2..].starts_with(char::is_whitespace)
+    {
+        body = body[2..].trim_start();
+    }
+
+    Some(format!(
+        "-- Auto-generated black-box stub for IP `{name}`, derived from\n\
+         -- Vivado's VHDL instantiation template (`{name}.vho`) so the\n\
+         -- static VHDL check can resolve `entity xil_defaultlib.{name}`.\n\
+         -- NOT for synthesis — vw::synth uses the real IP netlist.\n\
+         library ieee;\n\
+         use ieee.std_logic_1164.all;\n\
+         use ieee.numeric_std.all;\n\
+         \n\
+         entity {name} is\n\
+         {body}\n\
+         end entity;\n\
+         \n\
+         architecture stub of {name} is\n\
+         begin\n\
+         end architecture;\n"
+    ))
+}
+
+/// Turn each standalone XCI IP's Vivado instantiation template
+/// (`<ip>.vho`) into a black-box `<ip>_stub.vhdl` alongside it, so the
+/// static VHDL check can resolve `entity xil_defaultlib.<ip>` without
+/// the IP ever being synthesized. Scans
+/// `target/vw-project/*/*.gen/sources_1/ip/*/` for a top-level `.vho`
+/// (the top IP; sub-IP templates in nested dirs are skipped). Writes
+/// only when content changed, and is a no-op when there are no
+/// templates. Returns how many stubs were (re)written.
+pub fn write_ip_stubs_from_templates(
+    workspace_dir: &Utf8Path,
+) -> Result<usize> {
+    let project_root = workspace_dir.join("target/vw-project");
+    let Ok(projects) = fs::read_dir(project_root.as_std_path()) else {
+        return Ok(0);
+    };
+    let mut written = 0usize;
+    for project in projects.flatten() {
+        let name = project.file_name();
+        let ip_root = project
+            .path()
+            .join(format!("{}.gen", name.to_string_lossy()))
+            .join("sources_1")
+            .join("ip");
+        let Ok(ip_dirs) = fs::read_dir(&ip_root) else {
+            continue;
+        };
+        for ip_dir in ip_dirs.flatten() {
+            if !ip_dir.path().is_dir() {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(ip_dir.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("vho") {
+                    continue;
+                }
+                let Ok(vho) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Some(stub) = vho_component_to_entity(&vho) else {
+                    continue;
+                };
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                else {
+                    continue;
+                };
+                let out = ip_dir.path().join(format!("{stem}_stub.vhdl"));
+                let unchanged = fs::read_to_string(&out)
+                    .map(|c| c == stub)
+                    .unwrap_or(false);
+                if !unchanged && fs::write(&out, &stub).is_ok() {
+                    written += 1;
+                }
+            }
+        }
+    }
+    Ok(written)
+}
+
 fn find_testbench_file_recurse(
     testbench_name: &str,
     bench_dir: &Utf8Path,
@@ -4248,6 +4407,17 @@ pub fn dep_cache_paths_with_test(
     match load_lock_file(workspace_dir) {
         Ok(lock) => {
             for (name, locked) in lock.dependencies {
+                // A manifest path dep already claimed this name. The
+                // manifest is authoritative for a dependency's KIND, so
+                // a stale git lock entry left over from a `repo → path`
+                // switch must not override it (the reason the `out`
+                // insert order matters). The lock is rewritten to drop
+                // the entry on the next re-resolve — see
+                // `lock_is_stale_against_manifest` — but resolution has
+                // to be correct even before that runs.
+                if out.contains_key(&name) {
+                    continue;
+                }
                 let abs = resolve_dep_path(&locked.path)?;
                 out.insert(name, abs);
             }
@@ -4257,6 +4427,45 @@ pub fn dep_cache_paths_with_test(
     }
 
     Ok(out)
+}
+
+/// Drop `vw.lock` entries the manifest now declares as **path** deps —
+/// the stale git pin left behind by a `repo → path` switch. Path deps
+/// are never locked (nothing to pin), so the correct lock simply omits
+/// them. Rewrites the lock in place when it changed; returns whether it
+/// did (so the caller can report it).
+///
+/// Deliberately surgical: it removes only the now-path entries and
+/// leaves every other (git) pin untouched. A full re-resolve would hit
+/// the network and re-pin every branch-tracking git dep to its current
+/// HEAD — a `repo → path` edit must not silently bump unrelated
+/// dependencies. The reverse switch (`path → repo`) needs no handling
+/// here: it leaves the manifest dep git-shaped and unlocked, which
+/// [`dependencies_present`] already treats as "fetch me".
+pub fn prune_stale_path_deps_from_lock(
+    workspace_dir: &Utf8Path,
+) -> Result<bool> {
+    let Ok(mut lock) = load_lock_file(workspace_dir) else {
+        return Ok(false);
+    };
+    let Ok(config) = load_workspace_config(workspace_dir) else {
+        return Ok(false);
+    };
+    let path_dep_names: std::collections::HashSet<String> = config
+        .dependencies
+        .iter()
+        .chain(config.test_dependencies.iter())
+        .filter(|(_, dep)| dep.local_path().is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
+    let before = lock.dependencies.len();
+    lock.dependencies
+        .retain(|name, _| !path_dep_names.contains(name));
+    if lock.dependencies.len() == before {
+        return Ok(false);
+    }
+    write_lock_file(workspace_dir, &lock)?;
+    Ok(true)
 }
 
 fn resolve_dep_path(path: &Path) -> Result<PathBuf> {
@@ -5078,6 +5287,115 @@ async fn build_rust_library(
 #[cfg(test)]
 mod dependency_source_tests {
     use super::*;
+
+    #[test]
+    fn manifest_path_dep_wins_over_stale_git_lock_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        fs::create_dir_all(ws.join("local-foo")).unwrap();
+        fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"t\"\nversion = \"0.1.0\"\n\
+             [dependencies.foo]\npath = \"local-foo\"\n",
+        )
+        .unwrap();
+        // Stale git pin for `foo`, left over from before the
+        // `repo → path` switch.
+        fs::write(
+            ws.join("vw.lock"),
+            "[dependencies.foo]\n\
+             repo = \"https://example.com/foo.git\"\n\
+             commit = \"deadbeef\"\n\
+             path = \"foo-deadbeef\"\n",
+        )
+        .unwrap();
+        let paths = dep_cache_paths_with_test(ws, false).unwrap();
+        let foo = paths.get("foo").expect("foo resolves");
+        assert!(
+            foo.ends_with("local-foo"),
+            "manifest path dep must win over a stale git lock entry, \
+             got {foo:?}"
+        );
+    }
+
+    #[test]
+    fn prune_drops_now_path_dep_but_keeps_git_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        fs::create_dir_all(ws.join("local-foo")).unwrap();
+        fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"t\"\nversion = \"0.1.0\"\n\
+             [dependencies.foo]\npath = \"local-foo\"\n\
+             [dependencies.bar]\n\
+             repo = \"https://example.com/bar.git\"\nbranch = \"main\"\n",
+        )
+        .unwrap();
+        fs::write(
+            ws.join("vw.lock"),
+            "[dependencies.foo]\n\
+             repo = \"https://example.com/foo.git\"\n\
+             commit = \"dead\"\npath = \"foo-dead\"\n\
+             [dependencies.bar]\n\
+             repo = \"https://example.com/bar.git\"\n\
+             commit = \"beef\"\npath = \"bar-beef\"\n",
+        )
+        .unwrap();
+        // `foo` is now a path dep → its stale git entry is pruned;
+        // `bar` (still git) is left untouched.
+        assert!(prune_stale_path_deps_from_lock(ws).unwrap());
+        let lock = load_lock_file(ws).unwrap();
+        assert!(!lock.dependencies.contains_key("foo"), "foo pruned");
+        assert!(lock.dependencies.contains_key("bar"), "bar kept");
+        // Idempotent: nothing left to prune on a second pass.
+        assert!(!prune_stale_path_deps_from_lock(ws).unwrap());
+    }
+
+    #[test]
+    fn vho_template_rewrites_to_black_box_entity() {
+        // A realistic Vivado VHDL instantiation template: banner
+        // comments (one of which literally says "COMPONENT"), the
+        // component declaration, then the instantiation example.
+        let vho = "\
+-- (c) Copyright 1995-2024 AMD, Inc. All rights reserved.\n\
+-- The following code must appear in the VHDL architecture header:\n\
+------------- Begin Cut here for COMPONENT Declaration ------ COMP_TAG\n\
+component primary_clock\n\
+port (\n\
+  clk_out1 : out std_logic;\n\
+  locked : out std_logic;\n\
+  clk_in1 : in std_logic\n\
+);\n\
+end component;\n\
+-- COMP_TAG_END ------ End COMPONENT Declaration ------------\n\
+-- The following code must appear in the VHDL architecture body:\n\
+-------------- Begin Cut here for INSTANTIATION Template ----- INST_TAG\n\
+your_instance_name : primary_clock\n\
+  port map (\n\
+    clk_out1 => clk_out1,\n\
+    locked => locked,\n\
+    clk_in1 => clk_in1\n\
+  );\n\
+-- INST_TAG_END ------ End INSTANTIATION Template ---------\n";
+        let stub = vho_component_to_entity(vho).expect("component found");
+        assert!(stub.contains("entity primary_clock is"), "stub:\n{stub}");
+        assert!(stub.contains("clk_out1 : out std_logic"), "ports copied");
+        assert!(stub.contains("clk_in1 : in std_logic"), "ports copied");
+        assert!(stub.contains("end entity;"));
+        assert!(stub.contains("architecture stub of primary_clock is"));
+        // The instantiation example (a `component`-free section) must
+        // not leak in, and we must not have matched the banner comment.
+        assert!(
+            !stub.contains("your_instance_name"),
+            "instantiation template leaked into the stub"
+        );
+        assert!(!stub.contains("component"), "no component syntax remains");
+    }
+
+    #[test]
+    fn vho_without_component_returns_none() {
+        assert!(vho_component_to_entity("-- just a comment\nfoo\n").is_none());
+    }
 
     /// A `vw.toml` entry with `repo = "..."` parses as a git source —
     /// the historical behaviour that pre-dates path deps.

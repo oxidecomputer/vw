@@ -280,13 +280,51 @@ pub fn load_with_preloaded(
         in_progress: HashSet::new(),
         resolver,
         observer,
+        entry_override: None,
     };
     state.load_file(&entry, None, None)?;
     Ok(state.program)
 }
 
+/// Like [`load`], but the entry's content is supplied in memory rather
+/// than read from disk. `entry_path` is a synthetic path — it need not
+/// exist on disk; it only anchors the workspace/resolver (its parent
+/// dir is used for relative `src ./…` imports, and it feeds
+/// `LoadedProgram::files[0]`). `@name` imports still resolve through
+/// the resolver's dependency map and are read from disk normally.
+///
+/// This is what lets `vw check` build and run an in-memory
+/// `src @vw` + `vw::configure_ip` program without writing a temp file.
+pub fn load_source(
+    entry_source: &str,
+    entry_path: &Path,
+    resolver: &Resolver,
+) -> Result<LoadedProgram, LoadError> {
+    let mut noop = NoopObserver;
+    let mut state = State {
+        program: LoadedProgram::default(),
+        preloaded_mtimes: std::collections::HashMap::new(),
+        loaded: HashSet::new(),
+        in_progress: HashSet::new(),
+        resolver,
+        observer: &mut noop,
+        entry_override: Some((
+            entry_path.to_path_buf(),
+            entry_source.to_string(),
+        )),
+    };
+    state.load_file(entry_path, None, None)?;
+    Ok(state.program)
+}
+
 struct State<'r, 'o> {
     program: LoadedProgram,
+    /// In-memory content for the entry file, when the load was
+    /// started via [`load_source`]. When the loader visits this exact
+    /// path it uses this string instead of reading from disk; every
+    /// other (`src @dep/…`) file is read normally. `None` for
+    /// disk-backed loads.
+    entry_override: Option<(PathBuf, String)>,
     /// Files the loader has already read this call (its own dedup
     /// tracking). Grows as `load_file` recurses.
     loaded: HashSet<PathBuf>,
@@ -324,16 +362,33 @@ impl State<'_, '_> {
         }
         self.in_progress.insert(path.to_path_buf());
 
-        let source = fs::read_to_string(path).map_err(|e| LoadError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        // Stat right after the read so the recorded mtime matches
-        // the source we just captured. Failing to stat (fs
-        // permissions, deleted between read and stat, etc.)
-        // downgrades to `None`, which the preloaded-cache path
-        // treats as "unknown → always reload".
-        let mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        // A `load_source` entry is supplied in memory — use it instead
+        // of touching the disk (the synthetic path may not exist).
+        // Its mtime is `None` (nothing to stat), which the
+        // preloaded-cache path treats as "unknown → always reload".
+        let entry_override = match &self.entry_override {
+            Some((op, os)) if op.as_path() == path => Some(os.clone()),
+            _ => None,
+        };
+        let (source, mtime) = match entry_override {
+            Some(src) => (src, None),
+            None => {
+                let source =
+                    fs::read_to_string(path).map_err(|e| LoadError::Io {
+                        path: path.to_path_buf(),
+                        source: e,
+                    })?;
+                // Stat right after the read so the recorded mtime
+                // matches the source we just captured. Failing to
+                // stat (fs permissions, deleted between read and
+                // stat, etc.) downgrades to `None`, which the
+                // preloaded-cache path treats as "unknown → always
+                // reload".
+                let mtime =
+                    fs::metadata(path).ok().and_then(|m| m.modified().ok());
+                (source, mtime)
+            }
+        };
         let parsed = parse(&source);
         if !parsed.errors.is_empty() {
             return Err(LoadError::Parse {
@@ -468,6 +523,28 @@ mod tests {
         let prog = load(&entry, &Resolver::new()).unwrap();
         assert_eq!(prog.source.trim(), "puts hi");
         assert_eq!(prog.files.len(), 1);
+    }
+
+    #[test]
+    fn load_source_splices_in_memory_entry_and_resolves_named_dep() {
+        // The dep lives on disk under a cache root; the entry is
+        // supplied in memory and never written — mirroring the
+        // `src @vw` + `vw::configure_ip` pre-pass.
+        let dep = workspace();
+        fs::write(dep.path().join("module.htcl"), "proc vw::go {} {}\n")
+            .unwrap();
+        let resolver = Resolver::new().with_dep("vw", dep.path().to_path_buf());
+        // Synthetic entry path inside a (real) workspace dir, but with
+        // no file behind it.
+        let ws = workspace();
+        let entry = ws.path().join(".vw-configure-ip.htcl");
+        let prog = load_source("src @vw\nvw::go\n", &entry, &resolver).unwrap();
+        // Dep content spliced first, entry's own command last.
+        assert_eq!(prog.source, "proc vw::go {} {}\nvw::go\n");
+        // Entry (in-memory) + the dep file.
+        assert_eq!(prog.files.len(), 2);
+        assert_eq!(prog.files[0].path, entry);
+        assert_eq!(prog.files[0].mtime, None, "synthetic entry has no mtime");
     }
 
     #[test]

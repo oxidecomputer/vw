@@ -59,7 +59,8 @@ pub use complete::{
 pub use goto::definition_at;
 pub use hover::{hover_at, HoverTarget};
 pub use loader::{
-    load as load_program, load_with_observer as load_program_with_observer,
+    load as load_program, load_source as load_program_source,
+    load_with_observer as load_program_with_observer,
     load_with_preloaded as load_program_with_preloaded, ImportEdge, LoadError,
     LoadObserver, LoadedFile, LoadedProgram, SourceRegion,
 };
