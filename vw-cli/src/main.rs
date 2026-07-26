@@ -1939,6 +1939,19 @@ fn discover_check_targets(
             include_test_deps: false,
         });
     }
+    // `ip/module.htcl` is sourced implicitly at runtime by
+    // `vw::configure_ip` (which walks `<ws>/ip/**` via
+    // `list_ip_htcl_files`), so static discovery didn't include
+    // it and typos in ip-tree procs never surfaced via
+    // `vw check`. Add it explicitly so bare `vw check` catches
+    // the same class of errors the LSP does.
+    let ip_module = ws.join("ip/module.htcl");
+    if ip_module.is_file() {
+        targets.push(CheckTarget {
+            path: ip_module,
+            include_test_deps: false,
+        });
+    }
     for path in vw_lib::list_htcl_tests(&ws)? {
         let Ok(path) = Utf8PathBuf::from_path_buf(path) else {
             continue;

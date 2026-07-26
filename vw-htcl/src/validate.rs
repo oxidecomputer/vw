@@ -2683,9 +2683,70 @@ fn validate_command(
         } else {
             None
         };
-        let should_flag = !is_known_tcl_builtin(call_name)
-            && !is_primitive_prelude_proc(call_name)
-            && (uses_keyword || namespaced_match.is_some());
+        // Short-circuit BEFORE the expensive fuzzy sweep — Tcl
+        // builtins and the primitive prelude are the fast rejection
+        // path and account for the vast majority of calls in a
+        // healthy source. The old gate stopped here entirely when
+        // the call was positional (no -flag) and had no exact
+        // namespaced homonym; that let typos like `generate_dcmacc`
+        // slip past. The updated gate falls through to a Levenshtein
+        // sweep for genuinely-unknown positional calls.
+        if is_known_tcl_builtin(call_name)
+            || is_primitive_prelude_proc(call_name)
+        {
+            return;
+        }
+        // A Levenshtein-close hit against a proc the table already
+        // knows about is strong evidence the call is USER code with a
+        // typo. Compute lazily — only after we've confirmed the call
+        // isn't a builtin or prelude proc, so `bare_names` isn't
+        // allocated on every one of the thousands of legitimate
+        // builtin calls in a large workspace.
+        //
+        // Match against BOTH qualified names (`ip::generate_dcmac`)
+        // and their bare suffixes (`generate_dcmac`). Bare calls in
+        // the same namespace as the target are the common case —
+        // e.g. inside `namespace eval ip { ... }`, a call to
+        // `generate_dcmacc` fuzzy-matches the bare `generate_dcmac`
+        // at distance 1, but the qualified `ip::generate_dcmac` at
+        // distance 5 (past the length-scaled threshold). Rebuild
+        // the qualified name for the "did you mean" hint by
+        // finding the table entry whose suffix matches.
+        let need_fuzzy = !uses_keyword && namespaced_match.is_none();
+        let (fuzzy_match, fuzzy_hint) = if need_fuzzy {
+            let bare_names: Vec<String> = table
+                .keys()
+                .map(|k| {
+                    k.rsplit_once("::")
+                        .map(|(_, suffix)| suffix.to_string())
+                        .unwrap_or_else(|| k.clone())
+                })
+                .collect();
+            let suggestion = suggest_name(call_name, table.keys())
+                .or_else(|| suggest_name(call_name, bare_names.iter()));
+            let hint_name = suggestion.as_ref().map(|s| {
+                if s.contains("::") {
+                    s.clone()
+                } else {
+                    let suffix = format!("::{s}");
+                    table
+                        .keys()
+                        .filter(|k| k.ends_with(&suffix) || k.as_str() == s)
+                        .min_by_key(|k| k.len())
+                        .cloned()
+                        .unwrap_or_else(|| s.clone())
+                }
+            });
+            (suggestion, hint_name)
+        } else {
+            // Non-fuzzy path: `-flag` args or an exact namespaced
+            // homonym trip the diagnostic on their own; the
+            // suggestion (when the -flag path fires) comes from
+            // the plain `suggest_name` sweep below.
+            (None, None)
+        };
+        let should_flag =
+            uses_keyword || namespaced_match.is_some() || fuzzy_match.is_some();
         if should_flag {
             // Prefer the exact namespaced match as the "did you
             // mean" — it's a stronger signal than the fuzzy
@@ -2694,6 +2755,8 @@ fn validate_command(
             // anyway.
             let hint = if let Some(qualified) = &namespaced_match {
                 format!(" — did you mean `{qualified}`?")
+            } else if let Some(s) = fuzzy_hint {
+                format!(" — did you mean `{s}`?")
             } else {
                 match suggest_name(call_name, table.keys()) {
                     Some(s) => format!(" — did you mean `{s}`?"),
@@ -3523,6 +3586,37 @@ port::plum_if_pin -name p -pin q
         let err = d.iter().find(|m| m.severity == Severity::Error).unwrap();
         assert!(
             err.message.contains("did you mean `port::plumb_if_pin`"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// Bare positional call to a name that's one character off
+    /// from a defined proc — same shape as the metroid typo where
+    /// `generate_dcmacc` silently escaped the validator. The old
+    /// `uses_keyword || namespaced_match` gate short-circuited to
+    /// false for zero-arg positional calls; the fuzzy-match gate
+    /// now catches it.
+    #[test]
+    fn bare_positional_typo_of_known_proc_is_flagged() {
+        let src = "\
+namespace eval ip {
+  proc generate_dcmac {} unit { }
+  proc go {} unit {
+    generate_dcmacc
+  }
+}
+";
+        let d = diags(src);
+        let err = d
+            .iter()
+            .find(|m| {
+                m.severity == Severity::Error
+                    && m.message.contains("generate_dcmacc")
+            })
+            .unwrap_or_else(|| panic!("no diagnostic on typo: {d:?}"));
+        assert!(
+            err.message.contains("did you mean `ip::generate_dcmac`"),
             "{}",
             err.message
         );
