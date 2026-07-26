@@ -257,9 +257,40 @@ enum Commands {
         #[arg(
             long = "load",
             value_name = "FILE",
+            conflicts_with_all = [
+                "from_synth_checkpoint",
+                "from_place_checkpoint",
+                "from_route_checkpoint",
+            ],
             help = "Source FILE into the session as soon as Vivado is up"
         )]
         initial_load: Option<Utf8PathBuf>,
+        #[arg(
+            long = "from-synth-checkpoint",
+            conflicts_with_all = [
+                "from_place_checkpoint",
+                "from_route_checkpoint",
+            ],
+            help = "Skip design.htcl. On boot, open \
+                    <ws>/target/synth/<top>.dcp instead. Errors if the \
+                    checkpoint is missing."
+        )]
+        from_synth_checkpoint: bool,
+        #[arg(
+            long = "from-place-checkpoint",
+            conflicts_with_all = ["from_route_checkpoint"],
+            help = "Skip design.htcl. On boot, open \
+                    <ws>/target/place/<top>.dcp instead. Errors if the \
+                    checkpoint is missing."
+        )]
+        from_place_checkpoint: bool,
+        #[arg(
+            long = "from-route-checkpoint",
+            help = "Skip design.htcl. On boot, open \
+                    <ws>/target/route/<top>.dcp instead. Errors if the \
+                    checkpoint is missing."
+        )]
+        from_route_checkpoint: bool,
         #[arg(
             long,
             value_name = "ID",
@@ -799,26 +830,74 @@ async fn main() {
         Commands::Repl {
             log_level,
             initial_load,
+            from_synth_checkpoint,
+            from_place_checkpoint,
+            from_route_checkpoint,
             part,
             variant,
             info_with_stack,
         } => {
-            // Same `design.htcl` auto-discovery as `vw run`: if the
-            // user didn't pass `--load`, look for a `design.htcl`
-            // in the enclosing workspace and source it up front.
-            // Silent no-op when there's no workspace or no
-            // `design.htcl` — the REPL still boots and the user
-            // can `:load` something explicitly.
-            // Self-heal a fresh checkout: fetch missing deps the same
-            // way `vw check` does before the REPL resolves `src @dep`.
-            ensure_workspace_deps(&cwd).await;
-            let resolved_load = initial_load.or_else(|| {
-                vw_lib::find_workspace_dir(cwd.as_std_path())
-                    .and_then(|ws| vw_lib::find_design_file(&ws))
-            });
+            // `--from-*-checkpoint` short-circuits every other
+            // load path: skip `design.htcl` auto-discovery, skip
+            // `--load`, and instead resolve the requested DCP
+            // Rust-side so we can fail with a clear error BEFORE
+            // spawning Vivado if the checkpoint is missing.
+            // Clap already gates mutual exclusivity, so at most
+            // one of the three is true here.
+            let from_stage = if from_synth_checkpoint {
+                Some("synth")
+            } else if from_place_checkpoint {
+                Some("place")
+            } else if from_route_checkpoint {
+                Some("route")
+            } else {
+                None
+            };
+            let (resolved_load, initial_source) = if let Some(stage) =
+                from_stage
+            {
+                match resolve_checkpoint_path(&cwd, stage, variant.as_deref()) {
+                    Ok(path) => {
+                        // `src @vivado-cmd` first so the namespaced
+                        // wrapper is defined — a fresh REPL boot
+                        // hasn't loaded any modules yet, and
+                        // calling `vivado_cmd::open_checkpoint`
+                        // without it fires an "undefined proc"
+                        // error. Absolute path in braces so cwd
+                        // shifts inside the worker can't reroute.
+                        let snippet = format!(
+                            "src @vivado-cmd\n\
+                             vivado_cmd::open_checkpoint -file {{{path}}}\n",
+                        );
+                        (None, Some(snippet))
+                    }
+                    Err(e) => {
+                        eprintln!("{} {e}", "error:".bright_red());
+                        process::exit(1);
+                    }
+                }
+            } else {
+                // Same `design.htcl` auto-discovery as `vw run`:
+                // if the user didn't pass `--load`, look for a
+                // `design.htcl` in the enclosing workspace and
+                // source it up front. Silent no-op when there's
+                // no workspace or no `design.htcl` — the REPL
+                // still boots and the user can `:load` something
+                // explicitly.
+                // Self-heal a fresh checkout: fetch missing deps
+                // the same way `vw check` does before the REPL
+                // resolves `src @dep`.
+                ensure_workspace_deps(&cwd).await;
+                let resolved = initial_load.or_else(|| {
+                    vw_lib::find_workspace_dir(cwd.as_std_path())
+                        .and_then(|ws| vw_lib::find_design_file(&ws))
+                });
+                (resolved, None)
+            };
             if let Err(e) = vw_repl::run(vw_repl::ReplOptions {
                 log_level: log_level.into(),
                 initial_load: resolved_load,
+                initial_source,
                 part,
                 variant,
                 info_with_stack,
@@ -1461,6 +1540,59 @@ fn discover_sibling_vivado_cmd(start: &Utf8Path) -> Option<Utf8PathBuf> {
 /// git lock entry left by a `repo → path` switch. Exits the process on
 /// a fetch failure. Shared by `vw check` / `run` / `bench` / `repl` so
 /// they all self-heal a fresh checkout the same way.
+/// Resolve `<ws>/target/<stage>/<top>.dcp` for a `--from-*-checkpoint`
+/// invocation and confirm it exists on disk. Errors when there's no
+/// workspace, no top-entity resolution, or no DCP at the derived path.
+///
+/// `stage` must be one of `"synth" | "place" | "route"` — matches
+/// the on-disk convention in `~/src/htcl/vw/module.htcl` (see the
+/// `checkpoint_path` writes in `vw::synth` / `vw::place` /
+/// `vw::route`).
+fn resolve_checkpoint_path(
+    cwd: &Utf8Path,
+    stage: &str,
+    variant_query: Option<&str>,
+) -> Result<Utf8PathBuf, String> {
+    let ws =
+        vw_lib::find_workspace_dir(cwd.as_std_path()).ok_or_else(|| {
+            "`--from-*-checkpoint` requires a workspace (nearest `vw.toml`)"
+                .to_string()
+        })?;
+    let cfg = vw_lib::load_workspace_config(&ws)
+        .map_err(|e| format!("failed to load vw.toml: {e}"))?;
+    // Resolve the active variant name the same way the auto-project
+    // does: caller-supplied → workspace default → None. That keeps
+    // `<top>` consistent with what `vw::synth` / `vw::place` /
+    // `vw::route` used when they wrote the checkpoint.
+    let active_variant = if !cfg.workspace.variants.is_empty() {
+        cfg.workspace
+            .select_variant(variant_query)
+            .map_err(|e| e.to_string())?
+            .map(|v| v.name.clone())
+    } else {
+        None
+    };
+    let top = cfg
+        .workspace
+        .resolve_top(active_variant.as_deref())
+        .ok_or_else(|| {
+            format!(
+                "`--from-{stage}-checkpoint` needs a top-entity: set \
+                 `top = \"...\"` at the workspace or variant level in \
+                 `{ws}/vw.toml`",
+            )
+        })?;
+    let path = ws.join("target").join(stage).join(format!("{top}.dcp"));
+    if !path.exists() {
+        return Err(format!(
+            "checkpoint not found: {path}\n\
+             hint: run `vw::{stage}` (or the full flow through it) to \
+             produce the checkpoint before using `--from-{stage}-checkpoint`.",
+        ));
+    }
+    Ok(path)
+}
+
 async fn ensure_workspace_deps(cwd: &Utf8Path) {
     let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) else {
         return;

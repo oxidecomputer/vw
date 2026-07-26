@@ -83,7 +83,7 @@ pub fn entry_lines_windowed(
     // (single-line, no meaningful collapse) skip the marker column.
     let orange = Color::Rgb(255, 140, 0);
     let (kind_prefix_str, prefix_style) = kind_prefix(entry.kind, orange);
-    let marker_style = Style::default().fg(Color::DarkGray);
+    let marker_style = Style::default().fg(Color::Gray);
     // Marker column shows the group / block collapse affordance:
     //
     //   * Input entries always get a marker (▶ collapsed / ▼
@@ -118,10 +118,10 @@ pub fn entry_lines_windowed(
         ScrollbackKind::Stdout => Style::default().fg(Color::White),
         ScrollbackKind::Error => Style::default().fg(Color::Red),
         ScrollbackKind::Warning => Style::default().fg(orange),
-        ScrollbackKind::Notice => Style::default().fg(Color::DarkGray),
-        ScrollbackKind::Chatter => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
+        ScrollbackKind::Notice => Style::default().fg(Color::Gray),
+        ScrollbackKind::Chatter => {
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+        }
     };
     // For Input entries with a timer, render `<elapsed>` flush
     // right on the first line. Color follows whether it's still
@@ -320,17 +320,15 @@ fn kind_prefix(kind: ScrollbackKind, orange: Color) -> (&'static str, Style) {
             "⚠ ",
             Style::default().fg(orange).add_modifier(Modifier::BOLD),
         ),
-        ScrollbackKind::Notice => ("· ", Style::default().fg(Color::DarkGray)),
+        ScrollbackKind::Notice => ("· ", Style::default().fg(Color::Gray)),
         // Chatter: 2-space prefix (no diagnostic glyph) + DIM
-        // DarkGray — background-noise bucket for classifier-produced
+        // Gray — background-noise bucket for classifier-produced
         // NONE blocks. Multi-line Chatter still auto-collapses per
         // COLLAPSE_AUTO_THRESHOLD; the dim style just signals "this
         // is elidable" even before the user thinks about collapsing.
         ScrollbackKind::Chatter => (
             "  ",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
         ),
     }
 }
@@ -356,10 +354,8 @@ fn collapsible_lines(
          regular source-line path — collapsible_lines is the \
          collapsed-only placeholder helper"
     );
-    let marker_style = Style::default().fg(Color::DarkGray);
-    let dim = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM);
+    let marker_style = Style::default().fg(Color::Gray);
+    let dim = Style::default().fg(Color::Gray).add_modifier(Modifier::DIM);
     let source_lines: Vec<&str> = entry.text.lines().collect();
     // Preview: first non-empty line (else first line, else "").
     let preview = source_lines
@@ -391,7 +387,7 @@ fn timer_for(entry: &ScrollbackEntry) -> Option<(String, Style)> {
     let label = format_duration(elapsed);
     let style = if entry.completed_at.is_some() {
         // Frozen at final value — quiet, post-fact.
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Color::Gray)
     } else {
         // Live — slightly more present so the user sees it's
         // still moving.

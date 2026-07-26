@@ -107,6 +107,11 @@ pub struct ReplOptions {
     /// the Vivado worker comes up. Equivalent to typing `:load
     /// <path>` as the first input.
     pub initial_load: Option<Utf8PathBuf>,
+    /// If set, dispatch this literal htcl snippet as the first
+    /// input after the Vivado worker comes up. Takes precedence
+    /// over `initial_load`. Used by `vw repl --from-*-checkpoint`
+    /// to open a pre-existing DCP instead of running `design.htcl`.
+    pub initial_source: Option<String>,
     /// If true, INFO-severity Vivado messages carry their full Tcl
     /// stack frames into the scrollback. Off by default — INFO is
     /// noisy enough without stack traces — but useful when diagnosing

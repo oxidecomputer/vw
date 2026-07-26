@@ -513,10 +513,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Min(1), Constraint::Length(badge_width)])
         .split(area);
     f.render_widget(
-        Paragraph::new(Span::styled(
-            hint,
-            Style::default().fg(Color::DarkGray),
-        )),
+        Paragraph::new(Span::styled(hint, Style::default().fg(Color::Gray))),
         layout[0],
     );
     f.render_widget(
@@ -546,7 +543,7 @@ fn draw_reverse_search(f: &mut Frame, anchor: Rect, rs: &ReverseSearch) {
     );
     let body = vec![
         Line::from(vec![
-            Span::styled("query: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("query: ", Style::default().fg(Color::Gray)),
             Span::styled(
                 rs.query.clone(),
                 Style::default()
@@ -556,7 +553,7 @@ fn draw_reverse_search(f: &mut Frame, anchor: Rect, rs: &ReverseSearch) {
         ]),
         Line::from(Span::raw("")),
         Line::from(vec![
-            Span::styled("match: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("match: ", Style::default().fg(Color::Gray)),
             Span::raw(rs.match_text.clone()),
         ]),
     ];

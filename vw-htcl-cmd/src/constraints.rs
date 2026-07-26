@@ -100,6 +100,17 @@ pub struct ArgOverride {
     /// `object` placeholder is actually a specific type.
     #[serde(default, rename = "type")]
     pub arg_type: Option<String>,
+
+    /// Force this arg to be emitted positionally in the wrapper
+    /// body: `... $value` instead of `... -<flag> $value`. The
+    /// generator's default is to always route required args
+    /// through the flag form (matches most Vivado commands), but
+    /// a few — notably `get_property`'s trailing `<objects>` —
+    /// reject `-objects` with `[Common 17-170] Unknown option`.
+    /// Set `positional = true` in `cmd-constraints.toml` for
+    /// those specific args. Defaults to false.
+    #[serde(default)]
+    pub positional: bool,
 }
 
 /// All overrides for one command, indexed by arg ident.

@@ -2031,13 +2031,27 @@ impl App {
         }
         let Some(idx) = hit else { return false };
         let target = &mut self.scrollback[idx];
-        // Two toggle behaviors:
-        //   * Input rows: flip the whole group's visibility
-        //     via `group_collapsed`.
-        //   * Non-Input collapsible blocks: flip the entry's
+        // Toggle behaviors:
+        //   * Input rows whose OWN body is elided
+        //     (`collapse_state == Some(true)` — auto-collapsed
+        //     multi-line command) — expand the body first. The
+        //     user hit the marker because the visible chevron
+        //     sits next to a partial preview + `(N lines hidden)`
+        //     suffix, and their intent is "show me the rest of
+        //     the command I just typed". Only toggle
+        //     `group_collapsed` on subsequent clicks (body is
+        //     fully visible).
+        //   * Input rows with a fully-visible body — flip the
+        //     whole group's child visibility via
+        //     `group_collapsed`.
+        //   * Non-Input collapsible blocks — flip the entry's
         //     own multi-line body via `collapse_state`.
         if matches!(target.kind, ScrollbackKind::Input) {
-            target.group_collapsed = !target.group_collapsed;
+            if matches!(target.collapse_state, Some(true)) {
+                target.collapse_state = Some(false);
+            } else {
+                target.group_collapsed = !target.group_collapsed;
+            }
             return true;
         }
         match target.collapse_state {
@@ -2511,9 +2525,21 @@ impl App {
         // User-typed inputs stay expanded by default — auto-collapse
         // is a "wall of script output" convenience, not what the
         // user wants right after they just typed a command and are
-        // waiting to see its output.
+        // waiting to see its output. Both dimensions apply:
+        //  * `group_collapsed = false` keeps subsequent output
+        //    visible under this input header.
+        //  * `collapse_state = Some(false)` when the input is
+        //    multi-line, so the input body itself stays fully
+        //    visible instead of eliding to first-line +
+        //    "(N lines hidden)". Preserves toggleability via the
+        //    marker click — `Some(false)` still marks the entry
+        //    as a collapsible block, just one that starts
+        //    expanded.
         if let Some(entry) = self.scrollback.last_mut() {
             entry.group_collapsed = false;
+            if entry.collapse_state.is_some() {
+                entry.collapse_state = Some(false);
+            }
         }
 
         if let Some(cmd) = trimmed.strip_prefix(':') {
@@ -2983,7 +3009,19 @@ impl App {
                 self.worker_state = WorkerState::Ready;
                 self.child_pid = child_pid;
                 self.push(ScrollbackKind::Notice, "vivado ready".into());
-                if let Some(path) = self.opts.initial_load.clone() {
+                // `initial_source` (e.g. from
+                // `--from-*-checkpoint`) is a literal htcl snippet
+                // resolved by the CLI. It takes precedence over
+                // `initial_load` because it represents an
+                // explicit user request to skip `design.htcl` and
+                // pick up mid-flow from a persisted checkpoint.
+                if let Some(source) = self.opts.initial_source.clone() {
+                    self.push(
+                        ScrollbackKind::Notice,
+                        "auto-dispatching --from-*-checkpoint snippet".into(),
+                    );
+                    self.dispatch_eval_with_echo(source, true).await;
+                } else if let Some(path) = self.opts.initial_load.clone() {
                     match std::fs::read_to_string(path.as_std_path()) {
                         Ok(content) => {
                             self.push(

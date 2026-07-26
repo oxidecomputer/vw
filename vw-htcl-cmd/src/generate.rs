@@ -330,6 +330,14 @@ struct EffectiveArg {
     /// explicit per-arg `type = "..."` override in
     /// `cmd-constraints.toml` wins over the inferred value.
     arg_type: Option<String>,
+    /// True when the wrapper body should pass this arg
+    /// positionally (`... $value`) instead of via `-<flag> $value`.
+    /// Set by the `positional = true` constraint override —
+    /// needed for the small subset of Vivado commands
+    /// (`get_property`'s trailing `<objects>`, notably) that
+    /// reject the `-flag` form with `[Common 17-170] Unknown
+    /// option`.
+    positional: bool,
 }
 
 fn effective_args(
@@ -437,6 +445,7 @@ fn effective_arg(arg: &Argument, over: Option<&ArgOverride>) -> EffectiveArg {
         description: arg.description.clone(),
         typed,
         arg_type,
+        positional: over.positional,
     }
 }
 
@@ -720,20 +729,34 @@ fn emit_typed_invocation_with(
             "{indent}return [extern::_vw_global_call {orig} {{*}}$flags"
         );
         for (arg, flag) in included {
+            // `positional = true` in cmd-constraints.toml opts an
+            // arg OUT of the default `-<flag> $value` shape and
+            // into bare `$value`. Vivado's `get_property` is the
+            // canonical case: its trailing `<objects>` is
+            // positional-only (using `-objects` fires
+            // `[Common 17-170] Unknown option '-objects'`). The
+            // opt-in is per-arg — the same command may still want
+            // `-min` / `-max` / `-quiet` in flag form.
+            if arg.positional {
+                write!(line, " ${id}", id = arg.ident).unwrap();
+                continue;
+            }
             match arg.kind {
                 ArgKind::Positional => {
                     // Typed positional args carry Vivado object
                     // handles (`get_files`, `get_filesets`,
                     // `get_cells`, …). At the Tcl call level
-                    // Vivado's commands universally take these
-                    // via `-<flag> $value`, not positional — see
+                    // Vivado's commands mostly take these via
+                    // `-<flag> $value`, not positional — see
                     // the `make_wrapper -files [get_files ...]`
                     // example in the man page. Emit the flag
                     // form so both shimmer avoidance AND flag
                     // routing land at once; a bare positional
                     // yields `[Common 17-161] Invalid option
                     // value` because Vivado can't tell which
-                    // slot it was intended for.
+                    // slot it was intended for. Commands that
+                    // genuinely need the positional shape use
+                    // the `positional = true` override above.
                     write!(line, " -{flag} ${id}", id = arg.ident).unwrap();
                 }
                 _ => {
@@ -875,6 +898,16 @@ fn infer_return_type(returns: Option<&[String]>) -> Option<String> {
         // Name-of-object pages return `string` (a path/name).
         ("returns the name of the design object", "string"),
         ("name of the design object", "string"),
+        // Vivado's stock "This command returns a value, or list of
+        // values, or returns an error if it fails" idiom used on
+        // `get_property` (and other query commands whose return is
+        // a single string). Placed BEFORE the "nothing" catchall
+        // because the same page's description often also contains
+        // "returns nothing" as a side-note about missing-property
+        // behavior — matching "nothing" first would incorrectly
+        // land the wrapper on `unit`, silently swallowing the
+        // property value.
+        ("returns a value, or list of values", "string"),
         // "nothing" / "Tcl_OK on success" — side-effecting commands.
         // Placed AFTER the creator/current patterns so those
         // pull the actual return type from the descriptive prose

@@ -501,7 +501,7 @@ fn draw_result_list(f: &mut Frame, picker: &DiagnosticPicker, area: Rect) {
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(
                     "▼ ".to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 ),
                 Span::styled(
                     header_text,

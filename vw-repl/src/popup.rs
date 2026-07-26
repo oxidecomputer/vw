@@ -245,7 +245,7 @@ pub fn draw_signature_help_popup(
             body_lines.push(Line::from(""));
             body_lines.push(Line::from(Span::styled(
                 brief.to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             )));
         }
     }
