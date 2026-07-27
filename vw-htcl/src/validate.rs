@@ -870,6 +870,7 @@ fn check_return(
     declared: &crate::ast::TypeExpr,
     diags: &mut Vec<Diagnostic>,
 ) {
+    use crate::ast::{TypeExpr, WordForm};
     // `return` alone — bare — violates the annotation's promise
     // to produce a value UNLESS the declared type is `unit`,
     // which means "no meaningful value" and matches bare-return
@@ -877,7 +878,7 @@ fn check_return(
     let Some(arg) = cmd.words.get(1) else {
         let is_unit = matches!(
             declared,
-            crate::ast::TypeExpr::Named { name, .. } if name == "unit"
+            TypeExpr::Named { name, .. } if name == "unit"
         );
         if !is_unit {
             diags.push(Diagnostic {
@@ -892,24 +893,75 @@ fn check_return(
         }
         return;
     };
+    // `return NAME` — bareword form — where NAME matches a variable
+    // in scope is almost always a missing `$` (the user meant
+    // `return $NAME`). Without the sigil, Tcl returns the literal
+    // string "NAME", which passes runtime typing but silently
+    // subverts the annotation. `true`/`false` are the canonical bool
+    // literals and integer literals are legitimate bare returns for
+    // `int`-annotated procs, so exempt those.
+    if arg.form == WordForm::Bare {
+        if let Some(lit) = arg.as_text() {
+            let looks_like_literal =
+                lit == "true" || lit == "false" || lit.parse::<i64>().is_ok();
+            if !looks_like_literal && var_table.get(lit).is_some() {
+                diags.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "return of bare identifier `{lit}` — a variable \
+                         named `{lit}` is in scope but not dereferenced; \
+                         did you mean `return ${lit}`? (without `$` this \
+                         returns the literal string \"{lit}\")",
+                    ),
+                    span: cmd.span,
+                });
+                return;
+            }
+        }
+    }
     // Try to infer the returned expression's type. If we can't,
-    // skip — gradual typing (same policy as the arg-type check).
-    let Some(actual) =
-        value_type_with_procs(arg, sig_table, var_table, Some(proc_table))
-    else {
+    // fall through to a bare-literal check below — bare text at a
+    // structural type (Qualified newtype) can't be right regardless
+    // of whether the value_type pass could deduce it.
+    let inferred =
+        value_type_with_procs(arg, sig_table, var_table, Some(proc_table));
+    if let Some(actual) = inferred {
+        if !types_match(declared, &actual) {
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!(
+                    "return type mismatch: proc declared `{}`, but this \
+                     `return` produces `{}`",
+                    render_type_inline(declared),
+                    render_type_inline(&actual),
+                ),
+                span: cmd.span,
+            });
+        }
         return;
-    };
-    if !types_match(declared, &actual) {
-        diags.push(Diagnostic {
-            severity: Severity::Error,
-            message: format!(
-                "return type mismatch: proc declared `{}`, but this \
-                 `return` produces `{}`",
-                render_type_inline(declared),
-                render_type_inline(&actual),
-            ),
-            span: cmd.span,
-        });
+    }
+    // Uninferrable return + declared newtype (`foo::Bar`): a
+    // qualified type never comes from a bare text literal — the
+    // only paths to a valid value are `foo::Bar::from …`, a proc
+    // whose return_type is `foo::Bar`, or a `$var` bound to one.
+    // A bare text word at this position is a strong signal of a
+    // missing sigil or a wrong-shape return.
+    if matches!(declared, TypeExpr::Qualified { .. })
+        && arg.form == WordForm::Bare
+    {
+        if let Some(lit) = arg.as_text() {
+            diags.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!(
+                    "return type mismatch: proc declared `{}`, but this \
+                     `return` produces the literal string \"{lit}\" — a \
+                     `{}` value can't be a bare word",
+                    render_type_inline(declared),
+                    render_type_inline(declared),
+                ),
+                span: cmd.span,
+            });
+        }
     }
 }
 
@@ -4838,6 +4890,90 @@ proc branchy {} ns::TypeB {
             .filter(|x| x.message.contains("return type mismatch"))
             .collect();
         assert!(!errs.is_empty(), "expected mismatch inside if, got {d:?}");
+    }
+
+    #[test]
+    fn return_of_bare_identifier_matching_var_errors() {
+        // The metroid `configure_cpm5` bug: `set cpm5_cfg [...]`
+        // followed by `return cpm5_cfg` (missing `$`). Without the
+        // sigil this returns the literal string "cpm5_cfg" and
+        // silently subverts the annotation. The `set` must have a
+        // typed RHS so `cpm5_cfg` lands in the var table — an
+        // untyped literal (`set x 1`) wouldn't (see
+        // `value_type_with_procs`); the actual code uses a
+        // `cpm5::configure` call whose return type IS known.
+        let src = "\
+type cpm5::Config = Properties
+proc make_config {} cpm5::Config { return {} }
+proc configure_cpm5 {} cpm5::Config {
+  set cpm5_cfg [make_config]
+  return cpm5_cfg
+}
+";
+        let d = diags(src);
+        let errs: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("bare identifier"))
+            .collect();
+        assert_eq!(errs.len(), 1, "expected missing-sigil diag, got {d:?}");
+        assert!(
+            errs[0].message.contains("did you mean `return $cpm5_cfg`"),
+            "message names the intended var: {}",
+            errs[0].message,
+        );
+    }
+
+    #[test]
+    fn return_of_bare_true_false_ok() {
+        // `return true` / `return false` are the canonical bool
+        // literals — the bareword check must NOT fire on them even
+        // if a var of the same name were in scope.
+        let src = "\
+proc is_ok {} bool { return true }
+proc is_bad {} bool { return false }
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("bare identifier")),
+            "unexpected bare-identifier diag on bool literal: {d:?}",
+        );
+    }
+
+    #[test]
+    fn return_of_int_literal_ok() {
+        // `return 42` at `int` — bare integer literal, not a
+        // missing-sigil case.
+        let src = "\
+proc answer {} int { return 42 }
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("bare identifier")),
+            "unexpected bare-identifier diag on int literal: {d:?}",
+        );
+    }
+
+    #[test]
+    fn return_bareword_at_qualified_type_errors() {
+        // Bareword `return foo` at a qualified return type — even
+        // when `foo` isn't a var in scope, a qualified newtype
+        // can't come from a bare text literal.
+        let src = "\
+type cpm5::Config = Properties
+proc bad {} cpm5::Config { return not_a_var_anywhere }
+";
+        let d = diags(src);
+        let errs: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("return type mismatch"))
+            .collect();
+        assert_eq!(errs.len(), 1, "expected mismatch diag, got {d:?}");
+        assert!(
+            errs[0].message.contains("cpm5::Config")
+                && errs[0].message.contains("not_a_var_anywhere"),
+            "message names type and literal: {}",
+            errs[0].message,
+        );
     }
 
     #[test]
