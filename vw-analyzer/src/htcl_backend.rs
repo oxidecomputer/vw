@@ -641,6 +641,17 @@ impl LanguageBackend for HtclBackend {
         // takes its own read).
         let uris: Vec<Url> = self.docs.read().await.keys().cloned().collect();
         let roots = self.workspace_roots_snapshot().await;
+        // Open-doc set — used below to decide who owns a URI's
+        // diagnostics. When a file is open, its own analysis was
+        // built from the live buffer and is authoritative;
+        // cross-file diagnostics from OTHER open files targeting
+        // the same URI reflect whatever those files last saw on
+        // disk, which is stale as soon as this file gets edited.
+        // Ignoring them fixes the stuck-diagnostic bug where
+        // fixing `cips.htcl` doesn't clear its markers until every
+        // file that `src`s it also reindexes.
+        let open_uris: std::collections::HashSet<Url> =
+            uris.iter().cloned().collect();
         // Group by origin URI so a file `src`d by multiple open
         // docs doesn't get its diagnostics duplicated; when the
         // same file surfaces via more than one analysis, we keep
@@ -655,10 +666,11 @@ impl LanguageBackend for HtclBackend {
             // EMPTY one — so the editor clears stale errors when
             // the user fixes them. Without this, a file that
             // *used* to have errors keeps showing them until it's
-            // reopened.
-            by_uri
-                .entry(uri.clone())
-                .or_insert_with(|| analysis.diagnostics.clone());
+            // reopened. `insert` (not `or_insert_with`) so a
+            // freshly-committed analysis wins over a stale entry
+            // some earlier iteration's cross-file merge left
+            // behind.
+            by_uri.insert(uri.clone(), analysis.diagnostics.clone());
             // Seed an empty entry for every imported file that
             // sits inside the workspace. This is what makes fixed
             // errors CLEAR: after the fix, `cross_file_diagnostics`
@@ -687,6 +699,19 @@ impl LanguageBackend for HtclBackend {
                 // opened standalone), fall through: nothing to
                 // filter against.
                 if !roots.is_empty() && !uri_under_roots(u, &roots) {
+                    continue;
+                }
+                // Do NOT overlay cross-file diagnostics onto files
+                // that have their own open analysis — that
+                // analysis was just rebuilt from the live buffer
+                // and supersedes whatever the srcing file's stale
+                // analysis remembers. Skipping this was the entire
+                // reason old errors stuck around in Helix after
+                // the user fixed them: any parent doc's cached
+                // analysis kept re-injecting the same diagnostic
+                // on every workspace/diagnostic tick until that
+                // parent reindexed.
+                if open_uris.contains(u) {
                     continue;
                 }
                 by_uri.entry(u.clone()).or_default().push(d.clone());
@@ -3305,6 +3330,60 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         assert!(
             lib_after.is_empty(),
             "expected empty lib diagnostics after fix, got {lib_after:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_clear_when_open_import_is_fixed() {
+        // Regression for the "stuck diagnostic in Helix" bug:
+        // both `main.htcl` and `lib.htcl` are open. `main` srcs
+        // `lib`. Fixing `lib.htcl` should IMMEDIATELY clear its
+        // diagnostics — even though `main`'s analysis (which
+        // still holds a cross-file diag pointing at `lib`) hasn't
+        // been reindexed yet. The aggregator must trust `lib`'s
+        // own opened analysis over any stale cross-file entries
+        // targeting it from other files.
+        let dir = tempfile::tempdir().unwrap();
+        let lib_path = dir.path().join("lib.htcl");
+        let bad_lib = "proc broken {} { return 42 }\n";
+        std::fs::write(&lib_path, bad_lib).unwrap();
+        let main_path = dir.path().join("main.htcl");
+        let main_src = "src lib\n";
+        std::fs::write(&main_path, main_src).unwrap();
+        let backend = HtclBackend::new();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let lib_uri = Url::from_file_path(&lib_path).unwrap();
+        backend
+            .set_workspace_roots(vec![dir.path().to_path_buf()])
+            .await;
+        // Open both. `main`'s analysis will contain a cross-file
+        // diagnostic for `lib`; `lib`'s own analysis will contain
+        // its own local diagnostic.
+        backend
+            .set_text_sync(main_uri.clone(), main_src.into())
+            .await;
+        backend.set_text_sync(lib_uri.clone(), bad_lib.into()).await;
+        let ws: std::collections::HashMap<Url, Vec<Diagnostic>> =
+            backend.workspace_diagnostics().await.into_iter().collect();
+        assert!(
+            !ws.get(&lib_uri).map(|v| v.is_empty()).unwrap_or(true),
+            "expected non-empty lib diagnostics before fix: {ws:?}",
+        );
+        // Fix `lib` via the OPEN buffer — but DO NOT touch `main`.
+        // `main`'s analysis is now stale; its cross-file entry
+        // still points at `lib:<old-error>`.
+        backend
+            .set_text_sync(lib_uri.clone(), "proc fixed {} unit {}\n".into())
+            .await;
+        let ws: std::collections::HashMap<Url, Vec<Diagnostic>> =
+            backend.workspace_diagnostics().await.into_iter().collect();
+        let lib_after = ws.get(&lib_uri).unwrap_or_else(|| {
+            panic!("lib uri missing from post-fix workspace diags: {ws:?}")
+        });
+        assert!(
+            lib_after.is_empty(),
+            "expected empty lib diagnostics after fixing the open buffer, got \
+             {lib_after:?} (main.htcl's stale analysis re-injected them)",
         );
     }
 
