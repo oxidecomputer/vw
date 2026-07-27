@@ -171,8 +171,6 @@ pub fn validate_with_all_extras_and_vars<'doc>(
         &newtype_qualified_names,
         &mut diags,
     );
-    // Prior-batch signatures fill in the gaps. The doc's own entries
-    // win because `entry().or_insert(...)` is a no-op on present keys.
     for (name, sig) in extra_sigs {
         table.entry(name.clone()).or_insert(*sig);
     }
@@ -183,47 +181,40 @@ pub fn validate_with_all_extras_and_vars<'doc>(
     }
     validate_type_decl_triplets(&type_table, &table, &mut diags);
     validate_enum_decls(&enum_table, &type_table, &mut diags);
-    // Set of every declared newtype's qualified name — passed to
-    // the qualified-position validator so `Qualified` references
-    // that resolve to a real newtype pass through instead of
-    // hitting the enum-variant-focused reject.
     let newtype_names: std::collections::HashSet<String> =
         type_table.keys().cloned().collect();
     validate_qualified_positions(document, &newtype_names, &mut diags);
     let mut var_table = VarTypeTable::new();
-    // Build a proc table once so the return-type check can walk
-    // any proc's body without re-scanning the document per call.
     let proc_table = build_proc_table(document);
+    // Precompute per-signature arg-name → arg indexes so
+    // `validate_command` can do O(1) flag lookups instead of the
+    // O(N_args) linear scan `ProcSignature::find` does. Dcmac's
+    // auto-generated `ps_pmc_config` (and friends) carry ~890
+    // args; a bare `sig.find("boot_mode")` scans all of them, and
+    // `validate_command` invokes `find` multiple times per keyword
+    // argument (parse loop + requires + conflicts). Times thousands
+    // of call sites this compounds into minutes of CPU. Building the
+    // index once per sig — even for sigs never touched — is cheap
+    // (linear in total-args-in-workspace) and turns per-call-site
+    // work from O(K × N_args) into O(K).
+    let sig_env = SigEnv::build(&table);
     validate_stmts(
         &document.stmts,
         source,
         &table,
+        &sig_env,
         &proc_table,
         &newtype_qualified_names,
         &mut var_table,
         &mut diags,
     );
-    // Undefined-variable check. Errors (fail `vw check` / red LSP
-    // squiggle), mirror shape to unused-var pass but with the
-    // set-operation flipped. `extra_top_level_vars` seeds the
-    // top-level decl set so REPL batches see prior-batch vars.
     crate::undefined::validate_undefined_vars_with_extras(
         document,
         source,
         extra_top_level_vars,
         &mut diags,
     );
-    // Warning-level pass: unused-variable check. Runs last so the
-    // hard-error diagnostics keep priority visually and any short-
-    // circuit in earlier passes is unaffected by the walk here.
     crate::unused::validate_unused_vars(document, source, &mut diags);
-    // Undefined-src-module check. `src @<name>` where `<name>`
-    // isn't a registered dep name in the caller's `Resolver` fires
-    // a spanned Error diagnostic; without this the LSP silently
-    // drops the import (workspace.rs::collect_imports) and `vw
-    // check` only surfaces the failure via the loader's hard-abort
-    // path (no span). The check no-ops when `extra_dep_names` is
-    // empty — unit tests and non-workspace callers skip it.
     validate_src_imports(document, extra_dep_names, &mut diags);
     validate_test_attributes(document, &mut diags);
     diags
@@ -1456,10 +1447,76 @@ fn is_bool_type(ty: &crate::ast::TypeExpr) -> bool {
     )
 }
 
+/// Precomputed per-run lookups shared across every `validate_command`
+/// invocation. Building once amortises the O(N_procs)- and
+/// O(N_args)-per-proc setup that would otherwise run on every call
+/// site. Populated at the top of `validate_with_all_extras_and_vars`
+/// and threaded through `validate_stmts`.
+pub(crate) struct SigEnv<'a> {
+    /// Per-signature `arg_name -> &ProcArg`. Replaces
+    /// `ProcSignature::find`'s O(N_args) linear scan in the
+    /// keyword-arg parse loop (dcmac wrappers carry ~890 args).
+    pub arg_indexes: HashMap<String, HashMap<String, &'a ProcArg>>,
+    /// `bare_name -> [qualified proc names ending ::bare_name]`.
+    /// Lets the unknown-call path find a namespaced homonym in
+    /// O(1) instead of a linear scan of the whole signature
+    /// table on every builtin call.
+    pub suffix_index: HashMap<&'a str, Vec<&'a str>>,
+    /// Full list of qualified proc names, for the fuzzy sweep's
+    /// primary candidate set. Owned as `&str` slices into
+    /// `table`'s keys.
+    pub qualified_names: Vec<&'a str>,
+    /// Bare-name projection of `qualified_names` (last `::`
+    /// suffix, or the whole name if unqualified). The fuzzy
+    /// sweep used to compute this Vec on EVERY unknown positional
+    /// call — with a table of ~5000 wrapper procs and hundreds of
+    /// such call sites in a joined-source dump, that single
+    /// per-call alloc dominated `validate_stmts` (~100s on the
+    /// metroid workspace). Precomputed here once.
+    pub bare_names: Vec<String>,
+}
+
+impl<'a> SigEnv<'a> {
+    fn build(table: &'a HashMap<String, &'a ProcSignature>) -> Self {
+        let arg_indexes: HashMap<String, HashMap<String, &ProcArg>> = table
+            .iter()
+            .map(|(name, sig)| {
+                let idx: HashMap<String, &ProcArg> =
+                    sig.args.iter().map(|a| (a.name.clone(), a)).collect();
+                (name.clone(), idx)
+            })
+            .collect();
+        let mut suffix_index: HashMap<&str, Vec<&str>> = HashMap::new();
+        for k in table.keys() {
+            if let Some((_, suffix)) = k.rsplit_once("::") {
+                suffix_index.entry(suffix).or_default().push(k.as_str());
+            }
+        }
+        let qualified_names: Vec<&str> =
+            table.keys().map(String::as_str).collect();
+        let bare_names: Vec<String> = qualified_names
+            .iter()
+            .map(|k| {
+                k.rsplit_once("::")
+                    .map(|(_, suffix)| suffix.to_string())
+                    .unwrap_or_else(|| (*k).to_string())
+            })
+            .collect();
+        Self {
+            arg_indexes,
+            suffix_index,
+            qualified_names,
+            bare_names,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_stmts(
     stmts: &[Stmt],
     source: &str,
     table: &HashMap<String, &ProcSignature>,
+    env: &SigEnv,
     proc_table: &HashMap<String, &crate::ast::Proc>,
     newtype_names: &std::collections::HashSet<String>,
     var_table: &mut VarTypeTable,
@@ -1483,7 +1540,7 @@ fn validate_stmts(
                 }
             }
         }
-        validate_command(cmd, source, table, var_table, diags);
+        validate_command(cmd, source, table, env, var_table, diags);
         match &cmd.kind {
             CommandKind::Proc(proc) => {
                 // Return-type check: fires only when the proc has
@@ -1515,6 +1572,7 @@ fn validate_stmts(
                     &proc.body,
                     source,
                     table,
+                    env,
                     proc_table,
                     newtype_names,
                     &mut proc_scope,
@@ -1536,6 +1594,7 @@ fn validate_stmts(
                     &ns.body,
                     source,
                     table,
+                    env,
                     proc_table,
                     newtype_names,
                     var_table,
@@ -1556,6 +1615,7 @@ fn validate_stmts(
                         body,
                         source,
                         table,
+                        env,
                         proc_table,
                         newtype_names,
                         var_table,
@@ -2546,6 +2606,24 @@ fn is_known_tcl_builtin(name: &str) -> bool {
             | "format"
             | "scan"
             | "binary"
+            // Control flow. Note these are parsed as `Generic`
+            // commands (no dedicated `CommandKind`), so
+            // `validate_command` sees `if`/`while`/`foreach`/... as
+            // regular calls and would otherwise send every one
+            // through the fuzzy sweep — `if` alone can hit six
+            // figures of call sites in a joined-source dump.
+            | "if"
+            | "elseif"
+            | "else"
+            | "then"
+            | "for"
+            | "foreach"
+            | "while"
+            | "do"
+            | "break"
+            | "continue"
+            | "proc"
+            | "source"
             // Flow / introspection / interp.
             | "after"
             | "eval"
@@ -2560,6 +2638,18 @@ fn is_known_tcl_builtin(name: &str) -> bool {
             | "error"
             | "return"
             | "expr"
+            | "subst"
+            | "time"
+            | "trace"
+            | "unknown"
+            // More list / string builtins.
+            | "split"
+            | "join"
+            | "lreverse"
+            | "lassign"
+            | "lmap"
+            | "lrepeat"
+            | "dict_get"
             // I/O & filesystem.
             | "puts"
             // `putr` is our compile-time repr-dispatching shim:
@@ -2580,6 +2670,14 @@ fn is_known_tcl_builtin(name: &str) -> bool {
             | "fconfigure"
             | "fileevent"
             | "flush"
+            | "socket"
+            | "chan"
+            | "pwd"
+            | "cd"
+            | "glob"
+            | "pid"
+            | "env"
+            | "clock"
             // Channels / Tk-style.
             | "namespace"
             | "variable"
@@ -2621,6 +2719,7 @@ fn validate_command(
     cmd: &Command,
     source: &str,
     table: &HashMap<String, &ProcSignature>,
+    env: &SigEnv,
     var_table: &VarTypeTable,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -2673,29 +2772,30 @@ fn validate_command(
         // A positional-only call to a bare Tcl builtin (`llength`,
         // `dict`, etc.) still passes cleanly: `is_known_tcl_builtin`
         // filters those, and there's no namespaced homonym.
-        let uses_keyword = cmd.words.iter().skip(1).any(|w| {
-            w.as_text()
-                .is_some_and(|t| t.starts_with('-') && t.len() > 1)
-        });
-        let namespaced_match = if !call_name.contains("::") {
-            let suffix = format!("::{call_name}");
-            table.keys().find(|k| k.ends_with(&suffix)).cloned()
-        } else {
-            None
-        };
-        // Short-circuit BEFORE the expensive fuzzy sweep — Tcl
-        // builtins and the primitive prelude are the fast rejection
-        // path and account for the vast majority of calls in a
-        // healthy source. The old gate stopped here entirely when
-        // the call was positional (no -flag) and had no exact
-        // namespaced homonym; that let typos like `generate_dcmacc`
-        // slip past. The updated gate falls through to a Levenshtein
-        // sweep for genuinely-unknown positional calls.
+        //
+        // Short-circuit builtins FIRST — every `if`, `set`, `puts`,
+        // `list`, etc. hits this path and there can be tens of
+        // thousands of such call sites in a healthy source. The
+        // downstream `suffix_index` and fuzzy sweep are cheap per
+        // call (index is O(1), fuzzy allocs a bare-name Vec) but
+        // even cheap-per-call adds up at that scale.
         if is_known_tcl_builtin(call_name)
             || is_primitive_prelude_proc(call_name)
         {
             return;
         }
+        let uses_keyword = cmd.words.iter().skip(1).any(|w| {
+            w.as_text()
+                .is_some_and(|t| t.starts_with('-') && t.len() > 1)
+        });
+        let namespaced_match = if !call_name.contains("::") {
+            env.suffix_index
+                .get(call_name)
+                .and_then(|qs| qs.iter().min_by_key(|s| s.len()))
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
         // A Levenshtein-close hit against a proc the table already
         // knows about is strong evidence the call is USER code with a
         // typo. Compute lazily — only after we've confirmed the call
@@ -2714,26 +2814,23 @@ fn validate_command(
         // finding the table entry whose suffix matches.
         let need_fuzzy = !uses_keyword && namespaced_match.is_none();
         let (fuzzy_match, fuzzy_hint) = if need_fuzzy {
-            let bare_names: Vec<String> = table
-                .keys()
-                .map(|k| {
-                    k.rsplit_once("::")
-                        .map(|(_, suffix)| suffix.to_string())
-                        .unwrap_or_else(|| k.clone())
-                })
-                .collect();
-            let suggestion = suggest_name(call_name, table.keys())
-                .or_else(|| suggest_name(call_name, bare_names.iter()));
+            let suggestion =
+                suggest_name(call_name, env.qualified_names.iter().copied())
+                    .or_else(|| {
+                        suggest_name(
+                            call_name,
+                            env.bare_names.iter().map(String::as_str),
+                        )
+                    });
             let hint_name = suggestion.as_ref().map(|s| {
                 if s.contains("::") {
                     s.clone()
                 } else {
-                    let suffix = format!("::{s}");
-                    table
-                        .keys()
-                        .filter(|k| k.ends_with(&suffix) || k.as_str() == s)
-                        .min_by_key(|k| k.len())
-                        .cloned()
+                    env.suffix_index
+                        .get(s.as_str())
+                        .and_then(|qs| qs.iter().min_by_key(|k| k.len()))
+                        .map(|q| q.to_string())
+                        .or_else(|| table.get(s.as_str()).map(|_| s.clone()))
                         .unwrap_or_else(|| s.clone())
                 }
             });
@@ -2758,7 +2855,10 @@ fn validate_command(
             } else if let Some(s) = fuzzy_hint {
                 format!(" — did you mean `{s}`?")
             } else {
-                match suggest_name(call_name, table.keys()) {
+                match suggest_name(
+                    call_name,
+                    env.qualified_names.iter().copied(),
+                ) {
                     Some(s) => format!(" — did you mean `{s}`?"),
                     None => String::new(),
                 }
@@ -2807,7 +2907,18 @@ fn validate_command(
         let flag_name = flag_text.to_string();
         let value_word = cmd.words.get(idx + 1);
 
-        match sig.find(&flag_name) {
+        // O(1) flag lookup via the precomputed per-sig arg index.
+        // Fall back to `sig.find` when we don't have an index for
+        // this call — the index is keyed by qualified proc name,
+        // and a namespaced-shadow / entry-point mismatch would
+        // point us at a sig without a prebuilt index.
+        let arg_lookup: Option<&ProcArg> = env
+            .arg_indexes
+            .get(call_name)
+            .and_then(|idx| idx.get(&flag_name))
+            .copied()
+            .or_else(|| sig.find(&flag_name));
+        match arg_lookup {
             None => {
                 let known: Vec<&str> =
                     sig.args.iter().map(|a| a.name.as_str()).collect();
@@ -2988,7 +3099,16 @@ fn validate_command(
 
     // Inter-arg deps for present args.
     for (flag_name, flag_span) in &seen {
-        let Some(arg) = sig.find(flag_name) else {
+        // Same O(1) shortcut as the parse-loop lookup — falls
+        // back to the linear scan when the index doesn't cover
+        // this sig.
+        let Some(arg) = env
+            .arg_indexes
+            .get(call_name)
+            .and_then(|idx| idx.get(flag_name.as_str()))
+            .copied()
+            .or_else(|| sig.find(flag_name))
+        else {
             continue;
         };
         if let Some(req) = arg.attribute("requires") {
@@ -3226,23 +3346,30 @@ fn check_range(
 /// near-misses don't get nonsense suggestions tacked on).
 fn suggest_name<'a, I>(target: &str, candidates: I) -> Option<String>
 where
-    I: IntoIterator<Item = &'a String>,
+    I: IntoIterator<Item = &'a str>,
 {
     // rustc-style threshold: scales with name length so single-char
     // typos count for short names, but a 12-char identifier
     // tolerates a few keystroke errors. Floor at 1, ceiling at 3 —
     // anything past 3 starts producing surprising suggestions.
-    let threshold = (target.chars().count() / 3).clamp(1, 3);
-    let target_len = target.chars().count();
+    //
+    // Proc names in the workspace are ASCII-only (identifier grammar
+    // rejects non-ASCII), so `.len()` is the character count. That
+    // matters because `.chars().count()` walks the whole string
+    // (O(N_bytes)) and this suggestion path runs for every unknown
+    // positional call — with a 5000-candidate table, replacing
+    // `chars().count()` with `.len()` inside the length-diff
+    // shortcut collapses the fuzzy sweep from minutes to
+    // milliseconds on the metroid workspace.
+    let target_len = target.len();
+    let threshold = (target_len / 3).clamp(1, 3);
     let mut best: Option<(usize, &str)> = None;
     for cand in candidates {
         // Length-difference lower-bound: levenshtein(a, b) ≥ ||a| - |b||.
         // Skip candidates whose length already exceeds the threshold —
         // no amount of substitution/insertion can bring the distance
-        // in range. This alone cuts the ~5000-candidate scan on
-        // gtwiz-versal (proc names 20-80 chars, target ~15 chars)
-        // down to a small handful of viable comparisons.
-        let cand_len = cand.chars().count();
+        // in range.
+        let cand_len = cand.len();
         let len_diff = target_len.abs_diff(cand_len);
         if len_diff > threshold {
             continue;
@@ -3252,7 +3379,7 @@ where
             continue;
         }
         if best.map(|(b, _)| d < b).unwrap_or(true) {
-            best = Some((d, cand.as_str()));
+            best = Some((d, cand));
         }
     }
     best.map(|(_, s)| s.to_string())
@@ -3266,8 +3393,11 @@ where
 /// handful of cells — critical when the candidate table has
 /// thousands of entries.
 fn levenshtein_capped(a: &str, b: &str, max: usize) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
+    // Proc-name identifiers are ASCII, so bytes == chars and we can
+    // skip the `chars().collect::<Vec<char>>()` alloc pair that
+    // otherwise fires for every comparison in the fuzzy sweep.
+    let a = a.as_bytes();
+    let b = b.as_bytes();
     let m = a.len();
     let n = b.len();
     if m == 0 {
