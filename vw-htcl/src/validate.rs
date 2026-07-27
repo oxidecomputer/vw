@@ -3061,6 +3061,18 @@ fn validate_command(
                             }
                         }
                     }
+                    // Redundant-default warning: the caller wrote
+                    // `-flag X` where X exactly equals the arg's
+                    // `@default(X)`. Fires only for literal-text
+                    // values on both sides — `$var` / `[cmd]`
+                    // arg-side and non-literal defaults skip. Empty
+                    // defaults (`@default("")`) are a common
+                    // "sentinel for unset" idiom in the generated
+                    // wrappers, so we don't flag a matching
+                    // `-flag ""` — the user asked for the value
+                    // explicitly and the wrapper's `__vw_kw_..._set`
+                    // machinery would still observe kw_set=true.
+                    warn_if_redundant_default(&flag_name, arg, value, diags);
                 } else {
                     diags.push(Diagnostic {
                         severity: Severity::Error,
@@ -3285,6 +3297,77 @@ fn validate_value(
         check_range(
             call_name, &arg.name, range_attr, &literal, value_word, diags,
         );
+    }
+}
+
+/// Warn when a caller passes `-flag X` where X exactly equals the
+/// arg's `@default(X)`. Fires on literal-text values on BOTH sides;
+/// interpolated values (`$var`, `[cmd]`) are runtime-dynamic and
+/// skip. Skips empty-string defaults — those are the "sentinel for
+/// unset" idiom used across the auto-generated wrappers.
+fn warn_if_redundant_default(
+    flag_name: &str,
+    arg: &ProcArg,
+    value_word: &Word,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(default_attr) = arg.attribute("default") else {
+        return;
+    };
+    // `@default` takes one positional value. Skip weird shapes
+    // (no value, multiple values, `key=value`) — they aren't a
+    // meaningful equality target.
+    let [only] = default_attr.values.as_slice() else {
+        return;
+    };
+    let default_str: &str = match only {
+        AttributeValue::Integer { value, .. } => {
+            return warn_if_int_match(flag_name, *value, value_word, diags);
+        }
+        AttributeValue::String { value, .. }
+        | AttributeValue::Ident { value, .. } => value.as_str(),
+        AttributeValue::Keyed { .. } => return,
+    };
+    // Sentinel-unset convention — see doc comment.
+    if default_str.is_empty() {
+        return;
+    }
+    let Some(literal) = literal_value(value_word) else {
+        return;
+    };
+    if literal == default_str {
+        diags.push(Diagnostic {
+            severity: Severity::Warning,
+            message: format!(
+                "redundant `-{flag_name} {literal}` — this is the arg's \
+                 default; omit the flag"
+            ),
+            span: value_word.span,
+        });
+    }
+}
+
+fn warn_if_int_match(
+    flag_name: &str,
+    default: i64,
+    value_word: &Word,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(literal) = literal_value(value_word) else {
+        return;
+    };
+    let Ok(actual) = literal.parse::<i64>() else {
+        return;
+    };
+    if actual == default {
+        diags.push(Diagnostic {
+            severity: Severity::Warning,
+            message: format!(
+                "redundant `-{flag_name} {literal}` — this is the arg's \
+                 default; omit the flag"
+            ),
+            span: value_word.span,
+        });
     }
 }
 
@@ -4974,6 +5057,99 @@ proc bad {} cpm5::Config { return not_a_var_anywhere }
             "message names type and literal: {}",
             errs[0].message,
         );
+    }
+
+    #[test]
+    fn redundant_default_string_arg_warns() {
+        // `-freq "33.333"` when the arg's `@default("33.333")` —
+        // the flag is a no-op. Fires with a "redundant" warning.
+        let src = "\
+proc use_clock { @default(\"33.333\") freq } unit { puts $freq }
+use_clock -freq \"33.333\"
+";
+        let d = diags(src);
+        let warns: Vec<_> = d
+            .iter()
+            .filter(|x| x.message.contains("redundant"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected 1 redundant-default warn, got {d:?}"
+        );
+        assert_eq!(warns[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn redundant_default_bare_matches_quoted_default() {
+        // Same test, but the caller writes the value bare
+        // (`-freq 33.333`) while the default is quoted
+        // (`@default("33.333")`). literal_value normalizes both.
+        let src = "\
+proc use_clock { @default(\"33.333\") freq } unit { puts $freq }
+use_clock -freq 33.333
+";
+        assert_eq!(
+            diags(src)
+                .iter()
+                .filter(|x| x.message.contains("redundant"))
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn redundant_default_int_arg_warns() {
+        // `-count 0` when default is `@default(0)` — integer
+        // path; both sides normalize through `i64::parse`.
+        let src = "\
+proc count_up { @default(0) count } unit { puts $count }
+count_up -count 0
+";
+        assert_eq!(
+            diags(src)
+                .iter()
+                .filter(|x| x.message.contains("redundant"))
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn non_default_value_does_not_warn() {
+        // `-freq 100` when default is `33.333` — different value,
+        // no warning.
+        let src = "\
+proc use_clock { @default(\"33.333\") freq } unit { puts $freq }
+use_clock -freq 100
+";
+        assert!(!diags(src).iter().any(|x| x.message.contains("redundant")),);
+    }
+
+    #[test]
+    fn empty_default_is_sentinel_no_warn() {
+        // `@default("")` is the "unset sentinel" idiom in the
+        // generated wrappers. Explicitly passing `""` still flips
+        // the `__vw_kw_..._set` guard, so it isn't strictly
+        // redundant — no warning.
+        let src = "\
+proc configure { @default(\"\") config } unit { puts $config }
+configure -config \"\"
+";
+        assert!(!diags(src).iter().any(|x| x.message.contains("redundant")),);
+    }
+
+    #[test]
+    fn interpolated_value_does_not_warn() {
+        // Runtime-dynamic values (`$var`, `[cmd]`) can't be
+        // compared to a literal default at analysis time — skip
+        // silently.
+        let src = "\
+proc use_clock { @default(\"33.333\") freq } unit { puts $freq }
+set x 33.333
+use_clock -freq $x
+";
+        assert!(!diags(src).iter().any(|x| x.message.contains("redundant")),);
     }
 
     #[test]
