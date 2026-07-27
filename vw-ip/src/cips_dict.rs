@@ -249,18 +249,27 @@ fn load_ps_pmc_schema(data_root: &Path) -> Option<DictSchema> {
     })
 }
 
-/// Names of `<spirit:parameter>` entries that live at the top level of
-/// the CIPS IP-XACT — we don't want to re-emit them as inner dict
-/// fields. (Recovered by `vw ip generate` separately, but easier to
-/// hard-code the small list than to thread the IP-XACT through here.)
+/// Names of `<spirit:parameter>` entries the CIPS IP-XACT exposes at
+/// the top level of the component — the containers Vivado writes as
+/// `CONFIG.<NAME>` in the outer `set_property -dict`. We must NOT
+/// re-emit them as inner dict fields of `ps_pmc_config` (the schema
+/// this filter runs against), or the emitted wrapper would produce
+/// `CONFIG.PS_PMC_CONFIG.PS_PMC_CONFIG` and similar recursion.
+///
+/// Only container / component-identity names belong here. Ordinary
+/// scalar knobs like `PMC_REF_CLK_FREQMHZ`, `PMC_ALT_REF_CLK_FREQMHZ`,
+/// `GT_REFCLK_MHZ`, `AURORA_LINE_RATE_GPBS`,
+/// `BOOT_SECONDARY_PCIE_ENABLE` are ALSO settable at the top level in
+/// the Vivado GUI, but Xilinx's `param_mapping_direct.csv` groups them
+/// under `PS_PMC_CONFIG` too — nesting them in the dict works fine
+/// because Vivado accepts both forms, and it's the only path that
+/// preserves them (the CIPS `component.xml` doesn't list them
+/// individually, so a "recover from IP-XACT" filter would drop them
+/// entirely — the bug this comment now guards against).
 fn is_cips_toplevel(name: &str) -> bool {
     matches!(
         name,
-        "AURORA_LINE_RATE_GPBS"
-            | "BOOT_SECONDARY_PCIE_ENABLE"
-            | "Component_Name"
-            | "GT_REFCLK_MHZ"
-            | "PMC_REF_CLK_FREQMHZ"
+        "Component_Name"
             | "PS_PMC_CONFIG"
             | "PS_PMC_CONFIG_INTERNAL"
             | "PS_PMC_CONFIG_APPLIED"
