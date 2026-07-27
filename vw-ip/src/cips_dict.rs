@@ -46,7 +46,7 @@ pub struct DictSchema {
     pub sub_schemas: BTreeMap<String, DictSchema>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DictField {
     /// IP-XACT-style upper-snake name, e.g. `PCIE_APERTURES_DUAL_ENABLE`.
     pub name: String,
@@ -61,6 +61,17 @@ pub struct DictField {
     /// or from `param_mapping_presets.csv`. Empty when no enum data
     /// was found.
     pub enum_values: BTreeSet<String>,
+    /// When true, the generator emits `@baseline(<default>)` instead
+    /// of `@default(<default>)` for this field. Set via
+    /// `overrides.toml` (`baseline = true`) for scalar knobs whose
+    /// value can be shifted out from under a caller by a sibling
+    /// `-preset` / `-board_interface` — the runtime wrapper is
+    /// unchanged (still `if kw_set { dict set }`), but the annotation
+    /// documents the value as a baseline, and the redundant-default
+    /// lint stops flagging call-site values that match. See
+    /// [`crate::overrides::FieldOverride::baseline`] for the full
+    /// rationale.
+    pub baseline: bool,
 }
 
 impl DictSchema {
@@ -102,7 +113,14 @@ impl DictSchema {
         shape_path: &str,
         overrides: &OverridesFile,
     ) {
+        // Shape-wide baseline switch: when set, EVERY field in the
+        // shape is treated as baseline regardless of per-field
+        // config. Cheap to check once per shape.
+        let shape_baseline = overrides.shape_baseline(shape_path);
         for f in &mut self.fields {
+            if shape_baseline {
+                f.baseline = true;
+            }
             let field_lookup = lower(&f.name);
             let Some(fo) = overrides.field(shape_path, &field_lookup) else {
                 continue;
@@ -112,6 +130,9 @@ impl DictSchema {
             }
             if let Some(enum_values) = &fo.enum_values {
                 f.enum_values = enum_values.iter().cloned().collect();
+            }
+            if fo.baseline {
+                f.baseline = true;
             }
         }
         for (sub_name, sub) in &mut self.sub_schemas {
@@ -125,6 +146,11 @@ impl DictSchema {
         shape_path: &str,
         overrides: &OverridesFile,
     ) -> Self {
+        // Shape-wide baseline switch — same semantic as
+        // `reapply_overrides`: when true, every field the pairs
+        // loop constructs gets `baseline = true` without needing a
+        // per-field opt-in.
+        let shape_baseline = overrides.shape_baseline(shape_path);
         let mut fields = Vec::new();
         let mut sub_schemas = BTreeMap::new();
         for (raw_name, value) in pairs {
@@ -153,26 +179,30 @@ impl DictSchema {
                     let field_lookup = lower(raw_name);
                     let field_override =
                         overrides.field(shape_path, &field_lookup);
-                    let (final_default, enum_values) = match field_override {
-                        Some(fo) => {
-                            let d = fo
-                                .default
-                                .clone()
-                                .unwrap_or_else(|| default.clone());
-                            let e = fo
-                                .enum_values
-                                .clone()
-                                .map(|v| v.into_iter().collect::<BTreeSet<_>>())
-                                .unwrap_or_default();
-                            (d, e)
-                        }
-                        None => (default.clone(), BTreeSet::new()),
-                    };
+                    let (final_default, enum_values, baseline) =
+                        match field_override {
+                            Some(fo) => {
+                                let d = fo
+                                    .default
+                                    .clone()
+                                    .unwrap_or_else(|| default.clone());
+                                let e = fo
+                                    .enum_values
+                                    .clone()
+                                    .map(|v| {
+                                        v.into_iter().collect::<BTreeSet<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                (d, e, fo.baseline)
+                            }
+                            None => (default.clone(), BTreeSet::new(), false),
+                        };
                     fields.push(DictField {
                         name: raw_name.clone(),
                         default: final_default,
                         description: None,
                         enum_values,
+                        baseline: baseline || shape_baseline,
                     });
                 }
             }
@@ -313,6 +343,7 @@ fn parse_direct_csv(path: &Path, fields: &mut HashMap<String, DictField>) {
             default,
             description: None,
             enum_values: BTreeSet::new(),
+            ..Default::default()
         });
     }
 }
@@ -418,6 +449,7 @@ fn parse_presets_csv(path: &Path, fields: &mut HashMap<String, DictField>) {
             default: default.clone(),
             description: None,
             enum_values: BTreeSet::new(),
+            ..Default::default()
         });
         for v in enums {
             f.enum_values.insert(v);
@@ -833,11 +865,15 @@ CLOCK_MODE,REF CLK 33.33 MHz
             FieldOverride {
                 enum_values: Some(vec!["NRZ".into(), "PAM4".into()]),
                 default: None,
+                baseline: false,
             },
         );
         ov.shapes.insert(
             "intf::gt_settings::lr0_settings".into(),
-            ShapeOverrides { fields },
+            ShapeOverrides {
+                fields,
+                baseline: false,
+            },
         );
         // Note the shape path passed at the root is the outer shape;
         // the LR0_SETTINGS sub-schema descends to
@@ -870,6 +906,80 @@ CLOCK_MODE,REF CLK 33.33 MHz
     }
 
     #[test]
+    fn override_baseline_flag_flows_into_dict_field() {
+        // `overrides.toml` marks a field as baseline — the flag
+        // has to end up on the extracted `DictField` so the
+        // emitter can pick the `@baseline` vs `@default` attribute.
+        use crate::overrides::{FieldOverride, OverridesFile, ShapeOverrides};
+        let mut ov = OverridesFile::default();
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "rx_refclk_frequency".to_string(),
+            FieldOverride {
+                enum_values: None,
+                default: None,
+                baseline: true,
+            },
+        );
+        ov.shapes.insert(
+            "intf::gt_settings::lr0_settings".into(),
+            ShapeOverrides {
+                fields,
+                baseline: false,
+            },
+        );
+        let src = "LR0_SETTINGS {RX_REFCLK_FREQUENCY 156.25 RX_HD_EN 0}";
+        let s = DictSchema::from_paired_default(src, "intf::gt_settings", &ov);
+        let lr0 = s.sub_schemas.get("LR0_SETTINGS").unwrap();
+        let rx_freq = lr0
+            .fields
+            .iter()
+            .find(|f| f.name == "RX_REFCLK_FREQUENCY")
+            .expect("RX_REFCLK_FREQUENCY field");
+        assert!(rx_freq.baseline, "baseline flag should be set");
+        assert_eq!(rx_freq.default, "156.25");
+        let rx_hd = lr0
+            .fields
+            .iter()
+            .find(|f| f.name == "RX_HD_EN")
+            .expect("RX_HD_EN field");
+        assert!(!rx_hd.baseline, "non-flagged field stays baseline=false");
+    }
+
+    #[test]
+    fn shape_wide_baseline_marks_every_field() {
+        // Shape-level `baseline = true` applies to EVERY scalar
+        // field the schema extractor produces, regardless of per-
+        // field configuration. Per-field overrides still layer on
+        // top; they just can't OPT OUT of the shape-wide switch.
+        use crate::overrides::{FieldOverride, OverridesFile, ShapeOverrides};
+        let mut ov = OverridesFile::default();
+        let mut fields = HashMap::new();
+        fields.insert(
+            "rx_pam_sel".to_string(),
+            FieldOverride {
+                enum_values: Some(vec!["NRZ".into(), "PAM4".into()]),
+                default: None,
+                baseline: false,
+            },
+        );
+        ov.shapes.insert(
+            "intf::lr0_settings".into(),
+            ShapeOverrides {
+                fields,
+                baseline: true,
+            },
+        );
+        let src = "RX_PAM_SEL NRZ RX_HD_EN 0 RX_REFCLK_FREQUENCY 156.25";
+        let s = DictSchema::from_paired_default(src, "intf::lr0_settings", &ov);
+        // Every field — even the one WITHOUT a per-field override
+        // (RX_HD_EN, RX_REFCLK_FREQUENCY) and the one WITH a
+        // per-field enum but no per-field baseline (RX_PAM_SEL) —
+        // must land as baseline. That's the whole point.
+        assert!(s.fields.iter().all(|f| f.baseline), "{:?}", s.fields);
+    }
+
+    #[test]
     fn override_default_replaces_xml_default() {
         use crate::overrides::{FieldOverride, OverridesFile, ShapeOverrides};
         let mut ov = OverridesFile::default();
@@ -879,10 +989,16 @@ CLOCK_MODE,REF CLK 33.33 MHz
             FieldOverride {
                 enum_values: None,
                 default: Some("25.78125".into()),
+                baseline: false,
             },
         );
-        ov.shapes
-            .insert("intf::lr0_settings".into(), ShapeOverrides { fields });
+        ov.shapes.insert(
+            "intf::lr0_settings".into(),
+            ShapeOverrides {
+                fields,
+                baseline: false,
+            },
+        );
         let src = "RX_LINE_RATE 10.3125 RX_HD_EN 0";
         let s = DictSchema::from_paired_default(src, "intf::lr0_settings", &ov);
         let rx_line = s

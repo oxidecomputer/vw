@@ -464,8 +464,18 @@ fn emit_dict_field_arg(
     // either the row was missing one or the value had unbalanced
     // braces and was rejected — fall back to an empty string so the
     // user can omit the arg and let Vivado decide.
+    //
+    // Attribute name switches to `@baseline(<value>)` when the
+    // field's `overrides.toml` entry sets `baseline = true` — for
+    // scalar knobs whose value can be shifted by a sibling
+    // `-preset` / `-board_interface`. Runtime shape is unchanged
+    // (the wrapper still uses `if kw_set { dict set }`); the
+    // annotation just tells the analyzer and the reader that
+    // omission doesn't reset to `<value>`, and the redundant-default
+    // lint stops flagging call-site values that match.
+    let attr = if f.baseline { "baseline" } else { "default" };
     words.push(Word::Raw(format!(
-        "@default({})",
+        "@{attr}({})",
         format_attribute_value(&f.default)
     )));
     let lowered = lowercase_ident(&f.name);
@@ -2902,6 +2912,8 @@ fn extrapolate_quad_schema(
                 }
             }
             let mut default = f.default.clone();
+            let mut baseline =
+                f.baseline || opts.overrides.shape_baseline(shape_path);
             if let Some(fo) = field_override {
                 if let Some(d) = &fo.default {
                     default = d.clone();
@@ -2909,12 +2921,16 @@ fn extrapolate_quad_schema(
                 if let Some(ev) = &fo.enum_values {
                     enum_values = ev.iter().cloned().collect();
                 }
+                if fo.baseline {
+                    baseline = true;
+                }
             }
             fields.push(crate::DictField {
                 name,
                 default,
                 description: f.description.clone(),
                 enum_values,
+                baseline,
             });
         }
     }
@@ -3643,5 +3659,50 @@ mod tests {
         // stays scalar after.
         let p = mk_param("0", false);
         assert!(!is_properties_shaped_param(&p));
+    }
+
+    #[test]
+    fn dict_field_with_baseline_flag_emits_baseline_attr() {
+        // A `DictField` with `baseline: true` renders as
+        // `@baseline("<default>")` in the emitted arg list, not
+        // `@default("...")`. Non-baseline fields still emit
+        // `@default(...)` as before.
+        let baseline = crate::DictField {
+            name: "RX_REFCLK_FREQUENCY".into(),
+            default: "156.25".into(),
+            description: None,
+            enum_values: Default::default(),
+            baseline: true,
+        };
+        let normal = crate::DictField {
+            name: "RX_HD_EN".into(),
+            default: "0".into(),
+            description: None,
+            enum_values: Default::default(),
+            baseline: false,
+        };
+        let opts = GenerateOptions::default();
+        let mut doc = Doc::new();
+        emit_dict_field_arg(&mut doc, &baseline, &opts);
+        emit_dict_field_arg(&mut doc, &normal, &opts);
+        let out = doc.to_string();
+        assert!(
+            out.contains("@baseline(\"156.25\") rx_refclk_frequency"),
+            "expected baseline emission, got:\n{out}",
+        );
+        assert!(
+            out.contains("@default(0) rx_hd_en"),
+            "expected default emission, got:\n{out}",
+        );
+        // Sanity: the resulting attributes parse back through the
+        // HTCL grammar without errors — @baseline is treated as a
+        // first-class attribute the same as any @-prefixed name.
+        let wrapped = format!("proc t {{\n{out}}} unit {{ }}\n");
+        let parsed = vw_htcl::parse(&wrapped);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
     }
 }

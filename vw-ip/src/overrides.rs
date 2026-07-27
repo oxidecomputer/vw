@@ -103,6 +103,14 @@ impl OverridesFile {
         self.shapes.get(shape_path)?.fields.get(field_name)
     }
 
+    /// True when the shape at `shape_path` sets shape-wide
+    /// `baseline = true`. Missing shape → false. Callers use this
+    /// to force `@baseline(...)` emission on every field in the
+    /// shape, regardless of per-field configuration.
+    pub fn shape_baseline(&self, shape_path: &str) -> bool {
+        self.shapes.get(shape_path).is_some_and(|s| s.baseline)
+    }
+
     /// True when this override set is empty — no shapes registered.
     /// Callers use this to skip the whole override-application pass
     /// when there's nothing to do (fast path for IPs without an
@@ -113,10 +121,23 @@ impl OverridesFile {
 }
 
 /// Overrides scoped to one emitted proc / shape.
+///
+/// `baseline` at this level is the shape-wide switch: when true,
+/// every field in the shape gets `@baseline(...)` instead of
+/// `@default(...)`. Use it when the containing constructor takes a
+/// `-preset` (or other mutation source) that can shift ANY of the
+/// shape's fields — enumerating each field with per-field
+/// `baseline = true` would be tedious and easy to leave stale as
+/// new fields are generated. Per-field `baseline = false` cannot
+/// override the shape-level `true` (there's no "opt-out" — if the
+/// shape is baseline-wide, individual fields are too).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShapeOverrides {
     #[serde(default)]
     pub fields: HashMap<String, FieldOverride>,
+    /// Shape-wide baseline switch — see the type-level docs.
+    #[serde(default)]
+    pub baseline: bool,
 }
 
 /// Per-field refinement applied on top of the XML-derived schema.
@@ -128,12 +149,24 @@ pub struct ShapeOverrides {
 ///   authoritative, but Xilinx sometimes ships defaults that are
 ///   sentinels rather than useful values (e.g. `NA NA`). Overrides
 ///   absent → use XML value.
+/// - `baseline`: emit `@baseline(<value>)` instead of `@default(<value>)`.
+///   The field's runtime shape is unchanged (the wrapper uses the same
+///   `if kw_set { dict set }` gate either way), but the annotation
+///   documents that the value is the ParamInfo baseline — the value a
+///   FRESH IP would report, which a preset / board_interface / prior
+///   configuration can shift out from under omission. Callers that
+///   explicitly pass the baseline value are NOT flagged by the
+///   redundant-default lint under this variant. Use for scalar knobs
+///   downstream of a `-preset`-carrying constructor where omitting the
+///   flag doesn't pin the value.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FieldOverride {
     #[serde(default, rename = "enum")]
     pub enum_values: Option<Vec<String>>,
     #[serde(default)]
     pub default: Option<String>,
+    #[serde(default)]
+    pub baseline: bool,
 }
 
 #[cfg(test)]
@@ -196,6 +229,80 @@ fields.rx_line_rate = { default = "10.3125" }
             .expect("field present");
         assert_eq!(field.default.as_deref(), Some("10.3125"));
         assert!(field.enum_values.is_none());
+    }
+
+    #[test]
+    fn field_baseline_flag_parses() {
+        let f = write_tmp(
+            r#"
+[shapes."intf::gt_settings::lr0_settings"]
+fields.rx_refclk_frequency = { baseline = true }
+fields.tx_refclk_frequency = { baseline = true, enum = ["156.25", "161.13"] }
+"#,
+        );
+        let ov = OverridesFile::load_from(f.path()).unwrap();
+        let rx = ov
+            .field("intf::gt_settings::lr0_settings", "rx_refclk_frequency")
+            .expect("rx field present");
+        assert!(rx.baseline);
+        assert!(rx.default.is_none());
+        assert!(rx.enum_values.is_none());
+        let tx = ov
+            .field("intf::gt_settings::lr0_settings", "tx_refclk_frequency")
+            .expect("tx field present");
+        assert!(tx.baseline);
+        assert_eq!(
+            tx.enum_values.as_deref(),
+            Some(&["156.25".to_string(), "161.13".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn shape_level_baseline_flag_parses() {
+        // The shape-wide baseline switch flips every field in the
+        // shape without needing per-field entries. Useful when the
+        // containing constructor takes a `-preset` that can shift
+        // any of the shape's fields.
+        let f = write_tmp(
+            r#"
+[shapes."intf::lr0_settings"]
+baseline = true
+fields.rx_pam_sel = { enum = ["NRZ", "PAM4"] }
+"#,
+        );
+        let ov = OverridesFile::load_from(f.path()).unwrap();
+        assert!(ov.shape_baseline("intf::lr0_settings"));
+        assert!(!ov.shape_baseline("intf::other_shape"));
+        // Per-field override still parses alongside the shape flag.
+        let field = ov.field("intf::lr0_settings", "rx_pam_sel").unwrap();
+        assert!(field.enum_values.is_some());
+    }
+
+    #[test]
+    fn shape_baseline_defaults_to_false() {
+        let f = write_tmp(
+            r#"
+[shapes."intf::lr0_settings"]
+fields.rx_pam_sel = { enum = ["NRZ", "PAM4"] }
+"#,
+        );
+        let ov = OverridesFile::load_from(f.path()).unwrap();
+        assert!(!ov.shape_baseline("intf::lr0_settings"));
+    }
+
+    #[test]
+    fn baseline_defaults_to_false() {
+        // Existing override files that don't set `baseline` continue
+        // to emit `@default(...)` unchanged.
+        let f = write_tmp(
+            r#"
+[shapes."intf::lr0_settings"]
+fields.rx_pam_sel = { enum = ["NRZ", "PAM4"] }
+"#,
+        );
+        let ov = OverridesFile::load_from(f.path()).unwrap();
+        let field = ov.field("intf::lr0_settings", "rx_pam_sel").unwrap();
+        assert!(!field.baseline);
     }
 
     #[test]

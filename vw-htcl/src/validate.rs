@@ -3115,7 +3115,13 @@ fn validate_command(
         if in_one_of.contains(arg.name.as_str()) {
             continue;
         }
-        let is_required = arg.attribute("default").is_none();
+        // Optional if the arg has EITHER `@default(...)` (Rust-style
+        // "value if omitted") OR `@baseline(...)` (documented
+        // fresh-IP value; runtime still gates emission on
+        // `__vw_kw_..._set`, so omission is a legitimate call
+        // shape). Missing both → the caller MUST supply a value.
+        let is_required = arg.attribute("default").is_none()
+            && arg.attribute("baseline").is_none();
         if is_required {
             diags.push(Diagnostic {
                 severity: Severity::Error,
@@ -4973,6 +4979,31 @@ proc branchy {} ns::TypeB {
             .filter(|x| x.message.contains("return type mismatch"))
             .collect();
         assert!(!errs.is_empty(), "expected mismatch inside if, got {d:?}");
+    }
+
+    #[test]
+    fn baseline_arg_is_optional_and_does_not_warn_when_matched() {
+        // `@baseline(X)` behaves like `@default(X)` for optionality
+        // (the arg is NOT required), but explicitly passing X does
+        // NOT fire the redundant-default warning. This is the
+        // preset-shifted-baseline case: omitting the flag doesn't
+        // pin the value to X, so an explicit `-flag X` is
+        // meaningful, not redundant.
+        let src = "\
+proc use_it { @baseline(\"156.25\") freq } unit { puts $freq }
+use_it -freq \"156.25\"
+use_it
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|x| !x.message.contains("redundant")),
+            "baseline arg should not trigger redundant-default warn: {d:?}",
+        );
+        assert!(
+            d.iter()
+                .all(|x| !x.message.contains("missing required argument")),
+            "baseline arg should be optional (like @default): {d:?}",
+        );
     }
 
     #[test]
