@@ -124,6 +124,71 @@ impl HtclBackend {
         self.workspace_roots.read().await.clone()
     }
 
+    /// Preload analyses for every entry point `vw check` would
+    /// discover under each workspace root. These files land in
+    /// the docs map as "virtual-open" entries — the editor never
+    /// sent `did_open` for them, but their committed analysis
+    /// participates in `workspace_diagnostics` the same way an
+    /// actually-open file does. That's what lets space-D show
+    /// warnings in files the user hasn't visited yet.
+    ///
+    /// Entry-point set mirrors `vw-cli`'s `discover_check_targets`:
+    /// `<ws>/design.htcl`, `<ws>/module.htcl`, `<ws>/ip/module.htcl`,
+    /// and every discovered `bench/**/*.htcl` test. If an entry is
+    /// missing on disk (empty workspace) or the read fails,
+    /// silently skip that entry — a preload failure must never
+    /// block LSP startup or hide the on-open editor experience for
+    /// files that DO exist.
+    ///
+    /// Skips entries already in the docs map so this can be called
+    /// repeatedly (e.g. `did_change_workspace_folders`) without
+    /// clobbering the live buffer of a file the user is editing.
+    async fn preload_workspace_targets(&self, roots: &[std::path::PathBuf]) {
+        use crate::backend::LanguageBackend as _;
+        for root in roots {
+            let root_utf8 =
+                match camino::Utf8PathBuf::from_path_buf(root.clone()) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+            let ws = match vw_lib::find_workspace_dir(root_utf8.as_std_path()) {
+                Some(ws) => ws,
+                None => continue,
+            };
+            let mut targets: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(design) = vw_lib::find_design_file(&ws) {
+                targets.push(design.into_std_path_buf());
+            }
+            let module = ws.join("module.htcl");
+            if module.is_file() {
+                targets.push(module.into_std_path_buf());
+            }
+            let ip_module = ws.join("ip/module.htcl");
+            if ip_module.is_file() {
+                targets.push(ip_module.into_std_path_buf());
+            }
+            if let Ok(tests) = vw_lib::list_htcl_tests(&ws) {
+                targets.extend(tests);
+            }
+            for target in targets {
+                let Ok(uri) = Url::from_file_path(&target) else {
+                    continue;
+                };
+                {
+                    let docs = self.docs.read().await;
+                    if docs.contains_key(&uri) {
+                        continue;
+                    }
+                }
+                let Ok(text) = std::fs::read_to_string(&target) else {
+                    continue;
+                };
+                debug!(%uri, "preloading workspace target");
+                self.set_text(uri, text).await;
+            }
+        }
+    }
+
     /// Snapshot the current in-memory text for `uri`. Used by
     /// completion / hover / signature-help handlers that need the
     /// CURRENT text (what the user just typed) rather than the
@@ -539,7 +604,21 @@ impl LanguageBackend for HtclBackend {
     }
 
     async fn set_workspace_roots(&self, roots: Vec<std::path::PathBuf>) {
-        *self.workspace_roots.write().await = roots;
+        *self.workspace_roots.write().await = roots.clone();
+        // Preload the same set of files `vw check` scans so
+        // workspace-wide diagnostics cover the whole tree — not
+        // just the import graph reachable from the docs the
+        // user has explicitly opened. Without this the space-D
+        // picker misses warnings in leaf files (e.g. `ip/gtm.htcl`,
+        // `ip/dcmac.htcl`) until the user opens each one; with
+        // it, opening ANY file in the workspace surfaces the
+        // full-workspace picture on first analysis.
+        //
+        // Preload runs BEHIND `set_text`'s 250ms debounce (it
+        // just enqueues indexers) so this call returns fast; the
+        // per-file builds run on the indexer's spawn_blocking
+        // thread pool in the background.
+        self.preload_workspace_targets(&roots).await;
     }
 
     async fn save(&self, uri: &Url) {
@@ -640,6 +719,39 @@ impl LanguageBackend for HtclBackend {
         // read lock before calling `analysis_for` on each (which
         // takes its own read).
         let uris: Vec<Url> = self.docs.read().await.keys().cloned().collect();
+        // First-call gate: preloaded entry points can still be
+        // building the FIRST time this runs (initialize → preload
+        // spawns indexers, and the user opens a file before those
+        // indexers commit). Without this wait, the fan-out
+        // published from the user-open reindex reads a partial
+        // `workspace_diagnostics` snapshot — files whose preload
+        // hasn't committed yet contribute NOTHING, so the picker
+        // shows an incomplete picture until the user happens to
+        // open another file (which triggers a fresh fan-out
+        // AFTER preloads have finished).
+        //
+        // The bounded wait is per-URI: subscribe to that doc's
+        // analysis-watch channel and await the first non-`None`
+        // value. Already-committed docs return instantly.
+        // Preloads that fail to commit (indexer panic, disk read
+        // error) never publish a `Some` — 5 s is a generous
+        // ceiling that keeps the picker responsive even in that
+        // pathological case (the failing URI is simply omitted).
+        for uri in &uris {
+            let rx = {
+                let docs = self.docs.read().await;
+                docs.get(uri).map(|s| s.tx.subscribe())
+            };
+            let Some(mut rx) = rx else { continue };
+            if rx.borrow().is_some() {
+                continue;
+            }
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                rx.wait_for(|v| v.is_some()),
+            )
+            .await;
+        }
         let roots = self.workspace_roots_snapshot().await;
         // Open-doc set — used below to decide who owns a URI's
         // diagnostics. When a file is open, its own analysis was
@@ -3384,6 +3496,130 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
             lib_after.is_empty(),
             "expected empty lib diagnostics after fixing the open buffer, got \
              {lib_after:?} (main.htcl's stale analysis re-injected them)",
+        );
+    }
+
+    /// Wait until a preloaded/virtual-open URI has a committed
+    /// analysis. Test-only helper — `wait_for_reindex` only fires
+    /// on the NEXT commit, so it hangs when the preload's indexer
+    /// has already committed by the time the test observer
+    /// subscribes.
+    #[cfg(test)]
+    async fn wait_until_analysis_present(backend: &HtclBackend, uri: &Url) {
+        for _ in 0..200 {
+            if backend.analysis_for(uri).await.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for analysis of {uri}");
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_preload_covers_unopened_entry_points() {
+        // The workspace has a `design.htcl` (entry point `vw check`
+        // would discover) with warnings. The editor has NOT opened
+        // it. `workspace_diagnostics` should STILL surface those
+        // warnings because `set_workspace_roots` preloads the same
+        // entry-point set. Without this, Helix's space-D picker
+        // would show nothing for warnings in files the user
+        // hasn't visited.
+        let dir = tempfile::tempdir().unwrap();
+        // Minimal vw.toml to make this a valid workspace root
+        // (workspace-discovery walks up looking for it).
+        std::fs::write(
+            dir.path().join("vw.toml"),
+            "[workspace]\nname = \"t\"\n",
+        )
+        .unwrap();
+        // design.htcl carries a stub proc with a `@default(0)`
+        // arg; the redundant-default warning fires on the call
+        // site below.
+        let design_src = "\
+proc use_it { @default(0) count } unit { puts $count }
+use_it -count 0
+";
+        let design_path = dir.path().join("design.htcl");
+        std::fs::write(&design_path, design_src).unwrap();
+        let design_uri = Url::from_file_path(&design_path).unwrap();
+        // Open a DIFFERENT file — `other.htcl` — that does NOT
+        // src design.htcl. Without preload, design.htcl wouldn't
+        // appear in the docs map at all.
+        let other_path = dir.path().join("other.htcl");
+        std::fs::write(&other_path, "puts hi\n").unwrap();
+        let other_uri = Url::from_file_path(&other_path).unwrap();
+        let backend = HtclBackend::new();
+        backend
+            .set_workspace_roots(vec![dir.path().to_path_buf()])
+            .await;
+        backend
+            .set_text_sync(other_uri.clone(), "puts hi\n".into())
+            .await;
+        // Wait for the preload's design.htcl indexer to commit.
+        // `wait_for_reindex` would hang if the preload already
+        // committed (it waits for the NEXT commit); the poll
+        // helper handles the already-committed case correctly.
+        wait_until_analysis_present(&backend, &design_uri).await;
+        let ws: std::collections::HashMap<Url, Vec<Diagnostic>> =
+            backend.workspace_diagnostics().await.into_iter().collect();
+        let design_diags = ws.get(&design_uri).unwrap_or_else(|| {
+            panic!(
+                "design.htcl missing from workspace diags — preload didn't \
+                 register it. Full map: {ws:?}"
+            )
+        });
+        assert!(
+            design_diags.iter().any(|d| d.message.contains("redundant")),
+            "expected redundant-default warning from preloaded design.htcl, \
+             got {design_diags:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_awaits_pending_preload_indexers() {
+        // The race the previous test doesn't cover: the user
+        // opens a file BEFORE preload indexers commit. If
+        // `workspace_diagnostics` doesn't wait for preloads, the
+        // fan-out that publishes for space-D reads a partial
+        // snapshot — preloaded URIs whose indexer is still
+        // running contribute NOTHING, so their diagnostics are
+        // silently dropped from the picker.
+        //
+        // We simulate the race by NOT awaiting the preload
+        // between `set_workspace_roots` and the first
+        // `workspace_diagnostics` call. Preload for `warn.htcl`
+        // hasn't committed at that instant; the assertion is
+        // that `workspace_diagnostics` still returns the warning
+        // (having awaited the commit internally).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vw.toml"),
+            "[workspace]\nname = \"t\"\n",
+        )
+        .unwrap();
+        let warn_src = "\
+proc use_it { @default(0) count } unit { puts $count }
+use_it -count 0
+";
+        let warn_path = dir.path().join("design.htcl");
+        std::fs::write(&warn_path, warn_src).unwrap();
+        let warn_uri = Url::from_file_path(&warn_path).unwrap();
+        let backend = HtclBackend::new();
+        // set_workspace_roots kicks off the preload but returns
+        // BEFORE any preload indexer commits.
+        backend
+            .set_workspace_roots(vec![dir.path().to_path_buf()])
+            .await;
+        // Straight to workspace_diagnostics — no
+        // wait_until_analysis_present. This is the racey path.
+        let ws: std::collections::HashMap<Url, Vec<Diagnostic>> =
+            backend.workspace_diagnostics().await.into_iter().collect();
+        let diags = ws.get(&warn_uri).unwrap_or_else(|| {
+            panic!("preloaded design.htcl missing from ws diags: {ws:?}")
+        });
+        assert!(
+            diags.iter().any(|d| d.message.contains("redundant")),
+            "expected redundant-default warning, got {diags:?}",
         );
     }
 
