@@ -487,37 +487,156 @@ impl HtclBackend {
         generation: u64,
         debounce: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
-        let docs_arc = self.docs.clone();
-        let roots_arc = self.workspace_roots.clone();
-        tokio::spawn(async move {
-            if !debounce.is_zero() {
-                tokio::time::sleep(debounce).await;
-            }
-            let roots = roots_arc.read().await.clone();
-            let uri_inner = uri.clone();
-            let analysis = match tokio::task::spawn_blocking(move || {
-                HtclBackend::build_analysis(&uri_inner, text, &roots)
-            })
-            .await
-            {
-                Ok(a) => a,
-                Err(_) => return,
-            };
-            let docs = docs_arc.read().await;
-            if let Some(state) = docs.get(&uri) {
-                if state.generation == generation {
-                    debug!(uri = %uri, generation, "index committed");
-                    let _ = state.tx.send_replace(Some(analysis));
-                } else {
-                    debug!(
-                        uri = %uri,
-                        generation,
-                        current = state.generation,
-                        "index superseded, discarded",
-                    );
-                }
-            }
+        spawn_indexer_task(
+            self.docs.clone(),
+            self.workspace_roots.clone(),
+            uri,
+            text,
+            generation,
+            debounce,
+        )
+    }
+}
+
+/// Standalone version of `HtclBackend::spawn_indexer`. Split out so
+/// the fan-out (`reindex_importers_of`, called from the indexer's
+/// own commit path) can spawn follow-up indexers without needing a
+/// live reference to the surrounding `HtclBackend` — the tokio task
+/// only ever holds the two `Arc`s the indexer itself needs.
+fn spawn_indexer_task(
+    docs: Arc<RwLock<HashMap<Url, DocState>>>,
+    workspace_roots: Arc<RwLock<Vec<std::path::PathBuf>>>,
+    uri: Url,
+    text: String,
+    generation: u64,
+    debounce: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !debounce.is_zero() {
+            tokio::time::sleep(debounce).await;
+        }
+        let roots = workspace_roots.read().await.clone();
+        let uri_inner = uri.clone();
+        let analysis = match tokio::task::spawn_blocking(move || {
+            HtclBackend::build_analysis(&uri_inner, text, &roots)
         })
+        .await
+        {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        // Commit under the generation guard. Superseded results
+        // are discarded — the `set_text` handler that bumped past
+        // us installed a fresher indexer that WILL commit.
+        let committed = {
+            let docs_r = docs.read().await;
+            let Some(state) = docs_r.get(&uri) else {
+                return;
+            };
+            if state.generation != generation {
+                debug!(
+                    uri = %uri,
+                    generation,
+                    current = state.generation,
+                    "index superseded, discarded",
+                );
+                return;
+            }
+            debug!(uri = %uri, generation, "index committed");
+            state.tx.send_replace(Some(analysis.clone()));
+            true
+        };
+        // Fan out to open documents whose CURRENT analysis
+        // imports `uri`. Reason: an import's disk / open-buffer
+        // content changed (that's what just committed here), so
+        // any doc that transitively `src`s it now has stale
+        // symbol/hover data for that region. Without this fan-out,
+        // editing `ip/clock.htcl` leaves `ip/module.htcl`'s hover
+        // pointing at the pre-edit analysis until the user
+        // touches module.htcl itself. Fan-out uses the same
+        // 0ms-debounce path `save()` takes so the ripple lands
+        // fast; cascading (A imports B imports C, C edits) still
+        // converges because each level's fan-out only fires ONCE
+        // per commit (there's no re-entry: A's rebuild doesn't
+        // re-fire B's, since B's imports of A haven't changed).
+        if committed {
+            reindex_importers_of(&docs, &workspace_roots, &uri).await;
+        }
+    })
+}
+
+/// Enqueue a fresh indexer for every open doc whose currently-
+/// committed analysis lists `changed` in `view.imports`. Called from
+/// the indexer commit path so downstream files pick up upstream
+/// edits (doc comments, signatures, new procs) without waiting for
+/// the downstream file to be edited itself.
+///
+/// Skips docs that don't have a committed analysis yet (they'll
+/// pick up the change on their first commit anyway) and skips the
+/// changed URI itself (it just committed).
+async fn reindex_importers_of(
+    docs: &Arc<RwLock<HashMap<Url, DocState>>>,
+    workspace_roots: &Arc<RwLock<Vec<std::path::PathBuf>>>,
+    changed: &Url,
+) {
+    // Collect the (uri, text, new_generation, prev_task) tuples under
+    // the write lock, then release the lock BEFORE awaiting aborts
+    // and spawning new indexers — other handlers can proceed
+    // concurrently. Matches the pattern in `set_text`.
+    let mut to_spawn: Vec<(
+        Url,
+        String,
+        u64,
+        Option<tokio::task::JoinHandle<()>>,
+    )> = Vec::new();
+    {
+        let mut docs_w = docs.write().await;
+        // Snapshot the URIs first — we can't hold two live borrows
+        // (one to iterate, one to `get_mut`) at once.
+        let candidates: Vec<Url> = docs_w
+            .iter()
+            .filter(|(u, _)| *u != changed)
+            .filter_map(|(u, state)| {
+                let analysis = state.tx.borrow();
+                analysis
+                    .as_ref()
+                    .filter(|a| {
+                        a.view.imports.iter().any(|i| &i.file_uri == changed)
+                    })
+                    .map(|_| u.clone())
+            })
+            .collect();
+        for u in candidates {
+            let Some(state) = docs_w.get_mut(&u) else {
+                continue;
+            };
+            state.generation += 1;
+            let prev = state.index_task.take();
+            to_spawn.push((u, state.text.clone(), state.generation, prev));
+        }
+    }
+    for (u, text, gen, prev) in to_spawn {
+        if let Some(h) = prev {
+            h.abort();
+        }
+        let handle = spawn_indexer_task(
+            docs.clone(),
+            workspace_roots.clone(),
+            u.clone(),
+            text,
+            gen,
+            std::time::Duration::ZERO,
+        );
+        let mut docs_w = docs.write().await;
+        if let Some(state) = docs_w.get_mut(&u) {
+            if state.generation == gen {
+                state.index_task = Some(handle);
+            } else {
+                handle.abort();
+            }
+        } else {
+            handle.abort();
+        }
     }
 }
 
@@ -3643,6 +3762,88 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("timed out waiting for analysis of {uri}");
+    }
+
+    /// Poll `analysis_for(uri)` until the returned analysis
+    /// satisfies `predicate`, or timeout. Test-only helper — the
+    /// fan-out reindex fires a NEW commit under a NEW generation,
+    /// so callers waiting for downstream refresh can't just re-use
+    /// `wait_for_reindex`; they need a predicate that recognizes
+    /// "the analysis I want has arrived."
+    #[cfg(test)]
+    async fn wait_until_analysis_matches(
+        backend: &HtclBackend,
+        uri: &Url,
+        predicate: impl Fn(&DocAnalysis) -> bool,
+    ) {
+        for _ in 0..200 {
+            if let Some(a) = backend.analysis_for(uri).await {
+                if predicate(&a) {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for matching analysis of {uri}");
+    }
+
+    #[tokio::test]
+    async fn edit_to_imported_file_ripples_to_open_importer() {
+        // Regression: user edits `clock.htcl` (adds a doc comment
+        // to `configure_clocks`) but hovers in `module.htcl` still
+        // show the pre-edit signature. Root cause was no fan-out
+        // reindex — module's analysis committed BEFORE the clock
+        // edit and had no mechanism to re-fire on upstream changes.
+        //
+        // Test shape: dir with `lib.htcl` (defines a proc) and
+        // `main.htcl` (`src lib`). Open both. Update lib on disk
+        // AND via `set_text` to add a doc comment. Assert main's
+        // analysis picks it up WITHOUT re-touching main.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vw.toml"),
+            "[workspace]\nname = \"t\"\n",
+        )
+        .unwrap();
+        let lib_path = dir.path().join("lib.htcl");
+        let lib_v1 = "proc greet {} unit { puts hi }\n";
+        std::fs::write(&lib_path, lib_v1).unwrap();
+        let lib_uri = Url::from_file_path(&lib_path).unwrap();
+        let main_path = dir.path().join("main.htcl");
+        let main_src = "src lib\ngreet\n";
+        std::fs::write(&main_path, main_src).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+
+        let backend = HtclBackend::new();
+        backend
+            .set_workspace_roots(vec![dir.path().to_path_buf()])
+            .await;
+        backend
+            .set_text_sync(main_uri.clone(), main_src.into())
+            .await;
+        backend.set_text_sync(lib_uri.clone(), lib_v1.into()).await;
+        // Sanity: main's initial view contains lib_v1's proc but
+        // NO doc comment yet.
+        let a = backend.analysis_for(&main_uri).await.unwrap();
+        assert!(a.view.view_source.contains("proc greet"));
+        assert!(
+            !a.view.view_source.contains("## greeting"),
+            "pre-edit view unexpectedly has doc comment: {}",
+            a.view.view_source,
+        );
+
+        // User edits lib.htcl: add a doc comment. Update disk
+        // (equivalent of `did_save`) AND the open buffer.
+        let lib_v2 = "## greeting proc\nproc greet {} unit { puts hi }\n";
+        std::fs::write(&lib_path, lib_v2).unwrap();
+        backend.set_text_sync(lib_uri.clone(), lib_v2.into()).await;
+
+        // main.htcl is NOT touched here — the fan-out is what
+        // should ripple the change through.
+        wait_until_analysis_matches(&backend, &main_uri, |a| {
+            a.view.view_source.contains("## greeting")
+        })
+        .await;
     }
 
     #[tokio::test]
