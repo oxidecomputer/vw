@@ -1122,6 +1122,20 @@ impl LanguageBackend for HtclBackend {
             line: position.line,
             character: position.character,
         });
+        // Suppress completion inside comments. Helix's LSP client
+        // auto-triggers on typing, so writing prose inside a
+        // `#`-line otherwise pops a dropdown on every space —
+        // pure noise. The check: on the line up to the cursor,
+        // the first non-whitespace char is `#`. That covers both
+        // standalone `# text` and `## doc comment` lines, plus
+        // mid-command `# comment` continuations (which in htcl
+        // are still line-anchored — the comment starts at
+        // column-0-after-ws, same shape). It doesn't catch `#`
+        // inside strings / brackets — those don't start comments
+        // in htcl anyway, so no false positives on real code.
+        if in_line_comment(&current_text, offset) {
+            return Vec::new();
+        }
         let current_parsed = vw_htcl::parse(&current_text);
 
         // `src <partial>` is filesystem-aware, so it takes its own
@@ -1949,6 +1963,35 @@ fn lc_to_pos(lc: LineCol) -> Position {
     }
 }
 
+/// True when `offset` lies on a line whose first non-whitespace
+/// byte before the cursor is `#`. That's the shape of every htcl
+/// comment — standalone `# text`, `## doc comment`, and mid-command
+/// `# inline comment` continuations all start `<ws>#…` at column 0
+/// of their line. Used by the completion handler to suppress its
+/// dropdown while the user is writing prose in a comment.
+///
+/// Bytes only (ASCII-fast); no UTF-8 walking. `\n` bounds the
+/// backward scan so we never look past the current line. `#` inside
+/// a string / bracket on a preceding line can't reach here because
+/// the scan stops at the enclosing `\n` first.
+fn in_line_comment(source: &str, offset: u32) -> bool {
+    let bytes = source.as_bytes();
+    let end = (offset as usize).min(bytes.len());
+    let line_start = bytes[..end]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    for &b in &bytes[line_start..end] {
+        match b {
+            b' ' | b'\t' | b'\r' => continue,
+            b'#' => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Parse one htcl `text` and push every `proc` / `type` / `enum`
 /// declaration whose name contains `needle` (case-insensitive, empty
 /// `needle` matches all) into `out`. Stops as soon as `out` reaches
@@ -2526,6 +2569,93 @@ gr\n";
         labels.sort();
         assert_eq!(labels, vec!["greet", "grumble"]);
         assert_eq!(items[0].kind, Some(CompletionItemKind::FUNCTION));
+    }
+
+    #[test]
+    fn in_line_comment_recognizes_standalone_and_indented_comments() {
+        // Cursor after `# hello` on a standalone comment line.
+        let src = "# hello world\nputs hi\n";
+        assert!(in_line_comment(src, 8), "cursor after `#` should count");
+        assert!(!in_line_comment(src, 0), "cursor before `#` should not");
+        // Indented comment (common inline_comment shape inside a
+        // multi-line call).
+        let src = "  # inner\nputs hi\n";
+        assert!(in_line_comment(src, 5), "cursor after indent + `#`");
+        // Doc comments (`##`) share the same shape — start with `#`.
+        let src = "## doc\n";
+        assert!(in_line_comment(src, 4));
+    }
+
+    #[test]
+    fn in_line_comment_returns_false_on_code_line() {
+        // A `#` appearing later inside a code line (e.g., inside a
+        // quoted string) is NOT the start of a comment in htcl —
+        // the check requires `#` to be the FIRST non-ws char of
+        // the line before the cursor.
+        let src = "puts \"hi # not comment\"\n";
+        // Cursor right after `#`.
+        assert!(!in_line_comment(src, 10));
+        // Cursor mid-code, no `#` on the line.
+        assert!(!in_line_comment(src, 3));
+    }
+
+    #[test]
+    fn in_line_comment_scan_stops_at_line_boundary() {
+        // A `#` on the PREVIOUS line must not leak into the
+        // current line's classification — the backward scan must
+        // stop at `\n`.
+        let src = "# prev line\nfoo bar\n";
+        // Cursor on the code line at `bar`.
+        let off = src.find("bar").unwrap() as u32;
+        assert!(!in_line_comment(src, off));
+    }
+
+    #[tokio::test]
+    async fn completion_returns_empty_when_cursor_is_inside_a_comment() {
+        // Regression: without this suppression, Helix's LSP client
+        // auto-triggers completion on every keystroke inside a
+        // `#` comment line, so writing prose pops a dropdown on
+        // each space. The suppression fires when the cursor sits
+        // on a line whose first non-ws char before the cursor is
+        // `#`.
+        let backend = HtclBackend::new();
+        let src = "\
+proc greet {} { }\n\
+# writing a note about greet\n";
+        backend.set_text_sync(uri(), src.into()).await;
+        // Cursor at end of the comment line (line 1, char 27).
+        let items = backend
+            .completion(
+                &uri(),
+                Position {
+                    line: 1,
+                    character: 27,
+                },
+            )
+            .await;
+        assert!(
+            items.is_empty(),
+            "expected no completions inside comment, got {items:?}",
+        );
+        // Sanity: completion on the next (code) line still fires.
+        let src = "\
+proc greet {} { }\n\
+# writing a note about greet\n\
+gr\n";
+        backend.set_text_sync(uri(), src.into()).await;
+        let items = backend
+            .completion(
+                &uri(),
+                Position {
+                    line: 2,
+                    character: 2,
+                },
+            )
+            .await;
+        assert!(
+            items.iter().any(|i| i.label == "greet"),
+            "expected greet in completions on code line, got {items:?}",
+        );
     }
 
     #[tokio::test]
