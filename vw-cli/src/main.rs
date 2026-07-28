@@ -353,6 +353,17 @@ enum Commands {
                     default"
         )]
         all_variants: bool,
+        #[arg(
+            long = "ip-generate",
+            help = "When IP wrappers under `target/ip/` are stale relative \
+                    to `ip/**.htcl`, regenerate them in-process (runs \
+                    `vw::configure_ip` + `vw::generate_ip_stubs`, no \
+                    synthesis) instead of erroring. Fast path for the \
+                    common `edited an IP config, want to re-check` flow — \
+                    orders of magnitude cheaper than `vw run`, and less \
+                    destructive than `rm -rf target/`."
+        )]
+        ip_generate: bool,
     },
     #[command(about = "Run htcl-level tests (@test procs under test/)")]
     Test {
@@ -914,6 +925,7 @@ async fn main() {
             all_parts,
             variant,
             all_variants,
+            ip_generate,
         } => {
             // Two shapes:
             //   `vw check FILE [FILE...]` — check the explicit list.
@@ -953,6 +965,52 @@ async fn main() {
             // on an unresolved import. Shared with `run`/`bench`/`repl`.
             ensure_workspace_deps(&cwd).await;
             let mut had_errors = false;
+            // Upfront IP regeneration when the user asked for it AND
+            // wrappers are stale. This runs BEFORE the HTCL/VHDL
+            // checks so subsequent analyses see the fresh wrappers
+            // and the staleness gate at the bottom of the check no
+            // longer trips. Regeneration is the same in-process
+            // `configure_ip -generate_targets false` +
+            // `generate_ip_stubs` path used when VHDL diagnostics
+            // report missing libraries — no synthesis, no full
+            // Vivado run. Failure here is downgraded to a warning:
+            // the check will still run and surface whatever it finds
+            // (including the staleness error if regen didn't take).
+            if ip_generate {
+                if let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path())
+                {
+                    if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
+                        let project_dir = vw_lib::vw_project_dir(&ws);
+                        let stale = vw_lib::project_needs_wipe(
+                            &ws,
+                            project_dir.as_std_path(),
+                            &cfg.workspace.name,
+                        )
+                        .unwrap_or(false);
+                        if stale {
+                            println!(
+                                "{} regenerating IP wrappers \
+                                 (--ip-generate, `ip/**.htcl` changed)…",
+                                "note:".bright_yellow(),
+                            );
+                            if let Err(e) = ensure_ip_generated(
+                                &ws,
+                                None,
+                                None,
+                                vw_vivado::LogLevel::Warning,
+                            )
+                            .await
+                            {
+                                eprintln!(
+                                    "{} IP regeneration did not complete \
+                                     cleanly: {e}",
+                                    "warning:".yellow(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             // conflicts_with on the clap args guarantees at most
             // one non-Default source at a time. Map both flag
             // families to the same PartSelector; the resolver
@@ -1092,6 +1150,56 @@ async fn main() {
                                 "error:".bright_red(),
                             );
                         }
+                    }
+                }
+                // IP-wrapper staleness. The VHDL check above verifies
+                // that whatever wrappers are in `target/ip/` PARSE
+                // and RESOLVE, but not that they match the CURRENT
+                // `ip/**.htcl` config. If the user edited an IP
+                // config (added a slot, changed a preset, whatever)
+                // and hasn't run `vw run`/`vw repl` since, `vw check`
+                // used to pass silently — the on-disk wrappers still
+                // reflected the pre-edit config. Compare the current
+                // source-set fingerprint against the manifest that
+                // `vw::mark_project_configured` writes on every
+                // successful generation; a mismatch means the design
+                // in `target/` is a lie about the design in source.
+                //
+                // Same helper `vw run` / `vw repl` use to decide
+                // whether to wipe the on-disk Vivado project, so
+                // there's exactly one authoritative notion of
+                // "wrappers match sources."
+                if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
+                    let name = &cfg.workspace.name;
+                    let project_dir = vw_lib::vw_project_dir(&ws);
+                    match vw_lib::project_needs_wipe(
+                        &ws,
+                        project_dir.as_std_path(),
+                        name,
+                    ) {
+                        Ok(true) if project_dir.exists() => {
+                            had_errors = true;
+                            eprintln!(
+                                "{} IP wrappers under `target/ip/` are \
+                                 stale — the `ip/**.htcl` config has \
+                                 changed since the last generation. Run \
+                                 `vw check --ip-generate` to regenerate \
+                                 just the wrappers in-process (no \
+                                 synthesis) and re-check.",
+                                "error:".bright_red(),
+                            );
+                        }
+                        // Wipe-needed but the project doesn't exist
+                        // yet is the "fresh workspace" case, which
+                        // the VHDL block above already handles by
+                        // calling `ensure_ip_generated` when it sees
+                        // the missing-library diagnostics.
+                        Ok(_) => {}
+                        Err(e) => eprintln!(
+                            "{} could not compare IP source fingerprint: \
+                             {e}",
+                            "warning:".yellow(),
+                        ),
                     }
                 }
             }
@@ -3422,13 +3530,34 @@ async fn ensure_ip_generated(
     // instantiation-template stubs for the standalone XCI IPs so
     // `entity xil_defaultlib.<ip>` (e.g. a bare `clk_wizard` like
     // `primary_clock`) also resolves. Neither step synthesizes.
-    let program = vw_htcl::load_program_source(
+    //
+    // Explicit `src ip` (when the workspace has one) loads
+    // `ip/module.htcl` and every file it transitively `src`s into
+    // the LoadedProgram at compile time. Without this, `vw::
+    // configure_ip` would auto-load them at runtime via an RPC
+    // `compile_htcl_module` → `uplevel #0 $tcl` eval, which the
+    // Tcl side attributes to the anonymous script — so any
+    // Vivado warning coming from an `ip/*.htcl` proc surfaces as
+    // `<input>:N` and the stack-frame rewriter can't map it back
+    // to source (proc_table has no entry for procs the LoadedProgram
+    // didn't see). Sourcing here puts them in `program.files`,
+    // `configure_ip`'s `info procs ::ip::configure` gate skips
+    // the RPC compile, and the rewriter's per-proc lookup
+    // resolves `configure_cips`, `configure_gtm`, … to their
+    // real `ip/<name>.htcl:<line>` positions.
+    let has_ip_module = ws.join("ip/module.htcl").is_file();
+    let src = if has_ip_module {
+        "src @vw\n\
+         src ip\n\
+         vw::configure_ip -generate_targets false\n\
+         vw::generate_ip_stubs\n"
+    } else {
         "src @vw\n\
          vw::configure_ip -generate_targets false\n\
-         vw::generate_ip_stubs\n",
-        entry.as_std_path(),
-        &resolver,
-    )?;
+         vw::generate_ip_stubs\n"
+    };
+    let program =
+        vw_htcl::load_program_source(src, entry.as_std_path(), &resolver)?;
     let run_result = run_loaded_program(
         &entry, &program, /*check_only=*/ false, part, variant, log_level,
         /*info_with_stack=*/ false, /*bunyan=*/ false,
