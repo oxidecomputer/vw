@@ -1406,6 +1406,10 @@ proc ::vw::dispatch {line} {
         }
     }
 }
+#---- diagnostic levels ----
+
+# Failure to assign a block design address space WARN -> CRIT
+set_msg_config -id {[BD 5-700]} -new_severity {CRITICAL WARNING}
 
 # ---------- main ----------
 
