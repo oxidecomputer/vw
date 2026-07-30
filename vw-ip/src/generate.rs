@@ -2840,8 +2840,7 @@ fn model_param_anchor_default(
 /// Post-process an anchor-derived schema: if its keys follow the
 /// `QUAD<n>_(RX|TX)<m>` pattern (Vivado's per-quad-per-channel
 /// pin-map convention), replicate the slot set across every quad
-/// the IP declares and attach an `@enum(…)` value list of valid
-/// pin paths.
+/// the IP declares.
 ///
 /// **Key extrapolation.** Model-param anchors typically only
 /// enumerate ONE quad's worth of slots as a template. Detect the
@@ -2851,14 +2850,18 @@ fn model_param_anchor_default(
 /// name starts `QUAD<k>_` counts, so gtwiz-versal's 5-quad layout
 /// materializes 40 slots (5 × 8) from the 8-slot QUAD0 template.
 ///
-/// **Value enum.** For each slot whose stripped name matches
-/// `RX<m>` or `TX<m>`, build the enum
-/// `[undef, /INTF0_<dir><n>_GT_IP_Interface_0, /INTF1_<dir><n>_…,
-/// … /INTF<N-1>_<dir><n>_…]`. `N` = number of interface split
-/// nodes on the IP (8 for gtwiz-versal, detected by scanning the
-/// parameter set for the `INTF<k>_` prefix). `n` ranges over the
-/// channel count implied by the source slot name — same convention
-/// Vivado's BD builder uses when materializing GT interface pins.
+/// **No auto-enum on the values.** An earlier version of this
+/// function attached `@enum(undef, /INTF<i>_<dir><n>_GT_IP_Interface_0, …)`
+/// to each RX/TX slot. That was wrong: the `_GT_IP_Interface_0`
+/// suffix is a specific BD pin name from one reference topology,
+/// not a fixed Vivado convention — the actual pin path is
+/// whatever the user's block-design names it, which is
+/// arbitrary. Constraining the slot to a hard-coded name set
+/// rejects legitimate values. We leave `enum_values` empty here
+/// (any string accepted); when a workspace really wants a
+/// vocabulary restriction it can add one via
+/// `overrides.toml` at the shape's `intf::…::lane_map` (or
+/// wherever) path, which layers on top a few lines below.
 fn extrapolate_quad_schema(
     schema: &mut crate::DictSchema,
     component: &Component,
@@ -2874,12 +2877,6 @@ fn extrapolate_quad_schema(
         return;
     }
     let max_quads = count_indexed_prefix(component, "QUAD");
-    let max_intfs = count_indexed_prefix(component, "INTF");
-    // Number of RX/TX channels per interface. Look at any INTF_RXn
-    // or INTF_TXn model params — same shape as the QUAD channels.
-    // Fall back to 4 (Xilinx's fixed per-interface channel count on
-    // Versal GT wizards) if we can't count.
-    let n_channels = detect_channel_count(schema).max(1);
 
     // Build a fresh field list: one per (quad, orig_local_slot)
     // pair, ordered quad-major then original-order.
@@ -2900,17 +2897,6 @@ fn extrapolate_quad_schema(
             let field_override =
                 opts.overrides.field(shape_path, &field_lookup);
             let mut enum_values = f.enum_values.clone();
-            // Auto-derived pin-path enum. Only overwrite when the
-            // slot name has a recognizable direction — leaves
-            // non-RX/TX slots (uncommon on this pattern but
-            // possible) alone.
-            if let Some(dir_ch) = parse_dir_channel(&local) {
-                let derived =
-                    derive_pin_enum(dir_ch.0, dir_ch.1, max_intfs, n_channels);
-                if !derived.is_empty() {
-                    enum_values = derived;
-                }
-            }
             let mut default = f.default.clone();
             let mut baseline =
                 f.baseline || opts.overrides.shape_baseline(shape_path);
@@ -2949,26 +2935,9 @@ fn parse_quad_slot(name: &str) -> Option<(usize, String)> {
 
 /// Split an `RX<m>` / `TX<m>` slot local name into
 /// `(direction, m)`. Direction is `"RX"` or `"TX"`.
-fn parse_dir_channel(local: &str) -> Option<(&'static str, usize)> {
-    let (dir, rest) = if let Some(r) = local.strip_prefix("RX") {
-        ("RX", r)
-    } else {
-        let r = local.strip_prefix("TX")?;
-        ("TX", r)
-    };
-    // Channel index has to be a run of digits terminating the local
-    // name (`RX0`, `TX3`). Anything else disqualifies.
-    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let m: usize = rest.parse().ok()?;
-    Some((dir, m))
-}
-
 /// Count how many top-level params share the `<prefix><N>_` shape,
 /// which gives us the max index for that family. Used to figure
-/// out the IP's max quad count and interface count without
-/// hard-coding.
+/// out the IP's max quad count without hard-coding.
 fn count_indexed_prefix(component: &Component, prefix: &str) -> usize {
     let mut indices = std::collections::BTreeSet::new();
     for p in component.component_parameters() {
@@ -2985,47 +2954,6 @@ fn count_indexed_prefix(component: &Component, prefix: &str) -> usize {
         }
     }
     indices.iter().max().map(|n| n + 1).unwrap_or(0)
-}
-
-/// Peek at an anchor's fields to figure out how many RX/TX
-/// channels the shape carries. `QUAD0_RX0..RX3` → 4. Returns 0
-/// when no direction-shaped slots are present.
-fn detect_channel_count(schema: &crate::DictSchema) -> usize {
-    let mut max_ch: usize = 0;
-    for f in &schema.fields {
-        let Some((_q, local)) = parse_quad_slot(&f.name) else {
-            continue;
-        };
-        if let Some((_dir, ch)) = parse_dir_channel(&local) {
-            max_ch = max_ch.max(ch + 1);
-        }
-    }
-    max_ch
-}
-
-/// Build the `@enum(…)` value list for a `QUAD<q>_<dir><n>` slot.
-/// Enum contents: the `undef` sentinel + every valid interface
-/// pin path (`/INTF<i>_<dir><m>_GT_IP_Interface_0`) for `i` in
-/// `0..n_intfs` and `m` in `0..n_channels`. Empty when either
-/// axis is zero (defensive — caller falls back to whatever the
-/// XML default declares).
-fn derive_pin_enum(
-    dir: &'static str,
-    _slot_channel: usize,
-    n_intfs: usize,
-    n_channels: usize,
-) -> std::collections::BTreeSet<String> {
-    let mut out = std::collections::BTreeSet::new();
-    if n_intfs == 0 || n_channels == 0 {
-        return out;
-    }
-    out.insert("undef".to_string());
-    for i in 0..n_intfs {
-        for m in 0..n_channels {
-            out.insert(format!("/INTF{i}_{dir}{m}_GT_IP_Interface_0"));
-        }
-    }
-    out
 }
 
 fn is_properties_shaped(default: &str) -> bool {
@@ -3704,5 +3632,49 @@ mod tests {
             "parse errors: {:?}",
             parsed.errors
         );
+    }
+
+    #[test]
+    fn extrapolate_quad_schema_does_not_synthesize_pin_path_enum() {
+        // Regression: an earlier version hard-coded
+        // `@enum(undef, /INTF<i>_<dir><n>_GT_IP_Interface_0, …)`
+        // on every QUAD*_RX*/TX* slot. The `_GT_IP_Interface_0`
+        // suffix is a specific BD pin name from one reference
+        // topology, not a fixed Vivado convention — a real BD
+        // can name the pin anything, so the derived enum
+        // wrongly rejected legitimate values. The fix leaves
+        // `enum_values` untouched by the extrapolator; any
+        // per-workspace vocabulary lives in overrides.toml.
+        let component = mk_component();
+        let mut schema = crate::DictSchema {
+            fields: vec![
+                crate::DictField {
+                    name: "QUAD0_RX0".into(),
+                    default: String::new(),
+                    description: None,
+                    enum_values: Default::default(),
+                    baseline: false,
+                },
+                crate::DictField {
+                    name: "QUAD0_TX0".into(),
+                    default: String::new(),
+                    description: None,
+                    enum_values: Default::default(),
+                    baseline: false,
+                },
+            ],
+            sub_schemas: Default::default(),
+        };
+        let opts = GenerateOptions::default();
+        extrapolate_quad_schema(&mut schema, &component, "", &opts);
+        for f in &schema.fields {
+            assert!(
+                f.enum_values.is_empty(),
+                "field {} unexpectedly got auto-enum {:?} — pin paths \
+                 must be user-supplied, not baked into the wrapper",
+                f.name,
+                f.enum_values,
+            );
+        }
     }
 }
