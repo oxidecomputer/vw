@@ -183,6 +183,36 @@ impl VwSyncApi for Agent {
 
         Ok(HttpResponseOk(result))
     }
+
+    async fn sync_clear(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<CommitResult>, HttpError> {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        // The same lock a commit takes: this is a commit, of an empty
+        // manifest, and it would be no better to interleave with one than two
+        // commits would be with each other.
+        let _guard = ctx.materializing.lock().await;
+        let result = vw_sync::clear(&ctx.root, &ctx.store)
+            .inspect_err(|e| {
+                slog::error!(rqctx.log, "cannot clear the tree";
+                    "root" => %ctx.root,
+                    InlineErrorChain::new(e),
+                );
+            })
+            .map_err(error::apply_error)?;
+
+        info!(rqctx.log, "tree cleared";
+            "deleted" => result.deleted,
+        );
+
+        Ok(HttpResponseOk(result))
+    }
 }
 
 impl Context {

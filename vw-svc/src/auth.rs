@@ -7,7 +7,11 @@ use reqwest::{
 };
 use serde::Deserialize;
 use slog::{error, info, Logger};
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use crate::Context;
 
@@ -32,6 +36,76 @@ const ANONYMOUS_USER: &str = "anonymous";
 
 /// Shared client so token checks reuse connections to the Github API.
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// How long a Github answer about a token is trusted for.
+///
+/// Deciding whether a token is good costs two round trips to Github, and
+/// without this every request pays them. That is barely noticeable for a
+/// person clicking around and ruinous for a source sync, which sends one
+/// request per file: a first sync of a few hundred files spent two minutes
+/// waiting on Github and burned five hundred API calls doing it.
+///
+/// A minute is short enough that revoking someone's access takes effect while
+/// they are still reading the email about it, and long enough that a whole
+/// sync costs one check.
+const AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// What Github said about a token, and when it stops being worth believing.
+struct CachedAuth {
+    name: String,
+    expires_at: Instant,
+}
+
+/// Answers about tokens, keyed by a digest of the token rather than the token.
+///
+/// Hashed because the raw value is a live credential and a map key is a poor
+/// place to leave one lying: this way a dump of the process, or a stray
+/// `Debug`, does not hand one over.
+static AUTH_CACHE: OnceLock<Mutex<HashMap<[u8; 32], CachedAuth>>> =
+    OnceLock::new();
+
+fn auth_cache() -> &'static Mutex<HashMap<[u8; 32], CachedAuth>> {
+    AUTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_key(token: &str) -> [u8; 32] {
+    *blake3::hash(token.as_bytes()).as_bytes()
+}
+
+/// The name Github last gave for this token, if that was recently enough.
+fn cached_name(token: &str) -> Option<String> {
+    let mut cache = auth_cache().lock().expect("the auth cache lock");
+    let key = cache_key(token);
+
+    match cache.get(&key) {
+        Some(entry) if entry.expires_at > Instant::now() => {
+            Some(entry.name.clone())
+        }
+        Some(_) => {
+            cache.remove(&key);
+            None
+        }
+        None => None,
+    }
+}
+
+fn remember(token: &str, name: &str) {
+    let mut cache = auth_cache().lock().expect("the auth cache lock");
+
+    // Expired entries are only noticed when their own token comes back, so a
+    // token used once and never again would otherwise sit here forever. This
+    // is the only place the map grows, so it is the right place to sweep.
+    let now = Instant::now();
+    cache.retain(|_, entry| entry.expires_at > now);
+
+    cache.insert(
+        cache_key(token),
+        CachedAuth {
+            name: name.to_owned(),
+            expires_at: now + AUTH_CACHE_TTL,
+        },
+    );
+}
 
 pub(crate) struct AuthorizedCaller {
     pub(crate) name: String,
@@ -70,10 +144,17 @@ pub(crate) async fn authorize_caller(
             .unwrap_or_else(|| ANONYMOUS_USER.to_owned())
     } else {
         let token = bearer_token(&rqctx).ok_or(AuthError::NoAuthToken)?;
-        let client = client();
-        let name = github_username(client, &token, &rqctx.log).await?;
-        check_redhawk_access(&name, client, &token, &rqctx.log).await?;
-        name
+
+        match cached_name(&token) {
+            Some(name) => name,
+            None => {
+                let client = client();
+                let name = github_username(client, &token, &rqctx.log).await?;
+                check_redhawk_access(&name, client, &token, &rqctx.log).await?;
+                remember(&token, &name);
+                name
+            }
+        }
     };
 
     // Github usernames are case insensitive, so the admin list is too.
@@ -207,4 +288,68 @@ async fn github_get(
         .send()
         .await
         .map_err(|e| AuthError::GithubError(format!("GET {url}: {e}")))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn a_token_is_only_checked_with_github_once_per_ttl() {
+        let token = "ghp_a_token_used_for_a_whole_sync";
+        assert!(cached_name(token).is_none(), "nothing is known yet");
+
+        remember(token, "rcgoodfellow");
+        assert_eq!(cached_name(token).as_deref(), Some("rcgoodfellow"));
+        // Repeated lookups keep hitting: this is the whole point, since a
+        // sync asks once per file.
+        assert_eq!(cached_name(token).as_deref(), Some("rcgoodfellow"));
+    }
+
+    #[test]
+    fn one_tokens_answer_is_not_anothers() {
+        remember("ghp_ferris", "ferris");
+        remember("ghp_gorris", "gorris");
+
+        assert_eq!(cached_name("ghp_ferris").as_deref(), Some("ferris"));
+        assert_eq!(cached_name("ghp_gorris").as_deref(), Some("gorris"));
+        assert!(cached_name("ghp_never_seen").is_none());
+    }
+
+    #[test]
+    fn an_answer_stops_being_believed_once_it_is_old() {
+        let token = "ghp_a_token_since_revoked";
+
+        // Reach past `remember` to place an entry that has already expired,
+        // which is the state a revoked token's entry reaches on its own after
+        // a minute.
+        auth_cache().lock().expect("lock").insert(
+            cache_key(token),
+            CachedAuth {
+                name: "rcgoodfellow".to_owned(),
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+
+        assert!(
+            cached_name(token).is_none(),
+            "a stale answer must send the next request back to github",
+        );
+    }
+
+    #[test]
+    fn the_cache_is_not_keyed_by_the_credential_itself() {
+        // The key reaches a map that outlives the request. Keying it by the
+        // raw token would leave live credentials sitting in process memory in
+        // a form anything walking the map could read straight off.
+        let token = "ghp_a_real_looking_token";
+        remember(token, "ferris");
+
+        let cache = auth_cache().lock().expect("lock");
+        assert!(
+            !cache.keys().any(|key| key.as_slice() == token.as_bytes()),
+            "the token itself should not be a key",
+        );
+        assert!(cache.contains_key(&cache_key(token)));
+    }
 }

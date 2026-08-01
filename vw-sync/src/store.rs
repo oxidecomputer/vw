@@ -15,6 +15,8 @@ pub enum StoreError {
     Write(Utf8PathBuf, #[source] std::io::Error),
     #[error("reading {0}")]
     Read(Utf8PathBuf, #[source] std::io::Error),
+    #[error("emptying {0}")]
+    Empty(Utf8PathBuf, #[source] std::io::Error),
 }
 
 /// Content held by digest, waiting to be placed into a tree.
@@ -60,6 +62,19 @@ impl Store {
             .map_err(|e| StoreError::Write(path.clone(), e))?;
 
         Ok(())
+    }
+
+    /// Discard everything held.
+    ///
+    /// Nothing is lost that a sender cannot deliver again — that is what makes
+    /// this safe to offer. A sender that no longer trusts what this store
+    /// claims to have empties it, and the next plan asks for the whole tree.
+    pub fn empty(&self) -> Result<(), StoreError> {
+        match std::fs::remove_dir_all(&self.root) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::Empty(self.root.clone(), e)),
+        }
     }
 
     pub fn get(&self, digest: &Digest) -> Result<Vec<u8>, StoreError> {

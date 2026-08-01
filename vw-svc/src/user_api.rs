@@ -254,6 +254,45 @@ impl VwUserApi for UserApi {
         Ok(dropshot::HttpResponseOk(result))
     }
 
+    async fn sync_clear(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::TargetPathParam,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<vw_api_types_versions::latest::CommitResult>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let target = path_params.into_inner();
+
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &target.name,
+            target.kind,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        let result = agent
+            .client
+            .sync_clear(&agent.environment)
+            .await
+            .map_err(|e| agent.failed(e))
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?
+            .into_inner();
+
+        info!(log, "cleared a source tree";
+            "environment" => &target.name,
+            "target" => %target.kind,
+            "deleted" => result.deleted,
+        );
+
+        Ok(dropshot::HttpResponseOk(result))
+    }
+
     async fn get_environment_keys(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<

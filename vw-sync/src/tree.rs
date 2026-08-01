@@ -126,6 +126,27 @@ pub fn apply(
     Ok(result)
 }
 
+/// Discard everything synchronization has put here.
+///
+/// The tree is made to match an empty manifest and the content store is
+/// emptied. Between them that removes every trace of what a sender last said,
+/// while leaving anything a build produced exactly where it was — the same
+/// rules decide what may be deleted here as anywhere else.
+///
+/// Nothing needs this to stay correct. A commit already replaces whatever
+/// differs from the manifest, so an ordinary sync is enough to fix a tree that
+/// is merely out of date. This is for the case where the receiver's account of
+/// itself is the thing in doubt: with nothing held and nothing in the tree,
+/// there is no account left to be wrong, and the sync that follows sends the
+/// whole tree because it genuinely is all missing.
+pub fn clear(
+    root: &Utf8Path,
+    store: &Store,
+) -> Result<CommitResult, ApplyError> {
+    store.empty()?;
+    apply(root, store, &TreeManifest::default())
+}
+
 /// Content the tree already holds, indexed by digest rather than by path.
 ///
 /// By digest because that is the question worth asking: whether the bytes are

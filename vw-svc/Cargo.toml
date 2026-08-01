@@ -31,6 +31,7 @@ slog = "2.8.2"
 slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", branch = "main" }
 slog-bunyan = "2.5.0"
 slog-async = "2.8.0"
+blake3 = "1"
 redb = "4.1.0"
 reqwest = { version = "0.13", features = ["json"] }
 uuid.workspace = true

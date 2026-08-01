@@ -5744,6 +5744,7 @@ dependencies = [
 name = "vw-svc"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "camino",
  "clap",
  "daft",

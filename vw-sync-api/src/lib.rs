@@ -106,4 +106,26 @@ pub trait VwSyncApi {
         path_params: Path<EnvironmentPathParam>,
         body: TypedBody<latest::TreeManifest>,
     ) -> Result<HttpResponseOk<latest::CommitResult>, HttpError>;
+
+    /// Discard the source tree and everything delivered towards it.
+    ///
+    /// The instance is left as though it had never been synchronized: no
+    /// source, and no record of what content it holds. Build output is
+    /// untouched, as it is for a commit.
+    ///
+    /// This is not part of an ordinary sync, which needs no help — a commit
+    /// replaces whatever differs from the manifest. It is what a sender uses
+    /// when it does not believe the instance's account of what it has, so that
+    /// the sync that follows sends everything rather than asking first.
+    ///
+    /// Answers with the result of committing an empty manifest, so the count
+    /// of what was removed is the `deleted` field.
+    #[endpoint {
+        method = DELETE,
+        path = "/environment/{environment}/sync",
+    }]
+    async fn sync_clear(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<latest::CommitResult>, HttpError>;
 }

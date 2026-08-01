@@ -147,6 +147,51 @@
         }
       }
     },
+    "/environment/{name}/target/{kind}/sync": {
+      "delete": {
+        "summary": "Discard an environment's source tree, so the next sync sends all of it.",
+        "description": "An ordinary sync does not need this: the instance is told the whole desired state and replaces whatever differs from it. This is for when what the instance says it has is itself in question — with the tree and the delivered content both gone there is nothing left to be wrong about, and the sync that follows sends every file.\n\nBuild output on the instance is not touched.",
+        "operationId": "sync_clear",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "description": "Which half of it.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TargetKind"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of the environment.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitResult"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/environment/{name}/target/{kind}/sync/blob/{digest}": {
       "put": {
         "summary": "Deliver one piece of source content.",

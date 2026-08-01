@@ -9,7 +9,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use tempfile::TempDir;
 use vw_api_types_versions::latest::{CommitResult, Digest, TreeManifest};
-use vw_sync::{apply, missing, scan, Store};
+use vw_sync::{apply, clear, missing, scan, Store};
 
 /// A sender and a receiver, with somewhere to stage delivered content.
 struct Pair {
@@ -488,4 +488,65 @@ fn a_commit_with_content_still_undelivered_is_refused() {
 
     assert!(result.is_err());
     assert!(pair.receiver_paths().is_empty());
+}
+
+#[test]
+fn clearing_makes_the_next_sync_send_everything() {
+    let pair = Pair::new();
+    pair.write("vw.toml", "[workspace]");
+    pair.write("hdl/top.vhd", "entity top is end;");
+
+    let (_, uploaded) = pair.sync();
+    assert_eq!(uploaded, 2);
+
+    let cleared = clear(&pair.receiver, &pair.store).expect("clear");
+    assert_eq!(cleared.deleted, 2);
+    assert!(pair.receiver_paths().is_empty());
+
+    // The point of the whole exercise: with nothing in the tree and nothing
+    // held, the plan can only ask for all of it. A clear that emptied the tree
+    // but left the store would have the receiver quietly rebuild from content
+    // whose trustworthiness was the reason for clearing.
+    let (result, uploaded) = pair.sync();
+    assert_eq!(uploaded, 2, "everything should cross the wire again");
+    assert_eq!(result.created, 2);
+    assert_eq!(result.unchanged, 0);
+    assert_eq!(pair.receiver_contents("hdl/top.vhd"), "entity top is end;");
+}
+
+#[test]
+fn clearing_leaves_build_output_alone() {
+    let pair = Pair::new();
+    pair.write("hdl/top.vhd", "entity top is end;");
+    pair.sync();
+
+    // Hours of synthesis. Forcing a sync is a statement about source, and
+    // taking the build with it would make `--force` something nobody would
+    // dare run.
+    pair.write_receiver("target/synth/top.dcp", "checkpoint");
+    pair.write_receiver(".gitignore", "notes.txt");
+    pair.write_receiver("notes.txt", "scratch");
+
+    clear(&pair.receiver, &pair.store).expect("clear");
+
+    assert_eq!(pair.receiver_contents("target/synth/top.dcp"), "checkpoint");
+    assert_eq!(pair.receiver_contents("notes.txt"), "scratch");
+}
+
+#[test]
+fn clearing_a_receiver_that_has_nothing_is_not_an_error() {
+    // A first sync run with `--force`, and a second force straight after the
+    // first. Neither has anything to remove, and neither is a mistake.
+    let pair = Pair::new();
+
+    let first =
+        clear(&pair.receiver, &pair.store).expect("clear an empty tree");
+    assert_eq!(first.deleted, 0);
+
+    pair.write("hdl/top.vhd", "entity top is end;");
+    pair.sync();
+    clear(&pair.receiver, &pair.store).expect("clear");
+    let again = clear(&pair.receiver, &pair.store).expect("clear again");
+
+    assert_eq!(again.deleted, 0);
 }

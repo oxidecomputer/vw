@@ -136,6 +136,20 @@ impl Agent {
             .expect("commit request")
     }
 
+    async fn clear_raw(&self, environment: &str) -> reqwest::Response {
+        self.client
+            .delete(format!("{}/environment/{environment}/sync", self.base_url))
+            .send()
+            .await
+            .expect("clear request")
+    }
+
+    async fn clear(&self) -> CommitResult {
+        let response = self.clear_raw(ENVIRONMENT).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.json().await.expect("decode clear result")
+    }
+
     async fn commit(&self, manifest: &TreeManifest) -> CommitResult {
         let response = self.commit_raw(manifest).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -368,4 +382,52 @@ async fn a_build_output_directory_survives_synchronization() {
         .await;
 
     assert_eq!(agent.contents("target/synth/top.dcp"), "checkpoint");
+}
+
+#[tokio::test]
+async fn a_cleared_agent_asks_for_the_whole_tree_again() {
+    let agent = Agent::start().await;
+    let files = [
+        ("hdl/top.vhd", "entity top is end;"),
+        ("vw.toml", "[workspace]"),
+    ];
+    agent.sync(&files).await;
+
+    // What `vw cloud sync --force` does: rather than argue with the instance
+    // about what it has, leave it with nothing to argue about.
+    let cleared = agent.clear().await;
+    assert_eq!(cleared.deleted, 2);
+    assert!(agent.paths().is_empty());
+
+    let (result, uploaded) = agent.sync(&files).await;
+    assert_eq!(uploaded, 2, "everything should be sent again");
+    assert_eq!(result.created, 2);
+    assert_eq!(result.unchanged, 0);
+    assert_eq!(agent.contents("hdl/top.vhd"), "entity top is end;");
+}
+
+#[tokio::test]
+async fn clearing_leaves_a_build_where_it_stands() {
+    let agent = Agent::start().await;
+    agent.sync(&[("hdl/top.vhd", "entity top is end;")]).await;
+    std::fs::create_dir_all(agent.root.join("target/synth")).expect("mkdir");
+    std::fs::write(agent.root.join("target/synth/top.dcp"), "checkpoint")
+        .expect("write");
+
+    agent.clear().await;
+
+    assert_eq!(agent.contents("target/synth/top.dcp"), "checkpoint");
+}
+
+#[tokio::test]
+async fn clearing_another_environment_is_refused() {
+    let agent = Agent::start().await;
+    agent.sync(&[("hdl/top.vhd", "entity top is end;")]).await;
+
+    // Of everything relayed here this is the one worth being surest about:
+    // serving it would delete a developer's tree on somebody else's say-so.
+    let response = agent.clear_raw("jalad").await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(agent.paths(), ["hdl/top.vhd"]);
 }

@@ -119,6 +119,12 @@ pub enum CloudCommand {
     Sync {
         #[arg(help = "Environment name")]
         name: String,
+        #[arg(
+            long,
+            help = "Discard the instance's source tree first, so every file \
+                    is sent again"
+        )]
+        force: bool,
         #[arg(long, help = "Keep syncing as files change, until interrupted")]
         watch: bool,
         #[arg(
@@ -222,12 +228,14 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
         }
         CloudCommand::Sync {
             name,
+            force,
             watch,
             debounce,
         } => {
             crate::cloud_sync::run(
                 &session,
                 &name,
+                force,
                 watch,
                 std::time::Duration::from_millis(debounce),
             )

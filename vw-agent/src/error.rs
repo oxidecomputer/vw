@@ -48,6 +48,7 @@ pub(crate) fn store_error(value: StoreError) -> HttpError {
         }
         StoreError::CreateDir(..)
         | StoreError::Write(..)
-        | StoreError::Read(..) => HttpError::for_internal_error(message),
+        | StoreError::Read(..)
+        | StoreError::Empty(..) => HttpError::for_internal_error(message),
     }
 }

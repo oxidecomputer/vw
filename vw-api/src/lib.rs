@@ -132,6 +132,24 @@ pub trait VwUserApi {
         body: TypedBody<latest::TreeManifest>,
     ) -> Result<HttpResponseOk<latest::CommitResult>, HttpError>;
 
+    /// Discard an environment's source tree, so the next sync sends all of it.
+    ///
+    /// An ordinary sync does not need this: the instance is told the whole
+    /// desired state and replaces whatever differs from it. This is for when
+    /// what the instance says it has is itself in question — with the tree and
+    /// the delivered content both gone there is nothing left to be wrong
+    /// about, and the sync that follows sends every file.
+    ///
+    /// Build output on the instance is not touched.
+    #[endpoint {
+        method = DELETE,
+        path = "/environment/{name}/target/{kind}/sync",
+    }]
+    async fn sync_clear(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::TargetPathParam>,
+    ) -> Result<HttpResponseOk<latest::CommitResult>, HttpError>;
+
     /// Fetch the ssh keypair that opens an environment's instances.
     ///
     /// The private key is only ever handed to the environment's owner.

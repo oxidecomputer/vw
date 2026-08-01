@@ -25,7 +25,15 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use colored::*;
 
+use futures::{StreamExt, TryStreamExt};
+
 use crate::cloud::CloudError;
+
+/// How many pieces of content are sent at once.
+///
+/// Enough to keep the link busy across a slow round trip, few enough not to
+/// look like an attack to anything in between.
+const UPLOAD_CONCURRENCY: usize = 16;
 use vw_api_types_versions::latest as types;
 
 /// A target's slice of the workspace, ready to be sent.
@@ -129,6 +137,7 @@ impl Target {
 pub async fn run(
     session: &crate::cloud::Session,
     environment: &str,
+    force: bool,
     watch: bool,
     debounce: std::time::Duration,
 ) -> Result<(), CloudError> {
@@ -136,6 +145,14 @@ pub async fn run(
     let config = vw_lib::load_workspace_config(&workspace)
         .map_err(CloudError::Workspace)?;
     let targets = targets(&workspace, config.cloud.as_ref());
+
+    // Only ever the first pass. Forcing is an answer to a doubt about what is
+    // on the instance, and once the sync below has settled it there is nothing
+    // left to doubt — re-clearing on every file save would mean re-uploading
+    // the whole workspace to see a one line edit.
+    if force {
+        clear(session, environment, &targets).await?;
+    }
 
     sync_once(session, environment, &targets).await?;
 
@@ -170,6 +187,37 @@ pub async fn run(
     }
 }
 
+/// Throw away what every target's instance has.
+///
+/// Leaves each instance as though it had never been synchronized, so the pass
+/// that follows finds nothing there and sends the whole tree. This is the
+/// entire implementation of forcing: the ordinary path already sends whatever
+/// the instance is missing, so making the instance miss everything is all
+/// there is to do.
+async fn clear(
+    session: &crate::cloud::Session,
+    environment: &str,
+    targets: &[Target],
+) -> Result<(), CloudError> {
+    for target in targets {
+        let result = session
+            .client
+            .sync_clear(environment, &target.kind)
+            .await
+            .map_err(|e| session.error(e))?
+            .into_inner();
+
+        println!(
+            "{} {} cleared ({} removed)",
+            "\u{2717}".bright_black(),
+            target.kind.to_string().cyan(),
+            result.deleted,
+        );
+    }
+
+    Ok(())
+}
+
 /// One pass over every target.
 async fn sync_once(
     session: &crate::cloud::Session,
@@ -187,25 +235,44 @@ async fn sync_once(
             .map_err(|e| session.error(e))?
             .into_inner();
 
-        for digest in &plan.missing {
+        // Uploaded several at a time. Each one is a whole round trip to the
+        // service, and source files are small enough that the time is almost
+        // entirely waiting rather than transferring — sending them one after
+        // another means the link sits idle for all of it. A first sync of a
+        // few hundred files is the case that makes this obvious.
+        //
+        // Blobs are named by their content and land in a store, so they may
+        // arrive in any order and are safe to send at once. The commit that
+        // follows is what imposes an order, and it happens after all of this.
+        let uploads = plan.missing.iter().map(|digest| {
             let path = target
                 .path_for(&manifest, digest)
                 .expect("the plan only asks for content the manifest names");
-            let contents = target
-                .read(path)
-                .map_err(|e| CloudError::ReadSource(path.to_owned(), e))?;
 
-            session
-                .client
-                .sync_blob(
-                    environment,
-                    &target.kind,
-                    digest.0.as_str(),
-                    contents,
-                )
-                .await
-                .map_err(|e| session.error(e))?;
-        }
+            async move {
+                let contents = target
+                    .read(path)
+                    .map_err(|e| CloudError::ReadSource(path.to_owned(), e))?;
+
+                session
+                    .client
+                    .sync_blob(
+                        environment,
+                        &target.kind,
+                        digest.0.as_str(),
+                        contents,
+                    )
+                    .await
+                    .map_err(|e| session.error(e))?;
+
+                Ok::<(), CloudError>(())
+            }
+        });
+
+        futures::stream::iter(uploads)
+            .buffer_unordered(UPLOAD_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await?;
 
         let result = session
             .client
