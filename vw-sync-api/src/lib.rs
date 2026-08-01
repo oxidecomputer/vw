@@ -128,4 +128,24 @@ pub trait VwSyncApi {
         rqctx: RequestContext<Self::Context>,
         path_params: Path<EnvironmentPathParam>,
     ) -> Result<HttpResponseOk<latest::CommitResult>, HttpError>;
+
+    /// Put the credentials a build needs to fetch its dependencies in place.
+    ///
+    /// Written as a `.netrc`, which is what git, cargo and the rest already
+    /// know how to read, so nothing on the instance needs teaching about where
+    /// its credentials come from.
+    ///
+    /// These belong to whoever is synchronizing, and `vw-svc` sends them with
+    /// every sync rather than once: an instance rebuilt underneath us comes
+    /// back with no credentials at all, and the alternative is builds that
+    /// fail to fetch until something notices.
+    #[endpoint {
+        method = PUT,
+        path = "/environment/{environment}/credentials",
+    }]
+    async fn put_credentials(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+        body: TypedBody<latest::Credentials>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 }

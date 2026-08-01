@@ -52,3 +52,10 @@ pub(crate) fn store_error(value: StoreError) -> HttpError {
         | StoreError::Empty(..) => HttpError::for_internal_error(message),
     }
 }
+
+/// Credentials that cannot be written are always this instance's problem: the
+/// request carried everything it needed to, and what failed was a filesystem
+/// it owns.
+pub(crate) fn netrc_error(value: crate::netrc::NetrcError) -> HttpError {
+    HttpError::for_internal_error(value.to_string())
+}

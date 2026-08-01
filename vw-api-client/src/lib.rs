@@ -54,6 +54,7 @@ pub mod agent {
         spec = "../openapi/vw-sync-api/vw-sync-api-latest.json",
         replace = {
             CommitResult = vw_api_types_versions::latest::CommitResult,
+            Credentials = vw_api_types_versions::latest::Credentials,
             Digest = vw_api_types_versions::latest::Digest,
             FileEntry = vw_api_types_versions::latest::FileEntry,
             SyncPlan = vw_api_types_versions::latest::SyncPlan,

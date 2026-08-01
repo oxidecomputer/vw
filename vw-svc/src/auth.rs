@@ -110,6 +110,16 @@ fn remember(token: &str, name: &str) {
 pub(crate) struct AuthorizedCaller {
     pub(crate) name: String,
     pub(crate) is_admin: bool,
+    /// The token the caller authorized themselves with.
+    ///
+    /// Kept because an instance needs credentials of its own to fetch a
+    /// build's dependencies, and this is already the caller's answer to
+    /// "prove you may reach these repositories". Nothing stores it — it is
+    /// relayed to the instance and dropped when the request ends.
+    ///
+    /// Absent when the service runs with `--no-auth`, where there was no
+    /// token to begin with.
+    pub(crate) token: Option<String>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -135,6 +145,8 @@ pub(crate) async fn authorize_caller(
 ) -> Result<AuthorizedCaller, AuthError> {
     let args = &rqctx.context().server_args;
 
+    let supplied = bearer_token(&rqctx);
+
     let name = if args.no_auth {
         // Authorization is off, so there is nothing to ask Github about. Take
         // the caller at their word about who they are so per-user endpoints
@@ -143,7 +155,7 @@ pub(crate) async fn authorize_caller(
         header(&rqctx, NO_AUTH_USER_HEADER)
             .unwrap_or_else(|| ANONYMOUS_USER.to_owned())
     } else {
-        let token = bearer_token(&rqctx).ok_or(AuthError::NoAuthToken)?;
+        let token = supplied.clone().ok_or(AuthError::NoAuthToken)?;
 
         match cached_name(&token) {
             Some(name) => name,
@@ -169,7 +181,11 @@ pub(crate) async fn authorize_caller(
         "req_id" => rqctx.request_id,
     );
 
-    Ok(AuthorizedCaller { name, is_admin })
+    Ok(AuthorizedCaller {
+        name,
+        is_admin,
+        token: supplied,
+    })
 }
 
 fn client() -> &'static reqwest::Client {

@@ -160,6 +160,16 @@ impl VwUserApi for UserApi {
         )
         .inspect_err(|e| log_relay_failure(&log, &target, e))?;
 
+        // Every sync begins here, which makes this the place to hand the
+        // instance the credentials its build will fetch dependencies with.
+        // Sent each time rather than once: an instance rebuilt underneath us
+        // comes back with none, and the failure that causes shows up much
+        // later as a build that cannot reach a private repository.
+        agent
+            .give_credentials(&caller, &log)
+            .await
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
         let plan = agent
             .client
             .sync_plan(&agent.environment, &manifest)

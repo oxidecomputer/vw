@@ -15,7 +15,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use reqwest::StatusCode;
 use tempfile::TempDir;
 use vw_api_types_versions::latest::{
-    CommitResult, Digest, FileEntry, SyncPlan, TreeManifest,
+    CommitResult, Credentials, Digest, FileEntry, SyncPlan, TreeManifest,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,6 +28,7 @@ struct Agent {
     client: reqwest::Client,
     _dir: TempDir,
     root: Utf8PathBuf,
+    netrc: Utf8PathBuf,
 }
 
 impl Agent {
@@ -35,6 +36,7 @@ impl Agent {
         let dir = TempDir::new().expect("scratch directory");
         let base = Utf8Path::from_path(dir.path()).expect("utf8 temp dir");
         let root = base.join("tree");
+        let netrc = base.join("home/.netrc");
         let port = free_port();
 
         let child = Command::new(env!("CARGO_BIN_EXE_vw-agent"))
@@ -44,6 +46,7 @@ impl Agent {
             .args(["--environment", ENVIRONMENT])
             .args(["--root", root.as_str()])
             .args(["--store", base.join("store").as_str()])
+            .args(["--netrc", netrc.as_str()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -55,6 +58,7 @@ impl Agent {
             client: reqwest::Client::new(),
             _dir: dir,
             root,
+            netrc,
         };
         agent.wait_until_ready().await;
         agent
@@ -148,6 +152,22 @@ impl Agent {
         let response = self.clear_raw(ENVIRONMENT).await;
         assert_eq!(response.status(), StatusCode::OK);
         response.json().await.expect("decode clear result")
+    }
+
+    async fn put_credentials(
+        &self,
+        environment: &str,
+        credentials: &Credentials,
+    ) -> reqwest::Response {
+        self.client
+            .put(format!(
+                "{}/environment/{environment}/credentials",
+                self.base_url
+            ))
+            .json(credentials)
+            .send()
+            .await
+            .expect("credentials request")
     }
 
     async fn commit(&self, manifest: &TreeManifest) -> CommitResult {
@@ -430,4 +450,76 @@ async fn clearing_another_environment_is_refused() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(agent.paths(), ["hdl/top.vhd"]);
+}
+
+fn credentials(token: &str) -> Credentials {
+    Credentials {
+        user: "picard".to_owned(),
+        token: token.to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn credentials_land_where_a_build_will_find_them() {
+    let agent = Agent::start().await;
+
+    let response = agent
+        .put_credentials(ENVIRONMENT, &credentials("ghp_darmokandjalad"))
+        .await;
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let contents = std::fs::read_to_string(&agent.netrc).expect("read netrc");
+    assert!(contents.contains("machine github.com"), "{contents}");
+    assert!(contents.contains("login picard"), "{contents}");
+    assert!(
+        contents.contains("password ghp_darmokandjalad"),
+        "{contents}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_credentials_file_is_readable_only_by_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let agent = Agent::start().await;
+
+    agent
+        .put_credentials(ENVIRONMENT, &credentials("ghp_darmokandjalad"))
+        .await;
+
+    let mode = std::fs::metadata(&agent.netrc)
+        .expect("stat netrc")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+}
+
+#[tokio::test]
+async fn credentials_for_another_environment_are_refused() {
+    let agent = Agent::start().await;
+
+    // The instance would otherwise take a stranger's token and hand it to
+    // whatever it builds next.
+    let response = agent
+        .put_credentials("jalad", &credentials("ghp_darmokandjalad"))
+        .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!agent.netrc.exists());
+}
+
+#[tokio::test]
+async fn clearing_a_tree_does_not_take_the_credentials_with_it() {
+    // `--force` throws away the source tree. Credentials are not source, and
+    // an instance that lost them would fail its next fetch for no reason the
+    // developer could see.
+    let agent = Agent::start().await;
+    agent
+        .put_credentials(ENVIRONMENT, &credentials("ghp_darmokandjalad"))
+        .await;
+    agent.sync(&[("hdl/top.vhd", "entity top is end;")]).await;
+
+    agent.clear().await;
+
+    assert!(agent.netrc.is_file());
 }

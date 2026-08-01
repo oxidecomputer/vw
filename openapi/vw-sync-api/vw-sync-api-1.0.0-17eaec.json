@@ -6,6 +6,44 @@
     "version": "1.0.0"
   },
   "paths": {
+    "/environment/{environment}/credentials": {
+      "put": {
+        "summary": "Put the credentials a build needs to fetch its dependencies in place.",
+        "description": "Written as a `.netrc`, which is what git, cargo and the rest already know how to read, so nothing on the instance needs teaching about where its credentials come from.\n\nThese belong to whoever is synchronizing, and `vw-svc` sends them with every sync rather than once: an instance rebuilt underneath us comes back with no credentials at all, and the alternative is builds that fail to fetch until something notices.",
+        "operationId": "put_credentials",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/environment/{environment}/sync": {
       "delete": {
         "summary": "Discard the source tree and everything delivered towards it.",
@@ -212,6 +250,24 @@
           "deleted",
           "unchanged",
           "updated"
+        ]
+      },
+      "Credentials": {
+        "description": "What a build needs in order to fetch its dependencies.\n\nSources are synchronized from a developer's machine, but the things a build pulls from Github are not: they are fetched by the instance itself, which therefore needs credentials for them. These are the caller's own — the same token that authorized the request that carries them — so an instance can reach exactly what its owner can reach and nothing more.\n\nNothing keeps a copy. `vw-svc` reads these off the request it is already authorizing and passes them straight through.",
+        "type": "object",
+        "properties": {
+          "token": {
+            "description": "A Github access token.",
+            "type": "string"
+          },
+          "user": {
+            "description": "The Github login the token belongs to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "user"
         ]
       },
       "Error": {

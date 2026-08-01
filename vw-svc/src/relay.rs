@@ -120,6 +120,43 @@ impl Agent {
         })
     }
 
+    /// Hand the instance the credentials a build fetches dependencies with.
+    ///
+    /// The caller's own token, passed straight through from the request that
+    /// carried it. This service keeps no copy and has no credentials of its
+    /// own to lend, which is the point: an instance can reach exactly what the
+    /// developer using it can reach.
+    ///
+    /// Does nothing when there is no token to pass on, which is the case under
+    /// `--no-auth`. A development service has no credentials to relay and
+    /// failing every sync over their absence would make that mode useless.
+    pub(crate) async fn give_credentials(
+        &self,
+        caller: &crate::auth::AuthorizedCaller,
+        log: &slog::Logger,
+    ) -> Result<(), RelayError> {
+        let Some(token) = caller.token.as_deref() else {
+            slog::debug!(log, "no credentials to relay";
+                "environment" => &self.environment,
+                "kind" => %self.kind,
+            );
+            return Ok(());
+        };
+
+        self.client
+            .put_credentials(
+                &self.environment,
+                &vw_api_types_versions::latest::Credentials {
+                    user: caller.name.clone(),
+                    token: token.to_owned(),
+                },
+            )
+            .await
+            .map_err(|e| self.failed(e))?;
+
+        Ok(())
+    }
+
     /// Wrap an error from the agent so it says which instance failed.
     pub(crate) fn failed(
         &self,

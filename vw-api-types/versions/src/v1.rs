@@ -279,3 +279,33 @@ pub struct CommitResult {
     pub deleted: usize,
     pub unchanged: usize,
 }
+
+/// What a build needs in order to fetch its dependencies.
+///
+/// Sources are synchronized from a developer's machine, but the things a build
+/// pulls from Github are not: they are fetched by the instance itself, which
+/// therefore needs credentials for them. These are the caller's own — the same
+/// token that authorized the request that carries them — so an instance can
+/// reach exactly what its owner can reach and nothing more.
+///
+/// Nothing keeps a copy. `vw-svc` reads these off the request it is already
+/// authorizing and passes them straight through.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Credentials {
+    /// The Github login the token belongs to.
+    pub user: String,
+    /// A Github access token.
+    pub token: String,
+}
+
+/// Written by hand so that debug formatting a request, a struct that contains
+/// one of these, or an error that quotes one cannot put a live credential in a
+/// log. The derived version would print the token.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("user", &self.user)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}

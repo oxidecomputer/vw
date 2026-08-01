@@ -26,11 +26,14 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
-use vw_api_types_versions::latest::{CommitResult, SyncPlan, TreeManifest};
+use vw_api_types_versions::latest::{
+    CommitResult, Credentials, SyncPlan, TreeManifest,
+};
 use vw_sync::Store;
 use vw_sync_api::{BlobPathParam, EnvironmentPathParam, VwSyncApi};
 
 mod error;
+mod netrc;
 
 #[derive(Parser)]
 #[command(name = "vw-agent")]
@@ -83,12 +86,23 @@ struct ServerArgs {
     /// Directory delivered content waits in before being put in place.
     #[arg(long, default_value = "/var/lib/vw-agent/store")]
     store: Utf8PathBuf,
+
+    /// Where to write the credentials a build fetches its dependencies with.
+    ///
+    /// Defaults to the `.netrc` of whoever the agent runs as. Provisioning
+    /// should point this at the home directory of the user builds run as when
+    /// that is somebody else — `/home/ubuntu/.netrc` on the vivado and
+    /// artifact instances, where the agent is root and the build is not.
+    #[arg(long)]
+    netrc: Option<Utf8PathBuf>,
 }
 
 pub struct Context {
     environment: String,
     root: Utf8PathBuf,
     store: Store,
+    /// Where the credentials for fetching dependencies are kept.
+    netrc: Utf8PathBuf,
     /// Held while a tree is being made to match a manifest.
     ///
     /// Two machines synchronizing the same environment is not a conflict worth
@@ -213,6 +227,36 @@ impl VwSyncApi for Agent {
 
         Ok(HttpResponseOk(result))
     }
+
+    async fn put_credentials(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+        body: dropshot::TypedBody<Credentials>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+        let credentials = body.into_inner();
+
+        netrc::write(&ctx.netrc, &credentials)
+            .inspect_err(|e| {
+                slog::error!(rqctx.log, "cannot write the credentials file";
+                    "path" => %ctx.netrc,
+                    InlineErrorChain::new(e),
+                );
+            })
+            .map_err(error::netrc_error)?;
+
+        // The login and the path, never the token.
+        info!(rqctx.log, "credentials in place";
+            "user" => &credentials.user,
+            "path" => %ctx.netrc,
+        );
+
+        Ok(HttpResponseUpdatedNoContent())
+    }
 }
 
 impl Context {
@@ -268,16 +312,31 @@ async fn serve(args: ServerArgs) {
         }
     }
 
+    // Resolved at startup rather than when the first credentials arrive, so
+    // an agent with nowhere to put them says so now instead of halfway
+    // through somebody's first sync.
+    let netrc = match netrc_path(&args) {
+        Some(path) => path,
+        None => {
+            slog::error!(log, "cannot work out where to write credentials";
+                "detail" => "HOME is not set and --netrc was not given",
+            );
+            std::process::exit(1);
+        }
+    };
+
     let context = Arc::new(Context {
         environment: args.environment.clone(),
         root: args.root.clone(),
         store: Store::new(args.store.clone()),
+        netrc: netrc.clone(),
         materializing: tokio::sync::Mutex::new(()),
     });
 
     info!(log, "serving source synchronization";
         "root" => %args.root,
         "store" => %args.store,
+        "netrc" => %netrc,
     );
 
     let server =
@@ -308,6 +367,16 @@ async fn serve(args: ServerArgs) {
         slog::error!(log, "agent stopped"; "error" => e);
         std::process::exit(1);
     }
+}
+
+/// Where credentials go, if it can be worked out at all.
+fn netrc_path(args: &ServerArgs) -> Option<Utf8PathBuf> {
+    if let Some(path) = &args.netrc {
+        return Some(path.clone());
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|home| Utf8PathBuf::from(home).join(".netrc"))
 }
 
 fn emit_spec() {
