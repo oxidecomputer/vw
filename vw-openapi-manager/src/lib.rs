@@ -66,6 +66,19 @@ pub fn all_apis() -> anyhow::Result<ManagedApis> {
             },
             api_description: vw_api::vw_admin_api_mod::stub_api_description,
         },
+        ManagedApiConfig {
+            ident: "vw-sync-api",
+            versions: Versions::new_versioned(vw_sync_api::supported_versions()),
+            title: "VW agent API",
+            metadata: ManagedApiMetadata {
+                description: Some(
+                    "Receive source on a build instance. Reachable only from \
+                     vw-svc over the rack's internal network.",
+                ),
+                ..Default::default()
+            },
+            api_description: vw_sync_api::vw_sync_api_mod::stub_api_description,
+        },
     ])
 }
 

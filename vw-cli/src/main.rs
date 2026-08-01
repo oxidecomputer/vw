@@ -18,6 +18,7 @@ use vw_lib::{
 
 mod bench_runner;
 mod cloud;
+mod cloud_sync;
 mod htcl_test;
 mod parallel_load;
 mod part_picker;

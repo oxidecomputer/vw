@@ -1,9 +1,17 @@
+pub use crate::v1::CommitResult;
+pub use crate::v1::Digest;
 pub use crate::v1::Environment;
 pub use crate::v1::EnvironmentCreate;
 pub use crate::v1::EnvironmentImages;
 pub use crate::v1::EnvironmentPathParam;
+pub use crate::v1::FileEntry;
 pub use crate::v1::ImageRef;
 pub use crate::v1::OxideInstance;
 pub use crate::v1::SshKeyPair;
+pub use crate::v1::SyncPlan;
+pub use crate::v1::TargetBlobPathParam;
+pub use crate::v1::TargetKind;
+pub use crate::v1::TargetPathParam;
+pub use crate::v1::TreeManifest;
 pub use crate::v1::UserEnvironment;
 pub use crate::v1::UserEnvironmentPathParam;

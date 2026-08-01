@@ -22,6 +22,8 @@ vw-ip = { path = "../vw-ip" }
 vw-htcl-cmd = { path = "../vw-htcl-cmd" }
 vw-repl = { path = "../vw-repl" }
 vw-api-client = { path = "../vw-api-client" }
+vw-sync = { path = "../vw-sync" }
+vw-api-types-versions = { path = "../vw-api-types/versions" }
 clap.workspace = true
 thiserror.workspace = true
 colored = "2.0"
@@ -43,3 +45,8 @@ cpp_demangle = "0.4"
 # via chrono, `hostname` field via gethostname) for the looker CI viewer.
 chrono = "0.4"
 gethostname = "1.1"
+# `vw cloud sync --watch`: filesystem change notification.
+notify = "6"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -16,6 +16,7 @@ mod error;
 mod keys;
 mod oxide;
 mod reconciler;
+mod relay;
 mod tls;
 mod user_api;
 
@@ -90,6 +91,19 @@ struct ServerArgs {
     /// Seconds between reconciler passes
     #[arg(long, default_value_t = 30)]
     reconcile_interval: u64,
+
+    /// Send vivado source to this address instead of to a rack instance.
+    ///
+    /// For running the whole stack on one machine: with no Oxide backend there
+    /// are no instances to look up, so there is nowhere for a sync to go. An
+    /// address here stands in for the instance the reconciler would otherwise
+    /// have recorded.
+    #[arg(long, value_name = "HOST:PORT")]
+    vivado_agent: Option<String>,
+
+    /// Send helios source to this address instead of to a rack instance.
+    #[arg(long, value_name = "HOST:PORT")]
+    helios_agent: Option<String>,
 }
 
 #[tokio::main]

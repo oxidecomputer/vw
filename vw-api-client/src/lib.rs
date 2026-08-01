@@ -23,7 +23,43 @@ use reqwest::header::{
 
 /// Client for the vw user API.
 pub mod user {
-    progenitor::generate_api!("../openapi/vw-user-api/vw-user-api-latest.json");
+    // Sync types are reused rather than regenerated, for the same reason as in
+    // `agent` below: a client and a relay passing structurally identical but
+    // incompatible spellings of the same manifest would need a conversion at
+    // every hop.
+    progenitor::generate_api!(
+        spec = "../openapi/vw-user-api/vw-user-api-latest.json",
+        replace = {
+            CommitResult = vw_api_types_versions::latest::CommitResult,
+            Digest = vw_api_types_versions::latest::Digest,
+            FileEntry = vw_api_types_versions::latest::FileEntry,
+            SyncPlan = vw_api_types_versions::latest::SyncPlan,
+            TargetKind = vw_api_types_versions::latest::TargetKind,
+            TreeManifest = vw_api_types_versions::latest::TreeManifest,
+        },
+    );
+}
+
+/// Client for the agent that runs on a build instance.
+///
+/// Used by `vw-svc` to relay source, not by anything on a developer's machine
+/// — the agents are only reachable from inside the rack.
+pub mod agent {
+    // The shared types are reused rather than regenerated. Progenitor would
+    // otherwise mint its own `TreeManifest` and `Digest`, structurally
+    // identical to the ones in `vw-api-types` and incompatible with them, and
+    // every relayed request would have to be copied field by field between two
+    // spellings of the same thing.
+    progenitor::generate_api!(
+        spec = "../openapi/vw-sync-api/vw-sync-api-latest.json",
+        replace = {
+            CommitResult = vw_api_types_versions::latest::CommitResult,
+            Digest = vw_api_types_versions::latest::Digest,
+            FileEntry = vw_api_types_versions::latest::FileEntry,
+            SyncPlan = vw_api_types_versions::latest::SyncPlan,
+            TreeManifest = vw_api_types_versions::latest::TreeManifest,
+        },
+    );
 }
 
 /// Client for the vw admin API.
@@ -81,6 +117,22 @@ pub fn admin_client(config: &ClientConfig<'_>) -> Result<admin::Client, Error> {
     Ok(admin::Client::new_with_client(
         config.base_url,
         http_client(config)?,
+    ))
+}
+
+/// A client for the agent at `base_url`.
+///
+/// No credentials: the agents sit on the rack's internal network behind
+/// `vw-svc`, which has already decided whether the caller owns the environment
+/// by the time anything reaches here.
+pub fn agent_client(base_url: &str) -> Result<agent::Client, Error> {
+    Ok(agent::Client::new_with_client(
+        base_url,
+        http_client(&ClientConfig {
+            base_url,
+            token: None,
+            insecure: false,
+        })?,
     ))
 }
 

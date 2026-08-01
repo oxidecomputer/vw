@@ -210,15 +210,51 @@ impl Session {
         for mut instance in managed {
             let name = instance.oxide_instance_name();
             if instance.oxide_instance.is_some() {
-                let address = self.external_ip(&name).await?;
+                let external = self.external_ip(&name).await?;
+                let internal = self.internal_ip(&name).await?;
                 if let Some(oxide) = instance.oxide_instance.as_mut() {
-                    oxide.external_ip = address;
+                    oxide.external_ip = external;
+                    oxide.internal_ip = internal;
                 }
             }
             map.insert_overwrite(instance);
         }
 
         Ok(map)
+    }
+
+    /// The instance's address on the rack's own network.
+    ///
+    /// The primary interface's, since that is the one every instance has. A
+    /// dual-stack interface reports its v4 address: it is what the agent binds
+    /// and what a URL can name without bracketing.
+    async fn internal_ip(
+        &self,
+        name: &str,
+    ) -> Result<Option<std::net::IpAddr>, OxideError> {
+        let interfaces = self
+            .client
+            .instance_network_interface_list()
+            .instance(name)
+            .project(self.project.as_str())
+            .limit(PAGE_SIZE)
+            .send()
+            .await?
+            .items
+            .clone();
+
+        let primary = interfaces
+            .iter()
+            .find(|interface| interface.primary)
+            .or_else(|| interfaces.first());
+
+        Ok(primary.map(|interface| match &interface.ip_stack {
+            types::PrivateIpStack::V4(v4) => std::net::IpAddr::V4(v4.ip),
+            types::PrivateIpStack::V6(v6) => std::net::IpAddr::V6(v6.ip),
+            types::PrivateIpStack::DualStack { v4, .. } => {
+                std::net::IpAddr::V4(v4.ip)
+            }
+        }))
     }
 
     /// The address an instance can be reached on from outside the rack.
@@ -657,6 +693,7 @@ fn ours(
             // Filled in per instance by the caller; the list does not carry
             // addresses.
             external_ip: None,
+            internal_ip: None,
         });
         // Two Oxide instances cannot share a name, so this cannot collide.
         map.insert_overwrite(instance);
@@ -1059,6 +1096,7 @@ mod test {
             id: Some(Uuid::new_v4()),
             state,
             external_ip: None,
+            internal_ip: None,
         });
         instance
     }
@@ -1077,6 +1115,7 @@ mod test {
             id: None,
             state: types::InstanceState::Creating,
             external_ip: None,
+            internal_ip: None,
         });
         assert_eq!(run_action(&pending), RunAction::Create);
     }

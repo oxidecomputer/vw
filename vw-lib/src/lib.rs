@@ -87,6 +87,36 @@ pub struct WorkspaceConfig {
     pub targets: Option<TargetsConfig>,
     #[serde(default)]
     pub tools: Option<ToolsConfig>,
+    /// How this workspace is split across a cloud environment's instances.
+    ///
+    /// Absent for a workspace that is never built remotely, which is most of
+    /// them.
+    #[serde(default)]
+    pub cloud: Option<CloudConfig>,
+}
+
+/// Which parts of the workspace belong on which build instance.
+///
+/// Only the exceptions are declared. Everything not claimed by another target
+/// goes to vivado, so adding a directory of HDL does not mean remembering to
+/// list it — the common case needs no configuration at all.
+///
+/// ```toml
+/// [cloud.helios]
+/// src = ["driver"]
+/// ```
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct CloudConfig {
+    /// Directories that belong to the helios instance rather than to vivado.
+    #[serde(default)]
+    pub helios: Option<CloudTargetConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct CloudTargetConfig {
+    /// Paths, relative to the workspace root, that make up this target's tree.
+    #[serde(default)]
+    pub src: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1041,6 +1071,7 @@ pub fn init_workspace(
         test_dependencies: HashMap::new(),
         targets: None,
         tools: None,
+        cloud: None,
     };
 
     save_workspace_config(workspace_dir, &config)?;
@@ -1482,6 +1513,7 @@ pub async fn add_dependency_with_token(
                 test_dependencies: HashMap::new(),
                 targets: None,
                 tools: None,
+                cloud: None,
             }
         });
 

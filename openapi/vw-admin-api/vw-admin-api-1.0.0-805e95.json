@@ -271,7 +271,7 @@
         "properties": {
           "external_ip": {
             "nullable": true,
-            "description": "The address to reach this instance on, once it has one.\n\nAbsent until the instance exists and the control plane has attached an external address to it.",
+            "description": "The address to reach this instance on from outside the rack, once it has one.\n\nAbsent until the instance exists and the control plane has attached an external address to it. This is what a developer's ssh goes to.",
             "type": "string",
             "format": "ip"
           },
@@ -280,6 +280,12 @@
             "description": "The Oxide instance id, once the control plane has assigned one.\n\nAbsent in the window between asking for an instance and hearing back about it, which is long enough to be worth showing: an environment mid-creation reports `creating` with no id rather than looking like nothing has happened.",
             "type": "string",
             "format": "uuid"
+          },
+          "internal_ip": {
+            "nullable": true,
+            "description": "The instance's address on the rack's own network.\n\nWhat `vw-svc` sends source to, rather than the external address: the internal path is a regional fabric rather than the public internet, and the difference is most of the bandwidth.",
+            "type": "string",
+            "format": "ip"
           },
           "state": {
             "$ref": "#/components/schemas/InstanceState"

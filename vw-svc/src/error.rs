@@ -7,7 +7,7 @@
 
 use dropshot::ClientErrorStatusCode;
 
-use crate::{auth, db, keys, oxide};
+use crate::{auth, db, keys, oxide, relay};
 
 impl From<auth::AuthError> for dropshot::HttpError {
     fn from(value: auth::AuthError) -> Self {
@@ -80,6 +80,37 @@ impl From<keys::KeyError> for dropshot::HttpError {
     fn from(value: keys::KeyError) -> Self {
         // Nothing the caller did; the service could not make a key.
         dropshot::HttpError::for_internal_error(value.to_string())
+    }
+}
+
+impl From<relay::RelayError> for dropshot::HttpError {
+    fn from(value: relay::RelayError) -> Self {
+        let message = value.to_string();
+        match value {
+            // The caller named something that is not theirs or not there.
+            relay::RelayError::NoSuchEnvironment => {
+                dropshot::HttpError::for_not_found(None, message)
+            }
+            // The environment is real but not ready. Not an error on anyone's
+            // part — an environment spends its first minute like this — so it
+            // is worth a status a client can wait on rather than give up at.
+            relay::RelayError::NoInstance { .. }
+            | relay::RelayError::NoAddress { .. } => {
+                dropshot::HttpError::for_unavail(None, message)
+            }
+            // The instance said no, or could not be reached. Either way the
+            // caller's request was fine and the detail is in the log.
+            relay::RelayError::Agent { .. } => dropshot::HttpError {
+                status_code: dropshot::ErrorStatusCode::BAD_GATEWAY,
+                error_code: None,
+                external_message: message.clone(),
+                internal_message: message,
+                headers: None,
+            },
+            relay::RelayError::Db(_) | relay::RelayError::Client(_) => {
+                dropshot::HttpError::for_internal_error(message)
+            }
+        }
     }
 }
 

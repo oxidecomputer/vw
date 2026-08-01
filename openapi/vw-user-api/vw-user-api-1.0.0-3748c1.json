@@ -147,6 +147,169 @@
         }
       }
     },
+    "/environment/{name}/target/{kind}/sync/blob/{digest}": {
+      "put": {
+        "summary": "Deliver one piece of source content.",
+        "operationId": "sync_blob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "digest",
+            "description": "The digest of the content in the body, verified on arrival.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TargetKind"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{name}/target/{kind}/sync/commit": {
+      "post": {
+        "summary": "Make the instance's source tree match the manifest.",
+        "operationId": "sync_commit",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "description": "Which half of it.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TargetKind"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of the environment.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TreeManifest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitResult"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{name}/target/{kind}/sync/plan": {
+      "post": {
+        "summary": "Report what source content an environment's instance still needs.",
+        "operationId": "sync_plan",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "description": "Which half of it.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TargetKind"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of the environment.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TreeManifest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncPlan"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/environments": {
       "get": {
         "summary": "Return a list of all environments for the calling user.",
@@ -174,6 +337,38 @@
   },
   "components": {
     "schemas": {
+      "CommitResult": {
+        "description": "What applying a manifest did.",
+        "type": "object",
+        "properties": {
+          "created": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "deleted": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "unchanged": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "updated": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "created",
+          "deleted",
+          "unchanged",
+          "updated"
+        ]
+      },
       "Environment": {
         "description": "An environment is a collection of instances that work together to build, analyze and test vw designs.",
         "type": "object",
@@ -322,6 +517,29 @@
           "request_id"
         ]
       },
+      "FileEntry": {
+        "description": "One file in a synchronized tree.",
+        "type": "object",
+        "properties": {
+          "digest": {
+            "description": "The digest of its contents.",
+            "type": "string"
+          },
+          "executable": {
+            "description": "Whether the execute bit is set. The only mode bit that survives the trip, because it is the only one a build cares about.",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Where the file goes, relative to the tree root, `/`-separated.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "digest",
+          "executable",
+          "path"
+        ]
+      },
       "ImageRef": {
         "description": "An Oxide image an environment's instances are built from.\n\nPinned by id, so publishing a newer image does not silently change what an existing environment boots. The name is carried along for display.",
         "type": "object",
@@ -420,7 +638,7 @@
         "properties": {
           "external_ip": {
             "nullable": true,
-            "description": "The address to reach this instance on, once it has one.\n\nAbsent until the instance exists and the control plane has attached an external address to it.",
+            "description": "The address to reach this instance on from outside the rack, once it has one.\n\nAbsent until the instance exists and the control plane has attached an external address to it. This is what a developer's ssh goes to.",
             "type": "string",
             "format": "ip"
           },
@@ -429,6 +647,12 @@
             "description": "The Oxide instance id, once the control plane has assigned one.\n\nAbsent in the window between asking for an instance and hearing back about it, which is long enough to be worth showing: an environment mid-creation reports `creating` with no id rather than looking like nothing has happened.",
             "type": "string",
             "format": "uuid"
+          },
+          "internal_ip": {
+            "nullable": true,
+            "description": "The instance's address on the rack's own network.\n\nWhat `vw-svc` sends source to, rather than the external address: the internal path is a regional fabric rather than the public internet, and the difference is most of the bandwidth.",
+            "type": "string",
+            "format": "ip"
           },
           "state": {
             "$ref": "#/components/schemas/InstanceState"
@@ -454,6 +678,45 @@
         "required": [
           "private_key",
           "public_key"
+        ]
+      },
+      "SyncPlan": {
+        "description": "What the receiver still needs before a manifest can be applied.",
+        "type": "object",
+        "properties": {
+          "missing": {
+            "description": "Digests the receiver holds nowhere — neither in its content store nor anywhere in the tree it already has.\n\nContent already present under a different path is not listed: a rename or a move costs nothing, because the receiver copies it locally.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "missing"
+        ]
+      },
+      "TreeManifest": {
+        "description": "The complete desired state of a target's source tree.\n\nComplete, not a changeset: a path absent from this is a path that should not exist, which is the only way deletions and renames can be expressed.",
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileEntry"
+            }
+          }
+        },
+        "required": [
+          "entries"
+        ]
+      },
+      "TargetKind": {
+        "description": "Which half of an environment a request is about.\n\nOnly the two that take source. The artifact instance holds build output and is reached as an object store, so there is nothing to synchronize to it.",
+        "type": "string",
+        "enum": [
+          "vivado",
+          "helios"
         ]
       }
     },

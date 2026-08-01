@@ -115,6 +115,20 @@ pub enum CloudCommand {
         #[arg(help = "Environment name")]
         name: String,
     },
+    #[command(about = "Push the workspace to an environment's instances")]
+    Sync {
+        #[arg(help = "Environment name")]
+        name: String,
+        #[arg(long, help = "Keep syncing as files change, until interrupted")]
+        watch: bool,
+        #[arg(
+            long,
+            value_name = "MS",
+            default_value_t = 150,
+            help = "How long to wait for changes to settle before syncing"
+        )]
+        debounce: u64,
+    },
     #[command(
         about = "Download the ssh key that opens an environment's instances"
     )]
@@ -133,6 +147,16 @@ pub enum CloudCommand {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CloudError {
+    #[error("no vw workspace here; run this from one, or from a directory inside it")]
+    NoWorkspace,
+    #[error("reading the workspace configuration")]
+    Workspace(#[source] vw_lib::VwError),
+    #[error("scanning {0}")]
+    Scan(camino::Utf8PathBuf, #[source] vw_sync::ScanError),
+    #[error("reading {0}")]
+    ReadSource(String, #[source] std::io::Error),
+    #[error("watching the workspace for changes")]
+    Watch(#[source] notify::Error),
     #[error("reading github credentials: {0}")]
     Credentials(#[from] vw_lib::VwError),
     #[error(
@@ -159,8 +183,8 @@ pub enum CloudError {
 }
 
 /// A connection to the service, and whether we had a credential to offer it.
-struct Session {
-    client: Client,
+pub struct Session {
+    pub client: Client,
     /// Whether a Github token was found and sent. A `401` means very different
     /// things depending on this: no token means the caller needs to set one
     /// up, a token means Github turned it down.
@@ -196,6 +220,19 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
         CloudCommand::Keys { name, dir } => {
             fetch_keys(&session, &name, dir.as_deref()).await
         }
+        CloudCommand::Sync {
+            name,
+            watch,
+            debounce,
+        } => {
+            crate::cloud_sync::run(
+                &session,
+                &name,
+                watch,
+                std::time::Duration::from_millis(debounce),
+            )
+            .await
+        }
     }
 }
 
@@ -218,7 +255,7 @@ impl Session {
     ///
     /// The service's own message is the part a person can act on, so pull it
     /// out of the response body rather than reporting the client's error enum.
-    fn error(
+    pub fn error(
         &self,
         error: vw_api_client::user::Error<types::Error>,
     ) -> CloudError {
@@ -617,7 +654,7 @@ mod test {
             (types::InstanceState::Failed, RED),
             (types::InstanceState::Destroyed, RED),
         ] {
-            let text = rendered(state.clone());
+            let text = rendered(state);
             assert!(
                 text.starts_with(expected),
                 "{state} should be coloured {expected:?}, got {text:?}",

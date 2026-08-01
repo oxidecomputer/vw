@@ -168,6 +168,7 @@ impl InstanceReconciler {
                             id: None,
                             state: oxide::types::InstanceState::Creating,
                             external_ip: None,
+                            internal_ip: None,
                         }),
                     });
                 }
@@ -271,6 +272,7 @@ fn same_state(
                 // The address turns up some time after the instance does, and
                 // it is the part somebody actually needs.
                 && recorded.external_ip == actual.external_ip
+                && recorded.internal_ip == actual.internal_ip
         }
         (None, None) => true,
         _ => false,
@@ -631,6 +633,7 @@ mod test {
                 id: Some(Uuid::nil()),
                 state,
                 external_ip: None,
+                internal_ip: None,
             }),
         }
     }
@@ -886,6 +889,7 @@ mod test {
             id: None,
             state: InstanceState::Creating,
             external_ip: None,
+            internal_ip: None,
         });
         let target = map([pending]);
 
@@ -910,6 +914,7 @@ mod test {
             id: None,
             state: InstanceState::Creating,
             external_ip: None,
+            internal_ip: None,
         });
         assert!(!pending.exists_on_rack());
         // ... even though it does look like it is on its way up.

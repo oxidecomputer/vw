@@ -1,0 +1,33 @@
+[package]
+name = "vw-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Receives source on a vw build instance"
+keywords = ["vhdl", "workspace", "dependency-management"]
+categories = ["development-tools"]
+
+[[bin]]
+name = "vw-agent"
+path = "src/main.rs"
+
+[dependencies]
+vw-sync = { path = "../vw-sync" }
+vw-sync-api = { path = "../vw-sync-api" }
+vw-api-types-versions = { path = "../vw-api-types/versions" }
+camino.workspace = true
+clap.workspace = true
+dropshot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+slog = "2.8.2"
+slog-bunyan = "2.5.0"
+slog-async = "2.8.0"
+slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", branch = "main" }
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest = { version = "0.13", features = ["json"] }
+vw-sync = { path = "../vw-sync" }
+serde_json.workspace = true

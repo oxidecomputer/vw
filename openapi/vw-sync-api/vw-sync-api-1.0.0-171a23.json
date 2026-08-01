@@ -1,0 +1,269 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "VW agent API",
+    "description": "Receive source on a build instance. Reachable only from vw-svc over the rack's internal network.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/environment/{environment}/sync/blob/{digest}": {
+      "put": {
+        "summary": "Deliver one piece of content.",
+        "description": "Rejected if the body does not hash to the digest in the path: the digest is how every later lookup finds this content, so storing it under a name it does not have would be worse than not storing it.",
+        "operationId": "sync_blob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "digest",
+            "description": "The digest of the content in the body, which is verified on arrival rather than taken at face value.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/sync/commit": {
+      "post": {
+        "summary": "Make the instance's tree match the manifest.",
+        "description": "The manifest is the complete desired state, so this adds, replaces and removes as needed. Anything a build produced is invisible to it.",
+        "operationId": "sync_commit",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TreeManifest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitResult"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/sync/plan": {
+      "post": {
+        "summary": "Report what content is missing before a tree can be made to match.",
+        "description": "Content already held anywhere in the instance's tree is not asked for, whatever path it currently sits under, so a rename or a directory move costs nothing over the wire.",
+        "operationId": "sync_plan",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TreeManifest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncPlan"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CommitResult": {
+        "description": "What applying a manifest did.",
+        "type": "object",
+        "properties": {
+          "created": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "deleted": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "unchanged": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "updated": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "created",
+          "deleted",
+          "unchanged",
+          "updated"
+        ]
+      },
+      "Error": {
+        "description": "Error information from a response.",
+        "type": "object",
+        "properties": {
+          "error_code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "request_id"
+        ]
+      },
+      "FileEntry": {
+        "description": "One file in a synchronized tree.",
+        "type": "object",
+        "properties": {
+          "digest": {
+            "description": "The digest of its contents.",
+            "type": "string"
+          },
+          "executable": {
+            "description": "Whether the execute bit is set. The only mode bit that survives the trip, because it is the only one a build cares about.",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Where the file goes, relative to the tree root, `/`-separated.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "digest",
+          "executable",
+          "path"
+        ]
+      },
+      "SyncPlan": {
+        "description": "What the receiver still needs before a manifest can be applied.",
+        "type": "object",
+        "properties": {
+          "missing": {
+            "description": "Digests the receiver holds nowhere — neither in its content store nor anywhere in the tree it already has.\n\nContent already present under a different path is not listed: a rename or a move costs nothing, because the receiver copies it locally.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "missing"
+        ]
+      },
+      "TreeManifest": {
+        "description": "The complete desired state of a target's source tree.\n\nComplete, not a changeset: a path absent from this is a path that should not exist, which is the only way deletions and renames can be expressed.",
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileEntry"
+            }
+          }
+        },
+        "required": [
+          "entries"
+        ]
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

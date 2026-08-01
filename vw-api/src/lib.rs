@@ -1,6 +1,7 @@
 use dropshot::{
     api_description, HttpError, HttpResponseCreated, HttpResponseDeleted,
-    HttpResponseOk, Path, RequestContext, ResultsPage, TypedBody,
+    HttpResponseOk, HttpResponseUpdatedNoContent, Path, RequestContext,
+    ResultsPage, TypedBody, UntypedBody,
 };
 use dropshot_api_manager_types::api_versions;
 use vw_api_types_versions::latest;
@@ -89,6 +90,47 @@ pub trait VwUserApi {
         rqctx: RequestContext<Self::Context>,
         path_params: Path<latest::EnvironmentPathParam>,
     ) -> Result<HttpResponseDeleted, HttpError>;
+
+    //
+    // Source synchronization
+    //
+    // Relayed to the instance that serves the named half of the environment,
+    // over the rack's internal network. The client never reaches an instance
+    // directly, so this is the only route source takes.
+    //
+
+    /// Report what source content an environment's instance still needs.
+    #[endpoint {
+        method = POST,
+        path = "/environment/{name}/target/{kind}/sync/plan",
+    }]
+    async fn sync_plan(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::TargetPathParam>,
+        body: TypedBody<latest::TreeManifest>,
+    ) -> Result<HttpResponseOk<latest::SyncPlan>, HttpError>;
+
+    /// Deliver one piece of source content.
+    #[endpoint {
+        method = PUT,
+        path = "/environment/{name}/target/{kind}/sync/blob/{digest}",
+    }]
+    async fn sync_blob(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::TargetBlobPathParam>,
+        body: UntypedBody,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Make the instance's source tree match the manifest.
+    #[endpoint {
+        method = POST,
+        path = "/environment/{name}/target/{kind}/sync/commit",
+    }]
+    async fn sync_commit(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::TargetPathParam>,
+        body: TypedBody<latest::TreeManifest>,
+    ) -> Result<HttpResponseOk<latest::CommitResult>, HttpError>;
 
     /// Fetch the ssh keypair that opens an environment's instances.
     ///

@@ -2,6 +2,7 @@
 use crate::{
     auth, db, keys, oxide,
     reconciler::{validate_environment_name, validate_user_name},
+    relay,
 };
 use dropshot::{ApiDescription, BuildError, ConfigDropshot};
 use slog::{error, info, o};
@@ -135,6 +136,124 @@ impl VwUserApi for UserApi {
         Ok(dropshot::HttpResponseCreated(ssh_key))
     }
 
+    async fn sync_plan(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::TargetPathParam,
+        >,
+        body: dropshot::TypedBody<vw_api_types_versions::latest::TreeManifest>,
+    ) -> Result<
+        dropshot::HttpResponseOk<vw_api_types_versions::latest::SyncPlan>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let target = path_params.into_inner();
+        let manifest = body.into_inner();
+
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &target.name,
+            target.kind,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        let plan = agent
+            .client
+            .sync_plan(&agent.environment, &manifest)
+            .await
+            .map_err(|e| agent.failed(e))
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?
+            .into_inner();
+
+        Ok(dropshot::HttpResponseOk(plan))
+    }
+
+    async fn sync_blob(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::TargetBlobPathParam,
+        >,
+        body: dropshot::UntypedBody,
+    ) -> Result<dropshot::HttpResponseUpdatedNoContent, dropshot::HttpError>
+    {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let params = path_params.into_inner();
+        let target = vw_api_types_versions::latest::TargetPathParam {
+            name: params.name.clone(),
+            kind: params.kind,
+        };
+
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &params.name,
+            params.kind,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        agent
+            .client
+            .sync_blob(
+                &agent.environment,
+                params.digest.0.as_str(),
+                body.as_bytes().to_vec(),
+            )
+            .await
+            .map_err(|e| agent.failed(e))
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        Ok(dropshot::HttpResponseUpdatedNoContent())
+    }
+
+    async fn sync_commit(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::TargetPathParam,
+        >,
+        body: dropshot::TypedBody<vw_api_types_versions::latest::TreeManifest>,
+    ) -> Result<
+        dropshot::HttpResponseOk<vw_api_types_versions::latest::CommitResult>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let target = path_params.into_inner();
+        let manifest = body.into_inner();
+
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &target.name,
+            target.kind,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        let result = agent
+            .client
+            .sync_commit(&agent.environment, &manifest)
+            .await
+            .map_err(|e| agent.failed(e))
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?
+            .into_inner();
+
+        info!(log, "relayed a source sync";
+            "environment" => &target.name,
+            "target" => %target.kind,
+            "created" => result.created,
+            "updated" => result.updated,
+            "deleted" => result.deleted,
+            "unchanged" => result.unchanged,
+        );
+
+        Ok(dropshot::HttpResponseOk(result))
+    }
+
     async fn get_environment_keys(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
@@ -233,4 +352,21 @@ pub async fn start_server(
 
 pub fn api_description() -> ApiDescription<Arc<Context>> {
     vw_api::vw_user_api_mod::api_description::<UserApi>().unwrap()
+}
+
+/// Say why a sync could not be passed on.
+///
+/// Every one of these is worth a line: an instance that is not up yet, an
+/// address that has not appeared, an agent that refused. None of it is visible
+/// from the response alone, which only says the sync did not happen.
+fn log_relay_failure(
+    log: &slog::Logger,
+    target: &vw_api_types_versions::latest::TargetPathParam,
+    error: &relay::RelayError,
+) {
+    slog::warn!(log, "cannot relay a source sync";
+        "environment" => &target.name,
+        "target" => %target.kind,
+        InlineErrorChain::new(error),
+    );
 }

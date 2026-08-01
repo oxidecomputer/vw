@@ -56,11 +56,58 @@ pub struct OxideInstance {
     /// nothing has happened.
     pub id: Option<Uuid>,
     pub state: InstanceState,
-    /// The address to reach this instance on, once it has one.
+    /// The address to reach this instance on from outside the rack, once it
+    /// has one.
     ///
     /// Absent until the instance exists and the control plane has attached an
-    /// external address to it.
+    /// external address to it. This is what a developer's ssh goes to.
     pub external_ip: Option<std::net::IpAddr>,
+    /// The instance's address on the rack's own network.
+    ///
+    /// What `vw-svc` sends source to, rather than the external address: the
+    /// internal path is a regional fabric rather than the public internet, and
+    /// the difference is most of the bandwidth.
+    pub internal_ip: Option<std::net::IpAddr>,
+}
+
+/// Which half of an environment a request is about.
+///
+/// Only the two that take source. The artifact instance holds build output and
+/// is reached as an object store, so there is nothing to synchronize to it.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    Vivado,
+    Helios,
+}
+
+impl std::fmt::Display for TargetKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Vivado => f.write_str("vivado"),
+            Self::Helios => f.write_str("helios"),
+        }
+    }
+}
+
+/// Which environment and half a synchronization request is for.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TargetPathParam {
+    /// The name of the environment.
+    pub name: String,
+    /// Which half of it.
+    pub kind: TargetKind,
+}
+
+/// Which piece of content is being delivered, and where.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TargetBlobPathParam {
+    pub name: String,
+    pub kind: TargetKind,
+    /// The digest of the content in the body, verified on arrival.
+    pub digest: Digest,
 }
 
 /// Body of a request to create an environment.
@@ -132,4 +179,103 @@ impl BiHashItem for UserEnvironment {
     }
 
     bi_upcast!();
+}
+
+// -----------------------------------------------------------------------------
+// Source synchronization
+// -----------------------------------------------------------------------------
+//
+// A target's source tree is carried as a set of content-addressed files. The
+// sender describes the tree it wants to exist, the receiver answers with the
+// content it does not already hold, the sender uploads only that, and a commit
+// makes the receiver's filesystem match.
+//
+// Whole files rather than diffs, because build sources are small and content
+// addressing already collapses the unchanged ones — the same shape Bazel and
+// Buck2 arrived at. Complete manifests rather than changesets, because the
+// same environment may be synchronized from a different machine tomorrow, and
+// a changeset computed against one machine's state is meaningless against
+// another's.
+
+/// A BLAKE3 digest of a file's contents, lowercase hex.
+///
+/// BLAKE3 because the sender re-hashes changed files on every save, and it is
+/// several times faster than SHA-256 for that.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(transparent)]
+pub struct Digest(pub String);
+
+impl std::fmt::Display for Digest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Digest {
+    /// Whether this looks like a digest at all.
+    ///
+    /// Worth checking before a digest reaches the filesystem: it names a file
+    /// in the content store, so anything outside `[0-9a-f]{64}` is either a
+    /// bug or an attempt to escape the store's directory.
+    pub fn is_well_formed(&self) -> bool {
+        self.0.len() == 64
+            && self
+                .0
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+}
+
+/// One file in a synchronized tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FileEntry {
+    /// Where the file goes, relative to the tree root, `/`-separated.
+    pub path: String,
+    /// The digest of its contents.
+    pub digest: Digest,
+    /// Whether the execute bit is set. The only mode bit that survives the
+    /// trip, because it is the only one a build cares about.
+    pub executable: bool,
+}
+
+/// The complete desired state of a target's source tree.
+///
+/// Complete, not a changeset: a path absent from this is a path that should
+/// not exist, which is the only way deletions and renames can be expressed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TreeManifest {
+    pub entries: Vec<FileEntry>,
+}
+
+/// What the receiver still needs before a manifest can be applied.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SyncPlan {
+    /// Digests the receiver holds nowhere — neither in its content store nor
+    /// anywhere in the tree it already has.
+    ///
+    /// Content already present under a different path is not listed: a rename
+    /// or a move costs nothing, because the receiver copies it locally.
+    pub missing: Vec<Digest>,
+}
+
+/// What applying a manifest did.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
+)]
+pub struct CommitResult {
+    pub created: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    pub unchanged: usize,
 }

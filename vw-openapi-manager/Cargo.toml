@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 vw-api = { path = "../vw-api" }
+vw-sync-api = { path = "../vw-sync-api" }
 dropshot-api-manager = "0.7.2"
 dropshot-api-manager-types = "0.7.2"
 anyhow = "1.0"
