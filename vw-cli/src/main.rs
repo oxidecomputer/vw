@@ -17,6 +17,7 @@ use vw_lib::{
 };
 
 mod bench_runner;
+mod cloud;
 mod htcl_test;
 mod parallel_load;
 mod part_picker;
@@ -417,6 +418,8 @@ enum Commands {
         about = "Generate htcl wrappers from Vivado command references"
     )]
     HtclCmd(HtclCmdCommand),
+    #[command(about = "Manage remote build environments on a vw service")]
+    Cloud(cloud::CloudArgs),
 }
 
 #[derive(Subcommand)]
@@ -1272,6 +1275,12 @@ async fn main() {
                 }
             }
         },
+        Commands::Cloud(args) => {
+            if let Err(e) = cloud::run(args).await {
+                eprintln!("{} {e}", "error:".bright_red());
+                process::exit(1);
+            }
+        }
     }
 }
 

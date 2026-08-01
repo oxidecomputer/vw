@@ -21,10 +21,13 @@ vw-analyzer = { path = "../vw-analyzer" }
 vw-ip = { path = "../vw-ip" }
 vw-htcl-cmd = { path = "../vw-htcl-cmd" }
 vw-repl = { path = "../vw-repl" }
-clap = { version = "4.0", features = ["derive"] }
+vw-api-client = { path = "../vw-api-client" }
+clap.workspace = true
+thiserror.workspace = true
 colored = "2.0"
 tokio.workspace = true
 camino.workspace = true
+dirs.workspace = true
 tracing-subscriber.workspace = true
 petgraph.workspace = true
 futures.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Development tasks for the vw workspace"
+publish = false
+
+[dependencies]
+rcgen = "0.14.8"
+camino.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+time = "0.3"

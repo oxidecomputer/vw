@@ -1,0 +1,40 @@
+[package]
+name = "vw-svc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VW as a service endpoint"
+keywords = ["vhdl", "workspace", "dependency-management"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "vw-svc"
+path = "src/main.rs"
+
+[dependencies]
+vw-lib = { path = "../vw-lib" }
+vw-api = { path = "../vw-api" }
+vw-api-types-versions = { path = "../vw-api-types/versions" }
+camino.workspace = true
+dropshot.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+tokio.workspace = true
+oxide.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+iddqd.workspace = true
+futures.workspace = true
+slog = "2.8.2"
+slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", branch = "main" }
+slog-bunyan = "2.5.0"
+slog-async = "2.8.0"
+redb = "4.1.0"
+reqwest = { version = "0.13", features = ["json"] }
+uuid.workspace = true
+daft = { version = "0.1.8", features = ["derive"] }
+ssh-key = { version = "0.6", features = ["ed25519", "rand_core", "getrandom"] }
+
+[dev-dependencies]
+tempfile.workspace = true

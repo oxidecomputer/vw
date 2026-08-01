@@ -1,0 +1,24 @@
+[package]
+name = "vw-openapi-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Manages the checked-in OpenAPI documents for the VW service APIs"
+keywords = ["vhdl", "workspace", "dependency-management"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "vw-openapi-manager"
+path = "src/main.rs"
+
+[dependencies]
+vw-api = { path = "../vw-api" }
+dropshot-api-manager = "0.7.2"
+dropshot-api-manager-types = "0.7.2"
+anyhow = "1.0"
+camino.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+dropshot-api-manager = "0.7.2"

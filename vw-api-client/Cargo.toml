@@ -1,0 +1,17 @@
+[package]
+name = "vw-api-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Progenitor generated clients for the VW service APIs"
+keywords = ["vhdl", "workspace", "dependency-management"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+progenitor = "0.14.0"
+progenitor-client = "0.14.0"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde.workspace = true
+uuid.workspace = true
+thiserror.workspace = true

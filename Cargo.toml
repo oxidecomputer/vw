@@ -12,6 +12,13 @@ members = [
     "vw-ip",
     "vw-htcl-cmd",
     "vw-repl",
+    "vw-svc",
+    "vw-api",
+    "vw-api-types",
+    "vw-api-client",
+    "vw-openapi-manager",
+    "xtask",
+    "vw-api-types/versions",
 ]
 
 [workspace.package]
@@ -22,6 +29,7 @@ repository = "https://github.com/oxidecomputer/vw"
 
 [workspace.dependencies]
 # Shared dependencies
+dropshot = "0.17.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
@@ -49,9 +57,13 @@ tui-textarea = { version = "0.7", default-features = false, features = ["crosste
 nucleo-matcher = "0.3"
 indicatif = "0.17"
 similar = { version = "2.6", features = ["inline"] }
-#ipxact = { path = "/home/ry/src/ipe/crates/ipxact" }
 ipxact = { git = "https://github.com/oxidecomputer/ipe", branch = "ry/init" }
 anodizer = { git = "https://github.com/oxidecomputer/anodizer", branch = "ry/vw-restructure" }
+schemars = "0.8.22"
+uuid = { version = "1.24.0", features = ["serde", "js", "v4"] }
+oxide = "0.17.0"
+clap = { version = "4.0", features = ["derive", "env"] }
+iddqd = { version = "0.4.6", features = ["daft"] }
 
 # Embedded VHDL LSP. Path deps while our
 # `new_with_config` / `set_config` patches are in flight against

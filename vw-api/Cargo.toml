@@ -1,0 +1,18 @@
+[package]
+name = "vw-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VW service API"
+keywords = ["vhdl", "workspace", "dependency-management"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+vw-api-types-versions = {path = "../vw-api-types/versions" }
+dropshot.workspace = true
+schemars.workspace = true
+dropshot-api-manager = "0.7.2"
+dropshot-api-manager-types = "0.7.2"
+serde.workspace = true
+uuid.workspace = true
