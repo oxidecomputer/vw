@@ -155,8 +155,6 @@ pub enum CloudCommand {
 pub enum CloudError {
     #[error("no vw workspace here; run this from one, or from a directory inside it")]
     NoWorkspace,
-    #[error("reading the workspace configuration")]
-    Workspace(#[source] vw_lib::VwError),
     #[error("scanning {0}")]
     Scan(camino::Utf8PathBuf, #[source] vw_sync::ScanError),
     #[error("reading {0}")]

@@ -5,17 +5,14 @@
 //! Pushing a workspace to the instances that build it.
 //!
 //! A workspace is split across an environment's two instances: vivado builds
-//! the hardware, helios builds whatever drives it, and they do not need each
-//! other's sources. The split is declared as exceptions —
+//! the hardware, helios builds whatever drives it, and neither needs the
+//! other's sources. Where the line falls is not a question a workspace gets to
+//! answer — a vw workspace keeps its driver in `driver`, so that is what goes
+//! to helios and everything else goes to vivado.
 //!
-//! ```toml
-//! [cloud.helios]
-//! src = ["driver"]
-//! ```
-//!
-//! — and everything not claimed goes to vivado. Adding a directory of HDL
-//! therefore needs no configuration at all, which is the case that happens
-//! every day.
+//! Nothing to declare, nothing to keep in step with the layout, and no way to
+//! have a workspace whose configuration disagrees with where its files
+//! actually are.
 //!
 //! Each target is synchronized independently: its own manifest, its own
 //! content, its own commit. Nothing is shared between them, so there is no
@@ -50,38 +47,32 @@ pub struct Target {
     pub excluded: Vec<String>,
 }
 
+/// The directory a vw workspace keeps its driver in.
+///
+/// Everything under it is built on helios and nothing else is, which is what
+/// makes the split something this can decide rather than something a workspace
+/// has to say.
+pub const DRIVER: &str = "driver";
+
 /// Work out how a workspace divides across an environment's instances.
 ///
-/// Returns nothing for a target with no sources, rather than an empty tree: an
-/// empty manifest is a valid instruction to delete everything, and sending one
-/// because a workspace has no `driver` directory would be a poor way to find
-/// that out.
-pub fn targets(
-    workspace: &Utf8Path,
-    config: Option<&vw_lib::CloudConfig>,
-) -> Vec<Target> {
-    let claimed: Vec<String> = config
-        .and_then(|cloud| cloud.helios.as_ref())
-        .map(|helios| helios.src.clone())
-        .unwrap_or_default();
-
-    let mut targets = Vec::new();
-
-    // Vivado takes the workspace as a whole, minus whatever helios claimed.
-    targets.push(Target {
+/// A workspace with no driver gets no helios target, rather than one with an
+/// empty tree: an empty manifest is a valid instruction to delete everything,
+/// and sending one because there is no `driver` directory would be a poor way
+/// to find that out.
+pub fn targets(workspace: &Utf8Path) -> Vec<Target> {
+    // Vivado takes the workspace as a whole, less the driver.
+    let mut targets = vec![Target {
         kind: types::TargetKind::Vivado,
         root: workspace.to_owned(),
-        excluded: claimed.clone(),
-    });
+        excluded: vec![DRIVER.to_owned()],
+    }];
 
-    for src in &claimed {
-        let root = workspace.join(src);
-        if !root.is_dir() {
-            continue;
-        }
+    let driver = workspace.join(DRIVER);
+    if driver.is_dir() {
         targets.push(Target {
             kind: types::TargetKind::Helios,
-            root,
+            root: driver,
             excluded: Vec::new(),
         });
     }
@@ -142,9 +133,8 @@ pub async fn run(
     debounce: std::time::Duration,
 ) -> Result<(), CloudError> {
     let workspace = workspace_root()?;
-    let config = vw_lib::load_workspace_config(&workspace)
-        .map_err(CloudError::Workspace)?;
-    let targets = targets(&workspace, config.cloud.as_ref());
+    let targets = targets(&workspace);
+    announce(&targets);
 
     // Only ever the first pass. Forcing is an answer to a doubt about what is
     // on the instance, and once the sync below has settled it there is nothing
@@ -184,6 +174,23 @@ pub async fn run(
             // there shortly.
             eprintln!("{} {e}", "error:".bright_red());
         }
+    }
+}
+
+/// Say which instance is getting which directory.
+///
+/// Worth the two lines because a target with nothing to do prints nothing, so
+/// a workspace with no driver and one whose helios instance is merely up to
+/// date look identical from the outside. Said once, before the first pass,
+/// because it describes the workspace rather than anything a sync does.
+fn announce(targets: &[Target]) {
+    for target in targets {
+        println!(
+            "{} {} {}",
+            "\u{2192}".bright_black(),
+            target.kind.to_string().cyan(),
+            target.root.as_str().bright_black(),
+        );
     }
 }
 
@@ -366,7 +373,6 @@ fn watcher(
 #[cfg(test)]
 mod test {
     use super::*;
-    use vw_lib::{CloudConfig, CloudTargetConfig};
 
     fn workspace(files: &[&str]) -> (tempfile::TempDir, Utf8PathBuf) {
         let dir = tempfile::TempDir::new().expect("scratch");
@@ -379,18 +385,10 @@ mod test {
         (dir, root)
     }
 
-    fn helios_claims(src: &[&str]) -> CloudConfig {
-        CloudConfig {
-            helios: Some(CloudTargetConfig {
-                src: src.iter().map(|s| (*s).to_owned()).collect(),
-            }),
-        }
-    }
-
     #[test]
-    fn a_workspace_with_no_split_is_all_vivados() {
+    fn a_workspace_with_no_driver_is_all_vivados() {
         let (_dir, root) = workspace(&["hdl/top.vhd", "vw.toml"]);
-        let targets = targets(&root, None);
+        let targets = targets(&root);
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].kind, types::TargetKind::Vivado);
@@ -402,7 +400,7 @@ mod test {
     }
 
     #[test]
-    fn what_helios_claims_does_not_go_to_vivado() {
+    fn the_driver_goes_to_helios_and_nowhere_else() {
         // The metroid shape: everything is vivado's except `driver`.
         let (_dir, root) = workspace(&[
             "hdl/top.vhd",
@@ -410,8 +408,7 @@ mod test {
             "driver/Cargo.toml",
             "driver/src/lib.rs",
         ]);
-        let config = helios_claims(&["driver"]);
-        let targets = targets(&root, Some(&config));
+        let targets = targets(&root);
 
         assert_eq!(targets.len(), 2);
 
@@ -432,13 +429,12 @@ mod test {
     }
 
     #[test]
-    fn a_claim_that_is_only_a_prefix_of_a_name_is_not_a_claim() {
+    fn a_name_that_merely_starts_with_driver_is_not_the_driver() {
         // `driver` must not swallow `drivers-notes.md`, which shares its
         // first six characters and nothing else.
         let (_dir, root) =
             workspace(&["driver/Cargo.toml", "drivers-notes.md"]);
-        let config = helios_claims(&["driver"]);
-        let targets = targets(&root, Some(&config));
+        let targets = targets(&root);
 
         let vivado = scan(&targets[0]).expect("scan");
         let paths: Vec<&str> =
@@ -447,13 +443,12 @@ mod test {
     }
 
     #[test]
-    fn a_claim_on_a_directory_that_is_not_there_is_ignored() {
-        // A workspace that declares a helios target but has not written it
-        // yet should sync its hardware, not fail — and certainly not send an
-        // empty manifest, which would mean "delete everything".
+    fn a_workspace_without_a_driver_syncs_its_hardware_anyway() {
+        // Plenty of workspaces are hardware only. That should sync what there
+        // is rather than fail — and certainly not send helios an empty
+        // manifest, which would mean "delete everything".
         let (_dir, root) = workspace(&["hdl/top.vhd"]);
-        let config = helios_claims(&["driver"]);
-        let targets = targets(&root, Some(&config));
+        let targets = targets(&root);
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].kind, types::TargetKind::Vivado);
@@ -467,8 +462,7 @@ mod test {
             "driver/Cargo.toml",
             "driver/target/debug/thing",
         ]);
-        let config = helios_claims(&["driver"]);
-        let targets = targets(&root, Some(&config));
+        let targets = targets(&root);
 
         for target in &targets {
             let manifest = scan(target).expect("scan");
