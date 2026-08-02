@@ -15,6 +15,8 @@ path = "src/main.rs"
 [dependencies]
 vw-sync = { path = "../vw-sync" }
 vw-remote = { path = "../vw-remote" }
+vw-bench = { path = "../vw-bench" }
+vw-lib = { path = "../vw-lib" }
 tokio-tungstenite.workspace = true
 vw-sync-api = { path = "../vw-sync-api" }
 vw-api-types-versions = { path = "../vw-api-types/versions" }

@@ -18,9 +18,11 @@
 //! always streamed.
 
 mod backend;
+pub mod bench;
 pub mod protocol;
 mod session;
 
 pub use backend::{InterruptHandle, NoteSink, RemoteBackend};
+pub use bench::BenchEvent;
 pub use protocol::{SessionEvent, SessionParams, SessionRequest};
 pub use session::{serve, workspace_root, SessionError};

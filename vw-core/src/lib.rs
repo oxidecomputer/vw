@@ -149,6 +149,27 @@ impl From<VhdlStandard> for VHDLStandard {
     }
 }
 
+/// The inverse of [`VhdlStandard`]'s `Display`.
+///
+/// Paired with it deliberately: the standard is written into command lines and
+/// now also sent to an instance that has to turn it back into the same value,
+/// and a spelling that only goes one way is a spelling that eventually
+/// disagrees with itself.
+impl std::str::FromStr for VhdlStandard {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim() {
+            "2008" => Ok(VhdlStandard::Vhdl2008),
+            "2019" => Ok(VhdlStandard::Vhdl2019),
+            other => Err(format!(
+                "'{other}' is not a vhdl standard vw knows; expected 2008 or \
+                 2019"
+            )),
+        }
+    }
+}
+
 impl fmt::Display for VhdlStandard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

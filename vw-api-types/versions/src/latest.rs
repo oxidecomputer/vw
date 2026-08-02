@@ -1,3 +1,4 @@
+pub use crate::v1::BenchQuery;
 pub use crate::v1::CleanResult;
 pub use crate::v1::CommitResult;
 pub use crate::v1::Credentials;

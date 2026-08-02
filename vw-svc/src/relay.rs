@@ -169,10 +169,6 @@ impl Agent {
         client: dropshot::WebsocketConnection,
         query: &vw_api_types_versions::latest::VivadoSessionQuery,
     ) -> Result<(), RelayError> {
-        use futures::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::protocol::Role;
-        use tokio_tungstenite::WebSocketStream;
-
         let upgraded = self
             .client
             .vivado_session(
@@ -186,42 +182,36 @@ impl Agent {
             .map_err(|e| self.failed(e))?
             .into_inner();
 
-        let instance =
-            WebSocketStream::from_raw_socket(upgraded, Role::Client, None)
-                .await;
-        let developer = WebSocketStream::from_raw_socket(
-            client.into_inner(),
-            Role::Server,
-            None,
-        )
-        .await;
+        join(client, upgraded).await;
 
-        let (mut to_instance, mut from_instance) = instance.split();
-        let (mut to_developer, mut from_developer) = developer.split();
+        Ok(())
+    }
 
-        // Either direction ending ends the session. A developer who has
-        // interrupted a build wants vivado torn down, not left running; an
-        // instance whose worker has died has nothing more to say.
-        let outbound = async {
-            while let Some(Ok(frame)) = from_developer.next().await {
-                if to_instance.send(frame).await.is_err() {
-                    break;
-                }
-            }
-            let _ = to_instance.close().await;
-        };
-        let inbound = async {
-            while let Some(Ok(frame)) = from_instance.next().await {
-                if to_developer.send(frame).await.is_err() {
-                    break;
-                }
-            }
-            let _ = to_developer.close().await;
-        };
+    /// Run this environment's testbenches on the instance, joined to `client`.
+    ///
+    /// Relayed the same way a vivado session is, and for the same reason: what
+    /// crosses is a conversation between the developer's machine and the
+    /// instance, and this service's only business with it was deciding whether
+    /// to allow it at all.
+    pub(crate) async fn join_bench_session(
+        &self,
+        client: dropshot::WebsocketConnection,
+        query: &vw_api_types_versions::latest::BenchQuery,
+    ) -> Result<(), RelayError> {
+        let upgraded = self
+            .client
+            .bench_session(
+                &self.environment,
+                query.concurrency,
+                query.filter.as_deref(),
+                query.ignore.as_deref(),
+                query.standard.as_deref(),
+            )
+            .await
+            .map_err(|e| self.failed(e))?
+            .into_inner();
 
-        tokio::pin!(outbound);
-        tokio::pin!(inbound);
-        futures::future::select(outbound, inbound).await;
+        join(client, upgraded).await;
 
         Ok(())
     }
@@ -236,6 +226,57 @@ impl Agent {
             source: Box::new(source),
         }
     }
+}
+
+/// Pass frames between a developer and an instance until one of them stops.
+///
+/// Untouched in both directions. Reading them would buy nothing — the two ends
+/// share a protocol this service has no part in — and would add a place for it
+/// to be misunderstood.
+///
+/// Either side ending ends the session. A developer who interrupted a build
+/// wants it torn down rather than left running; an instance whose worker has
+/// died has nothing more to say.
+async fn join(
+    client: dropshot::WebsocketConnection,
+    instance: reqwest::Upgraded,
+) {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    use tokio_tungstenite::WebSocketStream;
+
+    let instance =
+        WebSocketStream::from_raw_socket(instance, Role::Client, None).await;
+    let developer = WebSocketStream::from_raw_socket(
+        client.into_inner(),
+        Role::Server,
+        None,
+    )
+    .await;
+
+    let (mut to_instance, mut from_instance) = instance.split();
+    let (mut to_developer, mut from_developer) = developer.split();
+
+    let outbound = async {
+        while let Some(Ok(frame)) = from_developer.next().await {
+            if to_instance.send(frame).await.is_err() {
+                break;
+            }
+        }
+        let _ = to_instance.close().await;
+    };
+    let inbound = async {
+        while let Some(Ok(frame)) = from_instance.next().await {
+            if to_developer.send(frame).await.is_err() {
+                break;
+            }
+        }
+        let _ = to_developer.close().await;
+    };
+
+    tokio::pin!(outbound);
+    tokio::pin!(inbound);
+    futures::future::select(outbound, inbound).await;
 }
 
 impl From<TargetKind> for InstanceKind {

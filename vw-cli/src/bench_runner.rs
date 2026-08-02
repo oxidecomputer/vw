@@ -1,33 +1,31 @@
-//! Parallel `vw bench` runner (nextest-style). Enumerates VHDL / cosim
-//! testbenches, optionally filters by a name substring, and runs each one
-//! as an isolated `vw bench <name> --build-dir target/sim/<name>`
-//! subprocess — bounded by a concurrency limit — driving the shared
-//! [`crate::test_ui::NextestPanel`] live display.
+//! `vw bench` on this machine, and the display both machines feed.
 //!
-//! A subprocess-per-bench model (like cargo-nextest) gives us free output
-//! capture and per-bench nvc build-dir isolation, and keeps one failing
-//! bench from aborting the batch.
+//! The orchestration — what to run, in what order, how many at once — lives in
+//! `vw-bench`, because an instance running the same benches has to make the
+//! same decisions. What lives here is the part that belongs to a terminal:
+//! turning the run's events into the nextest-style panel, and rendering a
+//! failure well enough to act on.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use camino::Utf8Path;
 use colored::*;
-use tokio::sync::Semaphore;
 
 use crate::test_ui::{print_result_line, NextestPanel};
 
-struct BenchResult {
+#[derive(Clone)]
+pub struct BenchResult {
     name: String,
-    passed: bool,
-    /// Combined stdout+stderr of the subprocess, shown only on failure.
+    /// Combined stdout+stderr of the subprocess. Only failures are kept, so
+    /// there is no passing bench's output to decide what to do with.
     output: String,
 }
 
-/// Run every matching testbench in parallel. `filter` is a substring
-/// match against the testbench entity name (nextest-style); `None` runs
-/// all. `concurrency` caps how many run at once.
+/// Run every matching testbench in parallel, here.
+///
+/// `filter` is a substring match against the testbench entity name
+/// (nextest-style); `None` runs all. `concurrency` caps how many run at once.
 pub async fn run_benches(
     cwd: &Utf8Path,
     filter: Option<&str>,
@@ -38,13 +36,14 @@ pub async fn run_benches(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ws = vw_lib::find_workspace_dir(cwd.as_std_path())
         .ok_or("not in a vw workspace (no vw.toml in the parent chain)")?;
-    let bench_dir = ws.join("bench");
-    if !bench_dir.exists() {
-        eprintln!("no bench directory found under {}", ws.as_str().dimmed());
-        return Ok(());
-    }
 
-    let names = discover_benches(&bench_dir, filter, ignore)?;
+    let request = vw_bench::Request {
+        filter: filter.map(str::to_owned),
+        standard: vhdl_std.to_string(),
+        concurrency,
+        ignore: ignore.to_vec(),
+    };
+    let names = vw_bench::discover(&ws, &request)?;
 
     if list {
         for n in &names {
@@ -53,109 +52,52 @@ pub async fn run_benches(
         return Ok(());
     }
     if names.is_empty() {
-        match filter {
-            Some(f) => eprintln!("no testbenches matched {}", f.dimmed()),
-            None => eprintln!(
-                "no testbenches found under {}",
-                bench_dir.as_str().dimmed()
-            ),
-        }
+        report_nothing_found(&ws, filter);
         return Ok(());
     }
 
-    // Generate anodizer structs once up front; the per-bench subprocesses
-    // then skip it (the fingerprint is fresh), avoiding a regen race.
-    if let Err(e) = vw_lib::ensure_anodized(&ws, vhdl_std, None).await {
-        eprintln!("{} anodize failed: {e}", "error:".bright_red());
+    if let Err(e) = vw_bench::prepare(&ws, vhdl_std).await {
+        eprintln!("{} {e}", "error:".bright_red());
         std::process::exit(1);
     }
 
-    // Regenerate every mixed-signal bench's cosim scaffold up front.
-    // `bench/` is one cargo workspace whose members include each
-    // `bench/<name>` cosim crate; a missing generated
-    // `bench/<name>/Cargo.toml` (e.g. after `git clean -fdx`) makes
-    // cargo fail to LOAD the workspace manifest, so EVERY bench's rust
-    // build face-plants — not just the cosim ones. Doing this before the
-    // fan-out keeps the workspace valid; content-aware writes make it a
-    // no-op when nothing changed.
-    if let Err(e) = vw_lib::ensure_bench_scaffolds(&ws) {
-        eprintln!("{} bench scaffold failed: {e}", "error:".bright_red());
-        std::process::exit(1);
-    }
+    // One `vw bench <name> --build-dir …` per bench. The child is this same
+    // binary: it already knows how to run exactly one bench into an isolated
+    // directory, which is what the internal `--build-dir` mode is for.
+    let exe = std::env::current_exe()?;
+    let standard = vhdl_std.to_string();
+    let launch: vw_bench::Launch =
+        Arc::new(move |name: &str, build_dir: &str| {
+            let mut command = tokio::process::Command::new(&exe);
+            command.args([
+                "bench",
+                name,
+                "--build-dir",
+                build_dir,
+                "--std",
+                &standard,
+            ]);
+            command
+        });
 
     let overall = Instant::now();
     let panel = Arc::new(NextestPanel::new(names.len() as u64, "testbenches"));
-    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
-    let exe = std::env::current_exe()?;
-    let std_str = vhdl_std.to_string();
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    let mut handles = Vec::new();
-    for name in names {
-        let sem = sem.clone();
-        let exe = exe.clone();
-        let ws = ws.clone();
-        let std_str = std_str.clone();
-        let panel = panel.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
-            let row = panel.start(&name);
+    let summary = {
+        let panel = Arc::clone(&panel);
+        let failures = Arc::clone(&failures);
+        let rows =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        vw_bench::run(&ws, names, concurrency, launch, move |event| {
+            drive_panel(&panel, &rows, &failures, event)
+        })
+        .await
+    };
 
-            let build_dir = format!("{}/{}", vw_lib::BUILD_DIR, name);
-            let start = Instant::now();
-            let out = tokio::process::Command::new(&exe)
-                .args([
-                    "bench",
-                    &name,
-                    "--build-dir",
-                    &build_dir,
-                    "--std",
-                    &std_str,
-                ])
-                .current_dir(ws.as_std_path())
-                .output()
-                .await;
-            let secs = start.elapsed().as_secs_f64();
-
-            let result = match out {
-                Ok(o) => {
-                    let mut output =
-                        String::from_utf8_lossy(&o.stdout).into_owned();
-                    output.push_str(&String::from_utf8_lossy(&o.stderr));
-                    BenchResult {
-                        name: name.clone(),
-                        passed: o.status.success(),
-                        output,
-                    }
-                }
-                Err(e) => BenchResult {
-                    name: name.clone(),
-                    passed: false,
-                    output: format!("failed to launch subprocess: {e}"),
-                },
-            };
-
-            panel.finish(&row, &result.name, result.passed, secs);
-            result
-        }));
-    }
-
-    let mut failures: Vec<BenchResult> = Vec::new();
-    for h in handles {
-        match h.await {
-            Ok(r) => {
-                if !r.passed {
-                    failures.push(r);
-                }
-            }
-            Err(e) => failures.push(BenchResult {
-                name: "<panicked>".into(),
-                passed: false,
-                output: format!("runner task panicked: {e}"),
-            }),
-        }
-    }
     panel.clear();
 
+    let failures = failures.lock().expect("failures").clone();
     if !failures.is_empty() {
         println!("\n{}\n", "failures:".red().bold());
         for f in &failures {
@@ -163,30 +105,66 @@ pub async fn run_benches(
         }
     }
     print_result_line(panel.passed(), panel.failed(), overall.elapsed());
-    if panel.failed() > 0 {
+    if summary.failed > 0 {
         std::process::exit(1);
     }
     Ok(())
 }
 
-/// Enumerate testbench entity names (`*_tb`) under `bench_dir`, sorted and
-/// de-duplicated, filtered by a name substring when given.
-fn discover_benches(
-    bench_dir: &Utf8Path,
-    filter: Option<&str>,
-    ignore: &[String],
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let ignore: HashSet<String> = ignore.iter().cloned().collect();
-    let benches = vw_lib::list_testbenches(bench_dir, &ignore, true)?;
-    let mut names: Vec<String> = benches
-        .into_iter()
-        .map(|t| t.name)
-        .filter(|n| n.to_lowercase().ends_with("_tb"))
-        .filter(|n| filter.is_none_or(|f| n.contains(f)))
-        .collect();
-    names.sort();
-    names.dedup();
-    Ok(names)
+/// Turn one run event into whatever the terminal should show for it.
+///
+/// Shared by the local runner and the remote one, so a bench finishing looks
+/// the same whichever machine it finished on.
+pub fn drive_panel(
+    panel: &NextestPanel,
+    rows: &std::sync::Mutex<
+        std::collections::HashMap<String, indicatif::ProgressBar>,
+    >,
+    failures: &std::sync::Mutex<Vec<BenchResult>>,
+    event: vw_bench::Event,
+) {
+    match event {
+        vw_bench::Event::Discovered { .. } => {}
+        vw_bench::Event::Started { name } => {
+            let row = panel.start(&name);
+            rows.lock().expect("rows").insert(name, row);
+        }
+        vw_bench::Event::Finished {
+            name,
+            passed,
+            seconds,
+            output,
+        } => {
+            let row = rows.lock().expect("rows").remove(&name);
+            if let Some(row) = row {
+                panel.finish(&row, &name, passed, seconds);
+            }
+            if !passed {
+                failures
+                    .lock()
+                    .expect("failures")
+                    .push(BenchResult { name, output });
+            }
+        }
+        vw_bench::Event::Note { message } => {
+            eprintln!("{} {message}", "info:".cyan());
+        }
+    }
+}
+
+fn report_nothing_found(ws: &Utf8Path, filter: Option<&str>) {
+    let bench_dir = ws.join("bench");
+    if !bench_dir.exists() {
+        eprintln!("no bench directory found under {}", ws.as_str().dimmed());
+        return;
+    }
+    match filter {
+        Some(f) => eprintln!("no testbenches matched {}", f.dimmed()),
+        None => eprintln!(
+            "no testbenches found under {}",
+            bench_dir.as_str().dimmed()
+        ),
+    }
 }
 
 /// Failure block for one bench, in the same visual frame `vw test` uses:
@@ -273,4 +251,105 @@ fn demangle_symbol(sym: &str) -> String {
         }
     }
     sym.to_string()
+}
+
+/// Run the workspace's testbenches on an environment's instance.
+///
+/// The display is the local one, driven by the same events — a bench finishing
+/// looks the same whichever machine it finished on, because the thing that
+/// decided how it looks never moved.
+pub async fn run_benches_remotely(
+    session: &crate::cloud::Session,
+    environment: &str,
+    filter: Option<&str>,
+    concurrency: Option<usize>,
+    vhdl_std: vw_lib::VhdlStandard,
+    ignore: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use futures::StreamExt;
+
+    let ignored = (!ignore.is_empty()).then(|| ignore.join(","));
+    let upgraded = session
+        .client
+        .bench_session(
+            environment,
+            concurrency.map(|n| n as u32),
+            filter,
+            ignored.as_deref(),
+            Some(&vhdl_std.to_string()),
+        )
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
+
+    let mut socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        upgraded,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+
+    let overall = Instant::now();
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rows =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Sized when the instance says what it found, not before: only it can
+    // see the tree to count.
+    let mut panel: Option<Arc<NextestPanel>> = None;
+    let mut summary = vw_bench::Summary::default();
+
+    while let Some(message) = socket.next().await {
+        let text = match message? {
+            tokio_tungstenite::tungstenite::Message::Text(text) => text,
+            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+            _ => continue,
+        };
+
+        match serde_json::from_str::<vw_remote::BenchEvent>(&text)? {
+            vw_remote::BenchEvent::Progress { event } => {
+                if let vw_bench::Event::Discovered { names } = &event {
+                    if names.is_empty() {
+                        eprintln!("no testbenches matched");
+                        return Ok(());
+                    }
+                    panel = Some(Arc::new(NextestPanel::new(
+                        names.len() as u64,
+                        "testbenches",
+                    )));
+                }
+                if let Some(panel) = panel.as_ref() {
+                    drive_panel(panel, &rows, &failures, event);
+                }
+            }
+            vw_remote::BenchEvent::Done { passed, failed } => {
+                summary = vw_bench::Summary { passed, failed };
+                break;
+            }
+            vw_remote::BenchEvent::Fatal { message } => {
+                if let Some(panel) = panel.as_ref() {
+                    panel.clear();
+                }
+                return Err(message.into());
+            }
+        }
+    }
+
+    let Some(panel) = panel else {
+        // The instance never got as far as saying what it found.
+        return Err("the instance ended the run without reporting".into());
+    };
+    panel.clear();
+
+    let failures = failures.lock().expect("failures").clone();
+    if !failures.is_empty() {
+        println!("\n{}\n", "failures:".red().bold());
+        for f in &failures {
+            print_bench_failure(f);
+        }
+    }
+    print_result_line(panel.passed(), panel.failed(), overall.elapsed());
+    if summary.failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }

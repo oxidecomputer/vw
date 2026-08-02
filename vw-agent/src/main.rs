@@ -47,6 +47,15 @@ struct Cli {
 enum Commands {
     /// Run the agent
     Serve(ServerArgs),
+    /// Run exactly one testbench into an isolated build directory.
+    ///
+    /// Hidden because it is not for people: the batch runner fans one of
+    /// these out per bench, the same way `vw bench` does on a developer's
+    /// machine. A child per bench is what makes each one's output separable
+    /// and each one's build directory its own — `nvc` inherits stdio, so
+    /// several in one process would interleave beyond recovery.
+    #[command(hide = true)]
+    BenchOne(BenchOneArgs),
     /// Emit the OpenAPI spec
     EmitSpec,
 }
@@ -95,6 +104,22 @@ struct ServerArgs {
     /// artifact instances, where the agent is root and the build is not.
     #[arg(long)]
     netrc: Option<Utf8PathBuf>,
+}
+
+#[derive(Parser, Clone)]
+struct BenchOneArgs {
+    /// Workspace to run in.
+    #[arg(long)]
+    root: Utf8PathBuf,
+    /// The testbench entity to run.
+    #[arg(long)]
+    name: String,
+    /// Where nvc should build, relative to the workspace.
+    #[arg(long)]
+    build_dir: String,
+    /// The VHDL standard, as `nvc` spells it.
+    #[arg(long)]
+    std: String,
 }
 
 pub struct Context {
@@ -265,6 +290,87 @@ impl VwSyncApi for Agent {
         }))
     }
 
+    async fn bench_session(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+        query: dropshot::Query<vw_api_types_versions::latest::BenchQuery>,
+        websock: dropshot::WebsocketConnection,
+    ) -> dropshot::WebsocketChannelResult {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        let query = query.into_inner();
+        // The instance decides how many run at once when the client does not
+        // say, because the instance is the machine doing the work and knows
+        // what it has.
+        let concurrency =
+            query.concurrency.map(|n| n as usize).unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            });
+        let request = vw_bench::Request {
+            filter: query.filter.clone(),
+            standard: query
+                .standard
+                .clone()
+                .unwrap_or_else(|| "2019".to_owned()),
+            concurrency,
+            ignore: query.ignored(),
+        };
+
+        info!(rqctx.log, "running testbenches";
+            "root" => %ctx.root,
+            "filter" => query.filter.as_deref().unwrap_or("-"),
+            "concurrency" => concurrency,
+        );
+
+        // One child per bench, and the child is this same binary. It already
+        // knows how to run exactly one bench into its own directory, which is
+        // what the hidden `bench-one` mode is for.
+        let exe = std::env::current_exe()?;
+        let root = ctx.root.clone();
+        let standard = request.standard.clone();
+        let launch: vw_bench::Launch =
+            std::sync::Arc::new(move |name: &str, build_dir: &str| {
+                let mut command = tokio::process::Command::new(&exe);
+                command.args([
+                    "bench-one",
+                    "--root",
+                    root.as_str(),
+                    "--name",
+                    name,
+                    "--build-dir",
+                    build_dir,
+                    "--std",
+                    &standard,
+                ]);
+                command
+            });
+
+        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            websock.into_inner(),
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+
+        let result =
+            vw_remote::bench::serve(socket, &ctx.root, request, launch).await;
+
+        match &result {
+            Ok(()) => info!(rqctx.log, "testbenches finished"),
+            Err(e) => slog::error!(rqctx.log, "testbench run failed";
+                InlineErrorChain::new(e),
+            ),
+        }
+
+        result.map_err(Into::into)
+    }
+
     async fn vivado_session(
         rqctx: RequestContext<Self::Context>,
         path_params: dropshot::Path<EnvironmentPathParam>,
@@ -373,7 +479,39 @@ async fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve(args) => serve(args).await,
+        Commands::BenchOne(args) => bench_one(args).await,
         Commands::EmitSpec => emit_spec(),
+    }
+}
+
+/// Run one testbench and exit with whether it passed.
+///
+/// Output goes to this process's own stdout and stderr, where the parent
+/// captures it — that is the whole point of being a separate process.
+async fn bench_one(args: BenchOneArgs) {
+    let standard = match args.std.parse::<vw_lib::VhdlStandard>() {
+        Ok(standard) => standard,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    let result = vw_lib::run_testbench(
+        &args.root,
+        args.name,
+        standard,
+        true,
+        &[],
+        false,
+        false,
+        &args.build_dir,
+    )
+    .await;
+
+    if let Err(e) = result {
+        eprintln!("{e}");
+        std::process::exit(1);
     }
 }
 

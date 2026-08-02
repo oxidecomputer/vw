@@ -1,0 +1,14 @@
+[package]
+name = "vw-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Running a workspace's testbenches, wherever they run"
+
+[dependencies]
+camino.workspace = true
+serde.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+vw-lib = { path = "../vw-lib" }

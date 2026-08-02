@@ -13,6 +13,7 @@ members = [
     "vw-htcl-cmd",
     "vw-repl",
     "vw-remote",
+    "vw-bench",
     "vw-svc",
     "vw-agent",
     "vw-sync",

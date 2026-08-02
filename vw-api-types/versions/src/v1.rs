@@ -351,3 +351,43 @@ pub struct CleanResult {
     /// How much space it was taking, measured before it went.
     pub bytes: u64,
 }
+
+/// Which testbenches to run, and how.
+///
+/// Everything here is a choice the developer made on the command line.
+/// Discovery itself is not: it reads the tree, and the tree is on the
+/// instance.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct BenchQuery {
+    /// Substring match against a testbench's entity name. Absent runs all.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// The VHDL standard, as `nvc` spells it.
+    #[serde(default)]
+    pub standard: Option<String>,
+    /// How many benches run at once. Absent lets the instance decide from its
+    /// own processor count, which is the number that matters — it is the
+    /// machine doing the work.
+    #[serde(default)]
+    pub concurrency: Option<u32>,
+    /// Directory names to skip while looking for benches, comma separated.
+    ///
+    /// One string rather than a repeated parameter because a query parameter
+    /// has to be scalar, and because that is already how `--ignore` is
+    /// written on the command line.
+    #[serde(default)]
+    pub ignore: Option<String>,
+}
+
+impl BenchQuery {
+    /// The directory names to skip, as a list.
+    pub fn ignored(&self) -> Vec<String> {
+        self.ignore
+            .iter()
+            .flat_map(|joined| joined.split(','))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+}

@@ -168,6 +168,25 @@ enum Commands {
             help = "Filter to testbenches whose name contains this substring; omit to run all"
         )]
         testbench: Option<String>,
+        #[arg(
+            long,
+            help = "Run the testbenches on this machine instead of in a cloud \
+                    environment"
+        )]
+        local: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to run in. Only needed when you have \
+                    more than one."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
         #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
         std: CliVhdlStandard,
         #[arg(
@@ -786,6 +805,9 @@ async fn main() {
         },
         Commands::Bench {
             testbench,
+            local,
+            env,
+            insecure,
             std,
             list,
             concurrency,
@@ -855,21 +877,55 @@ async fn main() {
             } else {
                 // Parallel nextest-style runner: no positional runs every
                 // testbench; a positional filters by name substring.
-                let conc = concurrency.unwrap_or_else(|| {
-                    std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(4)
-                });
-                if let Err(e) = bench_runner::run_benches(
-                    &cwd,
-                    testbench.as_deref(),
-                    list,
-                    conc,
-                    std.into(),
-                    &ignore,
-                )
-                .await
-                {
+                //
+                // `--list` is answered from this machine's own tree even when
+                // the workspace builds in the cloud. It is a question about
+                // source, the source here is what the developer is editing,
+                // and a network round trip to be told the same answer would
+                // only be slower.
+                let cloud = if local || list {
+                    None
+                } else {
+                    match bench_site(env.as_deref(), insecure).await {
+                        Ok(site) => site,
+                        Err(e) => {
+                            eprintln!("{} {e}", "error:".bright_red());
+                            process::exit(1);
+                        }
+                    }
+                };
+
+                let outcome = match &cloud {
+                    Some((session, environment)) => {
+                        bench_runner::run_benches_remotely(
+                            session,
+                            environment,
+                            testbench.as_deref(),
+                            concurrency,
+                            std.into(),
+                            &ignore,
+                        )
+                        .await
+                    }
+                    None => {
+                        let conc = concurrency.unwrap_or_else(|| {
+                            std::thread::available_parallelism()
+                                .map(|n| n.get())
+                                .unwrap_or(4)
+                        });
+                        bench_runner::run_benches(
+                            &cwd,
+                            testbench.as_deref(),
+                            list,
+                            conc,
+                            std.into(),
+                            &ignore,
+                        )
+                        .await
+                    }
+                };
+
+                if let Err(e) = outcome {
                     eprintln!("{} {e}", "error:".bright_red());
                     process::exit(1);
                 }
@@ -2891,6 +2947,36 @@ fn overload_specialization_mangle(
 
 /// Thin loader wrapper: resolve the entry's `src` imports into one
 /// flattened program, then hand it to [`run_loaded_program`].
+/// Work out whether the testbenches belong on a cloud environment, and get
+/// the environment ready for them.
+///
+/// The same shape as `vw run`'s: cloud first, synchronized before anything
+/// runs, and a service that cannot be reached falls back to this machine with
+/// a warning rather than a failure.
+async fn bench_site(
+    named: Option<&str>,
+    insecure: bool,
+) -> Result<Option<(cloud::Session, String)>, Box<dyn std::error::Error>> {
+    let session = cloud::Session::from_env(insecure)?;
+
+    let environment = match cloud::pick_environment(&session, named).await {
+        Ok(environment) => environment,
+        Err(e) if cloud::Session::unreachable(&e) => {
+            eprintln!(
+                "{} no vw service reachable ({e}); running the testbenches on \
+                 this machine",
+                "warning:".yellow(),
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    cloud::sync_for_build(&session, &environment).await?;
+
+    Ok(Some((session, environment)))
+}
+
 /// Open a vivado session on this workspace's cloud environment, for the REPL.
 ///
 /// Falls back to a local worker when no service can be reached, with a warning

@@ -165,6 +165,22 @@ pub trait VwSyncApi {
         path_params: Path<EnvironmentPathParam>,
     ) -> Result<HttpResponseOk<latest::CleanResult>, HttpError>;
 
+    /// Run this workspace's testbenches on this instance.
+    ///
+    /// A websocket for the same reason a vivado session is one: a batch takes
+    /// minutes and finishes one bench at a time, and a developer watching it
+    /// should see each result land rather than a verdict at the end.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{environment}/bench/session",
+    }]
+    async fn bench_session(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+        query: Query<latest::BenchQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
+
     /// Drive a vivado worker on this instance.
     ///
     /// A websocket rather than a request and a reply because a build is not

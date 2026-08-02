@@ -342,6 +342,58 @@ impl VwUserApi for UserApi {
         Ok(dropshot::HttpResponseOk(cleaned))
     }
 
+    async fn bench_session(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::EnvironmentPathParam,
+        >,
+        query: dropshot::Query<vw_api_types_versions::latest::BenchQuery>,
+        websock: dropshot::WebsocketConnection,
+    ) -> dropshot::WebsocketChannelResult {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let name = path_params.into_inner().name;
+        let query = query.into_inner();
+
+        let target = vw_api_types_versions::latest::TargetPathParam {
+            name: name.clone(),
+            kind: vw_api_types_versions::latest::TargetKind::Vivado,
+        };
+
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &name,
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        // A bench build fetches the workspace's dependencies like any other,
+        // so the instance needs the caller's credentials before it starts.
+        agent
+            .give_credentials(&caller, &log)
+            .await
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        info!(log, "running testbenches";
+            "environment" => &name,
+            "user" => &caller.name,
+            "filter" => query.filter.as_deref().unwrap_or("-"),
+        );
+
+        let result = agent.join_bench_session(websock, &query).await;
+
+        match &result {
+            Ok(()) => info!(log, "testbench run ended";
+                "environment" => &name,
+            ),
+            Err(e) => log_relay_failure(&log, &target, e),
+        }
+
+        result.map_err(Into::into)
+    }
+
     async fn vivado_session(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<

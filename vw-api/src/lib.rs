@@ -165,6 +165,22 @@ pub trait VwUserApi {
         path_params: Path<latest::TargetPathParam>,
     ) -> Result<HttpResponseOk<latest::CleanResult>, HttpError>;
 
+    /// Run an environment's testbenches on its vivado instance.
+    ///
+    /// Relayed frame for frame. What comes back is the same stream of events a
+    /// local run produces, so the display on a developer's terminal is driven
+    /// by exactly what would have driven it here.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{name}/bench/session",
+    }]
+    async fn bench_session(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::EnvironmentPathParam>,
+        query: Query<latest::BenchQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
+
     /// Drive a vivado worker on an environment's vivado instance.
     ///
     /// Relayed frame for frame to the instance, which spawns the worker when

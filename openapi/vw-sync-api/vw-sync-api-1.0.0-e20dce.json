@@ -6,6 +6,73 @@
     "version": "1.0.0"
   },
   "paths": {
+    "/environment/{environment}/bench/session": {
+      "get": {
+        "summary": "Run this workspace's testbenches on this instance.",
+        "description": "A websocket for the same reason a vivado session is one: a batch takes minutes and finishes one bench at a time, and a developer watching it should see each result land rather than a verdict at the end.",
+        "operationId": "bench_session",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "concurrency",
+            "description": "How many benches run at once. Absent lets the instance decide from its own processor count, which is the number that matters — it is the machine doing the work.",
+            "schema": {
+              "nullable": true,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "filter",
+            "description": "Substring match against a testbench's entity name. Absent runs all.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ignore",
+            "description": "Directory names to skip while looking for benches, comma separated.\n\nOne string rather than a repeated parameter because a query parameter has to be scalar, and because that is already how `--ignore` is written on the command line.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "standard",
+            "description": "The VHDL standard, as `nvc` spells it.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Negotiating protocol upgrade from HTTP/1.1 to WebSocket"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
+    },
     "/environment/{environment}/build-output": {
       "delete": {
         "summary": "Remove everything a build wrote on this instance.",

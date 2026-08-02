@@ -25,6 +25,7 @@ vw-api-client = { path = "../vw-api-client" }
 tokio-tungstenite.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 vw-remote = { path = "../vw-remote" }
+vw-bench = { path = "../vw-bench" }
 vw-sync = { path = "../vw-sync" }
 vw-api-types-versions = { path = "../vw-api-types/versions" }
 clap.workspace = true

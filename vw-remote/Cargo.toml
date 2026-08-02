@@ -18,6 +18,7 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 vw-eda = { path = "../vw-eda" }
 vw-lib = { path = "../vw-lib" }
+vw-bench = { path = "../vw-bench" }
 vw-vivado = { path = "../vw-vivado" }
 
 [dev-dependencies]

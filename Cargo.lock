@@ -5551,6 +5551,7 @@ dependencies = [
  "vw-analyzer",
  "vw-api-client",
  "vw-api-types-versions",
+ "vw-bench",
  "vw-eda",
  "vw-htcl",
  "vw-htcl-cmd",
@@ -5580,6 +5581,8 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "vw-api-types-versions",
+ "vw-bench",
+ "vw-lib",
  "vw-remote",
  "vw-sync",
  "vw-sync-api",
@@ -5651,6 +5654,17 @@ dependencies = [
  "schemars",
  "serde",
  "uuid",
+]
+
+[[package]]
+name = "vw-bench"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "vw-lib",
 ]
 
 [[package]]
@@ -5781,6 +5795,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "vw-bench",
  "vw-eda",
  "vw-lib",
  "vw-vivado",
