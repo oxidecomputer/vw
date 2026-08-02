@@ -17,7 +17,7 @@ vw-sync = { path = "../vw-sync" }
 vw-remote = { path = "../vw-remote" }
 vw-bench = { path = "../vw-bench" }
 vw-lib = { path = "../vw-lib" }
-rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
+rust-s3 = { version = "0.37", default-features = false, features = ["with-tokio"] }
 blake3 = "1"
 rand = "0.8"
 reqwest = { version = "0.13", features = ["json"] }

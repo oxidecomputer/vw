@@ -31,7 +31,7 @@ futures.workspace = true
 http-body = "1"
 http-body-util = "0.1"
 tokio-stream = "0.1"
-rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
+rust-s3 = { version = "0.37", default-features = false, features = ["with-tokio"] }
 tokio-tungstenite.workspace = true
 slog = "2.8.2"
 slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", branch = "main" }
