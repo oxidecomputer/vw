@@ -77,6 +77,7 @@ enum CargoMessage {
     /// A file cargo produced.
     CompilerArtifact {
         package_id: String,
+        target: CargoTarget,
         #[serde(default)]
         filenames: Vec<Utf8PathBuf>,
     },
@@ -84,6 +85,26 @@ enum CargoMessage {
     CompilerMessage { message: RustcMessage },
     #[serde(other)]
     Other,
+}
+
+/// What a produced file was built as.
+#[derive(serde::Deserialize)]
+struct CargoTarget {
+    #[serde(default)]
+    kind: Vec<String>,
+}
+
+impl CargoTarget {
+    /// Whether this is a build script rather than something the driver is
+    /// made of.
+    ///
+    /// Cargo compiles every `build.rs` into a binary and reports it like any
+    /// other artifact. It is a step in the build, not a product of it — it
+    /// runs once on the machine that compiled it and means nothing anywhere
+    /// else, while weighing tens of megabytes unstripped.
+    fn is_build_script(&self) -> bool {
+        self.kind.iter().any(|kind| kind == "custom-build")
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -505,8 +526,9 @@ where
             }
             CargoMessage::CompilerArtifact {
                 package_id,
+                target,
                 filenames,
-            } if members.contains(&package_id) => {
+            } if members.contains(&package_id) && !target.is_build_script() => {
                 produced.extend(
                     filenames.into_iter().filter(|path| is_deliverable(path)),
                 );

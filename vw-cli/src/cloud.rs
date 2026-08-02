@@ -861,6 +861,10 @@ async fn artifacts(
 }
 
 /// Show what an environment has built.
+///
+/// Grouped by the instance that made it, because a flat alphabetical list
+/// interleaves two unrelated builds — a vivado report between two driver
+/// binaries tells nobody anything.
 fn show(available: &[vw_api_types_versions::latest::Artifact]) {
     if available.is_empty() {
         println!(
@@ -870,13 +874,47 @@ fn show(available: &[vw_api_types_versions::latest::Artifact]) {
         return;
     }
 
-    for artifact in available {
+    let mut sorted: Vec<&vw_api_types_versions::latest::Artifact> =
+        available.iter().collect();
+    sorted.sort_by(|a, b| {
+        source_order(a.kind)
+            .cmp(&source_order(b.kind))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    for artifact in sorted {
         println!(
             "{:<10} {:>10}  {}",
-            artifact.kind.to_string().cyan(),
+            colored_source(artifact.kind),
             human_bytes(artifact.size),
             artifact.name,
         );
+    }
+}
+
+/// Which instance built it, in a colour that is not the other one's.
+///
+/// Two builds land in the same listing and they have nothing to do with each
+/// other; telling them apart should not require reading.
+fn colored_source(
+    kind: vw_api_types_versions::latest::TargetKind,
+) -> colored::ColoredString {
+    let name = kind.to_string();
+    match kind {
+        vw_api_types_versions::latest::TargetKind::Vivado => name.cyan(),
+        vw_api_types_versions::latest::TargetKind::Helios => name.magenta(),
+    }
+}
+
+/// Sort key for the instance that built something.
+///
+/// Fixed rather than alphabetical so the order does not change if a kind is
+/// ever renamed, and so hardware comes before software, which is the order
+/// they happen in.
+fn source_order(kind: vw_api_types_versions::latest::TargetKind) -> u8 {
+    match kind {
+        vw_api_types_versions::latest::TargetKind::Vivado => 0,
+        vw_api_types_versions::latest::TargetKind::Helios => 1,
     }
 }
 
