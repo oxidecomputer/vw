@@ -8,11 +8,12 @@ description = "Driving a Vivado worker that is on another machine"
 
 [dependencies]
 async-trait.workspace = true
-camino.workspace = true
+camino = { workspace = true, features = ["serde1"] }
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
@@ -22,4 +23,5 @@ vw-bench = { path = "../vw-bench" }
 vw-vivado = { path = "../vw-vivado" }
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }

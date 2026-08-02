@@ -54,6 +54,12 @@ pub async fn build(
         match serde_json::from_str::<vw_remote::DriverEvent>(&text)
             .map_err(|e| CloudError::Transport(e.to_string()))?
         {
+            // A driver is more than one cargo invocation, because userland
+            // and a kernel module are different targets. Saying which is
+            // building keeps two sets of cargo output from reading as one.
+            vw_remote::DriverEvent::Building { unit } => {
+                println!("{:>12} {unit}", "Building".bright_green().bold());
+            }
             // Printed rather than rendered: cargo already said it better than
             // anything here could.
             vw_remote::DriverEvent::Line { text } => println!("{text}"),

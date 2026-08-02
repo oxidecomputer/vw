@@ -18,7 +18,7 @@
 //! library would buy — structured diagnostics — cargo already offers any
 //! caller through `--message-format=json`.
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
@@ -29,6 +29,13 @@ use tokio_tungstenite::WebSocketStream;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DriverEvent {
+    /// A new part of the build has started.
+    ///
+    /// A driver is not one cargo invocation. Userland and a kernel module are
+    /// built for different targets, and one `cargo build` produces artifacts
+    /// for exactly one target — so there are as many invocations as there are
+    /// targets, and it is worth saying which one is talking.
+    Building { unit: String },
     /// One line of cargo's output, as cargo wrote it.
     ///
     /// Forwarded verbatim, colour and all, so what a developer sees is what
@@ -109,12 +116,197 @@ where
     Ok(())
 }
 
-/// Spawn cargo and forward everything it says.
+/// One place cargo has to be run, and what to call it.
+struct Unit {
+    /// The directory to run from. This is the whole point: cargo reads
+    /// `.cargo/config.toml` from the current directory and its ancestors, and
+    /// explicitly does not read one belonging to a workspace member when it is
+    /// invoked from the workspace root. A member whose config selects a target
+    /// therefore cannot be built correctly any other way.
+    directory: Utf8PathBuf,
+    name: String,
+}
+
+/// What `cargo metadata` tells us about a driver workspace.
+#[derive(serde::Deserialize)]
+struct Metadata {
+    packages: Vec<Package>,
+    #[serde(default)]
+    workspace_members: Vec<String>,
+    #[serde(default)]
+    workspace_default_members: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct Package {
+    id: String,
+    name: String,
+    manifest_path: Utf8PathBuf,
+}
+
+impl Package {
+    fn directory(&self) -> Utf8PathBuf {
+        self.manifest_path
+            .parent()
+            .map(Utf8Path::to_owned)
+            .unwrap_or_default()
+    }
+
+    /// Whether this member's own cargo config selects a build target.
+    ///
+    /// This is vw's signal for "compiled for somewhere other than here". A
+    /// kernel module sets it because it is not userland; nothing else has a
+    /// reason to. It is a signal a project already has to set for its own
+    /// build to work, rather than one more file to keep in step.
+    fn is_separately_targeted(&self) -> bool {
+        let config = self.directory().join(".cargo/config.toml");
+        let Ok(text) = std::fs::read_to_string(&config) else {
+            return false;
+        };
+        let Ok(parsed) = text.parse::<toml::Table>() else {
+            return false;
+        };
+        parsed
+            .get("build")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|build| build.contains_key("target"))
+    }
+}
+
+/// Ask cargo what this workspace is made of.
+fn metadata(root: &Utf8Path) -> Option<Metadata> {
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root.as_std_path())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Every cargo invocation a driver build needs, in the order to run them.
+///
+/// vw's rule, and the whole of it: **a workspace member whose own
+/// `.cargo/config.toml` selects a build target is built separately, from its
+/// own directory.** Everything else is built together as the workspace's
+/// default members.
+///
+/// Two things force this and neither is a matter of taste. One cargo
+/// invocation compiles for exactly one target, so a driver with a kernel
+/// module and userland tooling is at least two invocations however it is
+/// arranged. And a member's cargo config only applies when cargo runs from
+/// that directory, so the invocation for such a member has to start there —
+/// which, as a bonus, is also what keeps workspace feature unification from
+/// pulling `std` into a `no_std` build.
+///
+/// Deriving it from a file the project already needs means there is nothing
+/// extra to declare, and nothing that can disagree with how the project
+/// actually builds.
+fn units(root: &Utf8Path) -> Vec<Unit> {
+    let mut units = vec![Unit {
+        directory: root.to_owned(),
+        name: "workspace".to_owned(),
+    }];
+
+    let Some(metadata) = metadata(root) else {
+        return units;
+    };
+
+    let mut separate: Vec<Unit> = metadata
+        .packages
+        .iter()
+        .filter(|package| metadata.workspace_members.contains(&package.id))
+        .filter(|package| package.is_separately_targeted())
+        .map(|package| Unit {
+            directory: package.directory(),
+            name: package.name.clone(),
+        })
+        .collect();
+    separate.sort_by(|a, b| a.name.cmp(&b.name));
+
+    units.append(&mut separate);
+    units
+}
+
+/// A member that is built for its own target and also in the workspace's
+/// default members.
+///
+/// Worth catching before anything runs. Cargo will build it for the host
+/// instead, quietly ignoring the target its config asks for, and the failure
+/// arrives much later as a duplicate `panic_impl` lang item or a missing
+/// `core` — which reads as a dependency problem and is not one.
+fn contradiction(root: &Utf8Path) -> Option<String> {
+    let metadata = metadata(root)?;
+
+    let offender = metadata
+        .packages
+        .iter()
+        .filter(|package| {
+            metadata.workspace_default_members.contains(&package.id)
+        })
+        .find(|package| package.is_separately_targeted())?;
+
+    Some(format!(
+        "`{name}` sets its own build target in {directory}/.cargo/config.toml, \
+         but it is also one of this workspace's `default-members`. Cargo does \
+         not read a member's config when it runs from the workspace root, so \
+         building it that way compiles it for this machine instead of for the \
+         target it asks for. Remove `{name}` from `default-members` — vw \
+         builds it separately, from its own directory, which is the only way \
+         that config takes effect.",
+        name = offender.name,
+        directory = offender
+            .directory()
+            .strip_prefix(root)
+            .unwrap_or(&offender.directory()),
+    ))
+}
+
+/// Run every part of the build, stopping at the first failure.
 async fn build(
     root: &Utf8Path,
     params: &BuildParams,
     events: tokio::sync::mpsc::UnboundedSender<DriverEvent>,
 ) {
+    // Said before anything is built, because the alternative is a compiler
+    // error several minutes from now that names none of this.
+    if let Some(contradiction) = contradiction(root) {
+        let _ = events.send(DriverEvent::Fatal {
+            message: contradiction,
+        });
+        return;
+    }
+
+    for unit in units(root) {
+        let _ = events.send(DriverEvent::Building {
+            unit: unit.name.clone(),
+        });
+
+        match build_one(&unit.directory, params, &events).await {
+            Some(true) => {}
+            // Reported already; there is no sense building the kernel module
+            // against a userland that did not compile.
+            Some(false) | None => return,
+        }
+    }
+
+    let _ = events.send(DriverEvent::Done {
+        success: true,
+        code: Some(0),
+    });
+}
+
+/// Spawn cargo in one directory and forward everything it says.
+///
+/// Returns whether it succeeded, or `None` if it could not be run at all — in
+/// which case the failure has already been reported.
+async fn build_one(
+    root: &Utf8Path,
+    params: &BuildParams,
+    events: &tokio::sync::mpsc::UnboundedSender<DriverEvent>,
+) -> Option<bool> {
     let mut command = tokio::process::Command::new("cargo");
     command.arg("build");
     if params.release {
@@ -140,7 +332,7 @@ async fn build(
             let _ = events.send(DriverEvent::Fatal {
                 message: format!("cannot run cargo on this instance: {e}"),
             });
-            return;
+            return None;
         }
     };
 
@@ -164,16 +356,19 @@ async fn build(
     }
 
     match status {
+        Ok(status) if status.success() => Some(true),
         Ok(status) => {
             let _ = events.send(DriverEvent::Done {
-                success: status.success(),
+                success: false,
                 code: status.code(),
             });
+            Some(false)
         }
         Err(e) => {
             let _ = events.send(DriverEvent::Fatal {
                 message: format!("waiting for cargo: {e}"),
             });
+            None
         }
     }
 }
@@ -214,6 +409,103 @@ mod test {
             expected,
             ["build", "--release", "--color", "always", "-p", "module"],
         );
+    }
+
+    /// A driver workspace with `userland` and, optionally, a member built for
+    /// its own target.
+    fn workspace(
+        separately_targeted: bool,
+        in_default_members: bool,
+    ) -> (tempfile::TempDir, Utf8PathBuf) {
+        let dir = tempfile::TempDir::new().expect("scratch");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8").to_owned();
+
+        let members = if in_default_members {
+            r#"["userland", "kmod"]"#
+        } else {
+            r#"["userland"]"#
+        };
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[workspace]\nmembers = [\"userland\", \"kmod\"]\n\
+                 default-members = {members}\nresolver = \"2\"\n"
+            ),
+        )
+        .expect("write");
+
+        for member in ["userland", "kmod"] {
+            let package = root.join(member);
+            std::fs::create_dir_all(package.join("src")).expect("mkdir");
+            std::fs::write(
+                package.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\n\
+                     edition = \"2021\"\n"
+                ),
+            )
+            .expect("write");
+            std::fs::write(package.join("src/lib.rs"), "").expect("write");
+        }
+
+        if separately_targeted {
+            let config = root.join("kmod/.cargo");
+            std::fs::create_dir_all(&config).expect("mkdir");
+            std::fs::write(
+                config.join("config.toml"),
+                "[build]\ntarget = \"x86_64-unknown-none.json\"\n\n\
+                 [unstable]\nbuild-std = [\"core\", \"alloc\"]\n",
+            )
+            .expect("write");
+        }
+
+        (dir, root)
+    }
+
+    #[test]
+    fn a_member_with_its_own_target_is_built_on_its_own() {
+        // vw's whole rule. The kernel module's cargo config only applies when
+        // cargo runs from its directory, so that is where it is run from.
+        let (_dir, root) = workspace(true, false);
+
+        let names: Vec<String> =
+            units(&root).into_iter().map(|unit| unit.name).collect();
+
+        assert_eq!(names, ["workspace", "kmod"]);
+    }
+
+    #[test]
+    fn a_workspace_that_is_all_userland_is_one_build() {
+        // The common case, and it should cost nothing: no member asks for a
+        // different target, so one invocation covers it.
+        let (_dir, root) = workspace(false, false);
+
+        let names: Vec<String> =
+            units(&root).into_iter().map(|unit| unit.name).collect();
+
+        assert_eq!(names, ["workspace"]);
+    }
+
+    #[test]
+    fn a_member_in_default_members_that_wants_its_own_target_is_refused() {
+        // The mistake worth catching: cargo silently builds it for the host
+        // and the failure surfaces minutes later as a duplicate lang item,
+        // which reads as a dependency problem and is not one.
+        let (_dir, root) = workspace(true, true);
+
+        let complaint = contradiction(&root).expect("should be caught");
+
+        assert!(complaint.contains("kmod"), "{complaint}");
+        assert!(complaint.contains("default-members"), "{complaint}");
+    }
+
+    #[test]
+    fn a_workspace_with_nothing_contradictory_is_left_alone() {
+        let (_dir, root) = workspace(true, false);
+        assert!(contradiction(&root).is_none());
+
+        let (_dir, root) = workspace(false, false);
+        assert!(contradiction(&root).is_none());
     }
 
     #[test]
