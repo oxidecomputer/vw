@@ -255,6 +255,20 @@ pub trait VwUserApi {
         path_params: Path<latest::EnvironmentPathParam>,
     ) -> Result<HttpResponseOk<Vec<latest::Artifact>>, HttpError>;
 
+    /// Remove every artifact an environment has stored.
+    ///
+    /// Irreversible: the object store keeps no versions, so what goes is gone.
+    /// The instances themselves are untouched — a build's output is still on
+    /// the machine that made it until that machine is cleaned or replaced.
+    #[endpoint {
+        method = DELETE,
+        path = "/environment/{name}/artifacts",
+    }]
+    async fn clear_artifacts(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<latest::ArtifactsCleared>, HttpError>;
+
     /// Download one artifact.
     ///
     /// Streamed through this service rather than handed out as a link to the

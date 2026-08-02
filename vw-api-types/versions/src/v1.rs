@@ -501,3 +501,22 @@ impl DriverBuildQuery {
             .collect()
     }
 }
+
+/// What clearing an environment's artifacts came to.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+pub struct ArtifactsCleared {
+    /// How many objects were removed.
+    pub removed: usize,
+    /// How much space they were taking.
+    pub bytes: u64,
+}

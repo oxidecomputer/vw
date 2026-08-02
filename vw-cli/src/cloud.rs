@@ -154,6 +154,13 @@ pub enum CloudCommand {
         all: bool,
         #[arg(
             long,
+            conflicts_with_all = ["get", "all"],
+            help = "Remove every stored artifact. The object store keeps no \
+                    versions, so this cannot be undone."
+        )]
+        clear: bool,
+        #[arg(
+            long,
             value_name = "DIR",
             help = "Directory to write downloads into [default: .]"
         )]
@@ -266,8 +273,9 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             name,
             get,
             all,
+            clear,
             out,
-        } => artifacts(&session, &name, &get, all, out.as_deref()).await,
+        } => artifacts(&session, &name, &get, all, clear, out.as_deref()).await,
         CloudCommand::Keys { name, dir } => {
             fetch_keys(&session, &name, dir.as_deref()).await
         }
@@ -816,8 +824,13 @@ async fn artifacts(
     environment: &str,
     get: &[String],
     all: bool,
+    clear: bool,
     out: Option<&Utf8Path>,
 ) -> Result<(), CloudError> {
+    if clear {
+        return clear_artifacts(session, environment).await;
+    }
+
     let available = session
         .client
         .get_artifacts(environment)
@@ -856,6 +869,37 @@ async fn artifacts(
     for artifact in wanted {
         download(session, environment, artifact, directory).await?;
     }
+
+    Ok(())
+}
+
+/// Throw away everything an environment has stored.
+///
+/// No confirmation, matching the rest of `vw cloud` — `delete` takes three
+/// instances down without asking either. What it does report is exactly what
+/// went, since that is the only record left of it.
+async fn clear_artifacts(
+    session: &Session,
+    environment: &str,
+) -> Result<(), CloudError> {
+    let cleared = session
+        .client
+        .clear_artifacts(environment)
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
+
+    if cleared.removed == 0 {
+        println!("{}", "nothing stored to clear".bright_black());
+        return Ok(());
+    }
+
+    println!(
+        "{} removed {} artifact(s), {}",
+        "\u{2713}".bright_green(),
+        cleared.removed,
+        human_bytes(cleared.bytes),
+    );
 
     Ok(())
 }

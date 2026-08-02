@@ -675,6 +675,66 @@ impl VwUserApi for UserApi {
         Ok(dropshot::HttpResponseOk(found))
     }
 
+    async fn clear_artifacts(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::EnvironmentPathParam,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<
+            vw_api_types_versions::latest::ArtifactsCleared,
+        >,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let name = path_params.into_inner().name;
+
+        let mut cleared =
+            vw_api_types_versions::latest::ArtifactsCleared::default();
+
+        for kind in [
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            vw_api_types_versions::latest::TargetKind::Helios,
+        ] {
+            let credentials =
+                crate::wiring::store_for(&caller.name, &name, kind, &args)
+                    .await
+                    .inspect_err(|e| {
+                        error!(log, "cannot reach the object store";
+                            "environment" => &name,
+                            "kind" => %kind,
+                            InlineErrorChain::new(e),
+                        );
+                    })?;
+
+            let (removed, bytes) = crate::artifacts::clear(&credentials)
+                .await
+                .inspect_err(|e| {
+                    error!(log, "cannot clear artifacts";
+                        "environment" => &name,
+                        "kind" => %kind,
+                        InlineErrorChain::new(e),
+                    );
+                })?;
+
+            cleared.removed += removed;
+            cleared.bytes += bytes;
+        }
+
+        // Said plainly and after the fact: this is not recoverable, and the
+        // record of who emptied what is the only thing left of it.
+        info!(log, "cleared an environment's artifacts";
+            "environment" => &name,
+            "user" => &caller.name,
+            "removed" => cleared.removed,
+            "bytes" => cleared.bytes,
+        );
+
+        Ok(dropshot::HttpResponseOk(cleared))
+    }
+
     async fn get_artifact(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<

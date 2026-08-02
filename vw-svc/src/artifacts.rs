@@ -67,6 +67,37 @@ pub(crate) async fn list(
         .collect())
 }
 
+/// Remove everything in one bucket.
+///
+/// Reported rather than silent about failures: an object that would not delete
+/// is one the developer thinks is gone and is not, which is worse than an
+/// error.
+pub(crate) async fn clear(
+    credentials: &S3Credentials,
+) -> Result<(usize, u64), ArtifactError> {
+    let bucket = bucket(credentials)?;
+    let pages = bucket
+        .list(String::new(), None)
+        .await
+        .map_err(ArtifactError::Store)?;
+
+    let mut removed = 0usize;
+    let mut bytes = 0u64;
+    for object in pages.into_iter().flat_map(|page| page.contents) {
+        let response = bucket
+            .delete_object(format!("/{}", object.key))
+            .await
+            .map_err(ArtifactError::Store)?;
+        if response.status_code() >= 300 {
+            return Err(ArtifactError::Refused(response.status_code()));
+        }
+        removed += 1;
+        bytes += object.size;
+    }
+
+    Ok((removed, bytes))
+}
+
 /// One artifact's bytes, as a stream.
 ///
 /// Not read into memory first: an image runs to hundreds of megabytes, and

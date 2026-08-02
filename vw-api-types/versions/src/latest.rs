@@ -1,5 +1,6 @@
 pub use crate::v1::Artifact;
 pub use crate::v1::ArtifactPathParam;
+pub use crate::v1::ArtifactsCleared;
 pub use crate::v1::BenchQuery;
 pub use crate::v1::CleanResult;
 pub use crate::v1::CommitResult;
