@@ -74,19 +74,27 @@ struct ServerArgs {
 
     /// The environment this agent belongs to.
     ///
-    /// Requests naming any other environment are refused. An agent is brought
-    /// up for one environment and stays that way, so a request for a different
-    /// one is a routing mistake rather than something to serve.
-    #[arg(long)]
-    environment: String,
-
-    /// Which half of the environment this is.
+    /// Not normally given. An instance belongs to exactly one environment for
+    /// its whole life, and `vw-svc` already wrote that fact into the
+    /// instance's hostname when it created it — so the answer is on the
+    /// machine, and asking for it again only creates a way for the two to
+    /// disagree.
     ///
-    /// Only used to say so in the logs today. It is what the two roles will
-    /// diverge on once the agent starts running builds rather than only
-    /// receiving the source for them.
-    #[arg(long, default_value = "vivado")]
-    kind: String,
+    /// Supply it to run an agent somewhere that is not one of those
+    /// instances, which in practice means a developer's own machine.
+    ///
+    /// Requests naming any other environment are refused however this was
+    /// arrived at: a request for a different environment is a routing mistake,
+    /// not something to serve.
+    #[arg(long)]
+    environment: Option<String>,
+
+    /// Which of the environment's instances this is.
+    ///
+    /// Derived from the hostname alongside the environment, and overridable
+    /// for the same reason.
+    #[arg(long)]
+    kind: Option<String>,
 
     /// Directory the source tree is kept in.
     ///
@@ -809,11 +817,80 @@ async fn bench_one(args: BenchOneArgs) {
     }
 }
 
+/// The kinds of instance an environment has.
+const KINDS: [&str; 3] = ["vivado", "helios", "artifact"];
+
+/// What this machine is, according to its own name.
+///
+/// `vw-svc` names each instance `<kind>-<environment>` when it creates it, so
+/// a box that calls itself `helios-darmok` is the helios half of `darmok` and
+/// there is nothing further to look up. Environment names are validated to
+/// contain no hyphen precisely so this splits without ambiguity.
+///
+/// Returns nothing when the hostname says nothing — a developer's laptop is
+/// not called `vivado-something` — in which case the flags have to say.
+fn identity_from_hostname() -> Option<(String, String)> {
+    read_hostname().as_deref().and_then(parse_identity)
+}
+
+/// This machine's name.
+///
+/// The running hostname rather than the file, because the running one is what
+/// the machine currently answers to. `/etc/hostname` is the persisted
+/// intention and can disagree with it — after a `hostnamectl`, or inside a
+/// namespace — and when the two differ the live one is the truth.
+fn read_hostname() -> Option<String> {
+    gethostname::gethostname()
+        .into_string()
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+}
+
+/// Split `<kind>-<environment>` into its parts, if that is what this is.
+fn parse_identity(hostname: &str) -> Option<(String, String)> {
+    let (kind, environment) = hostname.trim().split_once('-')?;
+    if !KINDS.contains(&kind) || environment.is_empty() {
+        return None;
+    }
+    Some((kind.to_owned(), environment.to_owned()))
+}
+
 async fn serve(args: ServerArgs) {
-    let log = logger().new(o!(
-        "environment" => args.environment.clone(),
-        "kind" => args.kind.clone(),
+    let bare = logger();
+
+    // What this instance is, taken from its own name unless told otherwise.
+    let derived = identity_from_hostname();
+    // Which environment is the part nothing can be assumed about — guessing
+    // would attach this agent to somebody's environment uninvited.
+    let Some(environment) = args
+        .environment
+        .clone()
+        .or_else(|| derived.as_ref().map(|(_, e)| e.clone()))
+    else {
+        slog::error!(bare, "cannot tell which environment this is";
+            "detail" => "this machine is not named `<kind>-<environment>`, \
+                         which is how vw-svc names an environment's instances. \
+                         Pass --environment to run an agent somewhere else.",
+        );
+        std::process::exit(1);
+    };
+
+    // Which half of it is safe to assume, and vivado is what an agent that was
+    // never told has always been.
+    let kind = args
+        .kind
+        .clone()
+        .or_else(|| derived.as_ref().map(|(k, _)| k.clone()))
+        .unwrap_or_else(|| String::from("vivado"));
+
+    let log = bare.new(o!(
+        "environment" => environment.clone(),
+        "kind" => kind.clone(),
     ));
+    if args.environment.is_none() && args.kind.is_none() {
+        info!(log, "took this instance's identity from its hostname");
+    }
 
     // Both are made now rather than on the first request, so a directory that
     // cannot be created is a startup failure naming it rather than a confusing
@@ -844,9 +921,9 @@ async fn serve(args: ServerArgs) {
     // The artifact instance is the one that holds the object store, so it is
     // the one that brings it up. Nothing is pre-shared: the admin credential
     // is generated here and stays here, and only an S3 key ever leaves.
-    let store = if args.kind == "artifact" {
+    let store = if kind == "artifact" {
         match garage::start(
-            &args.environment,
+            &environment,
             &garage::Settings {
                 dir: args.garage_dir.clone(),
                 s3_port: args.s3_port,
@@ -889,7 +966,7 @@ async fn serve(args: ServerArgs) {
 
     // Only where builds happen. An artifact instance holds the store rather
     // than filling it, and helios does not produce images.
-    if args.kind == "vivado" {
+    if kind == "vivado" {
         tokio::spawn(artifacts::synchronize(
             args.root.clone(),
             artifact_changes,
@@ -898,7 +975,7 @@ async fn serve(args: ServerArgs) {
     }
 
     let context = Arc::new(Context {
-        environment: args.environment.clone(),
+        environment: environment.clone(),
         artifact_target,
         artifact_target_path: args.artifact_target.clone(),
         object_store: store,
@@ -973,4 +1050,41 @@ fn logger() -> Logger {
         .build()
         .fuse();
     Logger::root(drain, o!())
+}
+
+#[cfg(test)]
+mod identity_test {
+    use super::*;
+
+    #[test]
+    fn an_instance_knows_itself_by_its_name() {
+        // Exactly the names `vw-svc` gives the three instances it creates.
+        assert_eq!(
+            parse_identity("vivado-darmok"),
+            Some(("vivado".to_owned(), "darmok".to_owned())),
+        );
+        assert_eq!(
+            parse_identity("helios-darmok"),
+            Some(("helios".to_owned(), "darmok".to_owned())),
+        );
+        assert_eq!(
+            parse_identity("artifact-jalad\n"),
+            Some(("artifact".to_owned(), "jalad".to_owned())),
+        );
+    }
+
+    #[test]
+    fn a_machine_that_is_not_one_of_ours_says_so() {
+        // A developer's own machine, or anything else that happens to have a
+        // hyphen in its name. Guessing here would attach an agent to an
+        // environment nobody asked for.
+        for hostname in
+            ["runabout", "my-laptop", "vivado", "vivado-", "-darmok", ""]
+        {
+            assert!(
+                parse_identity(hostname).is_none(),
+                "'{hostname}' should not look like an instance",
+            );
+        }
+    }
 }

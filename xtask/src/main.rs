@@ -8,12 +8,19 @@
 //!
 //! ```text
 //! cargo xtask devcerts    # generate a self-signed cert for `vw-svc --tls`
+//! cargo xtask openapi     # manage the checked-in OpenAPI documents
 //! ```
+//!
+//! One entry point, so `cargo xtask` on its own lists everything a developer
+//! can do here. Tasks with heavy dependencies live in their own crates and are
+//! reached through [`external`], so having them listed costs nothing to
+//! somebody who does not run them.
 
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 
 mod devcerts;
+mod external;
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -27,6 +34,15 @@ struct Cli {
 enum Command {
     #[command(about = "Generate a self-signed certificate for local https")]
     Devcerts(DevcertArgs),
+
+    #[command(
+        about = "Manage the checked-in OpenAPI documents",
+        long_about = "Manage the checked-in OpenAPI documents under \
+                      `openapi/`. Run `cargo xtask openapi --help` for what \
+                      it can do; `generate` writes them from the API traits \
+                      and `check` fails if what is on disk is out of date."
+    )]
+    Openapi(external::External),
 }
 
 #[derive(Parser)]
@@ -49,14 +65,35 @@ pub struct DevcertArgs {
     pub force: bool,
 }
 
+/// Whatever went wrong, from whichever task.
+#[derive(Debug, thiserror::Error)]
+enum XtaskError {
+    #[error(transparent)]
+    Devcerts(#[from] devcerts::DevcertError),
+    #[error(transparent)]
+    External(#[from] external::ExternalError),
+}
+
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Devcerts(args) => devcerts::run(args),
+    let result: Result<(), XtaskError> = match cli.command {
+        Command::Devcerts(args) => devcerts::run(args).map_err(Into::into),
+        // Replaces this process, so it only returns if it could not start.
+        Command::Openapi(external) => external
+            .exec("vw-openapi-manager", "vw-openapi-manager")
+            .map_err(Into::into),
     };
 
     if let Err(e) = result {
         eprintln!("error: {e}");
+        // The source chain matters here: "cannot run vw-openapi-manager" on
+        // its own does not say whether cargo is missing or the crate failed
+        // to build.
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            eprintln!("  caused by: {cause}");
+            source = cause.source();
+        }
         std::process::exit(1);
     }
 }

@@ -7,9 +7,9 @@
 //! Run it through the workspace alias:
 //!
 //! ```text
-//! cargo openapi list        # what documents are managed
-//! cargo openapi generate    # write them from the API traits
-//! cargo openapi check       # fail if what is on disk is out of date
+//! cargo xtask openapi list        # what documents are managed
+//! cargo xtask openapi generate    # write them from the API traits
+//! cargo xtask openapi check       # fail if what is on disk is out of date
 //! ```
 
 use std::process::ExitCode;

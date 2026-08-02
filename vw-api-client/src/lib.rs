@@ -5,9 +5,9 @@
 //!
 //! The OpenAPI documents these are generated from live in `openapi/` at the
 //! root of the repository and belong to `vw-openapi-manager`: run
-//! `cargo openapi generate` after changing an endpoint. Each is read through
+//! `cargo xtask openapi generate` after changing an endpoint. Each is read through
 //! the `-latest.json` symlink the manager maintains, so this crate does not
-//! have to be edited when the API version changes. `cargo openapi check`
+//! have to be edited when the API version changes. `cargo xtask openapi check`
 //! (also run as a test) fails if a document is out of date, which keeps these
 //! clients from drifting from the service.
 //!

@@ -16,6 +16,21 @@
 #: series = "illumos"
 #: name = "vw"
 #: from_output = "/work/release/vw"
+#: 
+#: [[publish]]
+#: series = "illumos"
+#: name = "vw-agent"
+#: from_output = "/work/release/vw-agent"
+#: 
+#: [[publish]]
+#: series = "illumos"
+#: name = "vw-svc"
+#: from_output = "/work/release/vw-svc"
+#:
+#: [[publish]]
+#: series = "illumos"
+#: name = "vw-analyzer"
+#: from_output = "/work/release/vw-analyzer"
 
 set -o errexit
 set -o pipefail
@@ -26,6 +41,9 @@ cargo --version
 rustc --version
 
 export PKG_CONFIG_PATH=/opt/ooce/lib/amd64/pkgconfig
+
+banner "api"
+cargo xtask openapi generate
 
 banner "check"
 cargo fmt -- --check

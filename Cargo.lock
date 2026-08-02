@@ -5806,6 +5806,7 @@ dependencies = [
  "camino",
  "clap",
  "dropshot",
+ "gethostname",
  "rand 0.8.7",
  "reqwest 0.13.4",
  "rust-s3",

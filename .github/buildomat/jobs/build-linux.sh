@@ -16,6 +16,21 @@
 #: series = "linux"
 #: name = "vw"
 #: from_output = "/work/release/vw"
+#: 
+#: [[publish]]
+#: series = "linux"
+#: name = "vw-agent"
+#: from_output = "/work/release/vw-agent"
+#: 
+#: [[publish]]
+#: series = "linux"
+#: name = "vw-svc"
+#: from_output = "/work/release/vw-svc"
+#:
+#: [[publish]]
+#: series = "linux"
+#: name = "vw-analyzer"
+#: from_output = "/work/release/vw-analyzer"
 
 set -o errexit
 set -o pipefail
@@ -25,6 +40,9 @@ sudo apt-get install build-essential pkg-config libssl-dev libfontconfig-dev -y
 
 cargo --version
 rustc --version
+
+banner "api"
+cargo xtask openapi generate
 
 banner "check"
 cargo fmt -- --check

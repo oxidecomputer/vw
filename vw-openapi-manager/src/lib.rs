@@ -6,8 +6,8 @@
 //! [Dropshot API manager](https://crates.io/crates/dropshot-api-manager).
 //!
 //! The manager owns the OpenAPI documents under `openapi/` at the root of the
-//! repository: `cargo openapi generate` writes them from the API traits in
-//! `vw-api`, and `cargo openapi check` fails if what is on disk no longer
+//! repository: `cargo xtask openapi generate` writes them from the API traits in
+//! `vw-api`, and `cargo xtask openapi check` fails if what is on disk no longer
 //! matches. That check also runs as a test in this crate, so a stale document
 //! turns up in `cargo test` rather than in a client that has quietly drifted
 //! from the service.
@@ -22,7 +22,7 @@ use dropshot_api_manager_types::{ManagedApiMetadata, Versions};
 
 /// How a developer invokes this binary. The manager quotes it back in its own
 /// guidance, so it needs to match the alias in `.cargo/config.toml`.
-const COMMAND: &str = "cargo openapi";
+const COMMAND: &str = "cargo xtask openapi";
 
 /// Where the managed documents live, relative to the repository root.
 const OPENAPI_DIR: &str = "openapi";

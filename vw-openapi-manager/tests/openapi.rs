@@ -15,7 +15,7 @@ fn openapi_documents_are_up_to_date() {
     match check_apis_up_to_date(&environment, &apis).expect("run check") {
         CheckResult::Success => {}
         CheckResult::NeedsUpdate => {
-            panic!("openapi documents are out of date; run `cargo openapi generate`")
+            panic!("openapi documents are out of date; run `cargo xtask openapi generate`")
         }
         CheckResult::Failures => {
             panic!("openapi documents failed validation; see the output above")

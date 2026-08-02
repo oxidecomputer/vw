@@ -2,7 +2,6 @@
 git-fetch-with-cli = true
 
 [alias]
-# Manage the checked-in OpenAPI documents under `openapi/`.
-openapi = "run --quiet -p vw-openapi-manager --"
-# Development tasks (see `cargo xtask --help`).
+# Every development task, including the OpenAPI documents under `openapi/`.
+# One entry point, so `cargo xtask` on its own lists what there is to do.
 xtask = "run --quiet -p xtask --"
