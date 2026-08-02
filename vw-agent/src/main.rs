@@ -35,6 +35,7 @@ use vw_sync_api::{BlobPathParam, EnvironmentPathParam, VwSyncApi};
 mod artifacts;
 mod error;
 mod garage;
+mod generated;
 mod netrc;
 
 #[derive(Parser)]
@@ -297,6 +298,58 @@ impl VwSyncApi for Agent {
         );
 
         Ok(HttpResponseOk(result))
+    }
+
+    async fn generated_manifest(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<TreeManifest>, HttpError> {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        // Finish vivado's work before reporting it: the stubs do not exist
+        // until the templates are spliced, and on a remote run this is the
+        // only place that happens.
+        let written = generated::prepare(&ctx.root);
+        let manifest = generated::manifest(&ctx.root);
+
+        info!(rqctx.log, "reporting generated ip";
+            "stubs_written" => written,
+            "files" => manifest.entries.len(),
+        );
+
+        Ok(HttpResponseOk(manifest))
+    }
+
+    async fn generated_file(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+        query: dropshot::Query<
+            vw_api_types_versions::latest::GeneratedFileQuery,
+        >,
+    ) -> Result<HttpResponseOk<dropshot::FreeformBody>, HttpError> {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+        let wanted = query.into_inner().path;
+
+        let contents = generated::read(&ctx.root, &wanted)
+            .inspect_err(|e| {
+                slog::warn!(rqctx.log, "refusing a generated file";
+                    "path" => &wanted,
+                    InlineErrorChain::new(e),
+                );
+            })
+            .map_err(error::generated_error)?;
+
+        Ok(HttpResponseOk(
+            dropshot::Body::with_content(contents).into(),
+        ))
     }
 
     async fn get_artifact_target(

@@ -463,6 +463,109 @@ impl VwUserApi for UserApi {
         result.map_err(Into::into)
     }
 
+    async fn generated_manifest(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::EnvironmentPathParam,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<vw_api_types_versions::latest::TreeManifest>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let name = path_params.into_inner().name;
+
+        let target = vw_api_types_versions::latest::TargetPathParam {
+            name: name.clone(),
+            kind: vw_api_types_versions::latest::TargetKind::Vivado,
+        };
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &name,
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        let manifest = agent
+            .client
+            .generated_manifest(&agent.environment)
+            .await
+            .map_err(|e| agent.failed(e))
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?
+            .into_inner();
+
+        info!(log, "reported generated ip";
+            "environment" => &name,
+            "files" => manifest.entries.len(),
+        );
+
+        Ok(dropshot::HttpResponseOk(manifest))
+    }
+
+    async fn generated_file(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::EnvironmentPathParam,
+        >,
+        query: dropshot::Query<
+            vw_api_types_versions::latest::GeneratedFileQuery,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<dropshot::FreeformBody>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let name = path_params.into_inner().name;
+        let wanted = query.into_inner().path;
+
+        let target = vw_api_types_versions::latest::TargetPathParam {
+            name: name.clone(),
+            kind: vw_api_types_versions::latest::TargetKind::Vivado,
+        };
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &name,
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        let contents = agent
+            .client
+            .generated_file(&agent.environment, &wanted)
+            .await
+            .map_err(|e| agent.failed(e))
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?
+            .into_inner();
+
+        // Small text files, read whole rather than streamed: a wrapper is a
+        // few kilobytes and there is nothing to gain from frames.
+        use futures::TryStreamExt;
+        let bytes = futures::TryStreamExt::try_fold(
+            contents.into_inner(),
+            Vec::new(),
+            |mut collected, chunk| async move {
+                collected.extend_from_slice(&chunk);
+                Ok(collected)
+            },
+        )
+        .await
+        .map_err(|e| {
+            dropshot::HttpError::for_internal_error(format!(
+                "reading a generated file from the instance: {e}"
+            ))
+        })?;
+
+        Ok(dropshot::HttpResponseOk(
+            dropshot::Body::with_content(bytes).into(),
+        ))
+    }
+
     async fn get_artifacts(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<

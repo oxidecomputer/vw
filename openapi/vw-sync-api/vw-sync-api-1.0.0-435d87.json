@@ -217,6 +217,81 @@
         }
       }
     },
+    "/environment/{environment}/generated": {
+      "post": {
+        "summary": "The VHDL vivado generated for this environment's IP.",
+        "description": "A `POST` because it finishes the job first: vivado writes an instantiation template per standalone IP, and turning those into black-box entities is a mechanical step that happens in Rust after the vivado pass. On a local run that happens on the developer's machine; on a remote one there is nobody there to do it, so it happens here, where the templates are.\n\nAnswers with paths relative to the workspace, so the far end can put each file exactly where its own tools will look for it.",
+        "operationId": "generated_manifest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TreeManifest"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/generated/file": {
+      "get": {
+        "summary": "One generated file's contents.",
+        "operationId": "generated_file",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/environment/{environment}/object-store": {
       "get": {
         "summary": "The key that opens this instance's object store.",

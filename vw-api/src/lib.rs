@@ -202,6 +202,30 @@ pub trait VwUserApi {
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
 
+    /// The VHDL vivado generated for this environment's IP.
+    ///
+    /// A developer's static analysis needs these to resolve the design, and
+    /// they only exist where vivado ran. Relayed from the vivado instance.
+    #[endpoint {
+        method = POST,
+        path = "/environment/{name}/generated",
+    }]
+    async fn generated_manifest(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<latest::TreeManifest>, HttpError>;
+
+    /// One generated file's contents.
+    #[endpoint {
+        method = GET,
+        path = "/environment/{name}/generated/file",
+    }]
+    async fn generated_file(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::EnvironmentPathParam>,
+        query: Query<latest::GeneratedFileQuery>,
+    ) -> Result<HttpResponseOk<FreeformBody>, HttpError>;
+
     /// List the artifacts an environment's builds have produced.
     ///
     /// Read from the environment's own object store, which lives on its

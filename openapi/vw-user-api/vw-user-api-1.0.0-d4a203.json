@@ -269,6 +269,83 @@
         "x-dropshot-websocket": {}
       }
     },
+    "/environment/{name}/generated": {
+      "post": {
+        "summary": "The VHDL vivado generated for this environment's IP.",
+        "description": "A developer's static analysis needs these to resolve the design, and they only exist where vivado ran. Relayed from the vivado instance.",
+        "operationId": "generated_manifest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of this environment to create.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TreeManifest"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{name}/generated/file": {
+      "get": {
+        "summary": "One generated file's contents.",
+        "operationId": "generated_file",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of this environment to create.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/environment/{name}/keys": {
       "get": {
         "summary": "Fetch the ssh keypair that opens an environment's instances.",

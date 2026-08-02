@@ -464,3 +464,13 @@ pub struct ArtifactPathParam {
     /// The artifact's file name.
     pub artifact: String,
 }
+
+/// Which generated file is wanted.
+///
+/// A path rather than a path segment because these are nested several levels
+/// deep — vivado buries a stub inside its project — and a path with slashes in
+/// it is not something a route can carry.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct GeneratedFileQuery {
+    pub path: String,
+}

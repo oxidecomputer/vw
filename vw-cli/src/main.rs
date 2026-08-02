@@ -408,6 +408,25 @@ enum Commands {
         files: Vec<Utf8PathBuf>,
         #[arg(
             long,
+            help = "Generate IP on this machine instead of in a cloud \
+                    environment"
+        )]
+        local: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to generate IP in. Only needed when \
+                    you have more than one."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+        #[arg(
+            long,
             value_name = "ID",
             conflicts_with_all = ["all_parts", "variant", "all_variants"],
             help = "Check against a specific `[[target-parts]]` entry by \
@@ -1109,12 +1128,34 @@ async fn main() {
         }
         Commands::Check {
             files,
+            local,
+            env,
+            insecure,
             part,
             all_parts,
             variant,
             all_variants,
             ip_generate,
         } => {
+            // Cloud first, like every other command that needs vivado. The
+            // check itself runs here — it is a static analysis of the source
+            // the developer is editing — but generating the IP wrappers it
+            // needs is a vivado job, and those come back afterwards.
+            //
+            // Resolved once, before anything, so a sync happens at most once
+            // per check rather than at each of the two places IP generation
+            // can be triggered from.
+            let cloud = if local {
+                None
+            } else {
+                match cloud_site(env.as_deref(), insecure).await {
+                    Ok(site) => site,
+                    Err(e) => {
+                        eprintln!("{} {e}", "error:".bright_red());
+                        process::exit(1);
+                    }
+                }
+            };
             // Two shapes:
             //   `vw check FILE [FILE...]` — check the explicit list.
             //   `vw check`               — discover from workspace:
@@ -1183,6 +1224,7 @@ async fn main() {
                             );
                             if let Err(e) = ensure_ip_generated(
                                 &ws,
+                                cloud.as_ref(),
                                 None,
                                 None,
                                 vw_vivado::LogLevel::Warning,
@@ -1275,6 +1317,7 @@ async fn main() {
                         );
                         if let Err(e) = ensure_ip_generated(
                             &ws,
+                            cloud.as_ref(),
                             None,
                             None,
                             // Terse: the check only cares about VHDL
@@ -1357,37 +1400,50 @@ async fn main() {
                 // whether to wipe the on-disk Vivado project, so
                 // there's exactly one authoritative notion of
                 // "wrappers match sources."
-                if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
-                    let name = &cfg.workspace.name;
-                    let project_dir = vw_lib::vw_project_dir(&ws);
-                    match vw_lib::project_needs_wipe(
-                        &ws,
-                        project_dir.as_std_path(),
-                        name,
-                    ) {
-                        Ok(true) if project_dir.exists() => {
-                            had_errors = true;
-                            eprintln!(
-                                "{} IP wrappers under `target/ip/` are \
+                //
+                // Only meaningful for a project on this machine. A
+                // cloud check has no local vivado project — what it
+                // fetches is the generated VHDL, not the project that
+                // produced it — and the instance keeps its own project
+                // honest, wiping and regenerating it whenever the
+                // source fingerprint moves. Asking whether a directory
+                // holding four stub files needs a wipe would be a
+                // category error, and one that answers "yes" every
+                // time, because there is no `.xpr` in it to compare
+                // against.
+                if cloud.is_none() {
+                    if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
+                        let name = &cfg.workspace.name;
+                        let project_dir = vw_lib::vw_project_dir(&ws);
+                        match vw_lib::project_needs_wipe(
+                            &ws,
+                            project_dir.as_std_path(),
+                            name,
+                        ) {
+                            Ok(true) if project_dir.exists() => {
+                                had_errors = true;
+                                eprintln!(
+                                    "{} IP wrappers under `target/ip/` are \
                                  stale — the `ip/**.htcl` config has \
                                  changed since the last generation. Run \
                                  `vw check --ip-generate` to regenerate \
                                  just the wrappers in-process (no \
                                  synthesis) and re-check.",
-                                "error:".bright_red(),
-                            );
-                        }
-                        // Wipe-needed but the project doesn't exist
-                        // yet is the "fresh workspace" case, which
-                        // the VHDL block above already handles by
-                        // calling `ensure_ip_generated` when it sees
-                        // the missing-library diagnostics.
-                        Ok(_) => {}
-                        Err(e) => eprintln!(
-                            "{} could not compare IP source fingerprint: \
+                                    "error:".bright_red(),
+                                );
+                            }
+                            // Wipe-needed but the project doesn't exist
+                            // yet is the "fresh workspace" case, which
+                            // the VHDL block above already handles by
+                            // calling `ensure_ip_generated` when it sees
+                            // the missing-library diagnostics.
+                            Ok(_) => {}
+                            Err(e) => eprintln!(
+                                "{} could not compare IP source fingerprint: \
                              {e}",
-                            "warning:".yellow(),
-                        ),
+                                "warning:".yellow(),
+                            ),
+                        }
                     }
                 }
             }
@@ -3814,6 +3870,7 @@ fn diagnostics_need_ip_generation(diags: &[vw_lib::VhdlDiagnostic]) -> bool {
 /// entirely in-library: no temp file, no `vw run` sub-process.
 async fn ensure_ip_generated(
     ws: &camino::Utf8Path,
+    cloud: Option<&(cloud::Session, String)>,
     part: Option<&str>,
     variant: Option<&str>,
     log_level: vw_vivado::LogLevel,
@@ -3877,18 +3934,16 @@ async fn ensure_ip_generated(
     };
     let program =
         vw_htcl::load_program_source(src, entry.as_std_path(), &resolver)?;
+    let site = match cloud {
+        Some((session, environment)) => Site::Remote {
+            session,
+            environment,
+        },
+        None => Site::Local,
+    };
     let run_result = run_loaded_program(
-        &entry,
-        // The IP pre-pass runs where the caller's own run will run; today that
-        // is decided by `vw check`, which is local by nature.
-        Site::Local,
-        &program,
-        /*check_only=*/ false,
-        part,
-        variant,
-        log_level,
-        /*info_with_stack=*/ false,
-        /*bunyan=*/ false,
+        &entry, site, &program, /*check_only=*/ false, part, variant,
+        log_level, /*info_with_stack=*/ false, /*bunyan=*/ false,
     )
     .await;
     // Rewrite the just-generated `.vho` instantiation templates into
@@ -3896,12 +3951,34 @@ async fn ensure_ip_generated(
     // component→entity splice is far simpler in Rust than in Tcl. Run
     // it even if the pre-pass reported a non-fatal error, since the
     // templates may already be on disk.
-    if let Ok(n) = vw_lib::write_ip_stubs_from_templates(ws) {
-        if n > 0 {
-            println!(
-                "{} wrote {n} IP stub(s) for the VHDL check",
-                "note:".bright_yellow(),
-            );
+    //
+    // Remotely, the templates are on the instance and so is the splice; what
+    // comes back is the finished VHDL. Either way the check that follows finds
+    // the same files at the same paths, which is the whole point — a language
+    // server that opens a wrapper has to open a real file.
+    match cloud {
+        Some((session, environment)) => {
+            match cloud::fetch_generated_ip(session, environment, ws).await {
+                Ok(0) => {}
+                Ok(n) => println!(
+                    "{} fetched {n} generated IP file(s) for the VHDL check",
+                    "note:".bright_yellow(),
+                ),
+                Err(e) => eprintln!(
+                    "{} could not fetch the generated IP: {e}",
+                    "warning:".yellow(),
+                ),
+            }
+        }
+        None => {
+            if let Ok(n) = vw_lib::write_ip_stubs_from_templates(ws) {
+                if n > 0 {
+                    println!(
+                        "{} wrote {n} IP stub(s) for the VHDL check",
+                        "note:".bright_yellow(),
+                    );
+                }
+            }
         }
     }
     run_result

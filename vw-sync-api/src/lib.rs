@@ -15,9 +15,9 @@
 //! after deciding whether the caller owns the environment in question.
 
 use dropshot::{
-    api_description, HttpError, HttpResponseOk, HttpResponseUpdatedNoContent,
-    Path, Query, RequestContext, TypedBody, UntypedBody,
-    WebsocketChannelResult, WebsocketConnection,
+    api_description, FreeformBody, HttpError, HttpResponseOk,
+    HttpResponseUpdatedNoContent, Path, Query, RequestContext, TypedBody,
+    UntypedBody, WebsocketChannelResult, WebsocketConnection,
 };
 use dropshot_api_manager_types::api_versions;
 use schemars::JsonSchema;
@@ -179,6 +179,37 @@ pub trait VwSyncApi {
         rqctx: RequestContext<Self::Context>,
         path_params: Path<EnvironmentPathParam>,
     ) -> Result<HttpResponseOk<latest::S3Credentials>, HttpError>;
+
+    /// The VHDL vivado generated for this environment's IP.
+    ///
+    /// A `POST` because it finishes the job first: vivado writes an
+    /// instantiation template per standalone IP, and turning those into
+    /// black-box entities is a mechanical step that happens in Rust after the
+    /// vivado pass. On a local run that happens on the developer's machine; on
+    /// a remote one there is nobody there to do it, so it happens here, where
+    /// the templates are.
+    ///
+    /// Answers with paths relative to the workspace, so the far end can put
+    /// each file exactly where its own tools will look for it.
+    #[endpoint {
+        method = POST,
+        path = "/environment/{environment}/generated",
+    }]
+    async fn generated_manifest(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<latest::TreeManifest>, HttpError>;
+
+    /// One generated file's contents.
+    #[endpoint {
+        method = GET,
+        path = "/environment/{environment}/generated/file",
+    }]
+    async fn generated_file(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+        query: Query<latest::GeneratedFileQuery>,
+    ) -> Result<HttpResponseOk<FreeformBody>, HttpError>;
 
     /// The key that opens this instance's object store.
     ///

@@ -59,3 +59,24 @@ pub(crate) fn store_error(value: StoreError) -> HttpError {
 pub(crate) fn netrc_error(value: crate::netrc::NetrcError) -> HttpError {
     HttpError::for_internal_error(value.to_string())
 }
+
+/// A caller asking for a generated file can get it wrong in exactly two ways:
+/// naming one that is not there, and naming something that was never theirs to
+/// ask for. Both are worth saying precisely — the first is a build that has not
+/// run, the second is a mistake nobody should be able to make by accident.
+pub(crate) fn generated_error(
+    value: crate::generated::GeneratedError,
+) -> HttpError {
+    let message = value.to_string();
+    match value {
+        crate::generated::GeneratedError::UnsafePath(_) => {
+            HttpError::for_bad_request(None, message)
+        }
+        crate::generated::GeneratedError::NotFound(_) => {
+            HttpError::for_not_found(None, message)
+        }
+        crate::generated::GeneratedError::Read(..) => {
+            HttpError::for_internal_error(message)
+        }
+    }
+}

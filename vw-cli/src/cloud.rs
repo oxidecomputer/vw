@@ -960,6 +960,70 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Bring the VHDL vivado generated for this environment's IP into the local
+/// tree.
+///
+/// A static analysis running here has to resolve `entity ip.<name>_wrapper`
+/// and `entity xil_defaultlib.<name>`, and those only exist where vivado ran.
+/// They land at the same paths they have on the instance, so a language server
+/// can open them and "go to definition" arrives somewhere real.
+///
+/// Only what differs is fetched. A check that changed no IP therefore costs
+/// one round trip, which matters because this runs before every check.
+pub async fn fetch_generated_ip(
+    session: &Session,
+    environment: &str,
+    workspace: &Utf8Path,
+) -> Result<usize, CloudError> {
+    let manifest = session
+        .client
+        .generated_manifest(environment)
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
+
+    let mut written = 0usize;
+    for entry in &manifest.entries {
+        let path = workspace.join(safe_name(&entry.path)?);
+
+        // Already here and already right. The common case: IP changes rarely
+        // and a check runs constantly.
+        if let Ok(existing) = std::fs::read(&path) {
+            if vw_sync::digest_bytes(&existing) == entry.digest {
+                continue;
+            }
+        }
+
+        let contents = session
+            .client
+            .generated_file(environment, &entry.path)
+            .await
+            .map_err(|e| session.error(e))?
+            .into_inner();
+
+        let bytes = futures::TryStreamExt::try_fold(
+            contents.into_inner(),
+            Vec::new(),
+            |mut collected, chunk| async move {
+                collected.extend_from_slice(&chunk);
+                Ok(collected)
+            },
+        )
+        .await
+        .map_err(|e| CloudError::Transport(e.to_string()))?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CloudError::KeyDir(parent.to_owned(), e))?;
+        }
+        std::fs::write(&path, bytes)
+            .map_err(|e| CloudError::KeyWrite(path.clone(), e))?;
+        written += 1;
+    }
+
+    Ok(written)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

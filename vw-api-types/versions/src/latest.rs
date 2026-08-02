@@ -10,6 +10,7 @@ pub use crate::v1::EnvironmentCreate;
 pub use crate::v1::EnvironmentImages;
 pub use crate::v1::EnvironmentPathParam;
 pub use crate::v1::FileEntry;
+pub use crate::v1::GeneratedFileQuery;
 pub use crate::v1::ImageRef;
 pub use crate::v1::ObjectStoreQuery;
 pub use crate::v1::OxideInstance;
