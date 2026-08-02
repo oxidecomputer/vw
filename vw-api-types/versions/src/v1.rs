@@ -309,3 +309,45 @@ impl std::fmt::Debug for Credentials {
             .finish()
     }
 }
+
+/// How a client wants the vivado worker for a session set up.
+///
+/// Only what the instance cannot work out for itself. The tree, the workspace
+/// configuration and the dependency cache are all on its side already, so the
+/// two flags that select what to build are the whole of it — everything else
+/// is read from `vw.toml` where the sources are.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct VivadoSessionQuery {
+    /// `--part`, for a workspace that declares parts at the top level.
+    #[serde(default)]
+    pub part: Option<String>,
+    /// `--variant`, for a workspace that declares variants.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Attach the Tcl call stack to INFO messages, not only to warnings and
+    /// errors.
+    #[serde(default)]
+    pub info_with_stack: bool,
+    /// Forward vivado's unclassified chatter rather than discarding it.
+    #[serde(default)]
+    pub verbose: bool,
+}
+
+/// What removing an instance's build output came to.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+pub struct CleanResult {
+    /// Whether there was any build output to remove.
+    pub existed: bool,
+    /// How much space it was taking, measured before it went.
+    pub bytes: u64,
+}

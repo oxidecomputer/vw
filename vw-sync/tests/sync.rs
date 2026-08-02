@@ -9,7 +9,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use tempfile::TempDir;
 use vw_api_types_versions::latest::{CommitResult, Digest, TreeManifest};
-use vw_sync::{apply, clear, missing, scan, Store};
+use vw_sync::{apply, clean, clear, missing, scan, Store};
 
 /// A sender and a receiver, with somewhere to stage delivered content.
 struct Pair {
@@ -549,4 +549,59 @@ fn clearing_a_receiver_that_has_nothing_is_not_an_error() {
     let again = clear(&pair.receiver, &pair.store).expect("clear again");
 
     assert_eq!(again.deleted, 0);
+}
+
+#[test]
+fn cleaning_removes_the_build_output_and_nothing_else() {
+    let pair = Pair::new();
+    pair.write("hdl/top.vhd", "entity top is end;");
+    pair.write(".gitignore", "notes.txt");
+    pair.sync();
+
+    // Hours of synthesis, plus something the receiver's own `.gitignore`
+    // covers — written here rather than synced, because an ignored file is
+    // invisible to synchronization by design.
+    pair.write_receiver("target/synth/top.dcp", "checkpoint");
+    pair.write_receiver("target/logs/vivado.log", "log");
+    pair.write_receiver("notes.txt", "scratch");
+
+    let cleaned = clean(&pair.receiver).expect("clean");
+
+    assert!(cleaned.existed);
+    assert!(cleaned.bytes > 0, "it should have measured what it removed");
+    assert!(!pair.receiver.join("target").exists());
+    // Source survives: a cleaned tree is one a build starts over in, not one
+    // that has to be pushed again.
+    assert_eq!(pair.receiver_contents("hdl/top.vhd"), "entity top is end;");
+    assert_eq!(pair.receiver_contents("notes.txt"), "scratch");
+}
+
+#[test]
+fn cleaning_a_tree_with_no_build_output_is_not_an_error() {
+    let pair = Pair::new();
+    pair.write("hdl/top.vhd", "entity top is end;");
+    pair.sync();
+
+    let cleaned = clean(&pair.receiver).expect("clean");
+
+    assert!(!cleaned.existed);
+    assert_eq!(cleaned.bytes, 0);
+}
+
+#[test]
+fn a_sync_after_a_clean_sends_nothing() {
+    // The point of cleaning only `target/`: the source is still there and
+    // still correct, so the next sync has no work to do. If cleaning took
+    // source with it, every clean would cost a full re-upload.
+    let pair = Pair::new();
+    pair.write("hdl/top.vhd", "entity top is end;");
+    pair.write("vw.toml", "[workspace]");
+    pair.sync();
+    pair.write_receiver("target/synth/top.dcp", "checkpoint");
+
+    clean(&pair.receiver).expect("clean");
+    let (result, uploaded) = pair.sync();
+
+    assert_eq!(uploaded, 0, "the source never left");
+    assert_eq!(result.unchanged, 2);
 }

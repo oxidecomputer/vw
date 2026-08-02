@@ -228,6 +228,90 @@ impl VwSyncApi for Agent {
         Ok(HttpResponseOk(result))
     }
 
+    async fn clean_build_output(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+    ) -> Result<
+        HttpResponseOk<vw_api_types_versions::latest::CleanResult>,
+        HttpError,
+    > {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        // The same lock a commit takes. Removing the build output while a
+        // tree is being written would not corrupt either — they are disjoint
+        // — but a build starting in between would see half a world.
+        let _guard = ctx.materializing.lock().await;
+        let cleaned = vw_sync::clean(&ctx.root)
+            .inspect_err(|e| {
+                slog::error!(rqctx.log, "cannot remove the build output";
+                    "root" => %ctx.root,
+                    InlineErrorChain::new(e),
+                );
+            })
+            .map_err(error::apply_error)?;
+
+        info!(rqctx.log, "build output removed";
+            "existed" => cleaned.existed,
+            "bytes" => cleaned.bytes,
+        );
+
+        Ok(HttpResponseOk(vw_api_types_versions::latest::CleanResult {
+            existed: cleaned.existed,
+            bytes: cleaned.bytes,
+        }))
+    }
+
+    async fn vivado_session(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+        query: dropshot::Query<
+            vw_api_types_versions::latest::VivadoSessionQuery,
+        >,
+        websock: dropshot::WebsocketConnection,
+    ) -> dropshot::WebsocketChannelResult {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        let query = query.into_inner();
+        let params = vw_remote::SessionParams {
+            part: query.part.clone(),
+            variant: query.variant.clone(),
+            info_with_stack: query.info_with_stack,
+            verbose: query.verbose,
+        };
+
+        info!(rqctx.log, "starting a vivado session";
+            "root" => %ctx.root,
+            "part" => query.part.as_deref().unwrap_or("-"),
+            "variant" => query.variant.as_deref().unwrap_or("-"),
+        );
+
+        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            websock.into_inner(),
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+
+        let result = vw_remote::serve(socket, &ctx.root, params).await;
+
+        match &result {
+            Ok(()) => info!(rqctx.log, "vivado session finished"),
+            Err(e) => slog::error!(rqctx.log, "vivado session failed";
+                InlineErrorChain::new(e),
+            ),
+        }
+
+        result.map_err(Into::into)
+    }
+
     async fn put_credentials(
         rqctx: RequestContext<Self::Context>,
         path_params: dropshot::Path<EnvironmentPathParam>,

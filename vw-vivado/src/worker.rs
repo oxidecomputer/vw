@@ -31,7 +31,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, warn};
 use vw_eda::{
     BackendError, EdaBackend, EvalOutput, Request, RequestOp, Response,
-    ResponseResult, WireMessage,
+    ResponseResult, StdoutSink, StreamKind, WireMessage,
 };
 
 /// Embedded shim TCL. Written to a temp file at worker startup and
@@ -93,49 +93,6 @@ fn vw_timing_log(event: &str, len: usize, preview: &str) {
         }
     }
 }
-
-/// Tag attached to each chunk a [`StdoutSink`] receives, so the
-/// caller can route it to the right UI lane. The shim's
-/// `puts`-interception path always produces [`StreamKind::Stdout`]
-/// — user TCL has no way to "label" a write. The PTY-line filter
-/// classifies Vivado's standard message format
-/// (`ERROR:`/`WARNING:`/`CRITICAL WARNING:`/`INFO:`) into the
-/// corresponding kind.
-///
-/// A consumer that doesn't care (e.g. `vw run` capturing for
-/// stdout pass-through) can ignore the kind and treat every chunk
-/// identically; the REPL uses it to colour error/warning lines.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamKind {
-    /// User TCL `puts` output, or any other chunk we don't have a
-    /// reason to label otherwise. Default.
-    Stdout,
-    /// Vivado `INFO:` line — usually low-importance chatter from
-    /// the message system.
-    Info,
-    /// Vivado `WARNING:` line.
-    Warning,
-    /// Vivado `CRITICAL WARNING:` line. Semantically means "your
-    /// run may fail because of this" — Vivado nests this severity
-    /// between WARNING and ERROR. Distinct from
-    /// [`StreamKind::Error`] so log-level filtering can treat them
-    /// separately (`--log-level=error` hides critical warnings;
-    /// `--log-level=critical` keeps them).
-    CriticalWarning,
-    /// Vivado `ERROR:` line. Distinct from the final
-    /// [`BackendError::Tcl`] returned by `eval` — these are emitted
-    /// *during* an eval and the final error often refers back to
-    /// them ("failed due to earlier errors").
-    Error,
-}
-
-/// Sink for streamed output during an eval. Called once per chunk
-/// the worker observes — from the shim's `puts` interception (Tcl
-/// user output) or from the PTY-line filter (Vivado's own message
-/// system). The [`StreamKind`] tags the chunk so the caller can
-/// route warnings and errors to a more attention-grabbing UI
-/// surface than ordinary stdout.
-pub type StdoutSink = Box<dyn FnMut(StreamKind, &str) + Send>;
 
 /// Spawn-time configuration for [`VivadoBackend`].
 #[derive(Clone, Default)]
@@ -675,20 +632,6 @@ impl VivadoBackend {
             })?;
         }
         Ok(backend)
-    }
-
-    /// Install a sink that's called per streaming chunk as output
-    /// is produced during eval. With a sink set, chunks are NOT
-    /// also accumulated into [`EvalOutput::stdout`] — the sink owns
-    /// the data, and the caller is expected to display or persist
-    /// it directly. The [`StreamKind`] argument tags each chunk
-    /// (user `puts` vs. Vivado's WARNING/ERROR/INFO messages) so
-    /// the caller can route the chunk to the appropriate UI lane.
-    pub fn set_stdout_sink<F>(&mut self, sink: F)
-    where
-        F: FnMut(StreamKind, &str) + Send + 'static,
-    {
-        self.stdout_sink = Some(Box::new(sink));
     }
 
     /// The Vivado child process's OS pid, if the child is still
@@ -1564,6 +1507,10 @@ impl EdaBackend for VivadoBackend {
         self.write_request(&request).await?;
         let (resp, _stdout) = self.read_response_for(id).await?;
         Ok(resp)
+    }
+
+    fn set_stdout_sink(&mut self, sink: StdoutSink) {
+        self.stdout_sink = Some(sink);
     }
 
     async fn shutdown(&mut self) -> Result<(), BackendError> {

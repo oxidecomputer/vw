@@ -27,6 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 iddqd.workspace = true
 futures.workspace = true
+tokio-tungstenite.workspace = true
 slog = "2.8.2"
 slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", branch = "main" }
 slog-bunyan = "2.5.0"

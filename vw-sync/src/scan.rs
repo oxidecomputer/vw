@@ -14,7 +14,15 @@ use vw_api_types_versions::latest::{FileEntry, TreeManifest};
 ///
 /// `.git` is here for the same reason rather than for size: the receiver has
 /// no use for history, and a half-copied object store is worse than none.
-pub const ALWAYS_IGNORED: [&str; 2] = ["target", ".git"];
+pub const ALWAYS_IGNORED: [&str; 2] = [BUILD_OUTPUT, ".git"];
+
+/// The directory a build writes its output to.
+///
+/// Named once here because two things depend on knowing it: synchronization,
+/// which must never send or delete it, and `vw clean`, whose entire job is to
+/// delete it. Those are opposite behaviours over the same directory, and them
+/// disagreeing about which directory would be a bad afternoon either way.
+pub const BUILD_OUTPUT: &str = "target";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {

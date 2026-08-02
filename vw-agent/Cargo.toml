@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 vw-sync = { path = "../vw-sync" }
+vw-remote = { path = "../vw-remote" }
+tokio-tungstenite.workspace = true
 vw-sync-api = { path = "../vw-sync-api" }
 vw-api-types-versions = { path = "../vw-api-types/versions" }
 camino.workspace = true
@@ -30,4 +32,6 @@ slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", 
 tempfile.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 vw-sync = { path = "../vw-sync" }
+vw-remote = { path = "../vw-remote" }
+tokio-tungstenite.workspace = true
 serde_json.workspace = true

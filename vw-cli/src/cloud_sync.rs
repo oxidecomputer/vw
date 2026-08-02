@@ -144,7 +144,7 @@ pub async fn run(
         clear(session, environment, &targets).await?;
     }
 
-    sync_once(session, environment, &targets).await?;
+    sync_once(session, environment, &targets, true).await?;
 
     if !watch {
         return Ok(());
@@ -168,7 +168,7 @@ pub async fn run(
         }
         while tokio::time::timeout(debounce, changes.recv()).await.is_ok() {}
 
-        if let Err(e) = sync_once(session, environment, &targets).await {
+        if let Err(e) = sync_once(session, environment, &targets, false).await {
             // A failed sync is not a reason to stop watching. The next save
             // tries again, and an instance that is still coming up will be
             // there shortly.
@@ -230,6 +230,7 @@ async fn sync_once(
     session: &crate::cloud::Session,
     environment: &str,
     targets: &[Target],
+    announce: bool,
 ) -> Result<(), CloudError> {
     for target in targets {
         let manifest = scan(target)
@@ -288,21 +289,39 @@ async fn sync_once(
             .map_err(|e| session.error(e))?
             .into_inner();
 
-        report(target, &manifest, plan.missing.len(), &result);
+        report(target, &manifest, plan.missing.len(), &result, announce);
     }
 
     Ok(())
 }
 
-/// Say what a target's sync did, and stay quiet when it did nothing.
+/// Say what a target's sync did.
+///
+/// A sync that changed nothing says so when `always` is set, and says nothing
+/// otherwise. Both are wanted, in different places. Watching a workspace means
+/// a sync per keystroke-ish burst, and a line each time that nothing happened
+/// would bury the ones where something did. But a sync run once — before a
+/// build, or because the developer asked for one — that printed nothing is
+/// indistinguishable from a sync that did not run, and "did my sources
+/// actually get there" is not a question anyone should have to answer by
+/// reading the source.
 fn report(
     target: &Target,
     manifest: &types::TreeManifest,
     uploaded: usize,
     result: &types::CommitResult,
+    always: bool,
 ) {
     let changed = result.created + result.updated + result.deleted;
     if changed == 0 {
+        if always {
+            println!(
+                "{} {} up to date ({} files)",
+                "\u{2713}".bright_green(),
+                target.kind.to_string().cyan(),
+                manifest.entries.len(),
+            );
+        }
         return;
     }
 
@@ -368,6 +387,63 @@ fn watcher(
     std::mem::forget(watcher);
 
     Ok(rx)
+}
+
+/// Remove the build output on every one of an environment's instances.
+///
+/// Both halves, because both build: vivado writes under the workspace root and
+/// the driver's cargo writes under `driver/`. Cleaning one and leaving the
+/// other would be a surprising thing for one command to do.
+pub async fn clean(
+    session: &crate::cloud::Session,
+    environment: &str,
+) -> Result<(), CloudError> {
+    let workspace = workspace_root()?;
+    let targets = targets(&workspace);
+
+    for target in &targets {
+        let result = session
+            .client
+            .clean_build_output(environment, &target.kind)
+            .await
+            .map_err(|e| session.error(e))?
+            .into_inner();
+
+        if result.existed {
+            println!(
+                "{} {} removed {}",
+                "\u{2713}".bright_green(),
+                target.kind.to_string().cyan(),
+                human_bytes(result.bytes),
+            );
+        } else {
+            println!(
+                "{} {} nothing to remove",
+                "\u{2713}".bright_green(),
+                target.kind.to_string().cyan(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// A byte count as a person would say it.
+///
+/// Build output runs to gigabytes, and "12093847552" is a number nobody reads.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 #[cfg(test)]

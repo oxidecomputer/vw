@@ -10,8 +10,10 @@ categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 vw-api-types-versions = { path = "../vw-api-types/versions" }
+base64 = "0.22"
 progenitor = "0.14.0"
 progenitor-client = "0.14.0"
+rand = "0.8"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 serde.workspace = true
 uuid.workspace = true

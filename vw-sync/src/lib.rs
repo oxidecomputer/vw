@@ -35,9 +35,9 @@ mod scan;
 mod store;
 mod tree;
 
-pub use scan::{scan, ScanError, ALWAYS_IGNORED};
+pub use scan::{scan, ScanError, ALWAYS_IGNORED, BUILD_OUTPUT};
 pub use store::{Store, StoreError};
-pub use tree::{apply, clear, missing, ApplyError};
+pub use tree::{apply, clean, clear, missing, ApplyError, Cleaned};
 
 use vw_api_types_versions::latest::Digest;
 

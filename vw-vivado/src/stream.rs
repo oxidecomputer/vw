@@ -36,7 +36,7 @@
 //! collapsible in the REPL) so users know noise was elided; users pick a
 //! level and get exactly the diagnostics at that severity or higher.
 
-use crate::StreamKind;
+use vw_eda::StreamKind;
 
 /// Severity ladder used for log-level filtering. Higher = more severe.
 /// Vivado does not emit a `DEBUG:`-tagged message of its own; the

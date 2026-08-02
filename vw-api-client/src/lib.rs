@@ -30,6 +30,7 @@ pub mod user {
     progenitor::generate_api!(
         spec = "../openapi/vw-user-api/vw-user-api-latest.json",
         replace = {
+            CleanResult = vw_api_types_versions::latest::CleanResult,
             CommitResult = vw_api_types_versions::latest::CommitResult,
             Digest = vw_api_types_versions::latest::Digest,
             FileEntry = vw_api_types_versions::latest::FileEntry,
@@ -53,6 +54,7 @@ pub mod agent {
     progenitor::generate_api!(
         spec = "../openapi/vw-sync-api/vw-sync-api-latest.json",
         replace = {
+            CleanResult = vw_api_types_versions::latest::CleanResult,
             CommitResult = vw_api_types_versions::latest::CommitResult,
             Credentials = vw_api_types_versions::latest::Credentials,
             Digest = vw_api_types_versions::latest::Digest,
@@ -153,5 +155,13 @@ fn http_client(config: &ClientConfig<'_>) -> Result<reqwest::Client, Error> {
     Ok(reqwest::Client::builder()
         .default_headers(headers)
         .danger_accept_invalid_certs(config.insecure)
+        // A vivado session is a websocket, and a websocket is an HTTP/1.1
+        // upgrade — a mechanism HTTP/2 does not have. Over TLS, ALPN otherwise
+        // negotiates HTTP/2 and the upgrade is refused before it starts, which
+        // is a confusing way to find out. Nothing here benefits from HTTP/2:
+        // the requests are small and already sent concurrently over separate
+        // connections. The oxide SDK forces the same thing for the same
+        // reason.
+        .http1_only()
         .build()?)
 }

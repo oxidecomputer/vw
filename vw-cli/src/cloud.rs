@@ -155,6 +155,17 @@ pub enum CloudCommand {
 pub enum CloudError {
     #[error("no vw workspace here; run this from one, or from a directory inside it")]
     NoWorkspace,
+    #[error(
+        "no cloud environments exist for you. Create one with `vw cloud \
+         create <name>`, or pass --local to build on this machine"
+    )]
+    NoEnvironments,
+    #[error(
+        "you have several cloud environments ({}); say which with --env, or \
+         pass --local to build on this machine",
+        .0.join(", ")
+    )]
+    AmbiguousEnvironment(Vec<String>),
     #[error("scanning {0}")]
     Scan(camino::Utf8PathBuf, #[source] vw_sync::ScanError),
     #[error("reading {0}")]
@@ -625,6 +636,139 @@ fn access_token() -> Result<Option<String>, CloudError> {
         }
     }
     Ok(None)
+}
+
+/// Open a vivado session on an environment's instance.
+///
+/// What comes back drives exactly like a local worker, because it implements
+/// the same trait and speaks the same protocol. The worker starts when this
+/// socket opens and dies when it closes, so a run never inherits anything from
+/// the one before it.
+pub async fn open_vivado_session(
+    session: &Session,
+    environment: &str,
+    params: vw_remote::SessionParams,
+) -> Result<vw_remote::RemoteBackend<reqwest::Upgraded>, CloudError> {
+    let upgraded = session
+        .client
+        .vivado_session(
+            environment,
+            Some(params.info_with_stack),
+            params.part.as_deref(),
+            params.variant.as_deref(),
+            Some(params.verbose),
+        )
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
+
+    let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        upgraded,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+
+    let mut backend = vw_remote::RemoteBackend::new(socket);
+
+    // What the instance is doing before it can run anything. Locally this
+    // stretch is silent too, but locally the developer knows why — the
+    // machine's fans are audible and vivado is in their process list. Across a
+    // network the same silence looks like a hang, and the wait is longer.
+    // Rendered the way the same notes are rendered on a local run — several
+    // of them are literally the same notes, produced by the same workspace
+    // resolution — so a developer moving between the two reads one thing.
+    backend.set_note_sink(Box::new(|message: &str| {
+        eprintln!("{} {message}", "info:".cyan());
+    }));
+
+    Ok(backend)
+}
+
+/// Which environment a bare `vw run` should use.
+///
+/// Named explicitly, or inferred when there is no ambiguity to resolve. Two
+/// environments and no `--env` is a question only the developer can answer,
+/// and guessing at it would run a build somewhere they did not intend.
+pub async fn pick_environment(
+    session: &Session,
+    named: Option<&str>,
+) -> Result<String, CloudError> {
+    if let Some(name) = named {
+        return Ok(name.to_owned());
+    }
+
+    let environments = session
+        .client
+        .get_environments()
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner()
+        .items;
+
+    match environments.len() {
+        0 => Err(CloudError::NoEnvironments),
+        1 => Ok(environments[0].name.clone()),
+        _ => Err(CloudError::AmbiguousEnvironment(
+            environments.iter().map(|e| e.name.clone()).collect(),
+        )),
+    }
+}
+
+impl Session {
+    /// A session pointed at whatever service the environment names.
+    ///
+    /// For commands that are not `vw cloud` and so have no `--url` of their
+    /// own. Same variable, same default, so a developer configures the service
+    /// once and every command finds it.
+    ///
+    /// `insecure` comes from the command's own flag; `VW_SVC_INSECURE` says
+    /// the same thing for a shell that talks to a development service all day
+    /// and would otherwise pass the flag every time. Either is enough.
+    pub fn from_env(insecure: bool) -> Result<Session, CloudError> {
+        let url = std::env::var("VW_SVC_URL")
+            .unwrap_or_else(|_| DEFAULT_SERVICE_URL.to_owned());
+        let insecure = insecure
+            || std::env::var("VW_SVC_INSECURE")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        Session::new(&url, insecure)
+    }
+
+    /// Whether the failure was the service being out of reach, rather than the
+    /// service saying no.
+    ///
+    /// The difference decides whether a bare `vw run` may quietly fall back to
+    /// building here: unreachable is a working-from-a-train problem, but a
+    /// service that answered and refused is telling us something.
+    pub fn unreachable(error: &CloudError) -> bool {
+        matches!(error, CloudError::Transport(_))
+    }
+}
+
+/// Remove the build output on an environment's instances.
+pub async fn clean_build_output(
+    session: &Session,
+    environment: &str,
+) -> Result<(), CloudError> {
+    crate::cloud_sync::clean(session, environment).await
+}
+
+/// Push the workspace to an environment before building in it.
+///
+/// A build reads what is on the instance, so this is what makes it the same
+/// code the developer is looking at.
+pub async fn sync_for_build(
+    session: &Session,
+    environment: &str,
+) -> Result<(), CloudError> {
+    crate::cloud_sync::run(
+        session,
+        environment,
+        false,
+        false,
+        std::time::Duration::from_millis(0),
+    )
+    .await
 }
 
 #[cfg(test)]

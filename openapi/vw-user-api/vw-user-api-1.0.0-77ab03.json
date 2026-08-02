@@ -147,6 +147,51 @@
         }
       }
     },
+    "/environment/{name}/target/{kind}/build-output": {
+      "delete": {
+        "summary": "Remove everything a build wrote on one of an environment's instances.",
+        "description": "`target/` is the one directory synchronization will never touch, in either direction, so it outlives every push and has to be removed on purpose. Source on the instance is left alone.",
+        "operationId": "clean_build_output",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "description": "Which half of it.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TargetKind"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of the environment.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleanResult"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/environment/{name}/target/{kind}/sync": {
       "delete": {
         "summary": "Discard an environment's source tree, so the next sync sends all of it.",
@@ -355,6 +400,70 @@
         }
       }
     },
+    "/environment/{name}/vivado/session": {
+      "get": {
+        "summary": "Drive a vivado worker on an environment's vivado instance.",
+        "description": "Relayed frame for frame to the instance, which spawns the worker when this opens and tears it down when it closes. A build is a conversation that runs for a long time and produces output throughout, so it is a websocket rather than a request and a reply — the developer sees each message as vivado emits it, exactly as they would running it locally.\n\nThe source being built is whatever the last synchronization put on the instance. Nothing is shipped over this socket.",
+        "operationId": "vivado_session",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of this environment to create.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "info_with_stack",
+            "description": "Attach the Tcl call stack to INFO messages, not only to warnings and errors.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "part",
+            "description": "`--part`, for a workspace that declares parts at the top level.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "variant",
+            "description": "`--variant`, for a workspace that declares variants.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "verbose",
+            "description": "Forward vivado's unclassified chatter rather than discarding it.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Negotiating protocol upgrade from HTTP/1.1 to WebSocket"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
+    },
     "/environments": {
       "get": {
         "summary": "Return a list of all environments for the calling user.",
@@ -382,6 +491,26 @@
   },
   "components": {
     "schemas": {
+      "CleanResult": {
+        "description": "What removing an instance's build output came to.",
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "description": "How much space it was taking, measured before it went.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "existed": {
+            "description": "Whether there was any build output to remove.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "bytes",
+          "existed"
+        ]
+      },
       "CommitResult": {
         "description": "What applying a manifest did.",
         "type": "object",

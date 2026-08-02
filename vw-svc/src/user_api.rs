@@ -303,6 +303,100 @@ impl VwUserApi for UserApi {
         Ok(dropshot::HttpResponseOk(result))
     }
 
+    async fn clean_build_output(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::TargetPathParam,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<vw_api_types_versions::latest::CleanResult>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let target = path_params.into_inner();
+
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &target.name,
+            target.kind,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        let cleaned = agent
+            .client
+            .clean_build_output(&agent.environment)
+            .await
+            .map_err(|e| agent.failed(e))
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?
+            .into_inner();
+
+        info!(log, "removed build output";
+            "environment" => &target.name,
+            "target" => %target.kind,
+            "bytes" => cleaned.bytes,
+        );
+
+        Ok(dropshot::HttpResponseOk(cleaned))
+    }
+
+    async fn vivado_session(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::EnvironmentPathParam,
+        >,
+        query: dropshot::Query<
+            vw_api_types_versions::latest::VivadoSessionQuery,
+        >,
+        websock: dropshot::WebsocketConnection,
+    ) -> dropshot::WebsocketChannelResult {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let name = path_params.into_inner().name;
+        let query = query.into_inner();
+
+        let target = vw_api_types_versions::latest::TargetPathParam {
+            name: name.clone(),
+            kind: vw_api_types_versions::latest::TargetKind::Vivado,
+        };
+
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &name,
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        // The worker will want to fetch this build's dependencies, and the
+        // credentials for that are the caller's. Sent before the session
+        // opens, because once it does this service is only moving frames.
+        agent
+            .give_credentials(&caller, &log)
+            .await
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        info!(log, "joining a vivado session";
+            "environment" => &name,
+            "user" => &caller.name,
+            "variant" => query.variant.as_deref().unwrap_or("-"),
+        );
+
+        let result = agent.join_vivado_session(websock, &query).await;
+
+        match &result {
+            Ok(()) => info!(log, "vivado session ended";
+                "environment" => &name,
+            ),
+            Err(e) => log_relay_failure(&log, &target, e),
+        }
+
+        result.map_err(Into::into)
+    }
+
     async fn get_environment_keys(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<

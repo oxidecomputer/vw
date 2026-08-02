@@ -16,7 +16,8 @@
 
 use dropshot::{
     api_description, HttpError, HttpResponseOk, HttpResponseUpdatedNoContent,
-    Path, RequestContext, TypedBody, UntypedBody,
+    Path, Query, RequestContext, TypedBody, UntypedBody,
+    WebsocketChannelResult, WebsocketConnection,
 };
 use dropshot_api_manager_types::api_versions;
 use schemars::JsonSchema;
@@ -148,4 +149,44 @@ pub trait VwSyncApi {
         path_params: Path<EnvironmentPathParam>,
         body: TypedBody<latest::Credentials>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Remove everything a build wrote on this instance.
+    ///
+    /// The opposite of what synchronization does: `target/` is the one thing a
+    /// sync will never send and never delete, which is exactly why removing it
+    /// needs saying explicitly. Source is untouched, so the next build starts
+    /// over without anything having to be pushed again.
+    #[endpoint {
+        method = DELETE,
+        path = "/environment/{environment}/build-output",
+    }]
+    async fn clean_build_output(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<latest::CleanResult>, HttpError>;
+
+    /// Drive a vivado worker on this instance.
+    ///
+    /// A websocket rather than a request and a reply because a build is not
+    /// one of those. It is a conversation that runs for minutes, produces
+    /// output the whole time, and has to show that output as it happens —
+    /// waiting for a synthesis run to finish before saying anything would make
+    /// the remote flow useless for the thing people actually do with it.
+    ///
+    /// What crosses the socket is the protocol `vw-eda` already uses to talk
+    /// to a local worker: commands in, output chunks and results back. The
+    /// worker is spawned when the socket opens and torn down when it closes,
+    /// so no state survives between runs — the same guarantee running vivado
+    /// locally gives, and what the checkpoint machinery in the htcl library
+    /// already relies on for speed.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{environment}/vivado/session",
+    }]
+    async fn vivado_session(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+        query: Query<latest::VivadoSessionQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
 }

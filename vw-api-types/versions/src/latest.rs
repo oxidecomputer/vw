@@ -1,3 +1,4 @@
+pub use crate::v1::CleanResult;
 pub use crate::v1::CommitResult;
 pub use crate::v1::Credentials;
 pub use crate::v1::Digest;
@@ -16,3 +17,4 @@ pub use crate::v1::TargetPathParam;
 pub use crate::v1::TreeManifest;
 pub use crate::v1::UserEnvironment;
 pub use crate::v1::UserEnvironmentPathParam;
+pub use crate::v1::VivadoSessionQuery;

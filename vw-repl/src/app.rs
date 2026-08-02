@@ -3888,7 +3888,7 @@ async fn worker_task(
     // the UI can colour them appropriately.
     let stdout_tx = tx.clone();
     let cw = cw_count.clone();
-    backend.set_stdout_sink(move |kind, chunk: &str| {
+    backend.set_stdout_sink(Box::new(move |kind, chunk: &str| {
         // Bump the CW counter exposed via the
         // `critical_warning_count` RPC. Only exact
         // CriticalWarning — errors already halt eval before any
@@ -3901,7 +3901,7 @@ async fn worker_task(
             kind,
             data: chunk.to_string(),
         });
-    });
+    }));
 
     while let Some(cmd) = rx.recv().await {
         match cmd {

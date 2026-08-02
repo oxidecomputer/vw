@@ -13,6 +13,7 @@
 mod handlers;
 mod raw_log;
 mod rpc;
+mod selection;
 pub mod stream;
 mod worker;
 
@@ -23,7 +24,13 @@ pub use handlers::{
 };
 pub use raw_log::raw_log_path_for_workspace;
 pub use rpc::{FnHandler, RpcHandler};
+pub use selection::{resolve_workspace_selection, Selection};
 pub use stream::{
     severity_of, stream_kind_for, Block, BlockAccumulator, LogLevel, Severity,
 };
-pub use worker::{AutoProject, StreamKind, VivadoBackend, VivadoConfig};
+pub use worker::{AutoProject, VivadoBackend, VivadoConfig};
+
+// Re-exported so the many call sites that reach for `vw_vivado::StreamKind`
+// keep working now that streaming belongs to the backend abstraction rather
+// than to this one backend.
+pub use vw_eda::{StdoutSink, StreamKind};

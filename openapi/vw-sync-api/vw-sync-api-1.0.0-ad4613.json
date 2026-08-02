@@ -6,6 +6,41 @@
     "version": "1.0.0"
   },
   "paths": {
+    "/environment/{environment}/build-output": {
+      "delete": {
+        "summary": "Remove everything a build wrote on this instance.",
+        "description": "The opposite of what synchronization does: `target/` is the one thing a sync will never send and never delete, which is exactly why removing it needs saying explicitly. Source is untouched, so the next build starts over without anything having to be pushed again.",
+        "operationId": "clean_build_output",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleanResult"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/environment/{environment}/credentials": {
       "put": {
         "summary": "Put the credentials a build needs to fetch its dependencies in place.",
@@ -216,10 +251,93 @@
           }
         }
       }
+    },
+    "/environment/{environment}/vivado/session": {
+      "get": {
+        "summary": "Drive a vivado worker on this instance.",
+        "description": "A websocket rather than a request and a reply because a build is not one of those. It is a conversation that runs for minutes, produces output the whole time, and has to show that output as it happens — waiting for a synthesis run to finish before saying anything would make the remote flow useless for the thing people actually do with it.\n\nWhat crosses the socket is the protocol `vw-eda` already uses to talk to a local worker: commands in, output chunks and results back. The worker is spawned when the socket opens and torn down when it closes, so no state survives between runs — the same guarantee running vivado locally gives, and what the checkpoint machinery in the htcl library already relies on for speed.",
+        "operationId": "vivado_session",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "info_with_stack",
+            "description": "Attach the Tcl call stack to INFO messages, not only to warnings and errors.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "part",
+            "description": "`--part`, for a workspace that declares parts at the top level.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "variant",
+            "description": "`--variant`, for a workspace that declares variants.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "verbose",
+            "description": "Forward vivado's unclassified chatter rather than discarding it.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Negotiating protocol upgrade from HTTP/1.1 to WebSocket"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
     }
   },
   "components": {
     "schemas": {
+      "CleanResult": {
+        "description": "What removing an instance's build output came to.",
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "description": "How much space it was taking, measured before it went.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "existed": {
+            "description": "Whether there was any build output to remove.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "bytes",
+          "existed"
+        ]
+      },
       "CommitResult": {
         "description": "What applying a manifest did.",
         "type": "object",

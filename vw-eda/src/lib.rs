@@ -15,6 +15,7 @@
 //! plan's "Wire protocol" section for the design rationale.
 
 pub mod protocol;
+pub mod stream;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -23,6 +24,7 @@ pub use protocol::{
     ErrorPayload, Request, RequestOp, Response, ResponseResult, StreamMessage,
     WireMessage,
 };
+pub use stream::{StdoutSink, StreamKind};
 
 /// Errors returned by an [`EdaBackend`].
 #[derive(Debug, Error)]
@@ -97,6 +99,16 @@ pub trait EdaBackend: Send {
         &mut self,
         request: Request,
     ) -> Result<Response, BackendError>;
+
+    /// Install a sink called once per chunk of output as it is produced,
+    /// rather than after the command finishes.
+    ///
+    /// On the trait rather than on one backend because it is the only way a
+    /// caller can show a long command's progress, and a caller should not have
+    /// to know which backend it is driving to get that. With a sink set,
+    /// chunks are not also accumulated into [`EvalOutput::stdout`] — the sink
+    /// owns them.
+    fn set_stdout_sink(&mut self, sink: StdoutSink);
 
     /// Cleanly shut the worker down. Backends should make this
     /// idempotent so that `Drop` can fall back to it without

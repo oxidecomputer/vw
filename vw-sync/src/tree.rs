@@ -312,3 +312,67 @@ fn collect_dirs(
 
     Ok(())
 }
+
+/// What removing a tree's build output came to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cleaned {
+    /// Whether there was anything there.
+    pub existed: bool,
+    /// How much space it was taking.
+    ///
+    /// Measured before removal rather than inferred from free space, which on
+    /// a shared instance is being moved by other things at the same time.
+    pub bytes: u64,
+}
+
+/// Remove everything a build wrote under `root`.
+///
+/// The counterpart to what synchronization refuses to touch: the same
+/// directory it will never send and never delete is the one this exists to
+/// delete, and both read the name from the same place.
+///
+/// Source is left alone. A cleaned tree is one a build starts over in, not one
+/// that has to be pushed again.
+pub fn clean(root: &Utf8Path) -> Result<Cleaned, ApplyError> {
+    let output = root.join(crate::BUILD_OUTPUT);
+    if !output.is_dir() {
+        return Ok(Cleaned::default());
+    }
+
+    let bytes = size_of(&output);
+    std::fs::remove_dir_all(&output)
+        .map_err(|e| ApplyError::Remove(output, e))?;
+
+    Ok(Cleaned {
+        existed: true,
+        bytes,
+    })
+}
+
+/// How much a directory holds, following nothing.
+///
+/// Symlinks are counted as themselves rather than followed: a build that
+/// linked to something outside its own output should not have that thing's
+/// size attributed to it, and following one out of the tree to measure it
+/// would be a strange thing to do on the way to a delete.
+fn size_of(path: &Utf8Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+
+    entries
+        .flatten()
+        .map(|entry| {
+            let Ok(metadata) = entry.metadata() else {
+                return 0;
+            };
+            if metadata.is_dir() {
+                Utf8PathBuf::from_path_buf(entry.path())
+                    .map(|child| size_of(&child))
+                    .unwrap_or(0)
+            } else {
+                metadata.len()
+            }
+        })
+        .sum()
+}

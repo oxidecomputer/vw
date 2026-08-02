@@ -8,7 +8,6 @@ use colored::*;
 use std::fmt;
 use std::process;
 
-use vw_eda::EdaBackend;
 use vw_lib::{
     add_dependency_with_token, clear_cache, generate_deps_tcl,
     get_access_credentials_for_repo, get_access_credentials_for_workspace,
@@ -133,6 +132,30 @@ enum Commands {
     },
     #[command(about = "Clear all cached repositories")]
     Clear,
+    #[command(
+        about = "Remove build output, on the cloud environment if there is one"
+    )]
+    Clean {
+        #[arg(
+            long,
+            help = "Remove this machine's build output instead of a cloud \
+                    environment's"
+        )]
+        local: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to clean. Only needed when you have \
+                    more than one."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+    },
     #[command(about = "List workspace dependencies")]
     List,
     #[command(about = "Generate deps.tcl file with all dependency VHDL files")]
@@ -190,6 +213,28 @@ enum Commands {
         #[arg(help = "Path to an .htcl source file. Omit to run the \
                     workspace's `design.htcl`.")]
         file: Option<Utf8PathBuf>,
+        #[arg(
+            long,
+            help = "Build on this machine instead of in a cloud environment"
+        )]
+        local: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to build in. Only needed when you have \
+                    more than one."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying \
+                    it. For development services fronted by a self-signed \
+                    certificate; this gives up any guarantee about who is on \
+                    the other end, and your access token is sent to whatever \
+                    answers."
+        )]
+        insecure: bool,
         #[arg(
             long,
             help = "Parse and print diagnostics only; don't launch Vivado"
@@ -628,6 +673,16 @@ async fn main() {
                 }
             }
         }
+        Commands::Clean {
+            local,
+            env,
+            insecure,
+        } => {
+            if let Err(e) = clean(&cwd, local, env.as_deref(), insecure).await {
+                eprintln!("{} {e}", "error:".bright_red());
+                process::exit(1);
+            }
+        }
         Commands::Clear => match clear_cache(&cwd) {
             Ok(cleared) => {
                 if !cleared.is_empty() {
@@ -803,6 +858,9 @@ async fn main() {
         }
         Commands::Run {
             file,
+            local,
+            env,
+            insecure,
             check,
             part,
             variant,
@@ -812,6 +870,10 @@ async fn main() {
         } => {
             // Self-heal a fresh checkout: fetch missing deps the same
             // way `vw check` does before resolving `src @dep` imports.
+            //
+            // Done here even for a cloud build: the entry file is parsed and
+            // lowered on this machine, so `src @dep` has to resolve here too.
+            // The instance fetches its own copy for vivado to read.
             ensure_workspace_deps(&cwd).await;
             let resolved = match file {
                 Some(f) => f,
@@ -823,8 +885,30 @@ async fn main() {
                     }
                 },
             };
+            // `--check` never launches vivado, so there is nothing to run
+            // remotely and no reason to make the user wait on a network call
+            // to find that out.
+            let cloud = if local || check {
+                None
+            } else {
+                match cloud_site(env.as_deref(), insecure).await {
+                    Ok(site) => site,
+                    Err(e) => {
+                        eprintln!("{} {e}", "error:".bright_red());
+                        process::exit(1);
+                    }
+                }
+            };
+            let site = match &cloud {
+                Some((session, environment)) => Site::Remote {
+                    session,
+                    environment,
+                },
+                None => Site::Local,
+            };
             if let Err(e) = run_htcl(
                 &resolved,
+                site,
                 check,
                 part.as_deref(),
                 variant.as_deref(),
@@ -1901,123 +1985,23 @@ struct CheckTarget {
 /// Errors when we can't find the enclosing workspace at all —
 /// otherwise returns an empty vec, letting the caller print
 /// "nothing to check" without treating it as a hard failure.
-/// Resolve the CLI's `--part` / `--variant` flags against the
-/// workspace's declared parts / variants and return the
-/// `(auto_project, active_variant)` pair the RPC and Vivado
-/// spawn need. Applies mutual-exclusion / mode-mismatch rules:
+/// Resolve `--part` / `--variant` for this workspace, showing whatever the
+/// resolution had to say for itself.
 ///
-/// - `--variant` on a part-mode workspace (no
-///   `[[workspace.variants]]`) → error.
-/// - `--part` on a variant-mode workspace → error (variants own
-///   their parts).
-/// - Neither flag → workspace default (either the default
-///   target-part or the default variant's `.part`).
-///
-/// The `active_variant` slot flows into the RPC session so
-/// `vw::vhdl_design_sources` filters by the CLI-picked variant
-/// automatically, without design.htcl having to name it.
+/// The resolving lives in `vw-vivado` because an agent running a build on an
+/// instance has to do exactly the same thing; all that is left here is
+/// deciding where the notes go, which on a developer's terminal is the
+/// terminal.
 pub(crate) fn resolve_workspace_selection(
     ws: &camino::Utf8Path,
     part: Option<&str>,
     variant: Option<&str>,
 ) -> Result<(Option<vw_vivado::AutoProject>, Option<String>), String> {
-    let Ok(cfg) = vw_lib::load_workspace_config(ws) else {
-        return Ok((None, None));
-    };
-    let ws_info = &cfg.workspace;
-    // Mode-mismatch guards.
-    if variant.is_some() && ws_info.variants.is_empty() {
-        return Err(format!(
-            "workspace at {ws} has no `[[workspace.variants]]` block; \
-             remove `--variant` or add variants to vw.toml",
-        ));
+    let selection = vw_vivado::resolve_workspace_selection(ws, part, variant)?;
+    for note in &selection.notes {
+        eprintln!("{} {note}", "info:".cyan());
     }
-    if part.is_some() && !ws_info.variants.is_empty() {
-        return Err(format!(
-            "workspace at {ws} is variant-mode (has \
-             `[[workspace.variants]]`); use `--variant <name>` instead of \
-             `--part` — variants own their parts inline",
-        ));
-    }
-    // Resolve to a specific variant (variant mode) or part (part mode).
-    if !ws_info.variants.is_empty() {
-        let selected =
-            ws_info.select_variant(variant).map_err(|e| e.to_string())?;
-        let Some(v) = selected else {
-            return Ok((None, None));
-        };
-        let persist_dir = prepare_persist_dir(ws, &ws_info.name)?;
-        Ok((
-            Some(vw_vivado::AutoProject {
-                name: ws_info.name.clone(),
-                part: v.part.clone(),
-                persist_dir,
-            }),
-            Some(v.name.clone()),
-        ))
-    } else {
-        let selected = ws_info
-            .select_target_part(part)
-            .map_err(|e| e.to_string())?;
-        let persist_dir = prepare_persist_dir(ws, &ws_info.name)?;
-        Ok((
-            selected.map(|p| vw_vivado::AutoProject {
-                name: ws_info.name.clone(),
-                part: p.to_string(),
-                persist_dir: persist_dir.clone(),
-            }),
-            None,
-        ))
-    }
-}
-
-/// Shared bootstrap for the on-disk Vivado project dir used by
-/// `vw run` and `vw repl`. Runs the one-shot legacy IP-cache
-/// cleanup + staleness wipe, then returns
-/// `Some(<ws>/target/vw-project)` on success.
-///
-/// A failure here is not fatal — we log the reason and fall back
-/// to `persist_dir: None` (in-memory project), so the user still
-/// gets a working session. That covers e.g. a read-only workspace
-/// or the `target/` dir being held by another process.
-fn prepare_persist_dir(
-    ws: &camino::Utf8Path,
-    name: &str,
-) -> Result<Option<std::path::PathBuf>, String> {
-    match vw_lib::prepare_vw_project_dir(ws, name) {
-        Ok(prep) => {
-            if prep.legacy_cache_removed > 0 {
-                eprintln!(
-                    "{} removed {} legacy IP cache entr{y} under \
-                     {ws}/target/ip — replaced by on-disk Vivado project",
-                    "info:".cyan(),
-                    prep.legacy_cache_removed,
-                    y = if prep.legacy_cache_removed == 1 {
-                        "y"
-                    } else {
-                        "ies"
-                    },
-                );
-            }
-            if let Some(wiped) = &prep.wiped_project {
-                eprintln!(
-                    "{} wiped stale Vivado project at {wiped} \
-                     (source fingerprint changed or manifest missing)",
-                    "info:".cyan(),
-                );
-            }
-            Ok(Some(prep.project_dir.into_std_path_buf()))
-        }
-        Err(e) => {
-            eprintln!(
-                "{} failed to prepare on-disk Vivado project dir under \
-                 {ws}/target/vw-project ({e}); falling back to in-memory \
-                 project (state won't persist across sessions)",
-                "warning:".bright_yellow(),
-            );
-            Ok(None)
-        }
-    }
+    Ok((selection.auto_project, selection.active_variant))
 }
 
 /// Locate the workspace's `design.htcl` for a bare `vw run` with
@@ -2811,7 +2795,7 @@ fn bunyan_severity_label(severity: vw_vivado::Severity) -> &'static str {
 }
 
 async fn ship_generic_reprs(
-    backend: &mut vw_vivado::VivadoBackend,
+    backend: &mut dyn vw_eda::EdaBackend,
     ty: &vw_htcl::TypeExpr,
     types: &std::collections::HashMap<String, &vw_htcl::TypeDecl>,
     emitted: &mut std::collections::HashSet<String>,
@@ -2863,8 +2847,106 @@ fn overload_specialization_mangle(
 
 /// Thin loader wrapper: resolve the entry's `src` imports into one
 /// flattened program, then hand it to [`run_loaded_program`].
+/// Remove build output, wherever this workspace builds.
+///
+/// Cloud first, like `vw run`: what gets cleaned is what would get built. A
+/// developer whose builds happen on an instance and whose `target/` here is
+/// months stale would find cleaning the local one a waste of a command.
+///
+/// Only build output goes. Source on the instance stays, so the next build
+/// starts over without anything having to be pushed again.
+async fn clean(
+    cwd: &Utf8Path,
+    local: bool,
+    named: Option<&str>,
+    insecure: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !local {
+        let session = cloud::Session::from_env(insecure)?;
+        match cloud::pick_environment(&session, named).await {
+            Ok(environment) => {
+                cloud::clean_build_output(&session, &environment).await?;
+                return Ok(());
+            }
+            Err(e) if cloud::Session::unreachable(&e) => {
+                eprintln!(
+                    "{} no vw service reachable ({e}); cleaning this machine",
+                    "warning:".yellow(),
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let workspace = vw_lib::find_workspace_dir(cwd.as_std_path()).ok_or(
+        "no vw workspace here; run this from one, or from a \
+                directory inside it",
+    )?;
+    let cleaned = vw_sync::clean(&workspace)?;
+
+    if cleaned.existed {
+        println!(
+            "{} removed {}/{}",
+            "\u{2713}".bright_green(),
+            workspace,
+            vw_sync::BUILD_OUTPUT,
+        );
+    } else {
+        println!("{} nothing to remove", "\u{2713}".bright_green());
+    }
+
+    Ok(())
+}
+
+/// Work out whether this run belongs in a cloud environment, and get the
+/// environment ready for it.
+///
+/// Cloud first: if there is an environment, that is where the build goes,
+/// because that is where the machine with the memory and the licence is. A
+/// service that cannot be reached is not fatal — plenty of work happens on a
+/// train — but it is said out loud, since silently building here when you
+/// meant to build there is an afternoon nobody gets back.
+async fn cloud_site(
+    named: Option<&str>,
+    insecure: bool,
+) -> Result<Option<(cloud::Session, String)>, Box<dyn std::error::Error>> {
+    let session = cloud::Session::from_env(insecure)?;
+
+    let environment = match cloud::pick_environment(&session, named).await {
+        Ok(environment) => environment,
+        Err(e) if cloud::Session::unreachable(&e) => {
+            eprintln!(
+                "{} no vw service reachable ({e}); building on this machine",
+                "warning:".yellow(),
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // The instance builds what it was last given, so give it this.
+    cloud::sync_for_build(&session, &environment).await?;
+
+    Ok(Some((session, environment)))
+}
+
+/// Where the vivado driving this run is.
+///
+/// Cloud first: an environment is used when there is one, because that is
+/// where the machine with the memory and the licence lives. `--local` is how
+/// you say you meant this one.
+pub(crate) enum Site<'a> {
+    Local,
+    Remote {
+        session: &'a cloud::Session,
+        environment: &'a str,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_htcl(
     file: &camino::Utf8Path,
+    site: Site<'_>,
     check_only: bool,
     part: Option<&str>,
     variant: Option<&str>,
@@ -2875,6 +2957,7 @@ async fn run_htcl(
     let program = load_htcl_program(file).await?;
     run_loaded_program(
         file,
+        site,
         &program,
         check_only,
         part,
@@ -2903,6 +2986,7 @@ async fn run_htcl(
 #[allow(clippy::too_many_arguments)]
 async fn run_loaded_program(
     file: &camino::Utf8Path,
+    site: Site<'_>,
     program: &vw_htcl::LoadedProgram,
     check_only: bool,
     part: Option<&str>,
@@ -3048,69 +3132,101 @@ async fn run_loaded_program(
         .as_deref()
         .and_then(camino::Utf8Path::from_path)
         .map(|p| p.to_path_buf());
-    let (auto_project, active_variant) = match ws_utf8.as_deref() {
-        Some(ws) => resolve_workspace_selection(ws, part, variant)?,
-        None => (None, None),
-    };
-    // Seed the RPC handler's preload map with everything the
-    // entry-file load pulled in. `vw run` is single-shot — no
-    // batches commit after this — so the initial population IS
-    // the final state. `compile_htcl_module` (called from
-    // `vw::configure_ip` if the user's htcl invokes it) then
-    // skips re-shipping files whose procs are already installed.
-    let preload: vw_vivado::SharedPreload = {
-        let mut m = std::collections::HashMap::new();
-        for f in &program.files {
-            if let Some(t) = f.mtime {
-                m.insert(f.path.clone(), t);
-            }
-        }
-        std::sync::Arc::new(std::sync::RwLock::new(m))
-    };
-    // Shared CRITICAL WARNING counter. Bumped by the stream sink
-    // below on each `Severity::CriticalWarning` chunk; read via
-    // the `critical_warning_count` RPC by `vw::synth` / `vw::place`
-    // to gate checkpoint writes on a CW-clean phase. Cloned into
-    // the handler and the sink so both sides see the same atomic.
     let cw_count: vw_vivado::SharedCriticalWarningCount =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let rpc_handler = vw_vivado::make_handler_full(
-        rpc_workspace_root.clone(),
-        active_variant,
-        preload,
-        cw_count.clone(),
-    );
-    // Raw byte-log: `<workspace>/target/logs/vivado-<ts>.log`.
-    // Failure to create the directory demotes to no-log rather than
-    // aborting the run — the log is a diagnostic aid, and a
-    // misconfigured target/ dir shouldn't block a synth flow.
-    let raw_log = rpc_workspace_root.as_deref().and_then(|ws| {
-        match vw_vivado::raw_log_path_for_workspace(ws) {
-            Ok(p) => {
-                eprintln!(
-                    "{} {}",
-                    "raw vivado log:".bright_black(),
-                    p.display().to_string().bright_black(),
-                );
-                Some(p)
-            }
-            Err(e) => {
-                eprintln!("{} raw log unavailable: {e}", "warning:".yellow());
-                None
-            }
+
+    // Local or remote, what comes back drives the same way: `EdaBackend` is
+    // the whole of what the rest of this function knows about vivado, and it
+    // streams either way. Everything assembled above — the RPC handler, the
+    // project, the raw log — is for a worker on this machine; a remote session
+    // builds its own from the tree it is holding, because every one of those
+    // answers is about where the files are.
+    let mut backend: Box<dyn vw_eda::EdaBackend> = match site {
+        Site::Local => {
+            let (auto_project, active_variant) = match ws_utf8.as_deref() {
+                Some(ws) => resolve_workspace_selection(ws, part, variant)?,
+                None => (None, None),
+            };
+            // Seed the RPC handler's preload map with everything the
+            // entry-file load pulled in. `vw run` is single-shot — no
+            // batches commit after this — so the initial population IS
+            // the final state. `compile_htcl_module` (called from
+            // `vw::configure_ip` if the user's htcl invokes it) then
+            // skips re-shipping files whose procs are already installed.
+            let preload: vw_vivado::SharedPreload = {
+                let mut m = std::collections::HashMap::new();
+                for f in &program.files {
+                    if let Some(t) = f.mtime {
+                        m.insert(f.path.clone(), t);
+                    }
+                }
+                std::sync::Arc::new(std::sync::RwLock::new(m))
+            };
+            // Shared CRITICAL WARNING counter. Bumped by the stream sink
+            // below on each `Severity::CriticalWarning` chunk; read via
+            // the `critical_warning_count` RPC by `vw::synth` / `vw::place`
+            // to gate checkpoint writes on a CW-clean phase. Cloned into
+            // the handler and the sink so both sides see the same atomic.
+            let rpc_handler = vw_vivado::make_handler_full(
+                rpc_workspace_root.clone(),
+                active_variant,
+                preload,
+                cw_count.clone(),
+            );
+            // Raw byte-log: `<workspace>/target/logs/vivado-<ts>.log`.
+            // Failure to create the directory demotes to no-log rather than
+            // aborting the run — the log is a diagnostic aid, and a
+            // misconfigured target/ dir shouldn't block a synth flow.
+            let raw_log = rpc_workspace_root.as_deref().and_then(|ws| {
+                match vw_vivado::raw_log_path_for_workspace(ws) {
+                    Ok(p) => {
+                        eprintln!(
+                            "{} {}",
+                            "raw vivado log:".bright_black(),
+                            p.display().to_string().bright_black(),
+                        );
+                        Some(p)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "{} raw log unavailable: {e}",
+                            "warning:".yellow()
+                        );
+                        None
+                    }
+                }
+            });
+
+            Box::new(
+                vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
+                    verbose,
+                    info_with_stack,
+                    rpc_handler: Some(rpc_handler),
+                    auto_project,
+                    raw_log,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| format!("failed to start Vivado worker: {e}"))?,
+            )
         }
-    });
-    let mut backend =
-        vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
-            verbose,
-            info_with_stack,
-            rpc_handler: Some(rpc_handler),
-            auto_project,
-            raw_log,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| format!("failed to start Vivado worker: {e}"))?;
+        Site::Remote {
+            session,
+            environment,
+        } => Box::new(
+            cloud::open_vivado_session(
+                session,
+                environment,
+                vw_remote::SessionParams {
+                    part: part.map(str::to_owned),
+                    variant: variant.map(str::to_owned),
+                    info_with_stack,
+                    verbose,
+                },
+            )
+            .await?,
+        ),
+    };
 
     // Build the proc-location table the stream sink uses to map
     // Tcl `<input>:N in ::proc` frames back to real htcl source.
@@ -3161,7 +3277,7 @@ async fn run_loaded_program(
         let worst = std::sync::Arc::clone(&worst_severity);
         let cw = std::sync::Arc::clone(&cw_count);
         let host = bunyan_host.clone();
-        backend.set_stdout_sink(move |kind, chunk: &str| {
+        backend.set_stdout_sink(Box::new(move |kind, chunk: &str| {
             let cur_origin = origin.lock().ok().and_then(|g| g.clone());
             worst.fetch_max(
                 severity_as_u8(vw_vivado::severity_of(kind)),
@@ -3200,7 +3316,7 @@ async fn run_loaded_program(
                     );
                 }
             }
-        });
+        }));
     }
 
     // Lower structured proc declarations and call sites to plain Tcl
@@ -3251,7 +3367,7 @@ async fn run_loaded_program(
     for sig in full_sigs.values() {
         if let Some(ret) = sig.return_type.as_ref() {
             ship_generic_reprs(
-                &mut backend,
+                &mut *backend,
                 ret,
                 &type_decl_table,
                 &mut emitted_generics,
@@ -3261,7 +3377,7 @@ async fn run_loaded_program(
         for arg in &sig.args {
             if let Some(ty) = arg.type_annotation.as_ref() {
                 ship_generic_reprs(
-                    &mut backend,
+                    &mut *backend,
                     ty,
                     &type_decl_table,
                     &mut emitted_generics,
@@ -3569,8 +3685,17 @@ async fn ensure_ip_generated(
     let program =
         vw_htcl::load_program_source(src, entry.as_std_path(), &resolver)?;
     let run_result = run_loaded_program(
-        &entry, &program, /*check_only=*/ false, part, variant, log_level,
-        /*info_with_stack=*/ false, /*bunyan=*/ false,
+        &entry,
+        // The IP pre-pass runs where the caller's own run will run; today that
+        // is decided by `vw check`, which is local by nature.
+        Site::Local,
+        &program,
+        /*check_only=*/ false,
+        part,
+        variant,
+        log_level,
+        /*info_with_stack=*/ false,
+        /*bunyan=*/ false,
     )
     .await;
     // Rewrite the just-generated `.vho` instantiation templates into

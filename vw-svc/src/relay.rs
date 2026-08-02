@@ -157,6 +157,75 @@ impl Agent {
         Ok(())
     }
 
+    /// Open a vivado session on the instance and join it to `client`.
+    ///
+    /// Frames are passed through untouched in both directions. This service
+    /// has already decided the only thing it is in a position to decide —
+    /// whether this caller owns this environment — and the conversation that
+    /// follows is between the developer's machine and the worker. Reading it
+    /// would buy nothing and add a place for it to be misunderstood.
+    pub(crate) async fn join_vivado_session(
+        &self,
+        client: dropshot::WebsocketConnection,
+        query: &vw_api_types_versions::latest::VivadoSessionQuery,
+    ) -> Result<(), RelayError> {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_tungstenite::WebSocketStream;
+
+        let upgraded = self
+            .client
+            .vivado_session(
+                &self.environment,
+                Some(query.info_with_stack),
+                query.part.as_deref(),
+                query.variant.as_deref(),
+                Some(query.verbose),
+            )
+            .await
+            .map_err(|e| self.failed(e))?
+            .into_inner();
+
+        let instance =
+            WebSocketStream::from_raw_socket(upgraded, Role::Client, None)
+                .await;
+        let developer = WebSocketStream::from_raw_socket(
+            client.into_inner(),
+            Role::Server,
+            None,
+        )
+        .await;
+
+        let (mut to_instance, mut from_instance) = instance.split();
+        let (mut to_developer, mut from_developer) = developer.split();
+
+        // Either direction ending ends the session. A developer who has
+        // interrupted a build wants vivado torn down, not left running; an
+        // instance whose worker has died has nothing more to say.
+        let outbound = async {
+            while let Some(Ok(frame)) = from_developer.next().await {
+                if to_instance.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            let _ = to_instance.close().await;
+        };
+        let inbound = async {
+            while let Some(Ok(frame)) = from_instance.next().await {
+                if to_developer.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            let _ = to_developer.close().await;
+        };
+
+        tokio::pin!(outbound);
+        tokio::pin!(inbound);
+        futures::future::select(outbound, inbound).await;
+
+        Ok(())
+    }
+
     /// Wrap an error from the agent so it says which instance failed.
     pub(crate) fn failed(
         &self,

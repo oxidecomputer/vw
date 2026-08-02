@@ -170,6 +170,17 @@ impl Agent {
             .expect("credentials request")
     }
 
+    async fn clean_raw(&self, environment: &str) -> reqwest::Response {
+        self.client
+            .delete(format!(
+                "{}/environment/{environment}/build-output",
+                self.base_url
+            ))
+            .send()
+            .await
+            .expect("clean request")
+    }
+
     async fn commit(&self, manifest: &TreeManifest) -> CommitResult {
         let response = self.commit_raw(manifest).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -522,4 +533,35 @@ async fn clearing_a_tree_does_not_take_the_credentials_with_it() {
     agent.clear().await;
 
     assert!(agent.netrc.is_file());
+}
+
+#[tokio::test]
+async fn build_output_can_be_removed_over_http() {
+    let agent = Agent::start().await;
+    agent.sync(&[("hdl/top.vhd", "entity top is end;")]).await;
+    std::fs::create_dir_all(agent.root.join("target/synth")).expect("mkdir");
+    std::fs::write(agent.root.join("target/synth/top.dcp"), "checkpoint")
+        .expect("write");
+
+    let response = agent.clean_raw(ENVIRONMENT).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: serde_json::Value = response.json().await.expect("decode");
+    assert_eq!(result["existed"], true);
+    assert!(result["bytes"].as_u64().expect("bytes") > 0);
+    assert!(!agent.root.join("target").exists());
+    // The source is still here, so the next sync has nothing to do.
+    assert_eq!(agent.paths(), ["hdl/top.vhd"]);
+}
+
+#[tokio::test]
+async fn cleaning_another_environment_is_refused() {
+    let agent = Agent::start().await;
+    std::fs::create_dir_all(agent.root.join("target")).expect("mkdir");
+    std::fs::write(agent.root.join("target/keep.me"), "output").expect("write");
+
+    let response = agent.clean_raw("jalad").await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(agent.root.join("target/keep.me").exists());
 }

@@ -1,7 +1,8 @@
 use dropshot::{
     api_description, HttpError, HttpResponseCreated, HttpResponseDeleted,
-    HttpResponseOk, HttpResponseUpdatedNoContent, Path, RequestContext,
-    ResultsPage, TypedBody, UntypedBody,
+    HttpResponseOk, HttpResponseUpdatedNoContent, Path, Query, RequestContext,
+    ResultsPage, TypedBody, UntypedBody, WebsocketChannelResult,
+    WebsocketConnection,
 };
 use dropshot_api_manager_types::api_versions;
 use vw_api_types_versions::latest;
@@ -149,6 +150,41 @@ pub trait VwUserApi {
         rqctx: RequestContext<Self::Context>,
         path_params: Path<latest::TargetPathParam>,
     ) -> Result<HttpResponseOk<latest::CommitResult>, HttpError>;
+
+    /// Remove everything a build wrote on one of an environment's instances.
+    ///
+    /// `target/` is the one directory synchronization will never touch, in
+    /// either direction, so it outlives every push and has to be removed on
+    /// purpose. Source on the instance is left alone.
+    #[endpoint {
+        method = DELETE,
+        path = "/environment/{name}/target/{kind}/build-output",
+    }]
+    async fn clean_build_output(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::TargetPathParam>,
+    ) -> Result<HttpResponseOk<latest::CleanResult>, HttpError>;
+
+    /// Drive a vivado worker on an environment's vivado instance.
+    ///
+    /// Relayed frame for frame to the instance, which spawns the worker when
+    /// this opens and tears it down when it closes. A build is a conversation
+    /// that runs for a long time and produces output throughout, so it is a
+    /// websocket rather than a request and a reply — the developer sees each
+    /// message as vivado emits it, exactly as they would running it locally.
+    ///
+    /// The source being built is whatever the last synchronization put on the
+    /// instance. Nothing is shipped over this socket.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{name}/vivado/session",
+    }]
+    async fn vivado_session(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::EnvironmentPathParam>,
+        query: Query<latest::VivadoSessionQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
 
     /// Fetch the ssh keypair that opens an environment's instances.
     ///

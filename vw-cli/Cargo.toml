@@ -22,6 +22,9 @@ vw-ip = { path = "../vw-ip" }
 vw-htcl-cmd = { path = "../vw-htcl-cmd" }
 vw-repl = { path = "../vw-repl" }
 vw-api-client = { path = "../vw-api-client" }
+tokio-tungstenite.workspace = true
+reqwest = { version = "0.13", features = ["json"] }
+vw-remote = { path = "../vw-remote" }
 vw-sync = { path = "../vw-sync" }
 vw-api-types-versions = { path = "../vw-api-types/versions" }
 clap.workspace = true
