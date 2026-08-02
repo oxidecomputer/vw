@@ -30,6 +30,7 @@ pub mod user {
     progenitor::generate_api!(
         spec = "../openapi/vw-user-api/vw-user-api-latest.json",
         replace = {
+            Artifact = vw_api_types_versions::latest::Artifact,
             CleanResult = vw_api_types_versions::latest::CleanResult,
             CommitResult = vw_api_types_versions::latest::CommitResult,
             Digest = vw_api_types_versions::latest::Digest,
@@ -57,9 +58,11 @@ pub mod agent {
             CleanResult = vw_api_types_versions::latest::CleanResult,
             CommitResult = vw_api_types_versions::latest::CommitResult,
             Credentials = vw_api_types_versions::latest::Credentials,
+            S3Credentials = vw_api_types_versions::latest::S3Credentials,
             Digest = vw_api_types_versions::latest::Digest,
             FileEntry = vw_api_types_versions::latest::FileEntry,
             SyncPlan = vw_api_types_versions::latest::SyncPlan,
+            TargetKind = vw_api_types_versions::latest::TargetKind,
             TreeManifest = vw_api_types_versions::latest::TreeManifest,
         },
     );

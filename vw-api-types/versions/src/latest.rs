@@ -1,3 +1,5 @@
+pub use crate::v1::Artifact;
+pub use crate::v1::ArtifactPathParam;
 pub use crate::v1::BenchQuery;
 pub use crate::v1::CleanResult;
 pub use crate::v1::CommitResult;
@@ -9,7 +11,9 @@ pub use crate::v1::EnvironmentImages;
 pub use crate::v1::EnvironmentPathParam;
 pub use crate::v1::FileEntry;
 pub use crate::v1::ImageRef;
+pub use crate::v1::ObjectStoreQuery;
 pub use crate::v1::OxideInstance;
+pub use crate::v1::S3Credentials;
 pub use crate::v1::SshKeyPair;
 pub use crate::v1::SyncPlan;
 pub use crate::v1::TargetBlobPathParam;

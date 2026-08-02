@@ -165,6 +165,38 @@ pub trait VwSyncApi {
         path_params: Path<EnvironmentPathParam>,
     ) -> Result<HttpResponseOk<latest::CleanResult>, HttpError>;
 
+    /// The key that opens this instance's object store.
+    ///
+    /// Answered only by the instance that runs the store. The admin credential
+    /// that minted this key never leaves that machine — this is the one thing
+    /// it hands out, and `vw-svc` passes it to the instance that has artifacts
+    /// to upload.
+    #[endpoint {
+        method = GET,
+        path = "/environment/{environment}/object-store",
+    }]
+    async fn get_object_store(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+        query: Query<latest::ObjectStoreQuery>,
+    ) -> Result<HttpResponseOk<latest::S3Credentials>, HttpError>;
+
+    /// Tell this instance where to put the artifacts it builds.
+    ///
+    /// Sent by `vw-svc`, which got it from the instance that runs the store —
+    /// this one cannot ask directly, since it has no way to know which of its
+    /// neighbours holds it. Remembered on disk, so a reboot between two builds
+    /// does not lose the answer.
+    #[endpoint {
+        method = PUT,
+        path = "/environment/{environment}/artifact-target",
+    }]
+    async fn put_artifact_target(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+        body: TypedBody<latest::S3Credentials>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
     /// Run this workspace's testbenches on this instance.
     ///
     /// A websocket for the same reason a vivado session is one: a batch takes

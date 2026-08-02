@@ -135,6 +135,30 @@ pub enum CloudCommand {
         )]
         debounce: u64,
     },
+    #[command(about = "List or download an environment's build artifacts")]
+    Artifacts {
+        #[arg(help = "Environment name")]
+        name: String,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Download this artifact instead of listing. Repeat, or \
+                    use --all, for several."
+        )]
+        get: Vec<String>,
+        #[arg(
+            long,
+            conflicts_with = "get",
+            help = "Download every artifact instead of listing"
+        )]
+        all: bool,
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "Directory to write downloads into [default: .]"
+        )]
+        out: Option<Utf8PathBuf>,
+    },
     #[command(
         about = "Download the ssh key that opens an environment's instances"
     )]
@@ -166,6 +190,8 @@ pub enum CloudError {
         .0.join(", ")
     )]
     AmbiguousEnvironment(Vec<String>),
+    #[error("no artifact called '{0}'; run `vw cloud artifacts <env>` to see what there is")]
+    NoSuchArtifact(String),
     #[error("scanning {0}")]
     Scan(camino::Utf8PathBuf, #[source] vw_sync::ScanError),
     #[error("reading {0}")]
@@ -232,6 +258,12 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
         }
         CloudCommand::Get { name } => get(&session, &name).await,
         CloudCommand::Delete { name } => delete(&session, &name).await,
+        CloudCommand::Artifacts {
+            name,
+            get,
+            all,
+            out,
+        } => artifacts(&session, &name, &get, all, out.as_deref()).await,
         CloudCommand::Keys { name, dir } => {
             fetch_keys(&session, &name, dir.as_deref()).await
         }
@@ -761,6 +793,139 @@ pub async fn sync_for_build(
         std::time::Duration::from_millis(0),
     )
     .await
+}
+
+/// List an environment's artifacts, or fetch some of them.
+///
+/// Everything comes through the service rather than from the store directly.
+/// The store is on the rack's internal network and its instance's external
+/// address is usually only reachable over a VPN — needing one to collect a
+/// build's output would make this useless from a train, which is exactly where
+/// people want it.
+async fn artifacts(
+    session: &Session,
+    environment: &str,
+    get: &[String],
+    all: bool,
+    out: Option<&Utf8Path>,
+) -> Result<(), CloudError> {
+    let available = session
+        .client
+        .get_artifacts(environment)
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
+
+    let wanted: Vec<&vw_api_types_versions::latest::Artifact> = if all {
+        available.iter().collect()
+    } else if get.is_empty() {
+        show(&available);
+        return Ok(());
+    } else {
+        // Named artifacts have to exist, and saying which one does not is more
+        // use than a download that quietly produces nothing.
+        let mut wanted = Vec::new();
+        for name in get {
+            let found = available
+                .iter()
+                .find(|artifact| artifact.name == *name)
+                .ok_or_else(|| CloudError::NoSuchArtifact(name.clone()))?;
+            wanted.push(found);
+        }
+        wanted
+    };
+
+    if wanted.is_empty() {
+        println!("{}", "no artifacts to download".bright_black());
+        return Ok(());
+    }
+
+    let directory = out.unwrap_or(Utf8Path::new("."));
+    std::fs::create_dir_all(directory)
+        .map_err(|e| CloudError::KeyDir(directory.to_owned(), e))?;
+
+    for artifact in wanted {
+        download(session, environment, artifact, directory).await?;
+    }
+
+    Ok(())
+}
+
+/// Show what an environment has built.
+fn show(available: &[vw_api_types_versions::latest::Artifact]) {
+    if available.is_empty() {
+        println!(
+            "{}",
+            "no artifacts yet; run a build that produces one".bright_black(),
+        );
+        return;
+    }
+
+    for artifact in available {
+        println!(
+            "{:<10} {:>10}  {}",
+            artifact.kind.to_string().cyan(),
+            human_bytes(artifact.size),
+            artifact.name,
+        );
+    }
+}
+
+/// Fetch one artifact into `directory`.
+async fn download(
+    session: &Session,
+    environment: &str,
+    artifact: &vw_api_types_versions::latest::Artifact,
+    directory: &Utf8Path,
+) -> Result<(), CloudError> {
+    use futures::StreamExt;
+
+    let response = session
+        .client
+        .get_artifact(environment, &artifact.kind, &artifact.name)
+        .await
+        .map_err(|e| session.error(e))?;
+
+    let path = directory.join(&artifact.name);
+    // Written as it arrives rather than collected first: an image runs to
+    // hundreds of megabytes and there is no reason for it to be in memory on
+    // the way past.
+    let mut file = std::fs::File::create(&path)
+        .map_err(|e| CloudError::KeyWrite(path.clone(), e))?;
+
+    let mut body = response.into_inner_stream();
+    let mut written = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| CloudError::Transport(e.to_string()))?;
+        std::io::Write::write_all(&mut file, &chunk)
+            .map_err(|e| CloudError::KeyWrite(path.clone(), e))?;
+        written += chunk.len() as u64;
+    }
+
+    println!(
+        "{} {} ({})",
+        "\u{2713}".bright_green(),
+        path.as_str(),
+        human_bytes(written),
+    );
+
+    Ok(())
+}
+
+/// A byte count as a person would say it.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 #[cfg(test)]

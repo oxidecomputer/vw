@@ -391,3 +391,76 @@ impl BenchQuery {
             .collect()
     }
 }
+
+/// How to reach an environment's object store, and the key that opens it.
+///
+/// Generated on the artifact instance and handed out from there, so the admin
+/// credential that minted it never leaves the machine that holds the store.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct S3Credentials {
+    /// The base URL of the S3 API, e.g. `http://172.30.0.7:3900`.
+    ///
+    /// Composed from [`port`](Self::port) and an address by whoever knows
+    /// which address the instance is reachable on. Each side supplies what it
+    /// knows: the instance cannot tell which of its addresses another machine
+    /// can use, and nobody else should be guessing which port it chose.
+    pub endpoint: String,
+    /// The port the store serves S3 on, as the instance running it configured
+    /// it.
+    pub port: u16,
+    /// The region the store answers to. Garage's own default is `garage`, and
+    /// signing fails against the wrong one.
+    pub region: String,
+    /// The bucket this environment's artifacts go in.
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// Written by hand so a secret cannot reach a log through a debug format.
+impl std::fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Credentials")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Which of an environment's buckets is being asked about.
+///
+/// One store holds a bucket per kind of instance that produces artifacts, and
+/// one key opens all of them — what differs between two callers is only which
+/// bucket is theirs to write to.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ObjectStoreQuery {
+    /// The instance kind whose bucket is wanted. Absent means vivado, which is
+    /// the one that produces images today.
+    #[serde(default)]
+    pub kind: Option<TargetKind>,
+}
+
+/// One artifact an environment's build produced.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct Artifact {
+    /// Which instance built it, and so which bucket it is in.
+    pub kind: TargetKind,
+    /// The file's name, which is its key in the bucket.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// When the store last accepted it, as the store reports it.
+    pub modified: Option<String>,
+}
+
+/// Which artifact is being fetched.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactPathParam {
+    pub name: String,
+    pub kind: TargetKind,
+    /// The artifact's file name.
+    pub artifact: String,
+}

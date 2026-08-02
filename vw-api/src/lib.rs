@@ -1,8 +1,8 @@
 use dropshot::{
-    api_description, HttpError, HttpResponseCreated, HttpResponseDeleted,
-    HttpResponseOk, HttpResponseUpdatedNoContent, Path, Query, RequestContext,
-    ResultsPage, TypedBody, UntypedBody, WebsocketChannelResult,
-    WebsocketConnection,
+    api_description, FreeformBody, HttpError, HttpResponseCreated,
+    HttpResponseDeleted, HttpResponseOk, HttpResponseUpdatedNoContent, Path,
+    Query, RequestContext, ResultsPage, TypedBody, UntypedBody,
+    WebsocketChannelResult, WebsocketConnection,
 };
 use dropshot_api_manager_types::api_versions;
 use vw_api_types_versions::latest;
@@ -201,6 +201,36 @@ pub trait VwUserApi {
         query: Query<latest::VivadoSessionQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
+
+    /// List the artifacts an environment's builds have produced.
+    ///
+    /// Read from the environment's own object store, which lives on its
+    /// artifact instance.
+    #[endpoint {
+        method = GET,
+        path = "/environment/{name}/artifacts",
+    }]
+    async fn get_artifacts(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<Vec<latest::Artifact>>, HttpError>;
+
+    /// Download one artifact.
+    ///
+    /// Streamed through this service rather than handed out as a link to the
+    /// store. The store sits on the rack's internal network, and its instance's
+    /// external address is often only reachable over a VPN — needing one to
+    /// collect a build's output would make this useless from anywhere else.
+    /// The body is passed through as it arrives, so an image of any size costs
+    /// this service no more memory than a small one.
+    #[endpoint {
+        method = GET,
+        path = "/environment/{name}/artifacts/{kind}/{artifact}",
+    }]
+    async fn get_artifact(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::ArtifactPathParam>,
+    ) -> Result<HttpResponseOk<FreeformBody>, HttpError>;
 
     /// Fetch the ssh keypair that opens an environment's instances.
     ///

@@ -17,6 +17,12 @@ vw-sync = { path = "../vw-sync" }
 vw-remote = { path = "../vw-remote" }
 vw-bench = { path = "../vw-bench" }
 vw-lib = { path = "../vw-lib" }
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
+blake3 = "1"
+rand = "0.8"
+reqwest = { version = "0.13", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
 tokio-tungstenite.workspace = true
 vw-sync-api = { path = "../vw-sync-api" }
 vw-api-types-versions = { path = "../vw-api-types/versions" }
@@ -32,7 +38,6 @@ slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", 
 
 [dev-dependencies]
 tempfile.workspace = true
-reqwest = { version = "0.13", features = ["json"] }
 vw-sync = { path = "../vw-sync" }
 vw-remote = { path = "../vw-remote" }
 tokio-tungstenite.workspace = true

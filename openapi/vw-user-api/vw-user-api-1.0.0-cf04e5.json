@@ -111,6 +111,96 @@
         }
       }
     },
+    "/environment/{name}/artifacts": {
+      "get": {
+        "summary": "List the artifacts an environment's builds have produced.",
+        "description": "Read from the environment's own object store, which lives on its artifact instance.",
+        "operationId": "get_artifacts",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of this environment to create.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Array_of_Artifact",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Artifact"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{name}/artifacts/{kind}/{artifact}": {
+      "get": {
+        "summary": "Download one artifact.",
+        "description": "Streamed through this service rather than handed out as a link to the store. The store sits on the rack's internal network, and its instance's external address is often only reachable over a VPN — needing one to collect a build's output would make this useless from anywhere else. The body is passed through as it arrives, so an image of any size costs this service no more memory than a small one.",
+        "operationId": "get_artifact",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "artifact",
+            "description": "The artifact's file name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TargetKind"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/environment/{name}/bench/session": {
       "get": {
         "summary": "Run an environment's testbenches on its vivado instance.",
@@ -559,6 +649,40 @@
   },
   "components": {
     "schemas": {
+      "Artifact": {
+        "description": "One artifact an environment's build produced.",
+        "type": "object",
+        "properties": {
+          "kind": {
+            "description": "Which instance built it, and so which bucket it is in.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TargetKind"
+              }
+            ]
+          },
+          "modified": {
+            "nullable": true,
+            "description": "When the store last accepted it, as the store reports it.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The file's name, which is its key in the bucket.",
+            "type": "string"
+          },
+          "size": {
+            "description": "Its size in bytes.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "kind",
+          "name",
+          "size"
+        ]
+      },
       "CleanResult": {
         "description": "What removing an instance's build output came to.",
         "type": "object",
@@ -938,6 +1062,14 @@
           "missing"
         ]
       },
+      "TargetKind": {
+        "description": "Which half of an environment a request is about.\n\nOnly the two that take source. The artifact instance holds build output and is reached as an object store, so there is nothing to synchronize to it.",
+        "type": "string",
+        "enum": [
+          "vivado",
+          "helios"
+        ]
+      },
       "TreeManifest": {
         "description": "The complete desired state of a target's source tree.\n\nComplete, not a changeset: a path absent from this is a path that should not exist, which is the only way deletions and renames can be expressed.",
         "type": "object",
@@ -951,14 +1083,6 @@
         },
         "required": [
           "entries"
-        ]
-      },
-      "TargetKind": {
-        "description": "Which half of an environment a request is about.\n\nOnly the two that take source. The artifact instance holds build output and is reached as an object store, so there is nothing to synchronize to it.",
-        "type": "string",
-        "enum": [
-          "vivado",
-          "helios"
         ]
       }
     },

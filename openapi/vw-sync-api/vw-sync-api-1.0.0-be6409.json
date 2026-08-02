@@ -6,6 +6,44 @@
     "version": "1.0.0"
   },
   "paths": {
+    "/environment/{environment}/artifact-target": {
+      "put": {
+        "summary": "Tell this instance where to put the artifacts it builds.",
+        "description": "Sent by `vw-svc`, which got it from the instance that runs the store — this one cannot ask directly, since it has no way to know which of its neighbours holds it. Remembered on disk, so a reboot between two builds does not lose the answer.",
+        "operationId": "put_artifact_target",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/S3Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/environment/{environment}/bench/session": {
       "get": {
         "summary": "Run this workspace's testbenches on this instance.",
@@ -136,6 +174,49 @@
         "responses": {
           "204": {
             "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/object-store": {
+      "get": {
+        "summary": "The key that opens this instance's object store.",
+        "description": "Answered only by the instance that runs the store. The admin credential that minted this key never leaves that machine — this is the one thing it hands out, and `vw-svc` passes it to the instance that has artifacts to upload.",
+        "operationId": "get_object_store",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "description": "The instance kind whose bucket is wanted. Absent means vivado, which is the one that produces images today.",
+            "schema": {
+              "$ref": "#/components/schemas/TargetKind"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3Credentials"
+                }
+              }
+            }
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -497,6 +578,44 @@
           "path"
         ]
       },
+      "S3Credentials": {
+        "description": "How to reach an environment's object store, and the key that opens it.\n\nGenerated on the artifact instance and handed out from there, so the admin credential that minted it never leaves the machine that holds the store.",
+        "type": "object",
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "bucket": {
+            "description": "The bucket this environment's artifacts go in.",
+            "type": "string"
+          },
+          "endpoint": {
+            "description": "The base URL of the S3 API, e.g. `http://172.30.0.7:3900`.\n\nComposed from [`port`](Self::port) and an address by whoever knows which address the instance is reachable on. Each side supplies what it knows: the instance cannot tell which of its addresses another machine can use, and nobody else should be guessing which port it chose.",
+            "type": "string"
+          },
+          "port": {
+            "description": "The port the store serves S3 on, as the instance running it configured it.",
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0
+          },
+          "region": {
+            "description": "The region the store answers to. Garage's own default is `garage`, and signing fails against the wrong one.",
+            "type": "string"
+          },
+          "secret_access_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_key_id",
+          "bucket",
+          "endpoint",
+          "port",
+          "region",
+          "secret_access_key"
+        ]
+      },
       "SyncPlan": {
         "description": "What the receiver still needs before a manifest can be applied.",
         "type": "object",
@@ -526,6 +645,14 @@
         },
         "required": [
           "entries"
+        ]
+      },
+      "TargetKind": {
+        "description": "Which half of an environment a request is about.\n\nOnly the two that take source. The artifact instance holds build output and is reached as an object store, so there is nothing to synchronize to it.",
+        "type": "string",
+        "enum": [
+          "vivado",
+          "helios"
         ]
       }
     },

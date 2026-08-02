@@ -32,7 +32,9 @@ use vw_api_types_versions::latest::{
 use vw_sync::Store;
 use vw_sync_api::{BlobPathParam, EnvironmentPathParam, VwSyncApi};
 
+mod artifacts;
 mod error;
+mod garage;
 mod netrc;
 
 #[derive(Parser)]
@@ -96,6 +98,38 @@ struct ServerArgs {
     #[arg(long, default_value = "/var/lib/vw-agent/store")]
     store: Utf8PathBuf,
 
+    /// Where to remember the object store artifacts are uploaded to.
+    ///
+    /// Kept so an instance that reboots between builds still knows where its
+    /// output goes without being told again.
+    #[arg(long, default_value = "/var/lib/vw-agent/artifact-target.json")]
+    artifact_target: Utf8PathBuf,
+
+    /// Directory the object store keeps its config, metadata and data in.
+    ///
+    /// Only consulted on an artifact instance, which is the only kind that
+    /// runs a store.
+    #[arg(long, default_value = "/var/lib/vw-agent/garage")]
+    garage_dir: Utf8PathBuf,
+
+    /// Port the object store serves S3 on.
+    ///
+    /// Garage's own default, and what every uploader is told to expect.
+    #[arg(long, default_value_t = 3900u16)]
+    s3_port: u16,
+
+    /// Port the object store's admin API listens on, bound to localhost.
+    #[arg(long, default_value_t = 3903u16)]
+    garage_admin_port: u16,
+
+    /// Port the object store uses to talk to itself.
+    #[arg(long, default_value_t = 3901u16)]
+    garage_rpc_port: u16,
+
+    /// How much of this instance's disk the object store may use.
+    #[arg(long, default_value = "100G")]
+    garage_capacity: String,
+
     /// Where to write the credentials a build fetches its dependencies with.
     ///
     /// Defaults to the `.netrc` of whoever the agent runs as. Provisioning
@@ -124,6 +158,18 @@ struct BenchOneArgs {
 
 pub struct Context {
     environment: String,
+    /// Where finished artifacts are uploaded, once anyone has said.
+    artifact_target: tokio::sync::watch::Sender<
+        Option<vw_api_types_versions::latest::S3Credentials>,
+    >,
+    /// Where that answer is kept across restarts.
+    artifact_target_path: Utf8PathBuf,
+    /// The object store this instance runs, if it is the one that runs it.
+    ///
+    /// Held so garage lives as long as the agent does, and so the key can be
+    /// handed to whoever asks for it. Distinct from `store` below, which is
+    /// where delivered source waits — this one is where finished artifacts go.
+    object_store: Option<garage::Store>,
     root: Utf8PathBuf,
     store: Store,
     /// Where the credentials for fetching dependencies are kept.
@@ -251,6 +297,93 @@ impl VwSyncApi for Agent {
         );
 
         Ok(HttpResponseOk(result))
+    }
+
+    async fn put_artifact_target(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+        body: dropshot::TypedBody<vw_api_types_versions::latest::S3Credentials>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+        let credentials = body.into_inner();
+
+        artifacts::remember(&ctx.artifact_target_path, &credentials)
+            .inspect_err(|e| {
+                slog::error!(rqctx.log, "cannot remember the artifact target";
+                    "path" => %ctx.artifact_target_path,
+                    InlineErrorChain::new(e),
+                );
+            })
+            .map_err(|e| HttpError::for_internal_error(e.to_string()))?;
+
+        info!(rqctx.log, "artifacts now go to a store";
+            "bucket" => &credentials.bucket,
+            "endpoint" => &credentials.endpoint,
+        );
+
+        // Waking the uploader, which will send anything already built.
+        let _ = ctx.artifact_target.send(Some(credentials));
+
+        Ok(HttpResponseUpdatedNoContent())
+    }
+
+    async fn get_object_store(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+        query: dropshot::Query<vw_api_types_versions::latest::ObjectStoreQuery>,
+    ) -> Result<
+        HttpResponseOk<vw_api_types_versions::latest::S3Credentials>,
+        HttpError,
+    > {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        let Some(store) = ctx.object_store.as_ref() else {
+            slog::warn!(
+                rqctx.log,
+                "asked for an object store this instance \
+                                    does not run"
+            );
+            return Err(HttpError::for_not_found(
+                None,
+                String::from(
+                    "this instance does not run an object store; the artifact \
+                     instance does",
+                ),
+            ));
+        };
+
+        let kind = query
+            .into_inner()
+            .kind
+            .unwrap_or(vw_api_types_versions::latest::TargetKind::Vivado)
+            .to_string();
+
+        let Some(bucket) = store.buckets.get(&kind) else {
+            slog::warn!(rqctx.log, "asked for a bucket that does not exist";
+                "kind" => &kind,
+            );
+            return Err(HttpError::for_not_found(
+                None,
+                format!("this store has no bucket for '{kind}'"),
+            ));
+        };
+
+        info!(rqctx.log, "handing out the object store key";
+            "bucket" => bucket,
+        );
+
+        let mut credentials = store.credentials.clone();
+        credentials.bucket = bucket.clone();
+
+        Ok(HttpResponseOk(credentials))
     }
 
     async fn clean_build_output(
@@ -547,8 +680,67 @@ async fn serve(args: ServerArgs) {
         }
     };
 
+    // The artifact instance is the one that holds the object store, so it is
+    // the one that brings it up. Nothing is pre-shared: the admin credential
+    // is generated here and stays here, and only an S3 key ever leaves.
+    let store = if args.kind == "artifact" {
+        match garage::start(
+            &args.environment,
+            &garage::Settings {
+                dir: args.garage_dir.clone(),
+                s3_port: args.s3_port,
+                admin_port: args.garage_admin_port,
+                rpc_port: args.garage_rpc_port,
+                capacity: args.garage_capacity.clone(),
+            },
+            &log,
+        )
+        .await
+        {
+            Ok(store) => Some(store),
+            Err(e) => {
+                slog::error!(log, "cannot bring up the object store";
+                    InlineErrorChain::new(&e),
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Where artifacts go, recovered from the last time anyone said. An agent
+    // that has never been told simply uploads nothing.
+    let remembered = artifacts::recall(&args.artifact_target)
+        .inspect_err(|e| {
+            slog::warn!(log, "cannot read the remembered artifact target";
+                InlineErrorChain::new(e),
+            );
+        })
+        .unwrap_or(None);
+    if let Some(target) = &remembered {
+        info!(log, "artifacts go to a store this instance was told about";
+            "bucket" => &target.bucket,
+        );
+    }
+    let (artifact_target, artifact_changes) =
+        tokio::sync::watch::channel(remembered);
+
+    // Only where builds happen. An artifact instance holds the store rather
+    // than filling it, and helios does not produce images.
+    if args.kind == "vivado" {
+        tokio::spawn(artifacts::synchronize(
+            args.root.clone(),
+            artifact_changes,
+            log.new(o!("task" => "artifacts")),
+        ));
+    }
+
     let context = Arc::new(Context {
         environment: args.environment.clone(),
+        artifact_target,
+        artifact_target_path: args.artifact_target.clone(),
+        object_store: store,
         root: args.root.clone(),
         store: Store::new(args.store.clone()),
         netrc: netrc.clone(),

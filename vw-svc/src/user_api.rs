@@ -170,6 +170,20 @@ impl VwUserApi for UserApi {
             .await
             .inspect_err(|e| log_relay_failure(&log, &target, e))?;
 
+        // And tell it where the artifacts it builds should go, if it has not
+        // been told since this service last restarted. Only vivado builds
+        // images, and only the artifact instance knows the key — this service
+        // is the one place that can see both.
+        wire_up_artifacts(
+            &caller.name,
+            &target.name,
+            target.kind,
+            &args,
+            &agent,
+            &log,
+        )
+        .await;
+
         let plan = agent
             .client
             .sync_plan(&agent.environment, &manifest)
@@ -449,6 +463,106 @@ impl VwUserApi for UserApi {
         result.map_err(Into::into)
     }
 
+    async fn get_artifacts(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::EnvironmentPathParam,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<Vec<vw_api_types_versions::latest::Artifact>>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let name = path_params.into_inner().name;
+
+        let mut found = Vec::new();
+        // Every kind that has a bucket, so one listing answers "what did this
+        // environment build" rather than "what did one half of it build".
+        for kind in [
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            vw_api_types_versions::latest::TargetKind::Helios,
+        ] {
+            let credentials =
+                match store_for(&caller.name, &name, kind, &args).await {
+                    Ok(credentials) => credentials,
+                    Err(e) => {
+                        error!(log, "cannot reach the object store";
+                            "environment" => &name,
+                            "kind" => %kind,
+                            InlineErrorChain::new(&e),
+                        );
+                        return Err(e.into());
+                    }
+                };
+
+            match crate::artifacts::list(&credentials, kind).await {
+                Ok(mut artifacts) => found.append(&mut artifacts),
+                Err(e) => {
+                    error!(log, "cannot list artifacts";
+                        "environment" => &name,
+                        "kind" => %kind,
+                        InlineErrorChain::new(&e),
+                    );
+                    return Err(e.into());
+                }
+            }
+        }
+
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(dropshot::HttpResponseOk(found))
+    }
+
+    async fn get_artifact(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::ArtifactPathParam,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<dropshot::FreeformBody>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let wanted = path_params.into_inner();
+
+        let credentials =
+            store_for(&caller.name, &wanted.name, wanted.kind, &args)
+                .await
+                .inspect_err(|e| {
+                    error!(log, "cannot reach the object store";
+                        "environment" => &wanted.name,
+                        InlineErrorChain::new(e),
+                    );
+                })?;
+
+        let stream = crate::artifacts::fetch(&credentials, &wanted.artifact)
+            .await
+            .inspect_err(|e| {
+                error!(log, "cannot fetch an artifact";
+                    "environment" => &wanted.name,
+                    "artifact" => &wanted.artifact,
+                    InlineErrorChain::new(e),
+                );
+            })?;
+
+        info!(log, "streaming an artifact";
+            "environment" => &wanted.name,
+            "kind" => %wanted.kind,
+            "artifact" => &wanted.artifact,
+        );
+
+        // Passed through frame by frame as the store produces them, so an
+        // image of any size costs this service no more memory than a small one.
+        let body = dropshot::Body::wrap(http_body_util::StreamBody::new(
+            futures::TryStreamExt::map_ok(stream, http_body::Frame::data),
+        ));
+
+        Ok(dropshot::HttpResponseOk(body.into()))
+    }
+
     async fn get_environment_keys(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
@@ -554,6 +668,136 @@ pub fn api_description() -> ApiDescription<Arc<Context>> {
 /// Every one of these is worth a line: an instance that is not up yet, an
 /// address that has not appeared, an agent that refused. None of it is visible
 /// from the response alone, which only says the sync did not happen.
+/// Environments whose vivado instance has already been told where its
+/// artifacts go.
+///
+/// Remembered so the two extra calls happen once rather than on every sync. A
+/// restart of this service forgets, which costs one repeat — cheaper than a
+/// wrong answer, since the agent stores the target itself and re-telling it
+/// the same thing is harmless.
+static ARTIFACTS_WIRED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+/// Fetch this environment's object store key and hand it to the instance that
+/// will fill it.
+///
+/// Best effort. An environment whose artifact instance is still coming up
+/// should still be able to synchronize source and run builds; the artifacts
+/// will find their way once it answers, because this runs again on the next
+/// sync.
+async fn wire_up_artifacts(
+    user: &str,
+    name: &str,
+    kind: vw_api_types_versions::latest::TargetKind,
+    args: &ServerArgs,
+    instance: &relay::Agent,
+    log: &slog::Logger,
+) {
+    // Remembered per instance rather than per environment: vivado and helios
+    // are told separately, and each has its own bucket to be told about.
+    let token = format!("{name}/{kind}");
+    let already = ARTIFACTS_WIRED
+        .get_or_init(Default::default)
+        .lock()
+        .map(|wired| wired.contains(&token))
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+
+    let artifact = match relay::Agent::resolve_artifact(user, name, args) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            info!(log, "no artifact instance to store artifacts on yet";
+                "environment" => name,
+                "detail" => %e,
+            );
+            return;
+        }
+    };
+
+    // The address the vivado instance will reach the store on, which is the
+    // artifact instance's own address on the rack's network.
+    let address = match artifact_address(user, name, args) {
+        Some(address) => address,
+        None => return,
+    };
+
+    let credentials = match artifact.object_store(address, kind).await {
+        Ok(credentials) => credentials,
+        Err(e) => {
+            info!(log, "cannot read the environment's object store yet";
+                "environment" => name,
+                "detail" => %e,
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = instance.set_artifact_target(&credentials).await {
+        error!(log, "cannot tell an instance where artifacts go";
+            "environment" => name,
+            "kind" => %kind,
+            InlineErrorChain::new(&e),
+        );
+        return;
+    }
+
+    info!(log, "artifacts wired up";
+        "environment" => name,
+        "kind" => %kind,
+        "bucket" => &credentials.bucket,
+    );
+
+    if let Ok(mut wired) = ARTIFACTS_WIRED.get_or_init(Default::default).lock()
+    {
+        wired.insert(token);
+    }
+}
+
+/// The key and bucket for one of an environment's artifact stores.
+async fn store_for(
+    user: &str,
+    name: &str,
+    kind: vw_api_types_versions::latest::TargetKind,
+    args: &ServerArgs,
+) -> Result<
+    vw_api_types_versions::latest::S3Credentials,
+    crate::artifacts::ArtifactError,
+> {
+    let artifact = relay::Agent::resolve_artifact(user, name, args)
+        .map_err(|_| crate::artifacts::ArtifactError::NoStore)?;
+    let address = artifact_address(user, name, args)
+        .ok_or(crate::artifacts::ArtifactError::NoStore)?;
+
+    artifact
+        .object_store(address, kind)
+        .await
+        .map_err(|_| crate::artifacts::ArtifactError::NoStore)
+}
+
+/// The artifact instance's address on the rack's network.
+fn artifact_address(
+    user: &str,
+    name: &str,
+    args: &ServerArgs,
+) -> Option<std::net::IpAddr> {
+    // A development override is an address the vivado agent can reach too,
+    // since with no rack behind this everything is on one machine.
+    if let Some(address) = args.artifact_agent.as_deref() {
+        return address.split(':').next().and_then(|host| host.parse().ok());
+    }
+
+    db::get_environment_status(UserEnvironmentPathParam {
+        user: user.to_owned(),
+        name: name.to_owned(),
+    })
+    .ok()
+    .and_then(|environment| environment.artifact_instance)
+    .and_then(|instance| instance.internal_ip)
+}
+
 fn log_relay_failure(
     log: &slog::Logger,
     target: &vw_api_types_versions::latest::TargetPathParam,

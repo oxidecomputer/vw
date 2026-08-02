@@ -20,6 +20,14 @@ use crate::{db, reconciler::InstanceKind};
 /// provisioning, so there is nothing to negotiate.
 pub(crate) const AGENT_PORT: u16 = 2729;
 
+/// Where an agent lives on the rack's network.
+fn agent_url(address: std::net::IpAddr) -> String {
+    match address {
+        std::net::IpAddr::V4(v4) => format!("http://{v4}:{AGENT_PORT}"),
+        std::net::IpAddr::V6(v6) => format!("http://[{v6}]:{AGENT_PORT}"),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RelayError {
     #[error("environment does not exist")]
@@ -99,12 +107,94 @@ impl Agent {
         let address =
             instance.internal_ip.ok_or(RelayError::NoAddress { kind })?;
 
-        let base_url = match address {
-            std::net::IpAddr::V4(v4) => format!("http://{v4}:{AGENT_PORT}"),
-            std::net::IpAddr::V6(v6) => format!("http://[{v6}]:{AGENT_PORT}"),
+        Agent::at(&agent_url(address), name, kind)
+    }
+
+    /// Find the instance that runs this environment's object store.
+    ///
+    /// Separate from [`Agent::resolve`] because the artifact instance is not
+    /// something source is ever synchronized to — it has no `TargetKind` — but
+    /// it is the one machine that knows where finished artifacts go.
+    pub(crate) fn resolve_artifact(
+        user: &str,
+        name: &str,
+        args: &crate::ServerArgs,
+    ) -> Result<Agent, RelayError> {
+        if let Some(address) = args.artifact_agent.as_deref() {
+            return Agent::at(
+                &format!("http://{address}"),
+                name,
+                TargetKind::Vivado,
+            );
+        }
+
+        let environment =
+            db::get_environment_status(UserEnvironmentPathParam {
+                user: user.to_owned(),
+                name: name.to_owned(),
+            })
+            .map_err(|e| match e {
+                db::GetError::NoSuchEnvironment => {
+                    RelayError::NoSuchEnvironment
+                }
+                other => RelayError::Db(other),
+            })?;
+
+        let instance =
+            environment
+                .artifact_instance
+                .ok_or(RelayError::NoInstance {
+                    kind: TargetKind::Vivado,
+                })?;
+        let address = instance.internal_ip.ok_or(RelayError::NoAddress {
+            kind: TargetKind::Vivado,
+        })?;
+
+        Agent::at(
+            &agent_url(address),
+            name,
+            // Only used for error text; there is no artifact target kind and
+            // inventing one would put it in the public API for no reason.
+            TargetKind::Vivado,
+        )
+    }
+
+    /// Where this environment's artifacts go, and the key that opens it.
+    ///
+    /// The endpoint is filled in here rather than by the instance that minted
+    /// the key: that instance cannot know which of its addresses another one
+    /// can reach it on, and this service has both in the same record.
+    pub(crate) async fn object_store(
+        &self,
+        address: std::net::IpAddr,
+        kind: TargetKind,
+    ) -> Result<vw_api_types_versions::latest::S3Credentials, RelayError> {
+        let mut credentials = self
+            .client
+            .get_object_store(&self.environment, Some(&kind))
+            .await
+            .map_err(|e| self.failed(e))?
+            .into_inner();
+
+        let port = credentials.port;
+        credentials.endpoint = match address {
+            std::net::IpAddr::V4(v4) => format!("http://{v4}:{port}"),
+            std::net::IpAddr::V6(v6) => format!("http://[{v6}]:{port}"),
         };
 
-        Agent::at(&base_url, name, kind)
+        Ok(credentials)
+    }
+
+    /// Tell this instance where the artifacts it builds should go.
+    pub(crate) async fn set_artifact_target(
+        &self,
+        credentials: &vw_api_types_versions::latest::S3Credentials,
+    ) -> Result<(), RelayError> {
+        self.client
+            .put_artifact_target(&self.environment, credentials)
+            .await
+            .map_err(|e| self.failed(e))?;
+        Ok(())
     }
 
     fn at(

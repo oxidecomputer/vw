@@ -10,6 +10,7 @@ use std::{
 use tokio::sync::Notify;
 
 mod admin_api;
+mod artifacts;
 mod auth;
 mod db;
 mod error;
@@ -104,6 +105,11 @@ struct ServerArgs {
     /// Send helios source to this address instead of to a rack instance.
     #[arg(long, value_name = "HOST:PORT")]
     helios_agent: Option<String>,
+
+    /// Ask this address for the environment's object store, rather than the
+    /// artifact instance the reconciler would have recorded.
+    #[arg(long, value_name = "HOST:PORT")]
+    artifact_agent: Option<String>,
 }
 
 #[tokio::main]
