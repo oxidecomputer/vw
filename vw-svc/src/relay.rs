@@ -185,6 +185,21 @@ impl Agent {
         Ok(credentials)
     }
 
+    /// Where this instance currently believes its artifacts go.
+    ///
+    /// An instance that has never been told answers that it has not, which is
+    /// the answer that matters at startup.
+    pub(crate) async fn artifact_target(
+        &self,
+    ) -> Result<vw_api_types_versions::latest::S3Credentials, RelayError> {
+        Ok(self
+            .client
+            .get_artifact_target(&self.environment)
+            .await
+            .map_err(|e| self.failed(e))?
+            .into_inner())
+    }
+
     /// Tell this instance where the artifacts it builds should go.
     pub(crate) async fn set_artifact_target(
         &self,

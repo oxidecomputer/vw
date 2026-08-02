@@ -263,7 +263,7 @@ async fn ensure_credentials(
         return Ok((minted.credentials, minted.buckets));
     }
 
-    let key = admin.create_key(&format!("vw-{environment}")).await?;
+    let key = admin.ensure_key(&format!("vw-{environment}"), log).await?;
 
     // A bucket per environment per kind, named for both. Even though an
     // artifact instance serves one environment today, a name that says which
@@ -271,7 +271,13 @@ async fn ensure_credentials(
     let mut buckets = std::collections::BTreeMap::new();
     for kind in KINDS {
         let bucket = format!("{kind}-{environment}");
-        let bucket_id = admin.create_bucket(&bucket).await?;
+        // Adopted if it is already there. That happens when this record was
+        // lost but the store's own state was not — a disk restored from a
+        // snapshot, a file removed by hand. Failing instead would leave an
+        // instance that cannot serve the artifacts sitting right there in a
+        // bucket, and creating a second bucket would orphan them. Neither is
+        // as good as picking up where we left off.
+        let bucket_id = admin.ensure_bucket(&bucket, log).await?;
         admin.allow(&bucket_id, &key.access_key_id).await?;
         buckets.insert(kind.to_owned(), bucket);
     }
@@ -441,7 +447,25 @@ impl Admin {
             .ok_or_else(|| GarageError::Unexpected("GetClusterStatus".into()))
     }
 
-    async fn create_key(&self, name: &str) -> Result<CreatedKey, GarageError> {
+    /// The key with this name, creating one only if there is not one already.
+    ///
+    /// Adopted rather than replaced for the same reason a bucket is, plus one
+    /// of its own: a new key every time this record was lost would leave the
+    /// old ones behind with permission on the bucket, so a store would collect
+    /// working credentials nobody remembers issuing. Garage will hand back the
+    /// secret of a key it already has, which is what makes reuse possible.
+    async fn ensure_key(
+        &self,
+        name: &str,
+        log: &Logger,
+    ) -> Result<CreatedKey, GarageError> {
+        if let Some(existing) = self.find_key(name).await? {
+            info!(log, "reusing the key this store was set up with";
+                "key" => &existing.access_key_id,
+            );
+            return Ok(existing);
+        }
+
         let created = self
             .post("CreateKey", &serde_json::json!({ "name": name }))
             .await?;
@@ -449,13 +473,70 @@ impl Admin {
             .map_err(|_| GarageError::Unexpected("CreateKey".into()))
     }
 
-    async fn create_bucket(&self, alias: &str) -> Result<String, GarageError> {
-        let created = self
-            .post("CreateBucket", &serde_json::json!({ "globalAlias": alias }))
+    /// The key named `name`, secret and all, if this store has one.
+    async fn find_key(
+        &self,
+        name: &str,
+    ) -> Result<Option<CreatedKey>, GarageError> {
+        let keys = self.get("ListKeys").await?;
+        let Some(existing) = keys.as_array().and_then(|keys| {
+            keys.iter().find(|key| {
+                key.get("name").and_then(serde_json::Value::as_str)
+                    == Some(name)
+            })
+        }) else {
+            return Ok(None);
+        };
+
+        let id = existing
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| GarageError::Unexpected("ListKeys".into()))?;
+
+        let full = self
+            .get(&format!("GetKeyInfo?id={id}&showSecretKey=true"))
             .await?;
-        let bucket: CreatedBucket = serde_json::from_value(created)
-            .map_err(|_| GarageError::Unexpected("CreateBucket".into()))?;
-        Ok(bucket.id)
+        serde_json::from_value(full)
+            .map(Some)
+            .map_err(|_| GarageError::Unexpected("GetKeyInfo".into()))
+    }
+
+    /// The bucket with this alias, creating it only if it is not there.
+    ///
+    /// Never destructive: an existing bucket is adopted with everything in it,
+    /// because the objects in it are the entire reason any of this exists.
+    async fn ensure_bucket(
+        &self,
+        alias: &str,
+        log: &Logger,
+    ) -> Result<String, GarageError> {
+        match self
+            .post("CreateBucket", &serde_json::json!({ "globalAlias": alias }))
+            .await
+        {
+            Ok(created) => {
+                let bucket: CreatedBucket = serde_json::from_value(created)
+                    .map_err(|_| {
+                        GarageError::Unexpected("CreateBucket".into())
+                    })?;
+                Ok(bucket.id)
+            }
+            // Already there, from an earlier life of this instance.
+            Err(GarageError::AdminRefused { status: 409, .. }) => {
+                let existing = self
+                    .get(&format!("GetBucketInfo?globalAlias={alias}"))
+                    .await?;
+                let bucket: CreatedBucket = serde_json::from_value(existing)
+                    .map_err(|_| {
+                        GarageError::Unexpected("GetBucketInfo".into())
+                    })?;
+                info!(log, "adopting a bucket that already exists";
+                    "bucket" => alias,
+                );
+                Ok(bucket.id)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn allow(
@@ -499,4 +580,70 @@ fn restrict(path: &Utf8Path) -> Result<(), GarageError> {
 #[cfg(not(unix))]
 fn restrict(_path: &Utf8Path) -> Result<(), GarageError> {
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn settings(dir: Utf8PathBuf) -> Settings {
+        Settings {
+            dir,
+            s3_port: 3900,
+            admin_port: 3903,
+            rpc_port: 3901,
+            capacity: "1G".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_restart_keeps_the_config_it_already_had() {
+        // The admin token in the config is the one garage's on-disk state was
+        // created under. Generating a fresh one on every boot would lock this
+        // instance out of its own store, and everything in it.
+        let dir = tempfile::TempDir::new().expect("scratch");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8").to_owned();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("garage.toml");
+        let settings = settings(root);
+
+        let first = ensure_config(&path, &settings).expect("first boot");
+        let written = std::fs::read_to_string(&path).expect("read");
+
+        let second = ensure_config(&path, &settings).expect("second boot");
+
+        assert_eq!(
+            first.admin_token, second.admin_token,
+            "a restart must not mint a new admin token",
+        );
+        assert_eq!(
+            written,
+            std::fs::read_to_string(&path).expect("read"),
+            "a restart must not rewrite the config at all",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_config_holds_secrets_and_is_kept_to_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("scratch");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8").to_owned();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("garage.toml");
+
+        ensure_config(&path, &settings(root)).expect("first boot");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn every_kind_that_builds_gets_a_bucket() {
+        // Helios has one before it has anything to put in it, so the day the
+        // driver build produces something there is nowhere for it to be
+        // missing.
+        assert!(KINDS.contains(&"vivado"));
+        assert!(KINDS.contains(&"helios"));
+    }
 }

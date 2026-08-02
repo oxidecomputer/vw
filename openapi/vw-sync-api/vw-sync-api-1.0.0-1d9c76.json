@@ -7,6 +7,39 @@
   },
   "paths": {
     "/environment/{environment}/artifact-target": {
+      "get": {
+        "summary": "Where this instance currently believes its artifacts should go.",
+        "description": "Answers `404` when it has never been told. Lets the service notice an instance that needs configuring — one created before there was a store, or whose store has since been rebuilt with a new key — without pushing credentials at every instance on every restart.",
+        "operationId": "get_artifact_target",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3Credentials"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
       "put": {
         "summary": "Tell this instance where to put the artifacts it builds.",
         "description": "Sent by `vw-svc`, which got it from the instance that runs the store — this one cannot ask directly, since it has no way to know which of its neighbours holds it. Remembered on disk, so a reboot between two builds does not lose the answer.",

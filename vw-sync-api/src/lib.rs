@@ -165,6 +165,21 @@ pub trait VwSyncApi {
         path_params: Path<EnvironmentPathParam>,
     ) -> Result<HttpResponseOk<latest::CleanResult>, HttpError>;
 
+    /// Where this instance currently believes its artifacts should go.
+    ///
+    /// Answers `404` when it has never been told. Lets the service notice an
+    /// instance that needs configuring — one created before there was a store,
+    /// or whose store has since been rebuilt with a new key — without pushing
+    /// credentials at every instance on every restart.
+    #[endpoint {
+        method = GET,
+        path = "/environment/{environment}/artifact-target",
+    }]
+    async fn get_artifact_target(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<latest::S3Credentials>, HttpError>;
+
     /// The key that opens this instance's object store.
     ///
     /// Answered only by the instance that runs the store. The admin credential

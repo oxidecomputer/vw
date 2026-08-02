@@ -20,6 +20,7 @@ mod reconciler;
 mod relay;
 mod tls;
 mod user_api;
+mod wiring;
 
 pub struct Context {
     server_args: ServerArgs,
@@ -202,6 +203,20 @@ async fn serve(args: ServerArgs) {
             "interval_secs" => args.reconcile_interval,
         );
         tokio::spawn(async move { reconciler.run(log).await });
+    }
+
+    // Environments outlive this service, so some of them may have been created
+    // while their instances were still coming up, or have had their object
+    // store rebuilt since. Put them right now rather than waiting for someone
+    // to synchronize source — an environment nobody has synced since the last
+    // restart would otherwise build images that went nowhere.
+    //
+    // In the background: an instance that is down should delay nothing, and
+    // the API can serve while this works through them.
+    {
+        let args = args.clone();
+        let log = log.new(slog::o!("component" => "artifacts"));
+        tokio::spawn(async move { wiring::ensure_all(&args, &log).await });
     }
 
     // Both servers run for the life of the process, so they have to be driven

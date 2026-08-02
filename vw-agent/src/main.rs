@@ -299,6 +299,34 @@ impl VwSyncApi for Agent {
         Ok(HttpResponseOk(result))
     }
 
+    async fn get_artifact_target(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+    ) -> Result<
+        HttpResponseOk<vw_api_types_versions::latest::S3Credentials>,
+        HttpError,
+    > {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        let current = ctx.artifact_target.borrow().clone();
+        let Some(current) = current else {
+            slog::debug!(rqctx.log, "no artifact target has been set");
+            return Err(HttpError::for_not_found(
+                None,
+                String::from(
+                    "this instance has not been told where its \
+                              artifacts go",
+                ),
+            ));
+        };
+
+        Ok(HttpResponseOk(current))
+    }
+
     async fn put_artifact_target(
         rqctx: RequestContext<Self::Context>,
         path_params: dropshot::Path<EnvironmentPathParam>,
