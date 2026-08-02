@@ -53,3 +53,6 @@ banner "build"
 cargo build --release
 mkdir -p /work/release/
 cp target/release/vw /work/release/
+cp target/release/vw-agent /work/release/
+cp target/release/vw-svc /work/release/
+cp target/release/vw-analyzer /work/release/
