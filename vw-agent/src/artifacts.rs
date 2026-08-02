@@ -21,11 +21,26 @@ use camino::{Utf8Path, Utf8PathBuf};
 use slog::{info, warn, Logger};
 use vw_api_types_versions::latest::S3Credentials;
 
-/// The directory a build leaves its images in, under the workspace.
-const IMAGE_DIR: &str = "target/image";
+/// Where a build leaves things worth keeping, and what to keep from each.
+///
+/// Directories under the workspace's `target`, paired with the extension that
+/// matters there. Everything else a build writes — checkpoints, logs, journal
+/// files, the vivado project — is either enormous, only meaningful on the
+/// machine that made it, or both.
+///
+/// `synth`, `place` and `route` each produce an `edif` and they are different
+/// netlists, which is why what goes in the bucket is keyed by the directory
+/// too rather than by file name alone.
+const GATHERED: [(&str, &str); 5] = [
+    ("image", "pdi"),
+    ("reports", "rpt"),
+    ("synth", "edif"),
+    ("place", "edif"),
+    ("route", "edif"),
+];
 
-/// What counts as an artifact worth keeping.
-const EXTENSION: &str = "pdi";
+/// The directory a build writes everything to, under the workspace.
+const BUILD_OUTPUT: &str = "target";
 
 /// How often to look.
 ///
@@ -126,7 +141,11 @@ pub(crate) async fn synchronize(
         };
 
         let mut currently = HashMap::new();
-        for artifact in artifacts(&root) {
+        for Found {
+            path: artifact,
+            key,
+        } in artifacts(&root)
+        {
             // An image is written over seconds, and this looks every second.
             // A file whose size or timestamp moved since the last pass is
             // still being written, and uploading it now would put a truncated
@@ -155,7 +174,6 @@ pub(crate) async fn synchronize(
                 continue;
             }
 
-            let key = artifact.file_name().unwrap_or("artifact").to_owned();
             match upload(&credentials, &key, &artifact).await {
                 Ok(()) => {
                     info!(log, "uploaded an artifact";
@@ -199,22 +217,49 @@ fn stamp(path: &Utf8Path) -> Option<Stamp> {
     })
 }
 
-/// Every artifact currently sitting in the image directory.
-///
-/// Not recursive: images are written flat, and descending would pick up the
-/// intermediate state of whatever wrote them.
-fn artifacts(root: &Utf8Path) -> Vec<Utf8PathBuf> {
-    let directory = root.join(IMAGE_DIR);
-    let Ok(entries) = std::fs::read_dir(&directory) else {
-        return Vec::new();
-    };
+/// One thing worth keeping, and the name it goes under.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Found {
+    /// Where it is on this instance.
+    path: Utf8PathBuf,
+    /// What it is called in the bucket: the path under `target`, so a netlist
+    /// from `synth` and one from `route` stay two different objects rather
+    /// than one overwriting the other.
+    key: String,
+}
 
-    let mut found: Vec<Utf8PathBuf> = entries
-        .flatten()
-        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.path()).ok())
-        .filter(|path| path.is_file())
-        .filter(|path| path.extension() == Some(EXTENSION))
-        .collect();
+/// Everything currently sitting in the directories a build fills.
+///
+/// Not recursive: each of these is written flat, and descending would pick up
+/// the working state of whatever wrote them — vivado's `.runs` scratch under a
+/// stage directory is neither small nor meaningful anywhere else.
+fn artifacts(root: &Utf8Path) -> Vec<Found> {
+    let mut found = Vec::new();
+
+    for (directory, extension) in GATHERED {
+        let source = root.join(BUILD_OUTPUT).join(directory);
+        let Ok(entries) = std::fs::read_dir(&source) else {
+            // A build that has not reached this stage yet, which is the
+            // ordinary case for most of them most of the time.
+            continue;
+        };
+
+        for path in entries
+            .flatten()
+            .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.path()).ok())
+            .filter(|path| path.is_file())
+            .filter(|path| path.extension() == Some(extension))
+        {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            found.push(Found {
+                key: format!("{directory}/{name}"),
+                path,
+            });
+        }
+    }
+
     found.sort();
     found
 }
@@ -302,30 +347,76 @@ mod test {
         }
     }
 
+    /// Put a file where a build would leave it.
+    fn build_output(root: &Utf8Path, relative: &str, contents: &str) {
+        let path = root.join(BUILD_OUTPUT).join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, contents).expect("write");
+    }
+
     #[test]
-    fn only_images_count_as_artifacts() {
+    fn only_what_a_build_produced_counts_as_an_artifact() {
         let (_dir, root) = scratch();
-        let images = root.join(IMAGE_DIR);
-        std::fs::create_dir_all(&images).expect("mkdir");
-        for name in ["top.pdi", "top.bit", "notes.txt", "second.pdi"] {
-            std::fs::write(images.join(name), "contents").expect("write");
+        build_output(&root, "image/top.pdi", "image");
+        build_output(&root, "reports/timing.rpt", "report");
+        build_output(&root, "synth/design.edif", "netlist");
+        // Neither small nor meaningful anywhere else.
+        build_output(&root, "image/top.bit", "bitstream");
+        build_output(&root, "synth/design.dcp", "checkpoint");
+        build_output(&root, "vw-project/project.xpr", "project");
+        build_output(&root, "logs/vivado.log", "log");
+        // A stage's working directory is not ours to send either.
+        build_output(&root, "synth/runs/inner.edif", "scratch");
+
+        let found: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(
+            found,
+            ["image/top.pdi", "reports/timing.rpt", "synth/design.edif",],
+        );
+    }
+
+    #[test]
+    fn a_netlist_from_each_stage_is_its_own_artifact() {
+        // `synth`, `place` and `route` all produce `design.edif` and they are
+        // three different netlists. Keyed by file name alone, whichever
+        // uploaded last would be the only one anybody could ever download.
+        let (_dir, root) = scratch();
+        for stage in ["synth", "place", "route"] {
+            build_output(&root, &format!("{stage}/design.edif"), stage);
         }
-        // A build's intermediate directory, which is not ours to send.
-        std::fs::create_dir_all(images.join("scratch")).expect("mkdir");
-        std::fs::write(images.join("scratch/inner.pdi"), "x").expect("write");
 
-        let found: Vec<String> = artifacts(&root)
-            .iter()
-            .map(|p| p.file_name().unwrap().to_owned())
-            .collect();
+        let found: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
 
-        assert_eq!(found, ["second.pdi", "top.pdi"]);
+        assert_eq!(
+            found,
+            [
+                "place/design.edif",
+                "route/design.edif",
+                "synth/design.edif"
+            ],
+        );
     }
 
     #[test]
     fn an_instance_with_no_build_output_has_nothing_to_send() {
         let (_dir, root) = scratch();
         assert!(artifacts(&root).is_empty());
+    }
+
+    #[test]
+    fn a_build_that_has_only_reached_synthesis_sends_what_it_has() {
+        // Most of the time most stages do not exist yet, and that is not a
+        // condition worth reporting — it is just a build in progress.
+        let (_dir, root) = scratch();
+        build_output(&root, "synth/design.edif", "netlist");
+
+        let found: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(found, ["synth/design.edif"]);
     }
 
     #[test]
@@ -367,9 +458,8 @@ mod test {
         // difference between "finished" and "half there" is the only thing
         // standing between a consumer and a truncated build.
         let (_dir, root) = scratch();
-        let images = root.join(IMAGE_DIR);
-        std::fs::create_dir_all(&images).expect("mkdir");
-        let path = images.join("top.pdi");
+        let path = root.join(BUILD_OUTPUT).join("image/top.pdi");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
 
         std::fs::write(&path, "half").expect("write");
         let half = stamp(&path).expect("stamp");

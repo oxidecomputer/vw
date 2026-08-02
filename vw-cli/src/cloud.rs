@@ -192,6 +192,8 @@ pub enum CloudError {
     AmbiguousEnvironment(Vec<String>),
     #[error("no artifact called '{0}'; run `vw cloud artifacts <env>` to see what there is")]
     NoSuchArtifact(String),
+    #[error("'{0}' is not a name an artifact may be written under")]
+    UnsafeArtifactName(String),
     #[error("scanning {0}")]
     Scan(camino::Utf8PathBuf, #[source] vw_sync::ScanError),
     #[error("reading {0}")]
@@ -886,7 +888,15 @@ async fn download(
         .await
         .map_err(|e| session.error(e))?;
 
-    let path = directory.join(&artifact.name);
+    // An artifact's name carries the stage that produced it — `synth/x.edif`
+    // and `route/x.edif` are different netlists — so the structure is kept on
+    // the way down rather than flattened into collisions.
+    let path = directory.join(safe_name(&artifact.name)?);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CloudError::KeyDir(parent.to_owned(), e))?;
+    }
+
     // Written as it arrives rather than collected first: an image runs to
     // hundreds of megabytes and there is no reason for it to be in memory on
     // the way past.
@@ -910,6 +920,28 @@ async fn download(
     );
 
     Ok(())
+}
+
+/// An artifact's name, once it has been established that it is only a name.
+///
+/// The name becomes a path on the developer's machine, and it arrives from a
+/// service. Nothing we run puts anything strange in it, but "nothing we run"
+/// is not the same as "nothing", and a download that can write outside the
+/// directory it was pointed at is the kind of thing that is obvious only
+/// afterwards.
+fn safe_name(name: &str) -> Result<&str, CloudError> {
+    let refused = || CloudError::UnsafeArtifactName(name.to_owned());
+
+    if name.is_empty() || name.starts_with('/') || name.contains('\\') {
+        return Err(refused());
+    }
+    for component in name.split('/') {
+        if component.is_empty() || component == ".." || component == "." {
+            return Err(refused());
+        }
+    }
+
+    Ok(name)
 }
 
 /// A byte count as a person would say it.
