@@ -129,8 +129,38 @@ pub struct ReplOptions {
     pub variant: Option<String>,
 }
 
+/// Where the vivado backing a REPL session runs.
+///
+/// Passed alongside [`ReplOptions`] rather than inside it: the options are
+/// cloned and debug-printed, and a live backend is neither. Everything above
+/// this — the editor, the scrollback, the symbol index, the diagnostics — is
+/// the same either way, because all of it is about the source on this machine.
+#[derive(Default)]
+pub enum Worker {
+    /// Spawn one on this machine, as `vw repl` always has.
+    #[default]
+    Local,
+    /// Drive one already running on an instance.
+    Remote {
+        /// The session, already opened.
+        backend: Box<dyn vw_eda::EdaBackend + Send>,
+        /// How to cut short a running command.
+        ///
+        /// Carried separately because the backend is borrowed for as long as
+        /// a command is in flight, and Ctrl-C has to work precisely then.
+        interrupt: Interrupt,
+    },
+}
+
+/// How to stop whatever the worker is running.
+///
+/// A local session signals vivado's process group; a remote one asks the
+/// instance to. The REPL does not need to know which, only that Ctrl-C during
+/// an eval means calling this.
+pub type Interrupt = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// Run the REPL until the user exits. Owns the terminal alternate
 /// screen for the duration; restores it on every exit path.
-pub async fn run(opts: ReplOptions) -> Result<(), ReplError> {
-    app::run(opts).await
+pub async fn run(opts: ReplOptions, worker: Worker) -> Result<(), ReplError> {
+    app::run(opts, worker).await
 }

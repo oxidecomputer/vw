@@ -20,9 +20,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use vw_eda::{EdaBackend, Request, RequestOp};
+use vw_eda::{EdaBackend, RequestOp};
 
-use crate::protocol::{SessionEvent, SessionParams};
+use crate::protocol::{SessionEvent, SessionParams, SessionRequest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -72,7 +72,19 @@ where
     });
 
     let result = match start(&events, root, &params).await {
-        Ok(backend) => drive(&mut incoming, &events, Box::new(backend)).await,
+        Ok(backend) => {
+            // Built before anything is running, because interrupting means
+            // reaching the worker while the backend is borrowed by the very
+            // command being interrupted.
+            let pid = backend.child_pid();
+            let interrupt: Interrupter = Box::new(move || match pid {
+                Some(pid) => vw_vivado::interrupt_process_group(pid),
+                None => tracing::warn!(
+                    "asked to interrupt, but the worker has no pid to signal"
+                ),
+            });
+            drive(&mut incoming, &events, Box::new(backend), interrupt).await
+        }
         Err(e) => Err(e),
     };
 
@@ -99,12 +111,17 @@ async fn drive<S>(
     incoming: &mut futures::stream::SplitStream<WebSocketStream<S>>,
     events: &UnboundedSender<SessionEvent>,
     mut backend: Box<dyn EdaBackend>,
+    interrupt: Interrupter,
 ) -> Result<(), SessionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     while let Some(message) = incoming.next().await {
-        let message = message.map_err(SessionError::Socket)?;
+        // A read failure here means the client went away between commands —
+        // a terminal closed, a laptop shut, a Ctrl-C at an idle prompt. It
+        // ends the session, but calling it a failure would put an error in
+        // the log for every developer who finished what they were doing.
+        let Ok(message) = message else { break };
 
         let text = match message {
             Message::Text(text) => text,
@@ -121,8 +138,12 @@ where
             _ => continue,
         };
 
-        let request: Request = match serde_json::from_str(&text) {
-            Ok(request) => request,
+        let request = match serde_json::from_str::<SessionRequest>(&text) {
+            Ok(SessionRequest::Run { request }) => request,
+            // Nothing is running, so there is nothing to stop. A Ctrl-C that
+            // lands in the gap between commands is the ordinary case of
+            // pressing it at an idle prompt.
+            Ok(SessionRequest::Interrupt) => continue,
             Err(e) => {
                 tracing::warn!("discarding an unreadable request: {e}");
                 continue;
@@ -133,14 +154,39 @@ where
         let id = request.id;
 
         // The command and the socket are watched together. A synthesis run
-        // takes minutes, and for all of them the developer may press Ctrl-C —
-        // so the socket cannot go unread until the command finishes, or the
-        // answer to "stop" would be "in a little while". Nothing else arrives
-        // mid-command: a request is answered before the next is sent, so
-        // anything on the socket now is the client leaving.
-        let outcome = tokio::select! {
-            result = backend.send(request) => Ran(result),
-            () = client_left(incoming) => Left,
+        // takes minutes, and for all of them the developer may press Ctrl-C or
+        // close the lid — so the socket cannot go unread until the command
+        // finishes, or the answer to "stop" would be "in a little while".
+        //
+        // The command's future is pinned outside the loop so that handling an
+        // interrupt does not cancel it. That matters: an interrupt is meant to
+        // make the command come back with an error, and the session carries on
+        // with everything the developer had loaded. Dropping the future would
+        // throw away the answer they are waiting for.
+        // Scoped so the borrow of `backend` ends with the command, leaving
+        // it free to be dropped below if the developer has gone.
+        let outcome = {
+            let running = backend.send(request);
+            tokio::pin!(running);
+
+            loop {
+                let interruption = tokio::select! {
+                    result = &mut running => break Ran(result),
+                    interruption = next_interruption(incoming) => interruption,
+                };
+
+                match interruption {
+                    Interruption::Left => break Left,
+                    Interruption::Interrupt => {
+                        // Exactly what the developer's own terminal would do
+                        // if vivado were on their machine: its Tcl traps
+                        // SIGINT into `interp cancel`, so the eval aborts and
+                        // the interpreter lives.
+                        tracing::info!("interrupting request {id}");
+                        interrupt();
+                    }
+                }
+            }
         };
 
         match outcome {
@@ -191,23 +237,53 @@ enum Outcome {
     Left,
 }
 
-/// Resolve when there is no longer a client on the other end.
+/// How to cut short whatever the worker is running.
 ///
-/// A close frame is the polite version; a connection that simply ends is what
-/// happens when the process is killed outright. Neither leaves anyone to send
-/// an answer to, so they are the same event.
-async fn client_left<S>(
+/// Injected rather than derived from the worker so that the behaviour worth
+/// testing — an interrupt reaching a command that is already in flight — does
+/// not need a real process to signal.
+type Interrupter = Box<dyn Fn() + Send>;
+
+/// Why a running command's peace was disturbed.
+enum Interruption {
+    /// The developer asked for it to stop.
+    Interrupt,
+    /// There is no developer any more.
+    Left,
+}
+
+/// Resolve when something arrives for a command that is already running.
+///
+/// A close frame is the polite way a client leaves; a connection that simply
+/// ends is what happens when the process is killed outright. Neither leaves
+/// anyone to send an answer to, so they are the same event.
+async fn next_interruption<S>(
     incoming: &mut futures::stream::SplitStream<WebSocketStream<S>>,
-) where
+) -> Interruption
+where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     loop {
-        match incoming.next().await {
-            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
-            // Anything else would be a client talking over its own
-            // outstanding request. There is nothing useful to do with it and
-            // it is not a reason to abandon the command.
+        let message = match incoming.next().await {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
+                return Interruption::Left
+            }
+            Some(Ok(Message::Text(text))) => text,
+            // Anything else is not something a client sends while it is
+            // waiting on an answer, and is not a reason to disturb the
+            // command.
             Some(Ok(_)) => continue,
+        };
+
+        match serde_json::from_str::<SessionRequest>(&message) {
+            Ok(SessionRequest::Interrupt) => return Interruption::Interrupt,
+            // A second command while the first is outstanding. The protocol
+            // does not allow it and acting on it would interleave two evals
+            // in one interpreter.
+            Ok(SessionRequest::Run { .. }) => {
+                tracing::warn!("ignoring a request sent over a running one");
+            }
+            Err(e) => tracing::warn!("discarding an unreadable message: {e}"),
         }
     }
 }
@@ -346,8 +422,61 @@ mod test {
     use futures::SinkExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::tungstenite::protocol::Role;
+    use vw_eda::Request;
 
     use super::*;
+
+    /// A worker whose command can be cut short, the way vivado's can.
+    ///
+    /// Stands in for the real mechanism without needing a process to signal:
+    /// the session normally interrupts by sending SIGINT to vivado's process
+    /// group, and what the caller observes is the eval coming back early with
+    /// the interpreter still alive.
+    struct InterruptibleWorker {
+        cancelled: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl EdaBackend for InterruptibleWorker {
+        fn name(&self) -> &str {
+            "interruptible"
+        }
+
+        async fn eval(
+            &mut self,
+            _tcl: &str,
+        ) -> Result<vw_eda::EvalOutput, vw_eda::BackendError> {
+            unreachable!("the session only ever calls send")
+        }
+
+        async fn send(
+            &mut self,
+            request: Request,
+        ) -> Result<vw_eda::Response, vw_eda::BackendError> {
+            tokio::select! {
+                () = self.cancelled.notified() => Ok(vw_eda::Response::err(
+                    request.id,
+                    vw_eda::ErrorPayload {
+                        message: "interrupted".to_owned(),
+                        code: None,
+                        info: None,
+                    },
+                )),
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    Ok(vw_eda::Response::ok(
+                        request.id,
+                        serde_json::json!("ran to completion"),
+                    ))
+                }
+            }
+        }
+
+        fn set_stdout_sink(&mut self, _sink: vw_eda::StdoutSink) {}
+
+        async fn shutdown(&mut self) -> Result<(), vw_eda::BackendError> {
+            Ok(())
+        }
+    }
 
     /// A worker that takes a very long time and notices being dropped.
     ///
@@ -415,9 +544,14 @@ mod test {
             .await;
             let (_outgoing, mut incoming) = socket.split();
             let (events, _drain) = mpsc::unbounded_channel();
-            drive(&mut incoming, &events, Box::new(SlowWorker { killed }))
-                .await
-                .expect("drive");
+            drive(
+                &mut incoming,
+                &events,
+                Box::new(SlowWorker { killed }),
+                Box::new(|| {}),
+            )
+            .await
+            .expect("drive");
         });
 
         let stream = TcpStream::connect(address).await.expect("connect");
@@ -432,16 +566,109 @@ mod test {
     }
 
     #[tokio::test]
+    async fn an_interrupt_reaches_a_command_that_is_already_running() {
+        // The REPL's Ctrl-C. It has to arrive while the command is in flight —
+        // an interrupt delivered after the thing it was meant to stop has
+        // finished is not an interrupt — and the command must come back with
+        // an error rather than the session being torn down, because the
+        // developer still has an hour of loaded state in it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&cancelled);
+
+        let served = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                stream,
+                Role::Server,
+                None,
+            )
+            .await;
+            let (_outgoing, mut incoming) = socket.split();
+            let (events, mut seen) = mpsc::unbounded_channel();
+
+            let worker = InterruptibleWorker {
+                cancelled: Arc::clone(&signal),
+            };
+            let interrupt: Interrupter =
+                Box::new(move || signal.notify_waiters());
+
+            drive(&mut incoming, &events, Box::new(worker), interrupt)
+                .await
+                .expect("drive");
+
+            drop(events);
+            let mut collected = Vec::new();
+            while let Some(event) = seen.recv().await {
+                collected.push(event);
+            }
+            collected
+        });
+
+        let stream = TcpStream::connect(address).await.expect("connect");
+        let mut client = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            stream,
+            Role::Client,
+            None,
+        )
+        .await;
+
+        client
+            .send(Message::Text(
+                serde_json::to_string(&SessionRequest::Run {
+                    request: Request {
+                        id: 1,
+                        op: RequestOp::Eval {
+                            tcl: "synth_design".to_owned(),
+                        },
+                    },
+                })
+                .expect("encode"),
+            ))
+            .await
+            .expect("send");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client
+            .send(Message::Text(
+                serde_json::to_string(&SessionRequest::Interrupt)
+                    .expect("encode"),
+            ))
+            .await
+            .expect("interrupt");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(client);
+
+        let events = tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the command should have been cut short")
+            .expect("session task");
+
+        // It answered — with an error, as an interrupted eval does — rather
+        // than running its full thirty seconds.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SessionEvent::Response(r)
+                    if matches!(r.result, vw_eda::ResponseResult::Err { .. })
+            )),
+            "expected an interrupted response, got {events:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn a_client_that_leaves_takes_the_worker_with_it() {
         let killed = Arc::new(AtomicBool::new(false));
         let (served, mut client) = session(Arc::clone(&killed)).await;
 
         // Ask for something long, then walk away — the developer pressing
         // Ctrl-C twenty seconds into a synthesis run.
-        let request = Request {
-            id: 1,
-            op: RequestOp::Eval {
-                tcl: "synth_design".to_owned(),
+        let request = SessionRequest::Run {
+            request: Request {
+                id: 1,
+                op: RequestOp::Eval {
+                    tcl: "synth_design".to_owned(),
+                },
             },
         };
         client
@@ -474,10 +701,12 @@ mod test {
         let killed = Arc::new(AtomicBool::new(false));
         let (served, mut client) = session(Arc::clone(&killed)).await;
 
-        let request = Request {
-            id: 1,
-            op: RequestOp::Eval {
-                tcl: "synth_design".to_owned(),
+        let request = SessionRequest::Run {
+            request: Request {
+                id: 1,
+                op: RequestOp::Eval {
+                    tcl: "synth_design".to_owned(),
+                },
             },
         };
         client

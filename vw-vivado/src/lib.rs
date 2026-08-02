@@ -28,7 +28,9 @@ pub use selection::{resolve_workspace_selection, Selection};
 pub use stream::{
     severity_of, stream_kind_for, Block, BlockAccumulator, LogLevel, Severity,
 };
-pub use worker::{AutoProject, VivadoBackend, VivadoConfig};
+pub use worker::{
+    interrupt_process_group, AutoProject, VivadoBackend, VivadoConfig,
+};
 
 // Re-exported so the many call sites that reach for `vw_vivado::StreamKind`
 // keep working now that streaming belongs to the backend abstraction rather

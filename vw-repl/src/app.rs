@@ -34,7 +34,6 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tui_textarea::{Input, TextArea};
-use vw_eda::EdaBackend;
 
 use crate::config::{self, CollapseMode};
 use crate::history::History;
@@ -456,14 +455,14 @@ pub struct App {
     /// editor handoff. See [`crate::popup`].
     popup: Option<crate::popup::PopupState>,
     worker_state: WorkerState,
-    /// Vivado child's OS pid, cached from `WorkerEvent::Started`.
-    /// Consulted by the Ctrl-C handler to send SIGINT for eval
-    /// cancellation without going through `worker_tx` (which is
-    /// blocked by the in-flight `backend.eval` we'd be trying to
-    /// cancel). `None` before Started, or when the PTY layer
-    /// couldn't report a pid — in either case Ctrl-C falls back
-    /// to its non-eval behavior (clear the current input).
-    child_pid: Option<u32>,
+    /// How to cancel the eval in flight, cached from
+    /// `WorkerEvent::Started`. Called by the Ctrl-C handler rather
+    /// than going through `worker_tx`, which is blocked by the very
+    /// eval being cancelled. `None` before Started — in which case
+    /// Ctrl-C falls back to its non-eval behavior (clear the current
+    /// input). Local sessions signal vivado's process group; remote
+    /// ones ask the instance to do the same thing.
+    interrupt: Option<crate::Interrupt>,
     worker_tx: mpsc::Sender<WorkerCmd>,
     eval_rx: mpsc::UnboundedReceiver<WorkerEvent>,
     /// Sender-side of the worker-event channel, kept on App so
@@ -558,7 +557,7 @@ enum WorkerEvent {
     /// PTY layer couldn't report a pid — cancellation degrades
     /// to a no-op in that case.
     Started {
-        child_pid: Option<u32>,
+        interrupt: crate::Interrupt,
     },
     /// One streaming chunk from the worker, with its source-of-
     /// origin tag so the UI can render Vivado WARNING/ERROR lines
@@ -595,7 +594,10 @@ enum WorkerEvent {
     },
 }
 
-pub async fn run(opts: ReplOptions) -> Result<(), ReplError> {
+pub async fn run(
+    opts: ReplOptions,
+    worker: crate::Worker,
+) -> Result<(), ReplError> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -626,7 +628,7 @@ pub async fn run(opts: ReplOptions) -> Result<(), ReplError> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_inner(&mut terminal, opts).await;
+    let result = run_inner(&mut terminal, opts, worker).await;
 
     disable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -642,6 +644,7 @@ pub async fn run(opts: ReplOptions) -> Result<(), ReplError> {
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     opts: ReplOptions,
+    worker: crate::Worker,
 ) -> Result<(), ReplError> {
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCmd>(8);
     let (event_tx, eval_rx) = mpsc::unbounded_channel::<WorkerEvent>();
@@ -707,6 +710,7 @@ async fn run_inner(
         opts.variant.clone(),
         rpc_workspace_root,
         preload.clone(),
+        worker,
     ));
 
     let mut app = App::new(
@@ -843,7 +847,7 @@ impl App {
             reverse_search: None,
             popup: None,
             worker_state: WorkerState::Starting,
-            child_pid: None,
+            interrupt: None,
             worker_tx,
             eval_rx,
             event_tx,
@@ -2217,24 +2221,16 @@ impl App {
                 // - **No eval running**: clear the current input
                 //   (reedline / readline convention).
                 if matches!(self.worker_state, WorkerState::Running) {
-                    if let Some(pid) = self.child_pid {
-                        // Signal the process GROUP, not the process.
-                        // Vivado's on-disk binary is a bash wrapper
-                        // that forks loader+Vivado as children without
-                        // `exec`, so `kill(pid, SIGINT)` would only
-                        // hit bash and bash won't forward it. See
-                        // `VivadoBackend::interrupt` for the full
-                        // writeup — we mirror the same `-pid`
-                        // negation here rather than round-tripping
-                        // through the worker channel (which is
-                        // blocked on the very eval we're cancelling).
-                        //
-                        // SAFETY: kill on a pgid we spawned. ESRCH
-                        // (empty group / race with child exit) is a
-                        // silent no-op.
-                        unsafe {
-                            libc::kill(-(pid as libc::pid_t), libc::SIGINT);
-                        }
+                    if let Some(interrupt) = self.interrupt.clone() {
+                        // Called directly rather than round-tripped
+                        // through the worker channel, which is blocked
+                        // on the very eval being cancelled. A local
+                        // session signals Vivado's process group; a
+                        // remote one asks the instance to do the same.
+                        // Either way the eval aborts and the
+                        // interpreter — with everything loaded into it
+                        // — survives.
+                        interrupt();
                         self.push(
                             ScrollbackKind::Notice,
                             "interrupt sent — Vivado will abort the \
@@ -3005,9 +3001,9 @@ impl App {
 
     async fn handle_worker_event(&mut self, event: WorkerEvent) {
         match event {
-            WorkerEvent::Started { child_pid } => {
+            WorkerEvent::Started { interrupt } => {
                 self.worker_state = WorkerState::Ready;
-                self.child_pid = child_pid;
+                self.interrupt = Some(interrupt);
                 self.push(ScrollbackKind::Notice, "vivado ready".into());
                 // `initial_source` (e.g. from
                 // `--from-*-checkpoint`) is a literal htcl snippet
@@ -3785,6 +3781,7 @@ async fn worker_task(
     variant: Option<String>,
     rpc_workspace_root: Option<std::path::PathBuf>,
     preload: vw_vivado::SharedPreload,
+    worker: crate::Worker,
 ) {
     // Auto-project bootstrap: same rule as `vw run`. If the
     // enclosing workspace declares `[[target-parts]]` or
@@ -3857,26 +3854,46 @@ async fn worker_task(
         preload,
         cw_count.clone(),
     );
-    let backend = vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
-        verbose,
-        verbose_log,
-        info_with_stack,
-        rpc_handler: Some(rpc_handler),
-        auto_project,
-        raw_log,
-        ..Default::default()
-    })
-    .await;
-    let mut backend = match backend {
-        Ok(b) => {
-            let _ = tx.send(WorkerEvent::Started {
-                child_pid: b.child_pid(),
-            });
-            b
+    // Everything assembled above — the RPC handler, the project, the raw log —
+    // is for a vivado on this machine. A remote session's instance built its
+    // own from the tree it is holding, because every one of those answers is
+    // about where the files are, and the files are there.
+    let mut backend: Box<dyn vw_eda::EdaBackend + Send> = match worker {
+        crate::Worker::Local => {
+            let spawned =
+                vw_vivado::VivadoBackend::spawn(vw_vivado::VivadoConfig {
+                    verbose,
+                    verbose_log,
+                    info_with_stack,
+                    rpc_handler: Some(rpc_handler),
+                    auto_project,
+                    raw_log,
+                    ..Default::default()
+                })
+                .await;
+            match spawned {
+                Ok(b) => {
+                    // Vivado's on-disk binary forks its real process without
+                    // `exec`, so cancelling means signalling the group. The
+                    // reasoning lives in `vw_vivado::interrupt_process_group`.
+                    let interrupt: crate::Interrupt = match b.child_pid() {
+                        Some(pid) => std::sync::Arc::new(move || {
+                            vw_vivado::interrupt_process_group(pid)
+                        }),
+                        None => std::sync::Arc::new(|| {}),
+                    };
+                    let _ = tx.send(WorkerEvent::Started { interrupt });
+                    Box::new(b)
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerEvent::StartFailed(e));
+                    return;
+                }
+            }
         }
-        Err(e) => {
-            let _ = tx.send(WorkerEvent::StartFailed(e));
-            return;
+        crate::Worker::Remote { backend, interrupt } => {
+            let _ = tx.send(WorkerEvent::Started { interrupt });
+            backend
         }
     };
 

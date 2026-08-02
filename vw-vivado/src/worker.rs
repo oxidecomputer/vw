@@ -706,15 +706,7 @@ impl VivadoBackend {
     #[cfg(unix)]
     pub fn interrupt(&self) -> Option<u32> {
         let pid = self.child_pid()?;
-        // SAFETY: `libc::kill(-pid, SIGINT)` on a process group
-        // we spawned. Negative pid selects the pgid. The only
-        // failure modes documented for the syscall are EPERM
-        // (we don't own the group — impossible here, we're the
-        // parent) and ESRCH (the group is empty — handled as a
-        // silent no-op; race window with child exit is benign).
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGINT);
-        }
+        interrupt_process_group(pid);
         Some(pid)
     }
 
@@ -1566,6 +1558,34 @@ impl Drop for VivadoBackend {
         // dropped and the read returns EOF.
     }
 }
+
+/// Cancel whatever the vivado at `pid` is running, without killing it.
+///
+/// Split out from [`VivadoBackend::interrupt`] because the two callers cannot
+/// both hold the backend. An interactive session interrupts from the UI while
+/// an eval has the backend borrowed, and an agent interrupts on behalf of a
+/// developer whose keyboard is on another continent — neither can take a
+/// `&mut`, and the part that is easy to get wrong should exist once.
+///
+/// Unix-only. Windows has no analogue that reliably reaches the child's Tcl
+/// signal handler, and every vw interactive user is on Unix.
+#[cfg(unix)]
+pub fn interrupt_process_group(pid: u32) {
+    // SAFETY: `libc::kill(-pid, SIGINT)` on a process group we spawned.
+    // Negative pid selects the pgid — necessary because vivado's on-disk
+    // binary is a bash wrapper that forks loader+vivado as children without
+    // `exec`, so signalling the pid alone would only reach bash, which does
+    // not forward it. The documented failures are EPERM (we don't own the
+    // group — impossible, we are the parent) and ESRCH (the group is empty —
+    // a benign race with the child exiting).
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGINT);
+    }
+}
+
+/// Windows stub. See the unix variant.
+#[cfg(not(unix))]
+pub fn interrupt_process_group(_pid: u32) {}
 
 /// Pump Vivado's PTY output in the background.
 ///

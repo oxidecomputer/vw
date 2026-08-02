@@ -21,6 +21,6 @@ mod backend;
 pub mod protocol;
 mod session;
 
-pub use backend::{NoteSink, RemoteBackend};
+pub use backend::{InterruptHandle, NoteSink, RemoteBackend};
 pub use protocol::{SessionEvent, SessionParams, SessionRequest};
 pub use session::{serve, workspace_root, SessionError};

@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use vw_eda::{EdaBackend, StreamKind};
-use vw_remote::{RemoteBackend, SessionEvent};
+use vw_remote::{RemoteBackend, SessionEvent, SessionRequest};
 
 /// How long the pretend worker waits between chunks.
 const GAP: Duration = Duration::from_millis(200);
@@ -34,10 +34,15 @@ async fn agent_that_dawdles(chunks: Vec<(StreamKind, &'static str)>) -> String {
             WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
 
         // Wait to be asked for something.
-        let request = socket.next().await.expect("a request").expect("frame");
-        let request: vw_eda::Request = match request {
+        let frame = socket.next().await.expect("a request").expect("frame");
+        let request = match frame {
             Message::Text(text) => {
-                serde_json::from_str(&text).expect("a request")
+                match serde_json::from_str::<SessionRequest>(&text)
+                    .expect("a request")
+                {
+                    SessionRequest::Run { request } => request,
+                    other => panic!("unexpected request: {other:?}"),
+                }
             }
             other => panic!("unexpected frame: {other:?}"),
         };

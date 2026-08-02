@@ -669,20 +669,12 @@ pub async fn open_vivado_session(
     )
     .await;
 
-    let mut backend = vw_remote::RemoteBackend::new(socket);
-
-    // What the instance is doing before it can run anything. Locally this
-    // stretch is silent too, but locally the developer knows why — the
-    // machine's fans are audible and vivado is in their process list. Across a
-    // network the same silence looks like a hang, and the wait is longer.
-    // Rendered the way the same notes are rendered on a local run — several
-    // of them are literally the same notes, produced by the same workspace
-    // resolution — so a developer moving between the two reads one thing.
-    backend.set_note_sink(Box::new(|message: &str| {
-        eprintln!("{} {message}", "info:".cyan());
-    }));
-
-    Ok(backend)
+    // No note sink here: where an instance's progress reports belong depends
+    // on who is asking. A one-shot run writes them to stderr. A full-screen
+    // REPL must not — anything written straight to the terminal lands in the
+    // middle of a frame it does not control — so it leaves this unset and the
+    // reports fall through to its scrollback instead.
+    Ok(vw_remote::RemoteBackend::new(socket))
 }
 
 /// Which environment a bare `vw run` should use.

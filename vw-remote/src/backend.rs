@@ -19,10 +19,33 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use vw_eda::{
     BackendError, EdaBackend, EvalOutput, Request, RequestOp, Response,
-    ResponseResult, StdoutSink,
+    ResponseResult, StdoutSink, StreamKind,
 };
 
-use crate::protocol::SessionEvent;
+use crate::protocol::{SessionEvent, SessionRequest};
+
+/// A way to stop whatever the worker is running, usable while it is running.
+///
+/// Cloneable and independent of the backend on purpose. The backend is
+/// borrowed for as long as an eval is in flight, so anything that had to go
+/// through it could only interrupt a command that had already finished — which
+/// is not an interrupt, it is a coincidence.
+#[derive(Clone)]
+pub struct InterruptHandle {
+    outgoing: tokio::sync::mpsc::UnboundedSender<SessionRequest>,
+}
+
+impl InterruptHandle {
+    /// Ask the instance to abandon what it is running.
+    ///
+    /// Best effort by nature: the command may finish on its own between this
+    /// being sent and it arriving, and a session that has already ended has
+    /// nothing to interrupt. Neither is worth reporting to somebody who just
+    /// pressed Ctrl-C.
+    pub fn interrupt(&self) {
+        let _ = self.outgoing.send(SessionRequest::Interrupt);
+    }
+}
 
 /// Where an agent's progress reports go.
 ///
@@ -35,7 +58,10 @@ pub type NoteSink = Box<dyn FnMut(&str) + Send>;
 
 /// A Vivado worker reached over a session.
 pub struct RemoteBackend<S> {
-    socket: WebSocketStream<S>,
+    incoming: futures::stream::SplitStream<WebSocketStream<S>>,
+    /// Everything leaving here goes through one task, so that a Ctrl-C can be
+    /// sent while an eval is still outstanding.
+    outgoing: tokio::sync::mpsc::UnboundedSender<SessionRequest>,
     stdout_sink: Option<StdoutSink>,
     note_sink: Option<NoteSink>,
     next_id: u64,
@@ -49,13 +75,40 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     /// Drive the worker on the far end of `socket`.
-    pub fn new(socket: WebSocketStream<S>) -> RemoteBackend<S> {
+    pub fn new(socket: WebSocketStream<S>) -> RemoteBackend<S>
+    where
+        S: 'static,
+    {
+        let (mut sink, incoming) = socket.split();
+        let (outgoing, mut to_send) =
+            tokio::sync::mpsc::unbounded_channel::<SessionRequest>();
+
+        tokio::spawn(async move {
+            while let Some(request) = to_send.recv().await {
+                let Ok(text) = serde_json::to_string(&request) else {
+                    continue;
+                };
+                if sink.send(Message::Text(text)).await.is_err() {
+                    break;
+                }
+            }
+            let _ = sink.close().await;
+        });
+
         RemoteBackend {
-            socket,
+            incoming,
+            outgoing,
             stdout_sink: None,
             note_sink: None,
             next_id: 1,
             fatal: None,
+        }
+    }
+
+    /// A handle for interrupting whatever this is running.
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            outgoing: self.outgoing.clone(),
         }
     }
 
@@ -65,12 +118,12 @@ where
         id
     }
 
-    async fn write(&mut self, request: &Request) -> Result<(), BackendError> {
-        let text = serde_json::to_string(request)?;
-        self.socket
-            .send(Message::Text(text))
-            .await
-            .map_err(|e| BackendError::Worker(format!("sending request: {e}")))
+    fn write(&mut self, request: Request) -> Result<(), BackendError> {
+        self.outgoing
+            .send(SessionRequest::Run { request })
+            .map_err(|_| {
+                BackendError::Worker("the session has ended".to_owned())
+            })
     }
 
     /// Read until the answer to `id` arrives, feeding everything else where it
@@ -88,7 +141,7 @@ where
         let mut stdout = String::new();
 
         loop {
-            let message = self.socket.next().await.ok_or_else(|| {
+            let message = self.incoming.next().await.ok_or_else(|| {
                 BackendError::Worker(
                     "the session ended before the command answered".to_owned(),
                 )
@@ -122,9 +175,16 @@ where
                     }
                 }
                 SessionEvent::Note { message } => {
-                    match self.note_sink.as_mut() {
-                        Some(sink) => sink(&message),
-                        None => tracing::info!("{message}"),
+                    // A caller with somewhere particular to put these gets
+                    // them there. Otherwise they join the output, which is
+                    // what a full-screen caller wants: it has scrollback and
+                    // no stderr to write to without tearing its own display.
+                    if let Some(sink) = self.note_sink.as_mut() {
+                        sink(&message);
+                    } else if let Some(sink) = self.stdout_sink.as_mut() {
+                        sink(StreamKind::Info, &format!("{message}\n"));
+                    } else {
+                        tracing::info!("{message}");
                     }
                 }
                 SessionEvent::Response(response) if response.id == id => {
@@ -184,11 +244,10 @@ where
         self.check_alive()?;
 
         let id = self.alloc_id();
-        self.write(&Request {
+        self.write(Request {
             id,
             op: RequestOp::Eval { tcl: tcl.into() },
-        })
-        .await?;
+        })?;
 
         let (response, stdout) = self.read_until(id).await?;
 
@@ -219,7 +278,7 @@ where
             request.id = self.alloc_id();
         }
         let id = request.id;
-        self.write(&request).await?;
+        self.write(request)?;
         let (response, _stdout) = self.read_until(id).await?;
         Ok(response)
     }
@@ -236,16 +295,13 @@ where
         }
 
         let id = self.alloc_id();
-        let _ = self
-            .write(&Request {
-                id,
-                op: RequestOp::Shutdown,
-            })
-            .await;
+        let _ = self.write(Request {
+            id,
+            op: RequestOp::Shutdown,
+        });
         // The far end tears Vivado down and closes; either an answer or the
         // close will end this, and neither is worth failing over.
         let _ = self.read_until(id).await;
-        let _ = self.socket.close(None).await;
 
         Ok(())
     }

@@ -293,6 +293,25 @@ enum Commands {
     )]
     Repl {
         #[arg(
+            long,
+            help = "Run vivado on this machine instead of in a cloud \
+                    environment"
+        )]
+        local: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to run in. Only needed when you have \
+                    more than one."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+        #[arg(
             long = "log-level",
             value_enum,
             default_value_t = CliLogLevel::Info,
@@ -927,6 +946,9 @@ async fn main() {
             vw_analyzer::run_stdio().await;
         }
         Commands::Repl {
+            local,
+            env,
+            insecure,
             log_level,
             initial_load,
             from_synth_checkpoint,
@@ -993,14 +1015,36 @@ async fn main() {
                 });
                 (resolved, None)
             };
-            if let Err(e) = vw_repl::run(vw_repl::ReplOptions {
-                log_level: log_level.into(),
-                initial_load: resolved_load,
-                initial_source,
-                part,
-                variant,
-                info_with_stack,
-            })
+            // Cloud first, the same as `vw run`: the session drives the
+            // vivado where this workspace builds. Resolved before the
+            // alternate screen goes up, so a sync or a service problem is
+            // reported on an ordinary terminal rather than flashing past
+            // inside a TUI that is about to exit.
+            let worker = if local {
+                vw_repl::Worker::Local
+            } else {
+                match remote_worker(env.as_deref(), insecure, &part, &variant)
+                    .await
+                {
+                    Ok(worker) => worker,
+                    Err(e) => {
+                        eprintln!("{} {e}", "error:".bright_red());
+                        process::exit(1);
+                    }
+                }
+            };
+
+            if let Err(e) = vw_repl::run(
+                vw_repl::ReplOptions {
+                    log_level: log_level.into(),
+                    initial_load: resolved_load,
+                    initial_source,
+                    part,
+                    variant,
+                    info_with_stack,
+                },
+                worker,
+            )
             .await
             {
                 eprintln!("{} {e}", "error:".bright_red());
@@ -2847,6 +2891,59 @@ fn overload_specialization_mangle(
 
 /// Thin loader wrapper: resolve the entry's `src` imports into one
 /// flattened program, then hand it to [`run_loaded_program`].
+/// Open a vivado session on this workspace's cloud environment, for the REPL.
+///
+/// Falls back to a local worker when no service can be reached, with a warning
+/// — the same bargain `vw run` strikes, and for the same reason: a developer
+/// on a train should still get a REPL, but not silently one that is not the
+/// one they meant.
+async fn remote_worker(
+    named: Option<&str>,
+    insecure: bool,
+    part: &Option<String>,
+    variant: &Option<String>,
+) -> Result<vw_repl::Worker, Box<dyn std::error::Error>> {
+    let session = cloud::Session::from_env(insecure)?;
+
+    let environment = match cloud::pick_environment(&session, named).await {
+        Ok(environment) => environment,
+        Err(e) if cloud::Session::unreachable(&e) => {
+            eprintln!(
+                "{} no vw service reachable ({e}); running vivado on this \
+                 machine",
+                "warning:".yellow(),
+            );
+            return Ok(vw_repl::Worker::Local);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // The instance builds what it was last given, so give it this before the
+    // first eval can ask for it.
+    cloud::sync_for_build(&session, &environment).await?;
+
+    let backend = cloud::open_vivado_session(
+        &session,
+        &environment,
+        vw_remote::SessionParams {
+            part: part.clone(),
+            variant: variant.clone(),
+            info_with_stack: false,
+            verbose: false,
+        },
+    )
+    .await?;
+
+    // Taken before the backend is handed over, because once an eval is in
+    // flight the backend is borrowed and Ctrl-C has to work precisely then.
+    let handle = backend.interrupt_handle();
+
+    Ok(vw_repl::Worker::Remote {
+        backend: Box::new(backend),
+        interrupt: std::sync::Arc::new(move || handle.interrupt()),
+    })
+}
+
 /// Remove build output, wherever this workspace builds.
 ///
 /// Cloud first, like `vw run`: what gets cleaned is what would get built. A
@@ -3213,8 +3310,8 @@ async fn run_loaded_program(
         Site::Remote {
             session,
             environment,
-        } => Box::new(
-            cloud::open_vivado_session(
+        } => {
+            let mut remote = cloud::open_vivado_session(
                 session,
                 environment,
                 vw_remote::SessionParams {
@@ -3224,8 +3321,18 @@ async fn run_loaded_program(
                     verbose,
                 },
             )
-            .await?,
-        ),
+            .await?;
+            // What the instance is doing before it can run anything. Locally
+            // this stretch is silent too, but locally the developer knows why
+            // — the machine's fans are audible and vivado is in their process
+            // list. Across a network the same silence looks like a hang, and
+            // the wait is longer. Rendered the way the same notes are on a
+            // local run, several of them being literally the same notes.
+            remote.set_note_sink(Box::new(|message: &str| {
+                eprintln!("{} {message}", "info:".cyan());
+            }));
+            Box::new(remote)
+        }
     };
 
     // Build the proc-location table the stream sink uses to map

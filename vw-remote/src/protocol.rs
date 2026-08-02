@@ -18,10 +18,24 @@ use serde::{Deserialize, Serialize};
 use vw_eda::{Request, Response, StreamKind};
 
 /// What a client sends.
-///
-/// The same [`Request`] a local backend would receive, which is the point:
-/// the client is driving the same worker it always drove.
-pub type SessionRequest = Request;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SessionRequest {
+    /// Something for the worker to do — the same [`Request`] a local backend
+    /// would receive, which is the point: the client is driving the same
+    /// worker it always drove.
+    Run { request: Request },
+
+    /// Abandon whatever is running, but keep the session.
+    ///
+    /// What Ctrl-C means in the REPL. Not a request for the worker, which is
+    /// busy and by definition not reading — it is a request about the worker,
+    /// and the agent acts on it by signalling the process the way an
+    /// interactive user's terminal would if vivado were on their own machine.
+    /// The eval then comes back as an error, the interpreter survives, and the
+    /// developer keeps everything they had loaded.
+    Interrupt,
+}
 
 /// What an agent sends back.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +149,36 @@ mod test {
             SessionEvent::Response(r) => assert_eq!(r.id, 7),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn an_interrupt_is_distinguishable_from_work() {
+        let interrupt = serde_json::to_string(&SessionRequest::Interrupt)
+            .expect("serialize");
+        let work = serde_json::to_string(&SessionRequest::Run {
+            request: Request {
+                id: 1,
+                op: vw_eda::RequestOp::Eval {
+                    tcl: "synth_design".to_owned(),
+                },
+            },
+        })
+        .expect("serialize");
+
+        assert!(interrupt.contains(r#""op":"interrupt""#), "{interrupt}");
+        assert!(work.contains(r#""op":"run""#), "{work}");
+
+        // And the round trip keeps them apart, which is the whole point: an
+        // interrupt mistaken for work would be queued behind the very thing
+        // it is trying to stop.
+        assert!(matches!(
+            serde_json::from_str::<SessionRequest>(&interrupt),
+            Ok(SessionRequest::Interrupt),
+        ));
+        assert!(matches!(
+            serde_json::from_str::<SessionRequest>(&work),
+            Ok(SessionRequest::Run { .. }),
+        ));
     }
 
     #[test]
