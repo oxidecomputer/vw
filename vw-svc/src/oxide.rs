@@ -96,8 +96,18 @@ pub(crate) enum ImageError {
     NoMatchingImage(String),
     // No `{0}`: log sites report this through `InlineErrorChain`, which
     // appends the source itself. See `PassError`.
+    //
+    // Boxed because the oxide client's error is large enough that carrying it
+    // inline makes every `Result` in this module the size of a failure that
+    // almost never happens. `RelayError` boxes its own for the same reason.
     #[error("listing images failed")]
-    List(#[from] OxideError),
+    List(#[source] Box<OxideError>),
+}
+
+impl From<OxideError> for ImageError {
+    fn from(value: OxideError) -> Self {
+        ImageError::List(Box::new(value))
+    }
 }
 
 /// Establish the connection to the Oxide API.
@@ -197,11 +207,7 @@ impl Session {
             .clone();
 
         let managed = ours(instances.iter().map(|instance| {
-            (
-                instance.name.to_string(),
-                instance.id,
-                instance.run_state.clone(),
-            )
+            (instance.name.to_string(), instance.id, instance.run_state)
         }));
 
         // The external address is what somebody needs in order to ssh in, and
@@ -1132,7 +1138,7 @@ mod test {
             types::InstanceState::Stopping,
         ] {
             assert_eq!(
-                run_action(&recorded(Some(state.clone()))),
+                run_action(&recorded(Some(state))),
                 RunAction::Wait,
                 "{state} needs no action",
             );

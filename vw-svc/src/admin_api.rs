@@ -1,10 +1,17 @@
-//! This module implements the user api trait `[vw_api::VwAdminApi]`
-use crate::{Context, ServerArgs};
+//! This module implements the admin api trait `[vw_api::VwAdminApi]`
+//!
+//! Everything here reaches across users, which is the whole reason it is a
+//! separate API on a separate port: the user API can only ever see the caller's
+//! own environments, and that property is easier to keep when the endpoints
+//! that break it do not sit beside it.
+
+use crate::{auth, db, Context, ServerArgs};
 use dropshot::{ApiDescription, BuildError, ConfigDropshot};
 use slog::{info, o};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Notify;
 use vw_api::VwAdminApi;
+use vw_api_types_versions::latest::UserEnvironmentPathParam;
 
 pub struct AdminApi {}
 impl VwAdminApi for AdminApi {
@@ -20,7 +27,28 @@ impl VwAdminApi for AdminApi {
         >,
         dropshot::HttpError,
     > {
-        todo!()
+        let log = rqctx.log.clone();
+        let caller = auth::authorize_administrator(rqctx).await?;
+
+        let environments = db::list_all_environments().inspect_err(|e| {
+            slog::error!(log, "cannot list environments";
+                slog_error_chain::InlineErrorChain::new(e),
+            );
+        })?;
+
+        info!(log, "listed every environment";
+            "administrator" => &caller.name,
+            "environments" => environments.len(),
+        );
+
+        // One complete page: this endpoint takes no pagination parameters, and
+        // the number of environments on a rack is bounded by the number of
+        // developers using it. If that ever stops being true this becomes a
+        // `ResultsPage::new` with a selector keyed on user and name.
+        Ok(dropshot::HttpResponseOk(dropshot::ResultsPage {
+            next_page: None,
+            items: environments,
+        }))
     }
 
     async fn delete_environment(
@@ -29,7 +57,33 @@ impl VwAdminApi for AdminApi {
             vw_api_types_versions::latest::UserEnvironmentPathParam,
         >,
     ) -> Result<dropshot::HttpResponseDeleted, dropshot::HttpError> {
-        todo!()
+        let log = rqctx.log.clone();
+        let reconcile = rqctx.context().reconcile.clone();
+        let caller = auth::authorize_administrator(rqctx).await?;
+        let key: UserEnvironmentPathParam = path_params.into_inner();
+
+        // Named in the log before it happens as well as after: this is one
+        // person removing another person's work, and the record of who did it
+        // should survive whatever the deletion does next.
+        info!(log, "deleting an environment on behalf of the service";
+            "administrator" => &caller.name,
+            "user" => &key.user,
+            "environment" => &key.name,
+        );
+
+        db::delete_environment(key.clone()).inspect_err(|e| {
+            slog::error!(log, "cannot delete an environment";
+                "user" => &key.user,
+                "environment" => &key.name,
+                slog_error_chain::InlineErrorChain::new(e),
+            );
+        })?;
+
+        // Tear the instances down now rather than on the next tick, so a rack
+        // an administrator is reclaiming starts emptying immediately.
+        reconcile.notify_one();
+
+        Ok(dropshot::HttpResponseDeleted())
     }
 }
 
@@ -68,7 +122,7 @@ pub async fn start_server(
 
     info!(lg, "listening on {scheme}://{}", server.local_addr());
 
-    Ok(server.await.map_err(|e| StartServerError::ServerExit(e))?)
+    server.await.map_err(StartServerError::ServerExit)
 }
 
 pub fn api_description() -> ApiDescription<Arc<Context>> {

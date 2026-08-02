@@ -21,8 +21,11 @@ impl From<auth::AuthError> for dropshot::HttpError {
                     message,
                 )
             }
-            // The caller is known, but not entitled to use this service.
-            auth::AuthError::NoRedhawkProjectAccess => {
+            // The caller is known, but not entitled to this. Same status as
+            // lacking project access: they are who they say, and it is not
+            // enough.
+            auth::AuthError::NoRedhawkProjectAccess
+            | auth::AuthError::NotAnAdministrator(_) => {
                 dropshot::HttpError::for_client_error(
                     None,
                     ClientErrorStatusCode::FORBIDDEN,

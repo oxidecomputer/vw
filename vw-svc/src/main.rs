@@ -40,7 +40,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run the server
-    Serve(ServerArgs),
+    ///
+    /// Boxed because it carries every one of the service's settings while the
+    /// other two variants carry nothing, and an enum is as large as its
+    /// largest variant — so emitting a spec would otherwise move a few hundred
+    /// bytes of server configuration around for no reason.
+    Serve(Box<ServerArgs>),
     /// Emit the user OpenAPI spec
     EmitUserSpec,
     /// Emit the admin OpenAPI spec
@@ -117,7 +122,7 @@ struct ServerArgs {
 async fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Serve(args) => serve(args).await,
+        Commands::Serve(args) => serve(*args).await,
         Commands::EmitUserSpec => emit_user_spec(),
         Commands::EmitAdminSpec => emit_admin_spec(),
     };

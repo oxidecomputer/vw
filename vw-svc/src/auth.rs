@@ -6,7 +6,7 @@ use reqwest::{
     StatusCode,
 };
 use serde::Deserialize;
-use slog::{error, info, Logger};
+use slog::{error, info, warn, Logger};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
@@ -130,6 +130,10 @@ pub(crate) enum AuthError {
     TokenRejected,
     #[error("the supplied token does not have access to redhawk")]
     NoRedhawkProjectAccess,
+    #[error(
+        "'{0}' is not an administrator of this service; ask whoever runs it          to add you to --admin-users"
+    )]
+    NotAnAdministrator(String),
     #[error("an error occured talking to github: {0}")]
     GithubError(String),
 }
@@ -186,6 +190,29 @@ pub(crate) async fn authorize_caller(
         is_admin,
         token: supplied,
     })
+}
+
+/// Authorize a caller and require that they administer this service.
+///
+/// Everything the admin API exposes reaches across users — listing every
+/// environment on the rack, deleting somebody else's — so being a legitimate
+/// user is not enough. Administrators are named in `--admin-users` when the
+/// service starts; there is no way to grant it at runtime, deliberately, since
+/// the alternative is an endpoint that can promote its own caller.
+pub(crate) async fn authorize_administrator(
+    rqctx: RequestContext<Arc<Context>>,
+) -> Result<AuthorizedCaller, AuthError> {
+    let log = rqctx.log.clone();
+    let caller = authorize_caller(rqctx).await?;
+
+    if !caller.is_admin {
+        warn!(log, "refusing an administrative request";
+            "username" => &caller.name,
+        );
+        return Err(AuthError::NotAnAdministrator(caller.name));
+    }
+
+    Ok(caller)
 }
 
 fn client() -> &'static reqwest::Client {

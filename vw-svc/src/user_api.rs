@@ -545,7 +545,6 @@ impl VwUserApi for UserApi {
 
         // Small text files, read whole rather than streamed: a wrapper is a
         // few kilobytes and there is nothing to gain from frames.
-        use futures::TryStreamExt;
         let bytes = futures::TryStreamExt::try_fold(
             contents.into_inner(),
             Vec::new(),
@@ -769,7 +768,7 @@ pub async fn start_server(
 
     info!(lg, "listening on {scheme}://{}", server.local_addr());
 
-    Ok(server.await.map_err(|e| StartServerError::ServerExit(e))?)
+    server.await.map_err(StartServerError::ServerExit)
 }
 
 pub fn api_description() -> ApiDescription<Arc<Context>> {
