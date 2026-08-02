@@ -25,6 +25,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+/// How the agent stores what a build produced.
+///
+/// Passed in because storing is not this module's business — it knows what was
+/// built, not where anything keeps things. Called before the build is reported
+/// finished, so a developer whose command has returned can go and fetch what
+/// it made.
+pub type Uploader = Box<
+    dyn Fn(Vec<Utf8PathBuf>) -> futures::future::BoxFuture<'static, usize>
+        + Send,
+>;
+
 /// What the instance sends back while a build runs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -50,8 +61,45 @@ pub enum DriverEvent {
         /// a signal.
         code: Option<i32>,
     },
+    /// The build produced something worth keeping, and it has been stored.
+    Produced {
+        artifacts: Vec<String>,
+        stored: usize,
+    },
     /// The build could not be run at all.
     Fatal { message: String },
+}
+
+/// What cargo says about something it built.
+#[derive(serde::Deserialize)]
+#[serde(tag = "reason", rename_all = "kebab-case")]
+enum CargoMessage {
+    /// A file cargo produced.
+    CompilerArtifact {
+        package_id: String,
+        #[serde(default)]
+        filenames: Vec<Utf8PathBuf>,
+    },
+    /// Something rustc had to say, already formatted the way rustc formats it.
+    CompilerMessage { message: RustcMessage },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(serde::Deserialize)]
+struct RustcMessage {
+    #[serde(default)]
+    rendered: Option<String>,
+}
+
+/// Whether a file cargo produced is a deliverable rather than an intermediate.
+///
+/// A driver's outputs are things that run or load — a binary, a kernel module.
+/// An `rlib` is scaffolding for the next compilation and means nothing on
+/// another machine, and `.d` files are make fragments naming paths that only
+/// exist on the builder.
+fn is_deliverable(path: &Utf8Path) -> bool {
+    !matches!(path.extension(), Some("rlib" | "rmeta" | "d"))
 }
 
 /// What to build.
@@ -72,7 +120,8 @@ pub async fn serve<S>(
     socket: WebSocketStream<S>,
     root: &Utf8Path,
     params: BuildParams,
-) -> Result<(), crate::SessionError>
+    upload: Uploader,
+) -> Result<Vec<Utf8PathBuf>, crate::SessionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -102,18 +151,24 @@ where
         }
     });
 
-    let building = build(root, &params, events.clone());
+    let building = build(root, &params, events.clone(), upload);
     tokio::pin!(building);
 
-    tokio::select! {
-        () = &mut building => {}
-        _ = departed => tracing::info!("client left; abandoning the build"),
-    }
+    // A build that finishes after the developer has gone still produced
+    // something, and it still belongs in the store — but one abandoned part
+    // way through produced nothing worth keeping.
+    let produced = tokio::select! {
+        produced = &mut building => produced,
+        _ = departed => {
+            tracing::info!("client left; abandoning the build");
+            Vec::new()
+        }
+    };
 
     drop(events);
     let _ = writer.await;
 
-    Ok(())
+    Ok(produced)
 }
 
 /// One place cargo has to be run, and what to call it.
@@ -265,37 +320,62 @@ fn contradiction(root: &Utf8Path) -> Option<String> {
 }
 
 /// Run every part of the build, stopping at the first failure.
+///
+/// Returns what it produced, by absolute path, so the caller can put it
+/// somewhere it will outlive the instance.
 async fn build(
     root: &Utf8Path,
     params: &BuildParams,
     events: tokio::sync::mpsc::UnboundedSender<DriverEvent>,
-) {
+    upload: Uploader,
+) -> Vec<Utf8PathBuf> {
     // Said before anything is built, because the alternative is a compiler
     // error several minutes from now that names none of this.
     if let Some(contradiction) = contradiction(root) {
         let _ = events.send(DriverEvent::Fatal {
             message: contradiction,
         });
-        return;
+        return Vec::new();
     }
 
+    // Cargo is asked which of its members are the workspace's, so a
+    // dependency's artifacts are not mistaken for the driver's.
+    let members: std::collections::HashSet<String> = metadata(root)
+        .map(|metadata| metadata.workspace_members.into_iter().collect())
+        .unwrap_or_default();
+
+    let mut produced = Vec::new();
     for unit in units(root) {
         let _ = events.send(DriverEvent::Building {
             unit: unit.name.clone(),
         });
 
-        match build_one(&unit.directory, params, &events).await {
-            Some(true) => {}
+        match build_one(&unit.directory, params, &events, &members).await {
+            Some((true, mut artifacts)) => produced.append(&mut artifacts),
             // Reported already; there is no sense building the kernel module
             // against a userland that did not compile.
-            Some(false) | None => return,
+            Some((false, _)) | None => return Vec::new(),
         }
+    }
+
+    if !produced.is_empty() {
+        // Stored before the build is called finished. Otherwise a developer
+        // whose command has just returned successfully would go looking for
+        // the artifacts and find nothing, which is a race they have no way to
+        // know about.
+        let stored = upload(produced.clone()).await;
+        let _ = events.send(DriverEvent::Produced {
+            artifacts: produced.iter().map(ToString::to_string).collect(),
+            stored,
+        });
     }
 
     let _ = events.send(DriverEvent::Done {
         success: true,
         code: Some(0),
     });
+
+    produced
 }
 
 /// Spawn cargo in one directory and forward everything it says.
@@ -306,7 +386,8 @@ async fn build_one(
     root: &Utf8Path,
     params: &BuildParams,
     events: &tokio::sync::mpsc::UnboundedSender<DriverEvent>,
-) -> Option<bool> {
+    members: &std::collections::HashSet<String>,
+) -> Option<(bool, Vec<Utf8PathBuf>)> {
     let mut command = tokio::process::Command::new("cargo");
     command.arg("build");
     if params.release {
@@ -316,6 +397,11 @@ async fn build_one(
     // here it never is — but there is a terminal at the far end of this, and
     // it is the one that matters.
     command.args(["--color", "always"]);
+    // Structured, so the exact set of files this produced comes from cargo
+    // rather than from guessing at target directory layout. Diagnostics still
+    // arrive pre-rendered, colour and all, so nothing about what a developer
+    // sees changes.
+    command.args(["--message-format", "json-diagnostic-rendered-ansi"]);
     command.args(&params.args);
 
     let child = command
@@ -336,33 +422,41 @@ async fn build_one(
         }
     };
 
-    // Both streams, interleaved as they arrive. Cargo puts progress on stderr
-    // and a program's own output on stdout, and a developer wants them in the
-    // order they happened.
-    let mut tasks = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        tasks.push(tokio::spawn(forward(stdout, events.clone())));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        tasks.push(tokio::spawn(forward(stderr, events.clone())));
-    }
+    // The two streams say different things under `--message-format=json`.
+    // Cargo's own progress goes to stderr as ordinary text; rustc's
+    // diagnostics and the record of what was built come down stdout as JSON.
+    // Both are forwarded as they arrive, so the order a developer sees is the
+    // order things happened.
+    let structured = child.stdout.take().map(|stdout| {
+        tokio::spawn(read_messages(stdout, events.clone(), members.clone()))
+    });
+    let plain = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(forward(stderr, events.clone())));
 
     let status = child.wait().await;
 
     // Drained before reporting the result, so the last line of a failing build
     // never arrives after the verdict on it.
-    for task in tasks {
-        let _ = task.await;
+    let mut artifacts = Vec::new();
+    if let Some(structured) = structured {
+        if let Ok(found) = structured.await {
+            artifacts = found;
+        }
+    }
+    if let Some(plain) = plain {
+        let _ = plain.await;
     }
 
     match status {
-        Ok(status) if status.success() => Some(true),
+        Ok(status) if status.success() => Some((true, artifacts)),
         Ok(status) => {
             let _ = events.send(DriverEvent::Done {
                 success: false,
                 code: status.code(),
             });
-            Some(false)
+            Some((false, Vec::new()))
         }
         Err(e) => {
             let _ = events.send(DriverEvent::Fatal {
@@ -371,6 +465,57 @@ async fn build_one(
             None
         }
     }
+}
+
+/// Read cargo's structured output, forwarding what a person should see and
+/// keeping what was built.
+///
+/// Only the workspace's own members count. A dependency compiled along the way
+/// produces artifacts too, and none of them are the driver.
+async fn read_messages<R>(
+    reader: R,
+    events: tokio::sync::mpsc::UnboundedSender<DriverEvent>,
+    members: std::collections::HashSet<String>,
+) -> Vec<Utf8PathBuf>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut produced = Vec::new();
+    let mut lines = BufReader::new(reader).lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(message) = serde_json::from_str::<CargoMessage>(&line) else {
+            // Not something we understand. Cargo occasionally writes plain
+            // text here, and passing it on is better than swallowing it.
+            let _ = events.send(DriverEvent::Line { text: line });
+            continue;
+        };
+
+        match message {
+            CargoMessage::CompilerMessage { message } => {
+                if let Some(rendered) = message.rendered {
+                    // Already formatted by rustc, so it reads exactly as it
+                    // would on the developer's own machine.
+                    for text in rendered.lines() {
+                        let _ = events.send(DriverEvent::Line {
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+            }
+            CargoMessage::CompilerArtifact {
+                package_id,
+                filenames,
+            } if members.contains(&package_id) => {
+                produced.extend(
+                    filenames.into_iter().filter(|path| is_deliverable(path)),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    produced
 }
 
 /// Send every line of `reader` as it appears.

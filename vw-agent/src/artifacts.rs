@@ -286,6 +286,52 @@ fn digest_of(path: &Utf8Path) -> std::io::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Send a specific set of files to the store, keyed by where they sit under
+/// the build output directory.
+///
+/// The other path here polls, because vivado writes when it likes and nothing
+/// announces it. A cargo build does announce it — cargo names every file it
+/// produced — so there is nothing to discover and nothing to wait for.
+///
+/// Returns how many went. A failure is logged and skipped rather than
+/// abandoning the rest: one unreachable moment should not cost the other
+/// artifacts of the same build.
+pub(crate) async fn upload_all(
+    root: &Utf8Path,
+    credentials: &S3Credentials,
+    artifacts: &[Utf8PathBuf],
+    log: &Logger,
+) -> usize {
+    let mut sent = 0;
+    for artifact in artifacts {
+        // Keyed by its path under `target`, so a debug and a release build of
+        // the same name stay two objects, as do the same name built for two
+        // different targets.
+        let key = artifact
+            .strip_prefix(root.join(BUILD_OUTPUT))
+            .map(Utf8Path::to_string)
+            .unwrap_or_else(|_| {
+                artifact.file_name().unwrap_or("artifact").to_owned()
+            });
+
+        match upload(credentials, &key, artifact).await {
+            Ok(()) => {
+                info!(log, "uploaded a build artifact";
+                    "path" => %artifact,
+                    "bucket" => &credentials.bucket,
+                    "key" => &key,
+                );
+                sent += 1;
+            }
+            Err(e) => warn!(log, "cannot upload a build artifact";
+                "path" => %artifact,
+                "error" => %e,
+            ),
+        }
+    }
+    sent
+}
+
 /// Put one artifact in the bucket.
 ///
 /// Streamed from disk rather than read first, for the same reason the digest

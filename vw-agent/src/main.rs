@@ -535,16 +535,53 @@ impl VwSyncApi for Agent {
         )
         .await;
 
-        let result = vw_remote::driver::serve(socket, &ctx.root, params).await;
+        // Where the artifacts go is settled before the build starts, so the
+        // upload can happen the moment cargo is done rather than after the
+        // developer's command has already returned.
+        let target = ctx.artifact_target.borrow().clone();
+        let root = ctx.root.clone();
+        let upload_log = rqctx.log.clone();
+        let upload: vw_remote::driver::Uploader =
+            Box::new(move |produced: Vec<camino::Utf8PathBuf>| {
+                let target = target.clone();
+                let root = root.clone();
+                let log = upload_log.clone();
+                Box::pin(async move {
+                    match target {
+                        Some(credentials) => {
+                            artifacts::upload_all(
+                                &root,
+                                &credentials,
+                                &produced,
+                                &log,
+                            )
+                            .await
+                        }
+                        None => {
+                            slog::warn!(
+                                log,
+                                "nowhere to put the driver's artifacts; this \
+                                 instance has not been told where its store is"
+                            );
+                            0
+                        }
+                    }
+                })
+            });
+
+        let result =
+            vw_remote::driver::serve(socket, &ctx.root, params, upload).await;
 
         match &result {
-            Ok(()) => info!(rqctx.log, "driver build finished"),
+            Ok(produced) => info!(rqctx.log, "driver build finished";
+                "artifacts" => produced.len(),
+            ),
             Err(e) => slog::error!(rqctx.log, "driver build failed";
                 InlineErrorChain::new(e),
             ),
         }
 
-        result.map_err(Into::into)
+        result.map(|_| ()).map_err(Into::into)
     }
 
     async fn bench_session(

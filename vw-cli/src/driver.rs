@@ -63,6 +63,23 @@ pub async fn build(
             // Printed rather than rendered: cargo already said it better than
             // anything here could.
             vw_remote::DriverEvent::Line { text } => println!("{text}"),
+            // Named so a developer knows what to look for in the store
+            // without having to guess at target directory layout.
+            vw_remote::DriverEvent::Produced { artifacts, stored } => {
+                for artifact in &artifacts {
+                    println!(
+                        "{:>12} {artifact}",
+                        "Produced".bright_green().bold(),
+                    );
+                }
+                if stored > 0 {
+                    println!(
+                        "{:>12} {stored} artifact(s) — `vw cloud artifacts` \
+                         to fetch them",
+                        "Stored".bright_green().bold(),
+                    );
+                }
+            }
             vw_remote::DriverEvent::Done { success, code } => {
                 if !success {
                     eprintln!(
