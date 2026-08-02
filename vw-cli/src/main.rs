@@ -18,6 +18,7 @@ use vw_lib::{
 mod bench_runner;
 mod cloud;
 mod cloud_sync;
+mod driver;
 mod htcl_test;
 mod parallel_load;
 mod part_picker;
@@ -89,6 +90,39 @@ struct Cli {
     command: Commands,
 }
 
+/// What can be done with the workspace's driver.
+#[derive(Subcommand)]
+enum DriverCommand {
+    #[command(about = "Build the driver on the helios instance")]
+    Build {
+        #[arg(
+            long,
+            help = "Build on this machine instead of in a cloud environment"
+        )]
+        local: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to build in. Only needed when you have \
+                    more than one."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+        #[arg(long, help = "Build with optimizations")]
+        release: bool,
+        #[arg(
+            trailing_var_arg = true,
+            help = "Further arguments for cargo, e.g. `-p module`"
+        )]
+        args: Vec<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "Initialize a new workspace")]
@@ -132,6 +166,11 @@ enum Commands {
     },
     #[command(about = "Clear all cached repositories")]
     Clear,
+    #[command(about = "Work with the workspace's driver")]
+    Driver {
+        #[command(subcommand)]
+        command: DriverCommand,
+    },
     #[command(
         about = "Remove build output, on the cloud environment if there is one"
     )]
@@ -724,6 +763,34 @@ async fn main() {
                         "vw update".cyan()
                     );
                 }
+                Err(e) => {
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Driver { command } => {
+            let DriverCommand::Build {
+                local,
+                env,
+                insecure,
+                release,
+                args,
+            } = command;
+            match driver_build(
+                &cwd,
+                local,
+                env.as_deref(),
+                insecure,
+                release,
+                &args,
+            )
+            .await
+            {
+                Ok(true) => {}
+                // A build that failed is not a vw failure; the message came
+                // from cargo and has already been printed.
+                Ok(false) => process::exit(1),
                 Err(e) => {
                     eprintln!("{} {e}", "error:".bright_red());
                     process::exit(1);
@@ -3028,7 +3095,12 @@ async fn bench_site(
         Err(e) => return Err(e.into()),
     };
 
-    cloud::sync_for_build(&session, &environment).await?;
+    cloud::sync_for_build(
+        &session,
+        &environment,
+        Some(vw_api_types_versions::latest::TargetKind::Vivado),
+    )
+    .await?;
 
     Ok(Some((session, environment)))
 }
@@ -3062,7 +3134,12 @@ async fn remote_worker(
 
     // The instance builds what it was last given, so give it this before the
     // first eval can ask for it.
-    cloud::sync_for_build(&session, &environment).await?;
+    cloud::sync_for_build(
+        &session,
+        &environment,
+        Some(vw_api_types_versions::latest::TargetKind::Vivado),
+    )
+    .await?;
 
     let backend = cloud::open_vivado_session(
         &session,
@@ -3084,6 +3161,55 @@ async fn remote_worker(
         backend: Box::new(backend),
         interrupt: std::sync::Arc::new(move || handle.interrupt()),
     })
+}
+
+/// Build the driver, wherever this workspace builds it.
+///
+/// Cloud first, like everything else that needs a toolchain the developer's
+/// machine may not have: the driver targets illumos and pins its own compiler,
+/// and the helios instance is where both of those are true.
+async fn driver_build(
+    cwd: &Utf8Path,
+    local: bool,
+    named: Option<&str>,
+    insecure: bool,
+    release: bool,
+    args: &[String],
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let workspace = vw_lib::find_workspace_dir(cwd.as_std_path())
+        .ok_or("no vw workspace here; run this from one, or from a directory inside it")?;
+
+    if !local {
+        let session = cloud::Session::from_env(insecure)?;
+        match cloud::pick_environment(&session, named).await {
+            Ok(environment) => {
+                // The instance builds what it was last given.
+                cloud::sync_for_build(
+                    &session,
+                    &environment,
+                    Some(vw_api_types_versions::latest::TargetKind::Helios),
+                )
+                .await?;
+                return Ok(driver::build(
+                    &session,
+                    &environment,
+                    release,
+                    args,
+                )
+                .await?);
+            }
+            Err(e) if cloud::Session::unreachable(&e) => {
+                eprintln!(
+                    "{} no vw service reachable ({e}); building on this \
+                     machine",
+                    "warning:".yellow(),
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(driver::build_locally(&workspace, release, args).await?)
 }
 
 /// Remove build output, wherever this workspace builds.
@@ -3164,7 +3290,12 @@ async fn cloud_site(
     };
 
     // The instance builds what it was last given, so give it this.
-    cloud::sync_for_build(&session, &environment).await?;
+    cloud::sync_for_build(
+        &session,
+        &environment,
+        Some(vw_api_types_versions::latest::TargetKind::Vivado),
+    )
+    .await?;
 
     Ok(Some((session, environment)))
 }

@@ -194,6 +194,8 @@ pub enum CloudError {
     NoSuchArtifact(String),
     #[error("'{0}' is not a name an artifact may be written under")]
     UnsafeArtifactName(String),
+    #[error("no driver here; {0} does not exist")]
+    NoDriver(Utf8PathBuf),
     #[error("scanning {0}")]
     Scan(camino::Utf8PathBuf, #[source] vw_sync::ScanError),
     #[error("reading {0}")]
@@ -276,11 +278,14 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             debounce,
         } => {
             crate::cloud_sync::run(
+                // `vw cloud sync` is the command that means "everything", so
+                // it is the one place with no filter.
                 &session,
                 &name,
                 force,
                 watch,
                 std::time::Duration::from_millis(debounce),
+                None,
             )
             .await
         }
@@ -786,6 +791,7 @@ pub async fn clean_build_output(
 pub async fn sync_for_build(
     session: &Session,
     environment: &str,
+    only: Option<vw_api_types_versions::latest::TargetKind>,
 ) -> Result<(), CloudError> {
     crate::cloud_sync::run(
         session,
@@ -793,6 +799,7 @@ pub async fn sync_for_build(
         false,
         false,
         std::time::Duration::from_millis(0),
+        only,
     )
     .await
 }

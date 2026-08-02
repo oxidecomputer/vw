@@ -356,6 +356,59 @@ impl VwUserApi for UserApi {
         Ok(dropshot::HttpResponseOk(cleaned))
     }
 
+    async fn driver_build(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::EnvironmentPathParam,
+        >,
+        query: dropshot::Query<vw_api_types_versions::latest::DriverBuildQuery>,
+        websock: dropshot::WebsocketConnection,
+    ) -> dropshot::WebsocketChannelResult {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let name = path_params.into_inner().name;
+        let query = query.into_inner();
+
+        // Helios, not vivado: the driver's target is native there and its
+        // pinned toolchain is installed there.
+        let target = vw_api_types_versions::latest::TargetPathParam {
+            name: name.clone(),
+            kind: vw_api_types_versions::latest::TargetKind::Helios,
+        };
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &name,
+            vw_api_types_versions::latest::TargetKind::Helios,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        // A build fetches the driver's dependencies from github like any
+        // other, so the instance needs the caller's credentials first.
+        agent
+            .give_credentials(&caller, &log)
+            .await
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        info!(log, "building the driver";
+            "environment" => &name,
+            "user" => &caller.name,
+            "release" => query.release,
+        );
+
+        let result = agent.join_driver_build(websock, &query).await;
+
+        match &result {
+            Ok(()) => info!(log, "driver build ended";
+                "environment" => &name,
+            ),
+            Err(e) => log_relay_failure(&log, &target, e),
+        }
+
+        result.map_err(Into::into)
+    }
+
     async fn bench_session(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<

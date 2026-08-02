@@ -217,6 +217,52 @@
         }
       }
     },
+    "/environment/{environment}/driver/build": {
+      "get": {
+        "summary": "Build the driver on this instance.",
+        "description": "A websocket because a build takes minutes and produces output the whole time, and because a developer who interrupts one should not leave cargo running on a machine nobody is watching.\n\nCargo is spawned rather than linked: the driver pins its toolchain in `rust-toolchain.toml`, which the rustup shim honours and a linked cargo would not, so linking it would quietly build a kernel module with the wrong compiler.",
+        "operationId": "driver_build",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "args",
+            "description": "Anything else to put on cargo's command line, separated by spaces.\n\nOne string because a query parameter has to be scalar. Split on whitespace at the far end, so a value containing a space cannot be expressed — no flag the driver build needs has one, and the alternative is reimplementing half a shell's quoting rules.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "release",
+            "description": "Build with optimizations.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Negotiating protocol upgrade from HTTP/1.1 to WebSocket"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
+    },
     "/environment/{environment}/generated": {
       "post": {
         "summary": "The VHDL vivado generated for this environment's IP.",

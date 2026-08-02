@@ -474,3 +474,30 @@ pub struct ArtifactPathParam {
 pub struct GeneratedFileQuery {
     pub path: String,
 }
+
+/// How to build the driver.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DriverBuildQuery {
+    /// Build with optimizations.
+    #[serde(default)]
+    pub release: bool,
+    /// Anything else to put on cargo's command line, separated by spaces.
+    ///
+    /// One string because a query parameter has to be scalar. Split on
+    /// whitespace at the far end, so a value containing a space cannot be
+    /// expressed — no flag the driver build needs has one, and the
+    /// alternative is reimplementing half a shell's quoting rules.
+    #[serde(default)]
+    pub args: Option<String>,
+}
+
+impl DriverBuildQuery {
+    /// The extra arguments, as cargo will receive them.
+    pub fn arguments(&self) -> Vec<String> {
+        self.args
+            .iter()
+            .flat_map(|joined| joined.split_whitespace())
+            .map(str::to_owned)
+            .collect()
+    }
+}

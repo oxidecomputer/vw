@@ -165,6 +165,22 @@ pub trait VwUserApi {
         path_params: Path<latest::TargetPathParam>,
     ) -> Result<HttpResponseOk<latest::CleanResult>, HttpError>;
 
+    /// Build the driver on an environment's helios instance.
+    ///
+    /// Relayed frame for frame. The driver's target is native there and its
+    /// pinned toolchain is installed there, which is the whole reason the
+    /// build does not happen on a developer's machine.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{name}/driver/build",
+    }]
+    async fn driver_build(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::EnvironmentPathParam>,
+        query: Query<latest::DriverBuildQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
+
     /// Run an environment's testbenches on its vivado instance.
     ///
     /// Relayed frame for frame. What comes back is the same stream of events a

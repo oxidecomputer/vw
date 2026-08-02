@@ -131,9 +131,16 @@ pub async fn run(
     force: bool,
     watch: bool,
     debounce: std::time::Duration,
+    only: Option<types::TargetKind>,
 ) -> Result<(), CloudError> {
     let workspace = workspace_root()?;
-    let targets = targets(&workspace);
+    let mut targets = targets(&workspace);
+    // A command that only drives one instance should not fail because the
+    // other one is down. `vw driver build` needs helios and nothing else; a
+    // vivado instance rebooting is not its problem.
+    if let Some(only) = only {
+        targets.retain(|target| target.kind == only);
+    }
     announce(&targets);
 
     // Only ever the first pass. Forcing is an answer to a doubt about what is

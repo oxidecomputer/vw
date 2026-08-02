@@ -292,6 +292,28 @@ impl Agent {
         Ok(())
     }
 
+    /// Build the driver on the instance, joined to `client`.
+    pub(crate) async fn join_driver_build(
+        &self,
+        client: dropshot::WebsocketConnection,
+        query: &vw_api_types_versions::latest::DriverBuildQuery,
+    ) -> Result<(), RelayError> {
+        let upgraded = self
+            .client
+            .driver_build(
+                &self.environment,
+                query.args.as_deref(),
+                Some(query.release),
+            )
+            .await
+            .map_err(|e| self.failed(e))?
+            .into_inner();
+
+        join(client, upgraded).await;
+
+        Ok(())
+    }
+
     /// Run this environment's testbenches on the instance, joined to `client`.
     ///
     /// Relayed the same way a vivado session is, and for the same reason: what

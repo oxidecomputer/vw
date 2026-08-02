@@ -243,6 +243,27 @@ pub trait VwSyncApi {
         body: TypedBody<latest::S3Credentials>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
+    /// Build the driver on this instance.
+    ///
+    /// A websocket because a build takes minutes and produces output the whole
+    /// time, and because a developer who interrupts one should not leave cargo
+    /// running on a machine nobody is watching.
+    ///
+    /// Cargo is spawned rather than linked: the driver pins its toolchain in
+    /// `rust-toolchain.toml`, which the rustup shim honours and a linked cargo
+    /// would not, so linking it would quietly build a kernel module with the
+    /// wrong compiler.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{environment}/driver/build",
+    }]
+    async fn driver_build(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+        query: Query<latest::DriverBuildQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
+
     /// Run this workspace's testbenches on this instance.
     ///
     /// A websocket for the same reason a vivado session is one: a batch takes

@@ -504,6 +504,49 @@ impl VwSyncApi for Agent {
         }))
     }
 
+    async fn driver_build(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+        query: dropshot::Query<vw_api_types_versions::latest::DriverBuildQuery>,
+        websock: dropshot::WebsocketConnection,
+    ) -> dropshot::WebsocketChannelResult {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        let query = query.into_inner();
+        let params = vw_remote::BuildParams {
+            release: query.release,
+            args: query.arguments(),
+        };
+
+        info!(rqctx.log, "building the driver";
+            "root" => %ctx.root,
+            "release" => params.release,
+            "args" => params.args.join(" "),
+        );
+
+        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            websock.into_inner(),
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+
+        let result = vw_remote::driver::serve(socket, &ctx.root, params).await;
+
+        match &result {
+            Ok(()) => info!(rqctx.log, "driver build finished"),
+            Err(e) => slog::error!(rqctx.log, "driver build failed";
+                InlineErrorChain::new(e),
+            ),
+        }
+
+        result.map_err(Into::into)
+    }
+
     async fn bench_session(
         rqctx: RequestContext<Self::Context>,
         path_params: dropshot::Path<EnvironmentPathParam>,

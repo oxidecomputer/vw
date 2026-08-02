@@ -5,6 +5,7 @@ pub use crate::v1::CleanResult;
 pub use crate::v1::CommitResult;
 pub use crate::v1::Credentials;
 pub use crate::v1::Digest;
+pub use crate::v1::DriverBuildQuery;
 pub use crate::v1::Environment;
 pub use crate::v1::EnvironmentCreate;
 pub use crate::v1::EnvironmentImages;
