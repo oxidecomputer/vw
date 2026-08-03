@@ -34,6 +34,20 @@ const NO_AUTH_USER_HEADER: &str = "x-vw-user";
 /// the caller did not name themselves.
 const ANONYMOUS_USER: &str = "anonymous";
 
+/// The caller identity for a token that belongs to no Github user.
+///
+/// That means a Github App installation token, which is what buildomat writes
+/// into a job's `.netrc`. A build machine is not a person and has no login to
+/// report, so every one of them is this one caller.
+///
+/// One identity for all of CI rather than one per repository, because the
+/// thing an identity separates here is environments — and a job already names
+/// its environment after itself (`ci$BUILDOMAT_JOB_ID`), so two jobs cannot
+/// collide by accident. What it does mean is that any CI job could delete
+/// another's environment by naming it, which is worth knowing and is not worth
+/// a second identity scheme to prevent between jobs in the same organization.
+const CI_USER: &str = "ci";
+
 /// Shared client so token checks reuse connections to the Github API.
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -165,7 +179,13 @@ pub(crate) async fn authorize_caller(
             Some(name) => name,
             None => {
                 let client = client();
-                let name = github_username(client, &token, &rqctx.log).await?;
+                // A token with no user behind it is a build machine's, and
+                // becomes `ci`. What decides whether it may be here at all is
+                // the redhawk check below, which is the same question asked of
+                // everybody and the one an installation token can answer.
+                let name = github_username(client, &token, &rqctx.log)
+                    .await?
+                    .unwrap_or_else(|| CI_USER.to_owned());
                 check_redhawk_access(&name, client, &token, &rqctx.log).await?;
                 remember(&token, &name);
                 name
@@ -283,29 +303,40 @@ async fn check_redhawk_access(
 }
 
 /// Look up the Github username the token belongs to.
+///
+/// `None` when the token is valid but belongs to nobody — see [`CI_USER`].
 async fn github_username(
     client: &reqwest::Client,
     token: &str,
     log: &Logger,
-) -> Result<String, AuthError> {
+) -> Result<Option<String>, AuthError> {
     let url = "https://api.github.com/user";
     let response = github_get(client, url, token).await?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(match status {
+        return match status {
             StatusCode::UNAUTHORIZED => {
                 info!(log, "github token rejected");
-                AuthError::TokenRejected
+                Err(AuthError::TokenRejected)
+            }
+            // A Github App installation token, which is what buildomat writes
+            // into a job's .netrc. It authenticates as an installation of an
+            // app rather than as a person, so there is no user to report and
+            // Github says so with "resource not accessible by integration".
+            // The token is fine; it just cannot answer this question.
+            StatusCode::FORBIDDEN => {
+                info!(log, "token belongs to no user; treating as ci");
+                Ok(None)
             }
             other => {
                 let e = AuthError::GithubError(format!(
                     "unexpected response {other} from {url}"
                 ));
                 error!(log, "github error getting username: {e}");
-                e
+                Err(e)
             }
-        });
+        };
     }
 
     let user: GithubUser = response.json().await.map_err(|e| {
@@ -315,7 +346,7 @@ async fn github_username(
     // Github logins are case insensitive but reported in their original case.
     // Downcasing here keeps one person from owning two sets of environments,
     // and is required anyway to build an Oxide instance name out of it.
-    Ok(user.login.to_lowercase())
+    Ok(Some(user.login.to_lowercase()))
 }
 
 async fn github_get(
@@ -336,6 +367,14 @@ async fn github_get(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn ci_is_a_name_an_instance_can_be_built_from() {
+        // Every identity ends up inside `vwsvc-{user}-{env}-{kind}`, so one
+        // that the naming scheme refuses would turn every CI job into a
+        // create that fails at the rack rather than at the door.
+        assert!(crate::reconciler::validate_user_name(CI_USER).is_ok());
+    }
 
     #[test]
     fn a_token_is_only_checked_with_github_once_per_ttl() {
