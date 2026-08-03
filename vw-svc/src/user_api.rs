@@ -858,7 +858,7 @@ pub async fn start_server(
     server_args: ServerArgs,
     log: slog::Logger,
     bind_address: SocketAddr,
-    tls: Option<dropshot::ConfigTls>,
+    tls: Option<crate::tls::Tls>,
     reconcile: Arc<Notify>,
 ) -> Result<(), StartServerError> {
     let scheme = crate::tls::scheme(&server_args);
@@ -874,14 +874,24 @@ pub async fn start_server(
     let lg = log.new(o!("component" => "user_api"));
     let api = api_description();
 
-    let server = dropshot::ServerBuilder::new(api, context, lg.clone())
-        .config(cfg)
-        .tls(tls)
-        .start()?;
+    // Shared rather than owned so that the certificate can be replaced under a
+    // server that is already running. Dropping the last handle shuts the
+    // server down, so this one outlives the follower task below.
+    let server = Arc::new(
+        dropshot::ServerBuilder::new(api, context, lg.clone())
+            .config(cfg)
+            .tls(crate::tls::initial(tls.as_ref()))
+            .start()?,
+    );
 
     info!(lg, "listening on {scheme}://{}", server.local_addr());
 
-    server.await.map_err(StartServerError::ServerExit)
+    crate::tls::follow_renewals(server.clone(), tls, lg.clone());
+
+    server
+        .wait_for_shutdown()
+        .await
+        .map_err(StartServerError::ServerExit)
 }
 
 pub fn api_description() -> ApiDescription<Arc<Context>> {

@@ -19,11 +19,29 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Subcommand};
 use colored::*;
+use indicatif::ProgressBar;
+use std::time::{Duration, Instant};
 use vw_api_client::user::{types, Client};
 
 /// Where the service lives if the caller does not say otherwise. Matches
 /// `vw-svc`'s own default user API port.
 const DEFAULT_SERVICE_URL: &str = "http://localhost:2727";
+
+/// How often `--wait` asks what an environment's instances are doing.
+///
+/// Instances take minutes, so this is far more often than anything changes.
+/// It is tuned for how quickly the answer arrives once it does, and the cost
+/// is a handful of requests against a service that is doing nothing else for
+/// this caller.
+const WAIT_POLL: Duration = Duration::from_secs(2);
+
+/// How long `--wait` waits before giving up.
+///
+/// Long enough that a rack under load is never mistaken for a broken one, and
+/// short enough that a script does not hang for an afternoon. Reaching it is
+/// not a statement that the environment failed — only that it did not finish
+/// while somebody was watching, and the states it stopped at are reported.
+const WAIT_LIMIT: Duration = Duration::from_secs(900);
 
 /// Hosts to look for a Github access token under, in preference order.
 const CREDENTIAL_HOSTS: [&str; 2] = ["github.com", "api.github.com"];
@@ -104,6 +122,12 @@ pub enum CloudCommand {
                     Replaces any key already there. [default: ~/.ssh]"
         )]
         key_dir: Option<Utf8PathBuf>,
+        #[arg(
+            long,
+            help = "Do not return until every instance is running. Their \
+                    agents come up a few seconds after that."
+        )]
+        wait: bool,
     },
     #[command(about = "Show a remote build environment")]
     Get {
@@ -228,6 +252,23 @@ pub enum CloudError {
     KeyDir(Utf8PathBuf, #[source] std::io::Error),
     #[error("writing {0}: {1}")]
     KeyWrite(Utf8PathBuf, #[source] std::io::Error),
+    #[error(
+        "the {kind} instance of '{environment}' is {state}; it is not coming up"
+    )]
+    InstanceUnusable {
+        environment: String,
+        kind: String,
+        state: String,
+    },
+    #[error(
+        "'{environment}' was still not fully running after {seconds}s ({states}). \
+         It was created and may yet come up; check with `vw cloud get {environment}`"
+    )]
+    WaitTimedOut {
+        environment: String,
+        seconds: u64,
+        states: String,
+    },
     #[error("cannot determine the home directory to put the key in")]
     NoHomeDirectory,
     #[error("home directory {0:?} is not valid utf-8")]
@@ -254,6 +295,7 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             helios_image,
             artifact_image,
             key_dir,
+            wait,
         } => {
             create(
                 &session,
@@ -264,6 +306,7 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
                     artifact_image,
                 },
                 key_dir.as_deref(),
+                wait,
             )
             .await
         }
@@ -396,6 +439,7 @@ async fn create(
     name: &str,
     images: types::EnvironmentCreate,
     key_dir: Option<&Utf8Path>,
+    wait: bool,
 ) -> Result<(), CloudError> {
     let keys = session
         .client
@@ -424,7 +468,94 @@ async fn create(
         }
     }
 
+    if wait {
+        wait_for_instances(session, name).await?;
+    }
+
     Ok(())
+}
+
+/// Wait until every one of `name`'s instances is running.
+///
+/// Creating an environment records the intent and returns; the instances are
+/// the reconciler's business and appear a minute or two later. That is the
+/// right shape for a service but the wrong one for a script, which has nothing
+/// to do with an environment whose machines do not exist yet.
+///
+/// What is waited for is the instance state Oxide reports, which is a weaker
+/// promise than the environment being usable: an agent takes a few more
+/// seconds to start after the machine it runs on does. It is still the useful
+/// boundary, because everything before it is measured in minutes.
+async fn wait_for_instances(
+    session: &Session,
+    name: &str,
+) -> Result<(), CloudError> {
+    let spinner = ProgressBar::new_spinner();
+    spinner.enable_steady_tick(Duration::from_millis(120));
+    spinner.set_message(format!("waiting for {}", name.cyan()));
+
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        let environment = session
+            .client
+            .get_environment(name)
+            .await
+            .map_err(|e| session.error(e))?
+            .into_inner();
+
+        spinner.set_message(instance_summary(&environment));
+
+        // Reported in the order they are displayed, so the kind named in an
+        // error is the one whose state the caller just watched go red.
+        let states: Vec<(&str, Option<&types::InstanceState>)> = INSTANCES
+            .iter()
+            .zip(instances(&environment))
+            .map(|((kind, _), instance)| {
+                (*kind, instance.as_ref().map(|i| &i.state))
+            })
+            .collect();
+
+        // A machine that has failed or gone away is not on its way to running,
+        // and waiting out the limit would only delay saying so.
+        for (kind, state) in &states {
+            if let Some(
+                state @ (types::InstanceState::Failed
+                | types::InstanceState::Destroyed),
+            ) = state
+            {
+                spinner.finish_and_clear();
+                return Err(CloudError::InstanceUnusable {
+                    environment: name.to_owned(),
+                    kind: (*kind).to_owned(),
+                    state: state.to_string(),
+                });
+            }
+        }
+
+        if states
+            .iter()
+            .all(|(_, state)| *state == Some(&types::InstanceState::Running))
+        {
+            spinner.finish_and_clear();
+            println!(
+                "{} All instances running: {}",
+                "✓".bright_green(),
+                name.cyan()
+            );
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            spinner.finish_and_clear();
+            return Err(CloudError::WaitTimedOut {
+                environment: name.to_owned(),
+                seconds: WAIT_LIMIT.as_secs(),
+                states: instance_summary(&environment),
+            });
+        }
+
+        tokio::time::sleep(WAIT_POLL).await;
+    }
 }
 
 async fn get(session: &Session, name: &str) -> Result<(), CloudError> {

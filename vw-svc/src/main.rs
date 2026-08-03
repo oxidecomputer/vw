@@ -177,7 +177,8 @@ async fn serve(args: ServerArgs) {
 
     // Resolve TLS before either server starts, so a bad certificate path is a
     // startup failure with a message naming it rather than a half-up service.
-    let tls = match tls::config(&args) {
+    // This also starts the watch that notices renewals.
+    let tls = match tls::config(&args, &log) {
         Ok(tls) => tls,
         Err(e) => {
             error!(log, "tls configuration error";

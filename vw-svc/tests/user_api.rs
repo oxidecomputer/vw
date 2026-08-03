@@ -378,7 +378,7 @@ async fn naming_an_image_without_an_oxide_backend_is_rejected() {
     // look like it took effect.
     let response = server
         .request(reqwest::Method::PUT, "ferris", "/environment/alpha")
-        .json(&serde_json::json!({ "vivado_image": "redhawk-dev-20260101" }))
+        .json(&serde_json::json!({ "vivado_image": "vw-vivado-20260101" }))
         .send()
         .await
         .expect("create environment");

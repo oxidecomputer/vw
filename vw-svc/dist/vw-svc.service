@@ -1,0 +1,65 @@
+# The vw service.
+#
+# Nothing site-specific lives here. Which certificate to serve, which rack to
+# provision on and who administers it all come from /etc/vw-svc/vw-svc.env, so
+# that reinstalling the unit never overwrites how a machine is configured.
+
+[Unit]
+Description=vw service
+Documentation=https://github.com/oxidecomputer/vw
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+
+# Root because of the certificate. Certbot keeps /etc/letsencrypt/live and
+# archive at 0700 root and re-creates them on every renewal, so a
+# group-readable arrangement made once does not survive the first renewal --
+# and the alternative, handing the service a copy, is a copy that cannot be
+# hot-reloaded. The sandboxing below gives back most of what this costs.
+User=root
+
+# 0600, because it holds the rack token.
+EnvironmentFile=/etc/vw-svc/vw-svc.env
+
+# The variables are deliberately unquoted: systemd splits them into separate
+# arguments, which is the whole reason the configuration can live in a file
+# rather than in this unit. An unset one expands to nothing.
+#
+# --db-path is fixed here rather than left to the environment file because it
+# follows from StateDirectory below, and is not something a site chooses.
+ExecStart=/usr/local/bin/vw-svc serve \
+    --db-path /var/lib/vw-svc/vw-svc.redb \
+    $VW_SVC_TLS $VW_SVC_RACK $VW_SVC_ADMINS $VW_SVC_EXTRA
+
+# Creates /var/lib/vw-svc on every start. The environment database lives here
+# and outlives the service: it is the record of which environments exist.
+StateDirectory=vw-svc
+
+# Environments outlive any one run of this service, and the reconciler puts
+# them right when it comes back.
+Restart=always
+RestartSec=5
+
+# Hardening. This reads a certificate, writes one database, and talks to a
+# rack and to agents; it has no business doing anything else. ProtectSystem
+# leaves /etc/letsencrypt readable, which is all the certificate watch needs.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

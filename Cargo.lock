@@ -6089,6 +6089,8 @@ dependencies = [
  "redb",
  "reqwest 0.13.4",
  "rust-s3",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "slog",

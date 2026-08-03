@@ -294,13 +294,45 @@ impl InstanceKind {
     /// Images for this kind are named with this prefix followed by a date, and
     /// an environment that does not name an image explicitly gets the newest
     /// one that matches.
+    ///
+    /// These are vw's own images, built by `redhawk-dev-image`, each of which
+    /// has an agent already installed and enabled. A stock OS image will boot
+    /// and answer ssh, but nothing will ever reach it through this service.
     pub(crate) fn image_prefix(&self) -> &'static str {
         match self {
-            Self::Vivado => "redhawk-dev-",
-            Self::Helios => "helios-3-base-",
-            Self::Artifact => "ubuntu-26-04-",
+            Self::Vivado => "vw-vivado-",
+            Self::Helios => "vw-helios-",
+            Self::Artifact => "vw-artifact-",
         }
     }
+
+    /// How much machine this kind of instance gets.
+    ///
+    /// Synthesis and a kernel build both take whatever they are given, so the
+    /// two build instances get the largest shape an environment is worth. The
+    /// artifact instance compiles nothing: it runs an object store, and the
+    /// work it does is moving bytes between a socket and a disk. Sizing it
+    /// like a build machine only takes cores away from environments that
+    /// would use them.
+    pub(crate) fn shape(&self) -> Shape {
+        match self {
+            Self::Vivado | Self::Helios => Shape {
+                vcpus: 16,
+                memory_gib: 32,
+            },
+            Self::Artifact => Shape {
+                vcpus: 4,
+                memory_gib: 16,
+            },
+        }
+    }
+}
+
+/// The cpu and memory an instance is created with.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Shape {
+    pub(crate) vcpus: u16,
+    pub(crate) memory_gib: u64,
 }
 
 impl Display for InstanceKind {
@@ -771,6 +803,26 @@ mod test {
             .map(|kind| instance("ferris", "alpha", kind, None)));
 
         assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn the_artifact_instance_is_not_sized_like_a_build_machine() {
+        // It runs an object store and nothing else. Giving it a builder's
+        // shape costs every environment cores and memory that only the two
+        // instances doing the compiling can use.
+        let artifact = InstanceKind::Artifact.shape();
+
+        for building in [InstanceKind::Vivado, InstanceKind::Helios] {
+            let shape = building.shape();
+            assert!(
+                artifact.vcpus < shape.vcpus,
+                "artifact has as many cpus as {building}",
+            );
+            assert!(
+                artifact.memory_gib < shape.memory_gib,
+                "artifact has as much memory as {building}",
+            );
+        }
     }
 
     #[test]

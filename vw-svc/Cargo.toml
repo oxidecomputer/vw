@@ -19,6 +19,8 @@ vw-api-client = { path = "../vw-api-client" }
 vw-api-types-versions = { path = "../vw-api-types/versions" }
 camino.workspace = true
 dropshot.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 thiserror.workspace = true
 clap.workspace = true
 tokio.workspace = true

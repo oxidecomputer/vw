@@ -43,9 +43,12 @@ const REQUEST_TIMEOUT_SECS: u64 = 300;
 /// minutes.
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 
-/// Shape of every instance the reconciler creates.
-const VCPUS: u16 = 16;
-const MEMORY_GIB: u64 = 32;
+/// Boot disk of every instance the reconciler creates.
+///
+/// One size for every kind, because it is the images rather than the work that
+/// set the floor: the vivado image alone is 512 GiB and an instance's disk
+/// cannot be smaller than the image laid down on it. Cpu and memory do vary —
+/// see [`InstanceKind::shape`].
 const BOOT_DISK_GIB: u64 = 600;
 
 /// Instances are named `vwsvc-{user}-{env}-{kind}`, and this prefix is the
@@ -556,6 +559,8 @@ impl Session {
             size: types::ByteCount(BOOT_DISK_GIB * 1024 * 1024 * 1024),
         };
 
+        let shape = instance.kind.shape();
+
         // Registered once per pass by `ensure_ssh_keys`, before any of this
         // environment's instances are created.
         let key_name = instance
@@ -570,8 +575,8 @@ impl Session {
                 instance.kind, instance.user, instance.environment
             ),
             hostname: instance.hostname().parse().map_err(bad_name)?,
-            ncpus: types::InstanceCpuCount(VCPUS),
-            memory: types::ByteCount(MEMORY_GIB * 1024 * 1024 * 1024),
+            ncpus: types::InstanceCpuCount(shape.vcpus),
+            memory: types::ByteCount(shape.memory_gib * 1024 * 1024 * 1024),
             boot_disk: Some(boot_disk),
             // Instances are reachable from outside the rack so that the vw client
             // and its source-sync daemon can talk to them directly.
@@ -598,6 +603,8 @@ impl Session {
             "instance" => &name,
             "image" => &image.name,
             "ssh_key" => key_name.as_deref().unwrap_or("none"),
+            "vcpus" => shape.vcpus,
+            "memory_gib" => shape.memory_gib,
         );
         self.client
             .instance_create()
