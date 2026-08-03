@@ -333,16 +333,17 @@ enum Commands {
         )]
         info_with_stack: bool,
         #[arg(
-            long = "bunyan",
-            help = "Emit newline-delimited bunyan JSON log records on \
-                    stdout instead of the human-readable stream, for \
-                    piping into `looker` in CI. Vivado INFO → bunyan \
-                    info (30), WARNING → warn (40), CRITICAL WARNING and \
-                    ERROR → error (50). Non-diagnostic noise is omitted \
-                    unless `--log-level=debug`. vw's own status lines \
-                    stay on stderr, so stdout is pure JSON."
+            long = "bunyan-out",
+            value_name = "PATH",
+            help = "Also write newline-delimited bunyan JSON log records to \
+                    this file, for `looker` to read in CI. Does not change \
+                    what appears on stdout, which stays the human-readable \
+                    stream. Vivado INFO → bunyan info (30), WARNING → warn \
+                    (40), CRITICAL WARNING and ERROR → error (50). \
+                    Non-diagnostic noise is omitted unless \
+                    `--log-level=debug`."
         )]
-        bunyan: bool,
+        bunyan_out: Option<Utf8PathBuf>,
     },
     #[command(about = "Launch the vw analyzer LSP server on stdio")]
     Analyzer,
@@ -1027,7 +1028,7 @@ async fn main() {
             variant,
             log_level,
             info_with_stack,
-            bunyan,
+            bunyan_out,
         } => {
             // Self-heal a fresh checkout: fetch missing deps the same
             // way `vw check` does before resolving `src @dep` imports.
@@ -1075,7 +1076,7 @@ async fn main() {
                 variant.as_deref(),
                 log_level.into(),
                 info_with_stack,
-                bunyan,
+                bunyan_out.as_deref(),
             )
             .await
             {
@@ -2882,13 +2883,49 @@ fn resolve_diagnostic_text(
     }
 }
 
-/// Emit one classified [`vw_vivado::Block`] as a bunyan JSON record on
-/// stdout (the `--bunyan` path). Diagnostic blocks map their severity to
-/// a bunyan level and honor the `--log-level` filter exactly like the
-/// human renderer; non-diagnostic NONE blocks only enter the structured
-/// stream at the `--log-level=debug` escape hatch (they always remain in
-/// the raw `vivado-*.log`). Filtered-out blocks are a no-op.
+/// Where `--bunyan-out` records are written.
+///
+/// Shared between the stdout sink — which runs on the backend's reader task —
+/// and the trailing flush on this one, so it is behind a mutex rather than
+/// owned by either. Buffered and flushed per record, so somebody tailing the
+/// file during a long synthesis run sees diagnostics as they happen.
+type BunyanSink =
+    std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>;
+
+/// Open the file `--bunyan-out` named, creating its parent if need be.
+///
+/// Truncates: a bunyan log is the record of one run, and appending would
+/// interleave this run's diagnostics with a previous one's under timestamps
+/// that make the result look like a single very long session.
+fn open_bunyan_sink(
+    path: &camino::Utf8Path,
+) -> Result<BunyanSink, Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("creating {parent} for --bunyan-out: {e}")
+            })?;
+        }
+    }
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("opening {path} for --bunyan-out: {e}"))?;
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(
+        std::io::BufWriter::new(file),
+    )))
+}
+
+/// Emit one classified [`vw_vivado::Block`] as a bunyan JSON record into the
+/// `--bunyan-out` file. Diagnostic blocks map their severity to a bunyan level
+/// and honor the `--log-level` filter exactly like the human renderer;
+/// non-diagnostic NONE blocks only enter the structured stream at the
+/// `--log-level=debug` escape hatch (they always remain in the raw
+/// `vivado-*.log`). Filtered-out blocks are a no-op.
+///
+/// This runs alongside [`render_block`] rather than instead of it: the file is
+/// an extra copy of the session, not a different way of showing it.
+#[allow(clippy::too_many_arguments)]
 fn emit_bunyan_block(
+    sink: &BunyanSink,
     block: &vw_vivado::Block,
     log_level: vw_vivado::LogLevel,
     proc_table: &std::collections::HashMap<String, vw_repl::ProcLocation>,
@@ -2911,6 +2948,7 @@ fn emit_bunyan_block(
                 return;
             }
             emit_bunyan_line(
+                sink,
                 bunyan_level_for(*severity),
                 "vivado",
                 Some(bunyan_severity_label(*severity)),
@@ -2928,6 +2966,7 @@ fn emit_bunyan_block(
                 return;
             }
             emit_bunyan_line(
+                sink,
                 bunyan_level_for(vw_vivado::Severity::None),
                 "vivado",
                 Some(bunyan_severity_label(vw_vivado::Severity::None)),
@@ -2939,14 +2978,20 @@ fn emit_bunyan_block(
     }
 }
 
-/// Write a single newline-delimited bunyan record to stdout. `serde_json`
-/// handles all escaping, so an embedded quote or newline in `msg` can't
-/// break the one-object-per-line protocol looker parses. Every required
+/// Write a single newline-delimited bunyan record to the `--bunyan-out` file.
+/// `serde_json` handles all escaping, so an embedded quote or newline in `msg`
+/// can't break the one-object-per-line protocol looker parses. Every required
 /// bunyan field is present (`v`, `name`, `hostname`, `pid`, `level`,
 /// `time`, `msg`); the original Vivado severity rides along in a
 /// non-standard `severity` field so a viewer can still distinguish
 /// CRITICAL WARNING from ERROR (both collapse to level 50).
+///
+/// A write that fails is dropped rather than reported. This is a second copy
+/// of output the user is already watching on stdout, and failing a synthesis
+/// run that is otherwise fine because a log file filled its disk would be the
+/// wrong trade.
 fn emit_bunyan_line(
+    sink: &BunyanSink,
     level: u8,
     component: &str,
     severity: Option<&str>,
@@ -2959,9 +3004,13 @@ fn emit_bunyan_line(
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let record =
         bunyan_record(level, component, severity, msg, hostname, pid, &time);
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{record}");
-    let _ = out.flush();
+    if let Ok(mut out) = sink.lock() {
+        let _ = writeln!(out, "{record}");
+        // Flushed per record so the file is useful while the run is still
+        // going, which is the whole point of writing it during a build that
+        // takes hours.
+        let _ = out.flush();
+    }
 }
 
 /// Build the bunyan record value. Pure (timestamp injected) so the field
@@ -3322,7 +3371,7 @@ async fn run_htcl(
     variant: Option<&str>,
     log_level: vw_vivado::LogLevel,
     info_with_stack: bool,
-    bunyan: bool,
+    bunyan_out: Option<&camino::Utf8Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let program = load_htcl_program(file).await?;
     run_loaded_program(
@@ -3334,7 +3383,7 @@ async fn run_htcl(
         variant,
         log_level,
         info_with_stack,
-        bunyan,
+        bunyan_out,
     )
     .await
 }
@@ -3363,7 +3412,7 @@ async fn run_loaded_program(
     variant: Option<&str>,
     log_level: vw_vivado::LogLevel,
     info_with_stack: bool,
-    bunyan: bool,
+    bunyan_out: Option<&camino::Utf8Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Under the hood the block renderer decides what to show; the
     // backend's `verbose` toggle still gates the unclassified PTY
@@ -3646,9 +3695,16 @@ async fn run_loaded_program(
     ));
     // Static bunyan record fields (`hostname`, `pid`), resolved once and
     // shared with the stdout sink and the trailing-flush below. Only
-    // consulted under `--bunyan`; cheap enough to compute either way.
+    // consulted under `--bunyan-out`; cheap enough to compute either way.
     let bunyan_host = gethostname::gethostname().to_string_lossy().into_owned();
     let bunyan_pid = std::process::id();
+    // Opened before vivado starts. A path that cannot be written is the
+    // caller's mistake and worth failing on, and finding that out after a
+    // synthesis run rather than before it would waste the whole run.
+    let bunyan_sink = match bunyan_out {
+        Some(path) => Some(open_bunyan_sink(path)?),
+        None => None,
+    };
     {
         let procs = std::sync::Arc::clone(&proc_table);
         let input_file = std::sync::Arc::clone(&input_file_for_stack);
@@ -3657,6 +3713,7 @@ async fn run_loaded_program(
         let worst = std::sync::Arc::clone(&worst_severity);
         let cw = std::sync::Arc::clone(&cw_count);
         let host = bunyan_host.clone();
+        let bunyan_sink = bunyan_sink.clone();
         backend.set_stdout_sink(Box::new(move |kind, chunk: &str| {
             let cur_origin = origin.lock().ok().and_then(|g| g.clone());
             worst.fetch_max(
@@ -3676,8 +3733,19 @@ async fn run_loaded_program(
                 .map(|mut a| a.push(kind, chunk))
                 .unwrap_or_default();
             for block in blocks {
-                if bunyan {
+                // Both surfaces, always. The file is an extra copy of the
+                // session rather than a different rendering of it, so asking
+                // for one never changes what the person watching sees.
+                render_block(
+                    &block,
+                    log_level,
+                    &procs,
+                    cur_origin.as_ref(),
+                    Some(input_file.as_path()),
+                );
+                if let Some(sink) = &bunyan_sink {
                     emit_bunyan_block(
+                        sink,
                         &block,
                         log_level,
                         &procs,
@@ -3685,14 +3753,6 @@ async fn run_loaded_program(
                         Some(input_file.as_path()),
                         &host,
                         bunyan_pid,
-                    );
-                } else {
-                    render_block(
-                        &block,
-                        log_level,
-                        &procs,
-                        cur_origin.as_ref(),
-                        Some(input_file.as_path()),
                     );
                 }
             }
@@ -3886,19 +3946,7 @@ async fn run_loaded_program(
                 // not already empty AND the source command wasn't a
                 // set binding.
                 if !out.value.is_empty() && !is_set_binding {
-                    if bunyan {
-                        // Eval return values are results, not
-                        // diagnostics — surface them at bunyan info so
-                        // stdout stays a pure JSON stream for looker.
-                        emit_bunyan_line(
-                            30,
-                            "result",
-                            None,
-                            &out.value,
-                            &bunyan_host,
-                            bunyan_pid,
-                        );
-                    } else if matches!(
+                    if matches!(
                         log_level,
                         vw_vivado::LogLevel::Debug | vw_vivado::LogLevel::Info
                     ) {
@@ -3908,6 +3956,22 @@ async fn run_loaded_program(
                         // `vw::configure_ip`'s `null` return is pure
                         // noise.
                         println!("{}", out.value);
+                    }
+                    if let Some(sink) = &bunyan_sink {
+                        // Eval return values are results, not diagnostics, so
+                        // they go in at bunyan info. Recorded whatever the log
+                        // level is: the file is meant to be the whole session,
+                        // and the terseness the level asks for is about what a
+                        // person is made to read.
+                        emit_bunyan_line(
+                            sink,
+                            30,
+                            "result",
+                            None,
+                            &out.value,
+                            &bunyan_host,
+                            bunyan_pid,
+                        );
                     }
                 }
             }
@@ -3931,8 +3995,16 @@ async fn run_loaded_program(
     let trailing = block_acc.lock().map(|mut a| a.flush()).unwrap_or_default();
     let cur_origin = current_origin.lock().ok().and_then(|g| g.clone());
     for block in trailing {
-        if bunyan {
+        render_block(
+            &block,
+            log_level,
+            &proc_table,
+            cur_origin.as_ref(),
+            Some(input_file_for_stack.as_path()),
+        );
+        if let Some(sink) = &bunyan_sink {
             emit_bunyan_block(
+                sink,
                 &block,
                 log_level,
                 &proc_table,
@@ -3940,14 +4012,6 @@ async fn run_loaded_program(
                 Some(input_file_for_stack.as_path()),
                 &bunyan_host,
                 bunyan_pid,
-            );
-        } else {
-            render_block(
-                &block,
-                log_level,
-                &proc_table,
-                cur_origin.as_ref(),
-                Some(input_file_for_stack.as_path()),
             );
         }
     }
@@ -4074,7 +4138,7 @@ async fn ensure_ip_generated(
     };
     let run_result = run_loaded_program(
         &entry, site, &program, /*check_only=*/ false, part, variant,
-        log_level, /*info_with_stack=*/ false, /*bunyan=*/ false,
+        log_level, /*info_with_stack=*/ false, /*bunyan_out=*/ None,
     )
     .await;
     // Rewrite the just-generated `.vho` instantiation templates into
@@ -4119,7 +4183,7 @@ async fn ensure_ip_generated(
 mod bunyan_tests {
     use super::*;
 
-    /// The severity→level mapping is the crux of `--bunyan`: INFO→30,
+    /// The severity→level mapping is the crux of `--bunyan-out`: INFO→30,
     /// WARNING→40, CRITICAL WARNING and ERROR both →50 (error), and
     /// non-diagnostic noise →20 (debug).
     #[test]
@@ -4163,6 +4227,82 @@ mod bunyan_tests {
         // Escaping round-trips the embedded quote and newline.
         let msg = v["msg"].as_str().unwrap();
         assert!(msg.contains('"') && msg.contains('\n'));
+    }
+
+    /// `--bunyan-out` names a file that may be anywhere the caller likes,
+    /// including somewhere that does not exist yet — `target/logs/run.bunyan`
+    /// on a clean checkout being the obvious case.
+    #[test]
+    fn the_sink_creates_the_directory_it_was_pointed_at() {
+        let dir = tempfile::TempDir::new().expect("scratch");
+        let path = camino::Utf8Path::from_path(dir.path())
+            .expect("utf8")
+            .join("deep/er/still/run.bunyan");
+
+        let sink = open_bunyan_sink(&path).expect("open");
+        emit_bunyan_line(&sink, 40, "vivado", None, "hello", "host1", 7);
+
+        assert!(path.exists(), "the file should be where it was asked for");
+    }
+
+    /// Each record has to land on its own line as it happens, so that the file
+    /// is readable while a run that takes hours is still going.
+    #[test]
+    fn records_are_flushed_one_per_line_as_they_are_written() {
+        let dir = tempfile::TempDir::new().expect("scratch");
+        let path = camino::Utf8Path::from_path(dir.path())
+            .expect("utf8")
+            .join("b");
+
+        let sink = open_bunyan_sink(&path).expect("open");
+        emit_bunyan_line(&sink, 30, "vivado", None, "first", "host1", 7);
+        emit_bunyan_line(&sink, 50, "vivado", None, "second", "host1", 7);
+
+        // Read while the sink is still open: nothing may be sitting in a
+        // buffer waiting for the process to end.
+        let written = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per record: {written:?}");
+        for (line, expected) in lines.iter().zip(["first", "second"]) {
+            let v: serde_json::Value =
+                serde_json::from_str(line).expect("each line parses alone");
+            assert_eq!(v["msg"], expected);
+        }
+    }
+
+    /// A bunyan log is the record of one run. Appending would interleave it
+    /// with a previous run's under timestamps that make the result look like
+    /// one very long session.
+    #[test]
+    fn opening_the_sink_again_does_not_append_to_the_last_run() {
+        let dir = tempfile::TempDir::new().expect("scratch");
+        let path = camino::Utf8Path::from_path(dir.path())
+            .expect("utf8")
+            .join("b");
+
+        let first = open_bunyan_sink(&path).expect("open");
+        emit_bunyan_line(&first, 30, "vivado", None, "old run", "host1", 7);
+        drop(first);
+
+        let second = open_bunyan_sink(&path).expect("reopen");
+        emit_bunyan_line(&second, 30, "vivado", None, "new run", "host1", 7);
+
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(written.lines().count(), 1, "got: {written:?}");
+        assert!(written.contains("new run"));
+    }
+
+    /// A path that cannot be opened is the caller's mistake, and has to be
+    /// reported before vivado starts rather than after a synthesis run.
+    #[test]
+    fn a_path_that_cannot_be_opened_is_an_error() {
+        let dir = tempfile::TempDir::new().expect("scratch");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        // A directory where the file should be.
+        let occupied = root.join("taken");
+        std::fs::create_dir(&occupied).expect("mkdir");
+
+        assert!(open_bunyan_sink(&occupied).is_err());
     }
 
     /// An info record with no `severity` (the eval-result echo path) still
