@@ -27,6 +27,14 @@ use vw_api_client::user::{types, Client};
 /// `vw-svc`'s own default user API port.
 const DEFAULT_SERVICE_URL: &str = "http://localhost:2727";
 
+/// Where the administrative API lives if the caller does not say otherwise.
+///
+/// A second listener on a second port rather than a path under the first one,
+/// so that whoever runs the service can decide separately who may reach it —
+/// the usual arrangement being that this one is not exposed outside the rack
+/// at all. That is also why it cannot be derived from `--url`.
+const DEFAULT_ADMIN_URL: &str = "http://localhost:2728";
+
 /// How often `--wait` asks what an environment's instances are doing.
 ///
 /// Instances take minutes, so this is far more often than anything changes.
@@ -71,6 +79,17 @@ pub struct CloudArgs {
         help = "Base URL of the vw service"
     )]
     url: String,
+
+    #[arg(
+        long,
+        global = true,
+        env = "VW_SVC_ADMIN_URL",
+        default_value = DEFAULT_ADMIN_URL,
+        help = "Base URL of the vw service's administrative API, which is a \
+                separate listener on a separate port. Only used by \
+                `vw cloud admin`."
+    )]
+    admin_url: String,
 
     #[arg(
         long,
@@ -191,6 +210,13 @@ pub enum CloudCommand {
         out: Option<Utf8PathBuf>,
     },
     #[command(
+        about = "Administer the service — every environment, whoever owns it"
+    )]
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+    #[command(
         about = "Download the ssh key that opens an environment's instances"
     )]
     Keys {
@@ -203,6 +229,24 @@ pub enum CloudCommand {
                     already there. [default: ~/.ssh]"
         )]
         dir: Option<Utf8PathBuf>,
+    },
+}
+
+/// What can be done through the administrative API.
+///
+/// Deliberately only the two things the user API cannot do: see across
+/// everybody, and delete something that is not yours. Anything an
+/// administrator can already do as themselves stays on `vw cloud`.
+#[derive(Subcommand)]
+pub enum AdminCommand {
+    #[command(about = "List every environment on the service and who owns it")]
+    List,
+    #[command(about = "Delete an environment belonging to someone else")]
+    Delete {
+        #[arg(help = "User the environment belongs to")]
+        user: String,
+        #[arg(help = "Environment name")]
+        name: String,
     },
 }
 
@@ -285,6 +329,18 @@ pub struct Session {
 }
 
 pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
+    // The administrative commands speak to a different listener, and none of
+    // them need the user API, so that session is the only one built.
+    if let CloudCommand::Admin { command } = args.command {
+        let session = AdminSession::new(&args.admin_url, args.insecure)?;
+        return match command {
+            AdminCommand::List => admin_list(&session).await,
+            AdminCommand::Delete { user, name } => {
+                admin_delete(&session, &user, &name).await
+            }
+        };
+    }
+
     let session = Session::new(&args.url, args.insecure)?;
 
     match args.command {
@@ -340,6 +396,176 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             )
             .await
         }
+        // Handled before the user session is built.
+        CloudCommand::Admin { .. } => unreachable!(),
+    }
+}
+
+/// A connection to the service's administrative API.
+///
+/// Separate from [`Session`] rather than a mode of it, because it is a
+/// different listener with a different generated client and a different set of
+/// endpoints. The credential is the same one: an administrator is a Github
+/// user the service was started with the name of, not a second identity.
+pub struct AdminSession {
+    client: vw_api_client::admin::Client,
+    authenticated: bool,
+}
+
+impl AdminSession {
+    fn new(url: &str, insecure: bool) -> Result<AdminSession, CloudError> {
+        let token = access_token()?;
+        Ok(AdminSession {
+            client: vw_api_client::admin_client(
+                &vw_api_client::ClientConfig {
+                    base_url: url,
+                    token: token.as_deref(),
+                    insecure,
+                },
+            )?,
+            authenticated: token.is_some(),
+        })
+    }
+
+    /// Render a client error in terms of what the service said.
+    ///
+    /// The same shape as [`Session::error`], over the admin client's own error
+    /// type. A 403 here is the interesting one: it means the caller is who
+    /// they say they are and is not an administrator, and the service's
+    /// message says how to become one.
+    fn error(
+        &self,
+        error: vw_api_client::admin::Error<vw_api_client::admin::types::Error>,
+    ) -> CloudError {
+        match error {
+            vw_api_client::admin::Error::ErrorResponse(response) => {
+                let status = response.status().as_u16();
+                if status == UNAUTHORIZED && !self.authenticated {
+                    return CloudError::NoCredentials;
+                }
+                CloudError::Service {
+                    status,
+                    message: response.into_inner().message,
+                }
+            }
+            other => CloudError::Transport(with_causes(&other)),
+        }
+    }
+}
+
+/// Every environment on the service, whoever owns it.
+async fn admin_list(session: &AdminSession) -> Result<(), CloudError> {
+    let page = session
+        .client
+        .get_environments()
+        .await
+        .map_err(|e| session.error(e))?;
+    let mut environments = page.into_inner().items;
+
+    if environments.is_empty() {
+        println!("No cloud environments exist on this service.");
+        return Ok(());
+    }
+
+    // Grouped by owner, because the question this command answers is usually
+    // "who is holding the rack" rather than "what is running".
+    environments.sort_by(|a, b| {
+        (&a.user, &a.environment.name).cmp(&(&b.user, &b.environment.name))
+    });
+
+    let mut current = None;
+    for entry in &environments {
+        if current != Some(&entry.user) {
+            println!("{}", entry.user.bright_white().bold());
+            current = Some(&entry.user);
+        }
+        println!(
+            "  {} - {}",
+            entry.environment.name.cyan(),
+            admin_instance_summary(&entry.environment),
+        );
+    }
+
+    let owners = environments
+        .iter()
+        .map(|e| &e.user)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    println!(
+        "\n{} environment{} across {} user{}",
+        environments.len(),
+        if environments.len() == 1 { "" } else { "s" },
+        owners,
+        if owners == 1 { "" } else { "s" },
+    );
+
+    Ok(())
+}
+
+/// Delete somebody else's environment.
+async fn admin_delete(
+    session: &AdminSession,
+    user: &str,
+    name: &str,
+) -> Result<(), CloudError> {
+    // Positional, and in the order the path template names them
+    // (`/environment/{user}/{name}`) rather than the order the spec lists the
+    // parameters in. Getting this backwards produces a 404 naming an
+    // environment that exists, which is a confusing thing to debug.
+    session
+        .client
+        .delete_environment(user, name)
+        .await
+        .map_err(|e| session.error(e))?;
+
+    println!(
+        "{} Deleted {}'s cloud environment: {}",
+        "✓".bright_green(),
+        user.bright_white(),
+        name.cyan(),
+    );
+    Ok(())
+}
+
+/// A one line rendering of an environment's instances, over the admin client's
+/// types.
+///
+/// The same shape as [`instance_summary`], which cannot be shared: the two
+/// APIs are generated separately and their `Environment` types are distinct
+/// Rust types that happen to look alike.
+fn admin_instance_summary(
+    environment: &vw_api_client::admin::types::Environment,
+) -> String {
+    let instances = [
+        &environment.vivado_instance,
+        &environment.helios_instance,
+        &environment.artifact_instance,
+    ];
+
+    INSTANCES
+        .iter()
+        .zip(instances)
+        .map(|((label, _), instance)| match instance {
+            Some(instance) => format!(
+                "{label}: {}",
+                admin_colored_state(&instance.state.to_string())
+            ),
+            None => format!("{label}: {}", "none".bright_black()),
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// [`colored_state`] over the admin client's state type, matched by name so
+/// the two listings read the same.
+fn admin_colored_state(state: &str) -> ColoredString {
+    match state {
+        "running" => state.green(),
+        "creating" | "starting" | "stopping" | "rebooting" | "migrating"
+        | "repairing" => state.magenta(),
+        "stopped" => state.bright_black(),
+        "failed" | "destroyed" => state.red(),
+        other => other.normal(),
     }
 }
 

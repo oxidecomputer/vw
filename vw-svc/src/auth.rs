@@ -145,7 +145,8 @@ pub(crate) enum AuthError {
     #[error("the supplied token does not have access to redhawk")]
     NoRedhawkProjectAccess,
     #[error(
-        "'{0}' is not an administrator of this service; ask whoever runs it          to add you to --admin-users"
+        "'{0}' is not an administrator of this service; ask whoever runs it \
+         to add you to --admin-users"
     )]
     NotAnAdministrator(String),
     #[error("an error occured talking to github: {0}")]
