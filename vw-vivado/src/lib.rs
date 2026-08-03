@@ -18,9 +18,9 @@ pub mod stream;
 mod worker;
 
 pub use handlers::{
-    make_handler, make_handler_full, make_handler_with_preloaded,
-    make_handler_with_variant, PreloadedPaths, SharedCriticalWarningCount,
-    SharedPreload,
+    make_handler, make_handler_full, make_handler_reporting,
+    make_handler_with_preloaded, make_handler_with_variant, PreloadedPaths,
+    Reporter, SharedCriticalWarningCount, SharedPreload,
 };
 pub use raw_log::raw_log_path_for_workspace;
 pub use rpc::{FnHandler, RpcHandler};

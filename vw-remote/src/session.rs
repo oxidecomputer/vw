@@ -323,11 +323,23 @@ async fn start(
     let cw_count: vw_vivado::SharedCriticalWarningCount =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let rpc_handler = vw_vivado::make_handler_full(
+    // Reported through the same channel as "starting vivado", so a decision
+    // taken on the instance — a checkpoint not reused, and why — reaches the
+    // person waiting on the build rather than only the agent's log, which on
+    // a CI worker nobody will ever read.
+    let reporter: vw_vivado::Reporter = {
+        let events = events.clone();
+        std::sync::Arc::new(move |message: String| {
+            let _ = events.send(SessionEvent::Note { message });
+        })
+    };
+
+    let rpc_handler = vw_vivado::make_handler_reporting(
         Some(root.as_std_path().to_path_buf()),
         selection.active_variant.clone(),
         preload,
         cw_count.clone(),
+        Some(reporter),
     );
 
     let raw_log =

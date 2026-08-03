@@ -193,6 +193,32 @@ pub fn make_handler_full(
     preloaded: SharedPreload,
     cw_count: SharedCriticalWarningCount,
 ) -> Arc<dyn RpcHandler> {
+    make_handler_reporting(
+        workspace_root,
+        active_variant,
+        preloaded,
+        cw_count,
+        None,
+    )
+}
+
+/// Somewhere to say something the person running the build should see.
+///
+/// The RPC surface answers questions Vivado asks, and some of those answers
+/// decide whether an hour of work happens or is skipped. When one of those
+/// goes the expensive way, the reason belongs in front of whoever is waiting —
+/// on a remote build that means the session's note channel, and locally it
+/// means stderr.
+pub type Reporter = Arc<dyn Fn(String) + Send + Sync>;
+
+/// [`make_handler_full`] with somewhere to report decisions worth explaining.
+pub fn make_handler_reporting(
+    workspace_root: Option<PathBuf>,
+    active_variant: Option<String>,
+    preloaded: SharedPreload,
+    cw_count: SharedCriticalWarningCount,
+    reporter: Option<Reporter>,
+) -> Arc<dyn RpcHandler> {
     let workspace_root = workspace_root.map(Arc::new);
     let active_variant = active_variant.map(Arc::new);
     FnHandler::new(move |method: String, args: Value| {
@@ -200,6 +226,7 @@ pub fn make_handler_full(
         let av = active_variant.clone();
         let pl = preloaded.clone();
         let cw = cw_count.clone();
+        let report = reporter.clone();
         async move {
             dispatch(
                 &method,
@@ -208,12 +235,14 @@ pub fn make_handler_full(
                 av.as_deref().map(|s| s.as_str()),
                 &pl,
                 &cw,
+                report.as_ref(),
             )
             .await
         }
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     method: &str,
     args: Value,
@@ -221,6 +250,7 @@ async fn dispatch(
     active_variant: Option<&str>,
     preloaded: &SharedPreload,
     cw_count: &SharedCriticalWarningCount,
+    reporter: Option<&Reporter>,
 ) -> Result<Value, String> {
     match method {
         "workspace_root" => workspace_root
@@ -271,7 +301,7 @@ async fn dispatch(
             design_phase_constraints(workspace_root, ConstraintPhase::Route)
         }
         "synth_needs_update" => {
-            synth_needs_update(workspace_root, active_variant, args)
+            synth_needs_update(workspace_root, active_variant, args, reporter)
         }
         "synth_mark_checkpoint" => {
             synth_mark_checkpoint(workspace_root, active_variant, args)
@@ -957,6 +987,7 @@ fn synth_needs_update(
     workspace_root: Option<&std::path::Path>,
     active_variant: Option<&str>,
     args: Value,
+    reporter: Option<&Reporter>,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
     let obj = args.as_object().ok_or_else(|| {
@@ -970,13 +1001,23 @@ fn synth_needs_update(
             .ok_or_else(|| {
                 "synth_needs_update: missing string `checkpoint`".to_string()
             })?;
-    let needs = vw_lib::synth_needs_update(
+    let status = vw_lib::synth_checkpoint_status(
         &ws,
         std::path::Path::new(checkpoint),
         active_variant,
     )
     .map_err(|e| format!("checking checkpoint freshness: {e}"))?;
-    Ok(Value::Bool(needs))
+
+    // Only when the answer costs something. A checkpoint that is reused is
+    // the expected case and saying so every time would bury the one line
+    // somebody needs on the run where it did not happen.
+    if status != vw_lib::CheckpointStatus::Fresh {
+        if let Some(report) = reporter {
+            report(format!("synth checkpoint not reused: {status}"));
+        }
+    }
+
+    Ok(Value::Bool(status != vw_lib::CheckpointStatus::Fresh))
 }
 
 /// `vhdl_dependency_sources` — return every transitive-dep VHDL

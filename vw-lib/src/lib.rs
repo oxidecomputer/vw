@@ -28,7 +28,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -769,7 +769,19 @@ impl Dependency {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LockFile {
-    pub dependencies: HashMap<String, LockedDependency>,
+    /// Ordered, and that is load-bearing rather than tidy.
+    ///
+    /// This file is serialized back out whenever dependencies are fetched, and
+    /// its bytes are part of the synth checkpoint's source fingerprint. A
+    /// `HashMap` iterates in an order Rust randomizes per process, so writing
+    /// an unchanged lockfile produced different bytes every time — which read
+    /// downstream as "the sources changed" and threw away a perfectly good
+    /// checkpoint on every fetch.
+    ///
+    /// That went unnoticed locally, where `~/.vw/deps` is warm and the file is
+    /// never rewritten. It showed up the moment builds moved to CI, where
+    /// every job starts on an empty worker, re-fetches, and rewrites it.
+    pub dependencies: BTreeMap<String, LockedDependency>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1115,7 +1127,7 @@ pub async fn update_workspace_with_token(
     let graph = build_dependency_graph(workspace_dir, true, creds).await?;
 
     let mut lock_file = LockFile {
-        dependencies: HashMap::new(),
+        dependencies: BTreeMap::new(),
     };
     let mut update_info = Vec::new();
     for idx in graph.node_indices() {
@@ -2736,17 +2748,124 @@ fn checkpoint_needs_update_with_fingerprint(
     checkpoint: &Path,
     current_fingerprint: u64,
 ) -> bool {
+    !matches!(
+        checkpoint_status(checkpoint, current_fingerprint),
+        CheckpointStatus::Fresh
+    )
+}
+
+/// Why a stage did or did not reuse its checkpoint.
+///
+/// The bool [`checkpoint_needs_update_with_fingerprint`] returns is what the
+/// flow acts on, but it is not what somebody debugging a build needs. "Synth
+/// ran again" has four quite different causes, and telling them apart from the
+/// outside means guessing — which is exactly the position this type exists to
+/// end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointStatus {
+    /// The checkpoint is usable; the stage can be skipped.
+    Fresh,
+    /// No checkpoint file. Either the stage has never run here, or something
+    /// removed it — `vw::synth` wipes its own stage directory on the full
+    /// path, so a run that failed before writing leaves this state behind.
+    Missing,
+    /// The checkpoint is there but its manifest sidecar is not. Means the
+    /// checkpoint was written and never marked, so its provenance is unknown
+    /// and it cannot safely be trusted.
+    Unmarked,
+    /// The manifest exists and does not contain a fingerprint.
+    Unreadable,
+    /// Both are present and the tracked sources have changed since.
+    Stale { stored: u64, current: u64 },
+}
+
+impl std::fmt::Display for CheckpointStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fresh => write!(f, "up to date"),
+            Self::Missing => write!(f, "no checkpoint file"),
+            Self::Unmarked => {
+                write!(f, "checkpoint present but never marked (no manifest)")
+            }
+            Self::Unreadable => write!(f, "manifest unreadable"),
+            Self::Stale { stored, current } => write!(
+                f,
+                "sources changed (checkpoint {stored:016x}, now {current:016x})"
+            ),
+        }
+    }
+}
+
+/// Classify `checkpoint` against `current_fingerprint`.
+///
+/// The single place that decides freshness; every `*_needs_update` is this
+/// with the answer narrowed to a bool.
+pub fn checkpoint_status(
+    checkpoint: &Path,
+    current_fingerprint: u64,
+) -> CheckpointStatus {
     if !checkpoint.exists() {
-        return true;
+        return CheckpointStatus::Missing;
     }
     let manifest = checkpoint_manifest_path(checkpoint);
     let Ok(stored) = fs::read_to_string(&manifest) else {
-        return true;
+        return CheckpointStatus::Unmarked;
     };
     let Ok(stored_fp) = stored.trim().parse::<u64>() else {
-        return true;
+        return CheckpointStatus::Unreadable;
     };
-    stored_fp != current_fingerprint
+    if stored_fp == current_fingerprint {
+        CheckpointStatus::Fresh
+    } else {
+        CheckpointStatus::Stale {
+            stored: stored_fp,
+            current: current_fingerprint,
+        }
+    }
+}
+
+/// Which tracked source files disagree with what the checkpoint was marked
+/// against, by re-fingerprinting each one on its own.
+///
+/// Only useful once [`checkpoint_status`] has said `Stale`: the combined
+/// fingerprint says something moved, and this says what. The stage manifest
+/// records only the combined value, so this cannot compare against the old
+/// per-file hashes — what it reports is the tracked set as it stands, which is
+/// enough to see a file nobody expected to be in it.
+pub fn fingerprint_breakdown(
+    workspace_dir: &Utf8Path,
+    paths: &[PathBuf],
+) -> Vec<(PathBuf, u64)> {
+    paths
+        .iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(workspace_dir.as_std_path())
+                .unwrap_or(path);
+            let mut h = fnv1a_64_extend(
+                0xcbf2_9ce4_8422_2325,
+                rel.to_string_lossy().as_bytes(),
+            );
+            match fs::read(path) {
+                Ok(content) => {
+                    h = fnv1a_64_extend(h, &[0x01]);
+                    h = fnv1a_64_extend(h, &fnv1a_64(&content).to_le_bytes());
+                }
+                Err(_) => h = fnv1a_64_extend(h, &[0x00]),
+            }
+            (path.clone(), h)
+        })
+        .collect()
+}
+
+/// [`checkpoint_status`] for the synth stage.
+pub fn synth_checkpoint_status(
+    workspace_dir: &Utf8Path,
+    checkpoint: &Path,
+    active_variant: Option<&str>,
+) -> Result<CheckpointStatus> {
+    let fp = synth_source_fingerprint(workspace_dir, active_variant)?;
+    Ok(checkpoint_status(checkpoint, fp))
 }
 
 /// Write the manifest sidecar for a freshly-produced synth
@@ -7198,6 +7317,153 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let xpr = inner.join(format!("{name}.xpr"));
         std::fs::write(xpr.as_std_path(), "").unwrap();
         project_dir.into_std_path_buf()
+    }
+
+    /// A lockfile serialized twice from equal contents must produce identical
+    /// bytes.
+    ///
+    /// This is not a style preference. `vw.lock` is rewritten whenever
+    /// dependencies are fetched, and its bytes feed the synth checkpoint's
+    /// source fingerprint — so a map that iterates in a different order each
+    /// process meant every fetch silently invalidated the checkpoint and threw
+    /// away an hour of synthesis. Nobody saw it locally, because a warm
+    /// `~/.vw/deps` means the file is never rewritten; CI re-fetches on every
+    /// job and hit it every time.
+    #[test]
+    fn a_lockfile_serializes_the_same_way_every_time() {
+        let dep = |n: &str| LockedDependency {
+            repo: format!("oxidecomputer/{n}"),
+            commit: "0f7c1d2e".to_owned(),
+            src: Vec::new(),
+            path: PathBuf::from(format!("/deps/{n}")),
+            recursive: false,
+            sim_only: false,
+            submodules: false,
+            exclude: Vec::new(),
+        };
+        // Enough entries that a randomized order would almost certainly differ
+        // between two builds of the same map.
+        let names = [
+            "ipe",
+            "anodizer",
+            "rust_hdl",
+            "vivado-cmd",
+            "clk-wizard",
+            "cips",
+            "dcmac",
+            "cpm5",
+            "gtwiz-versal",
+            "vw",
+            "vhdl-dungeon",
+            "redhawk",
+        ];
+
+        let build = || LockFile {
+            dependencies: names
+                .iter()
+                .map(|n| ((*n).to_owned(), dep(n)))
+                .collect(),
+        };
+
+        let first = toml::to_string_pretty(&build()).expect("serialize");
+        let second = toml::to_string_pretty(&build()).expect("serialize");
+
+        assert_eq!(first, second, "same contents must give the same bytes");
+
+        // And the order is the sorted one, so it is stable across processes
+        // and not merely stable within this one.
+        let order: Vec<&str> = first
+            .lines()
+            .filter_map(|l| l.strip_prefix("[dependencies."))
+            .filter_map(|l| l.strip_suffix(']'))
+            .collect();
+        let mut sorted = names.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(order, sorted, "entries should be in sorted order");
+    }
+
+    /// Each way a checkpoint can fail to be reused has to be told apart from
+    /// the others. They are indistinguishable from outside the process, which
+    /// is the whole reason for reporting them: "synth ran again" has four
+    /// causes and only one of them means the sources actually changed.
+    #[test]
+    fn every_reason_a_checkpoint_is_not_reused_is_distinguishable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Utf8Path::from_path(tmp.path()).unwrap();
+        let dcp = dir.join("top.dcp");
+        let manifest = dir.join("top.dcp.manifest");
+
+        // Nothing there at all.
+        assert_eq!(
+            checkpoint_status(dcp.as_std_path(), 42),
+            CheckpointStatus::Missing,
+        );
+
+        // Written but never marked — the state a stage leaves behind when it
+        // produced a checkpoint and did not record what it was built from.
+        std::fs::write(dcp.as_std_path(), "checkpoint").unwrap();
+        assert_eq!(
+            checkpoint_status(dcp.as_std_path(), 42),
+            CheckpointStatus::Unmarked,
+        );
+
+        // Marked with something that is not a fingerprint.
+        std::fs::write(manifest.as_std_path(), "not a number").unwrap();
+        assert_eq!(
+            checkpoint_status(dcp.as_std_path(), 42),
+            CheckpointStatus::Unreadable,
+        );
+
+        // Marked against different sources.
+        std::fs::write(manifest.as_std_path(), "7").unwrap();
+        assert_eq!(
+            checkpoint_status(dcp.as_std_path(), 42),
+            CheckpointStatus::Stale {
+                stored: 7,
+                current: 42
+            },
+        );
+
+        // And the one case where the stage gets skipped.
+        std::fs::write(manifest.as_std_path(), "42").unwrap();
+        assert_eq!(
+            checkpoint_status(dcp.as_std_path(), 42),
+            CheckpointStatus::Fresh,
+        );
+    }
+
+    /// The bool the flow acts on has to keep agreeing with the reason, or the
+    /// report would explain a decision that was not the one taken.
+    #[test]
+    fn the_reported_reason_agrees_with_the_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Utf8Path::from_path(tmp.path()).unwrap();
+        let dcp = dir.join("top.dcp");
+
+        for (fp, setup) in [
+            (42u64, None),
+            (42, Some(("42", true))),
+            (42, Some(("7", true))),
+        ] {
+            if let Some((stored, present)) = setup {
+                if present {
+                    std::fs::write(dcp.as_std_path(), "checkpoint").unwrap();
+                }
+                std::fs::write(
+                    dir.join("top.dcp.manifest").as_std_path(),
+                    stored,
+                )
+                .unwrap();
+            }
+            let status = checkpoint_status(dcp.as_std_path(), fp);
+            let needs =
+                checkpoint_needs_update_with_fingerprint(dcp.as_std_path(), fp);
+            assert_eq!(
+                needs,
+                status != CheckpointStatus::Fresh,
+                "reason {status} disagrees with needs_update={needs}",
+            );
+        }
     }
 
     /// Missing `.xpr` → always needs wipe (first-time-project

@@ -3586,11 +3586,20 @@ async fn run_loaded_program(
             // the `critical_warning_count` RPC by `vw::synth` / `vw::place`
             // to gate checkpoint writes on a CW-clean phase. Cloned into
             // the handler and the sink so both sides see the same atomic.
-            let rpc_handler = vw_vivado::make_handler_full(
+            // Same reports the remote path sends over its note channel; here
+            // there is no channel to send them over, so they go to stderr
+            // alongside vw's other status lines.
+            let reporter: vw_vivado::Reporter =
+                std::sync::Arc::new(|message: String| {
+                    eprintln!("{} {message}", "note:".bright_black());
+                });
+
+            let rpc_handler = vw_vivado::make_handler_reporting(
                 rpc_workspace_root.clone(),
                 active_variant,
                 preload,
                 cw_count.clone(),
+                Some(reporter),
             );
             // Raw byte-log: `<workspace>/target/logs/vivado-<ts>.log`.
             // Failure to create the directory demotes to no-log rather than
