@@ -184,9 +184,12 @@ pub enum CloudCommand {
         name: String,
         #[arg(
             long,
-            value_name = "FILE",
-            help = "Download this artifact instead of listing. Repeat, or \
-                    use --all, for several."
+            value_name = "PATTERN",
+            help = "Download the artifacts matching this instead of listing. \
+                    A glob, where '*' crosses '/' — so '*.edif' finds every \
+                    netlist and 'reports/*place*' finds the place reports. \
+                    Quote it, or the shell may try to expand it first. \
+                    Repeat, or use --all, for several."
         )]
         get: Vec<String>,
         #[arg(
@@ -265,8 +268,10 @@ pub enum CloudError {
         .0.join(", ")
     )]
     AmbiguousEnvironment(Vec<String>),
-    #[error("no artifact called '{0}'; run `vw cloud artifacts <env>` to see what there is")]
+    #[error("nothing matches '{0}'; run `vw cloud artifacts <env>` to see what there is")]
     NoSuchArtifact(String),
+    #[error("'{0}' is not a valid pattern: {1}")]
+    BadArtifactPattern(String, String),
     #[error("'{0}' is not a name an artifact may be written under")]
     UnsafeArtifactName(String),
     #[error("no driver here; {0} does not exist")]
@@ -1201,17 +1206,7 @@ async fn artifacts(
         show(&available);
         return Ok(());
     } else {
-        // Named artifacts have to exist, and saying which one does not is more
-        // use than a download that quietly produces nothing.
-        let mut wanted = Vec::new();
-        for name in get {
-            let found = available
-                .iter()
-                .find(|artifact| artifact.name == *name)
-                .ok_or_else(|| CloudError::NoSuchArtifact(name.clone()))?;
-            wanted.push(found);
-        }
-        wanted
+        select(&available, get)?
     };
 
     if wanted.is_empty() {
@@ -1228,6 +1223,60 @@ async fn artifacts(
     }
 
     Ok(())
+}
+
+/// Which artifacts the `--get` patterns name.
+///
+/// Every pattern is a glob over the whole artifact name, and `*` crosses `/`
+/// freely — so `*.edif` finds the netlists under place/, route/ and synth/
+/// without anyone having to know to write `**`. These names are a flat
+/// namespace that happens to contain slashes, not a filesystem, and treating
+/// the slash as a boundary would only make the obvious pattern the wrong one.
+///
+/// A name with no glob characters in it is a pattern that matches only itself,
+/// so naming a single artifact still works exactly as it did.
+///
+/// A pattern matching nothing is an error naming that pattern. Downloading the
+/// four things that did match and saying nothing about the fifth is how
+/// somebody ends up with a partial set of artifacts and no idea.
+fn select<'a>(
+    available: &'a [vw_api_types_versions::latest::Artifact],
+    patterns: &[String],
+) -> Result<Vec<&'a vw_api_types_versions::latest::Artifact>, CloudError> {
+    let mut chosen: Vec<&vw_api_types_versions::latest::Artifact> = Vec::new();
+
+    for pattern in patterns {
+        let glob = glob::Pattern::new(pattern).map_err(|e| {
+            CloudError::BadArtifactPattern(pattern.clone(), e.to_string())
+        })?;
+
+        let matched: Vec<_> = available
+            .iter()
+            .filter(|artifact| glob.matches(&artifact.name))
+            .collect();
+
+        if matched.is_empty() {
+            return Err(CloudError::NoSuchArtifact(pattern.clone()));
+        }
+
+        // Two patterns overlapping is an ordinary thing to type, and it should
+        // not mean downloading the same file twice.
+        for artifact in matched {
+            if !chosen.iter().any(|held| held.name == artifact.name) {
+                chosen.push(artifact);
+            }
+        }
+    }
+
+    // The order things are listed in, so a download reads like the listing it
+    // was chosen from rather than like the order the patterns were typed.
+    chosen.sort_by(|a, b| {
+        source_order(a.kind)
+            .cmp(&source_order(b.kind))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    Ok(chosen)
 }
 
 /// Throw away everything an environment has stored.
@@ -1473,6 +1522,144 @@ pub async fn fetch_generated_ip(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    use vw_api_types_versions::latest::{Artifact, TargetKind};
+
+    /// A real environment's listing, which is what the patterns have to be
+    /// good for.
+    fn listing() -> Vec<Artifact> {
+        let vivado = [
+            "image/vpk120.pdi",
+            "place/top_vpk120-netlist.edif",
+            "reports/top_vpk120-bus-skew.rpt",
+            "reports/top_vpk120-clock-utilization.rpt",
+            "reports/top_vpk120-drc.rpt",
+            "reports/top_vpk120-methodology.rpt",
+            "reports/top_vpk120-place-timing.rpt",
+            "reports/top_vpk120-place-utilization.rpt",
+            "reports/top_vpk120-power.rpt",
+            "reports/top_vpk120-route-status.rpt",
+            "reports/top_vpk120-route-timing.rpt",
+            "reports/top_vpk120-route-utilization.rpt",
+            "reports/top_vpk120-synth-utilization.rpt",
+            "reports/top_vpk120-timing-detail.rpt",
+            "reports/top_vpk120-timing-summary.rpt",
+            "route/top_vpk120-netlist.edif",
+            "synth/top_vpk120-netlist.edif",
+        ];
+        let helios = ["release/rh", "x86_64-illumos/release/rhdrv"];
+
+        vivado
+            .into_iter()
+            .map(|name| (name, TargetKind::Vivado))
+            .chain(helios.into_iter().map(|name| (name, TargetKind::Helios)))
+            .map(|(name, kind)| Artifact {
+                name: name.to_owned(),
+                kind,
+                size: 1,
+                modified: None,
+            })
+            .collect()
+    }
+
+    fn matching(patterns: &[&str]) -> Vec<String> {
+        let available = listing();
+        let patterns: Vec<String> =
+            patterns.iter().map(|p| (*p).to_owned()).collect();
+        select(&available, &patterns)
+            .expect("patterns should match")
+            .into_iter()
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_directory_pattern_takes_what_is_under_it() {
+        assert_eq!(matching(&["place/*"]), ["place/top_vpk120-netlist.edif"]);
+    }
+
+    #[test]
+    fn a_pattern_can_match_part_of_a_name() {
+        assert_eq!(
+            matching(&["reports/*place*"]),
+            [
+                "reports/top_vpk120-place-timing.rpt",
+                "reports/top_vpk120-place-utilization.rpt",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_star_crosses_a_slash() {
+        // The reason for the non-standard glob semantics: `*.edif` is what
+        // somebody types when they want the netlists, and they are in three
+        // different directories. Requiring `**/*.edif` would make the obvious
+        // pattern silently the wrong one.
+        assert_eq!(
+            matching(&["*.edif"]),
+            [
+                "place/top_vpk120-netlist.edif",
+                "route/top_vpk120-netlist.edif",
+                "synth/top_vpk120-netlist.edif",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_exact_name_still_names_one_thing() {
+        // What `--get` meant before it took patterns, and has to keep meaning.
+        assert_eq!(matching(&["image/vpk120.pdi"]), ["image/vpk120.pdi"],);
+    }
+
+    #[test]
+    fn overlapping_patterns_do_not_download_anything_twice() {
+        let found = matching(&["reports/*place*", "*place-timing*"]);
+
+        assert_eq!(
+            found,
+            [
+                "reports/top_vpk120-place-timing.rpt",
+                "reports/top_vpk120-place-utilization.rpt",
+            ],
+        );
+    }
+
+    #[test]
+    fn results_come_back_in_the_order_they_are_listed_in() {
+        // Patterns named backwards, and by the two different builders.
+        let found = matching(&["*rhdrv", "image/*"]);
+
+        assert_eq!(
+            found,
+            ["image/vpk120.pdi", "x86_64-illumos/release/rhdrv"],
+            "vivado before helios, whatever order was typed",
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_is_refused() {
+        // Rather than downloading the rest and leaving somebody with a partial
+        // set they think is complete.
+        let available = listing();
+        let patterns = vec!["place/*".to_owned(), "nosuch/*".to_owned()];
+
+        let refused = select(&available, &patterns);
+
+        assert!(
+            matches!(refused, Err(CloudError::NoSuchArtifact(p)) if p == "nosuch/*"),
+        );
+    }
+
+    #[test]
+    fn a_malformed_pattern_says_so() {
+        let available = listing();
+        let patterns = vec!["reports/[".to_owned()];
+
+        assert!(matches!(
+            select(&available, &patterns),
+            Err(CloudError::BadArtifactPattern(..)),
+        ));
+    }
 
     /// The escape `colored` emits for each colour we use.
     const GREEN: &str = "\u{1b}[32m";
