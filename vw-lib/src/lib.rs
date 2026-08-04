@@ -2204,6 +2204,30 @@ pub fn vhdl_design_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
     vhdl_design_sources_for_variant(workspace_dir, None)
 }
 
+/// Every VHDL source under `<workspace>/hdl/**`, with no variant filtering at
+/// all — the union of what every variant could build.
+///
+/// [`vhdl_design_sources`] answers a different question. It gives the surface
+/// of one build, so under no active variant it drops every variant-owned file;
+/// that is right for the analyzer and wrong for anything asking "could a change
+/// to this file matter to somebody". A workspace's top level is usually
+/// variant-owned, and a caller that wanted to know whether the design changed
+/// would be told no.
+///
+/// Empty vec when `<workspace_dir>/hdl/` does not exist.
+pub fn vhdl_design_sources_all_variants(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<PathBuf>> {
+    let hdl_dir = workspace_dir.join("hdl");
+    if !hdl_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files =
+        find_vhdl_files(hdl_dir.as_std_path(), /*recursive=*/ true, &[])?;
+    files.sort();
+    Ok(files)
+}
+
 /// Enumerate every VHDL source under `<workspace>/hdl/**` and
 /// filter by the `exclusive` file lists on the workspace's
 /// variants:

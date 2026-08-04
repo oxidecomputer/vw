@@ -124,6 +124,16 @@ enum DriverCommand {
     },
 }
 
+/// Which build's inputs [`Commands::Sources`] should list.
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum SourceSet {
+    /// Everything the hardware flow reads: VHDL, constraints, htcl, and the
+    /// workspace's dependency pins.
+    Design,
+    /// Everything the driver build reads.
+    Driver,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "Initialize a new workspace")]
@@ -348,6 +358,13 @@ enum Commands {
                     `--log-level=debug`."
         )]
         bunyan_out: Option<Utf8PathBuf>,
+    },
+    #[command(
+        about = "List the workspace files a build depends on, one per line"
+    )]
+    Sources {
+        #[arg(value_enum, help = "Which build's inputs to list")]
+        set: SourceSet,
     },
     #[command(about = "Launch the vw analyzer LSP server on stdio")]
     Analyzer,
@@ -1088,6 +1105,35 @@ async fn main() {
             {
                 eprintln!("{} {e}", "error:".bright_red());
                 process::exit(1);
+            }
+        }
+        Commands::Sources { set } => {
+            let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) else {
+                eprintln!(
+                    "{} no vw workspace here; run this from one, or from a \
+                     directory inside it",
+                    "error:".bright_red(),
+                );
+                process::exit(1);
+            };
+            match list_sources(&ws, set) {
+                Ok(paths) => {
+                    use std::io::Write;
+                    // Written through a locked handle rather than `println!`
+                    // so that a closed pipe ends the listing quietly. This is
+                    // a command people pipe into `head` and `grep`, and both
+                    // stop reading early.
+                    let mut out = std::io::stdout().lock();
+                    for path in paths {
+                        if writeln!(out, "{path}").is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
             }
         }
         Commands::Analyzer => {
@@ -4347,5 +4393,83 @@ mod bunyan_tests {
         assert_eq!(rec["level"], 30);
         assert_eq!(rec["component"], "result");
         assert_eq!(rec["v"], 0);
+    }
+}
+
+/// Every workspace file a build of `set` reads, relative to the workspace
+/// root and sorted.
+///
+/// Exists so that nothing outside vw has to keep its own idea of what a build
+/// depends on. CI wants to know whether a commit could have changed the
+/// hardware or the driver, and the honest answer to that is the same set the
+/// build itself enumerates — a second copy of it living in a job script would
+/// drift, and drift here means either a build that should have run and did
+/// not, or one that runs every time for nothing.
+///
+/// Two things are deliberately left out. Generated files under `target/` are
+/// build output, not input, and nothing tracks them. Dependency sources live
+/// outside the workspace entirely, so no diff of this repository can mention
+/// them — a change to one arrives as a change to `vw.lock`, which is listed.
+fn list_sources(
+    ws: &camino::Utf8Path,
+    set: SourceSet,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+
+    match set {
+        SourceSet::Design => {
+            // The same enumerators the synth fingerprint is built from, minus
+            // the ones that name files this repository does not contain.
+            paths.extend(vw_lib::vhdl_design_sources_all_variants(ws)?);
+            paths.extend(vw_lib::vhdl_bench_sources(ws)?);
+            paths.extend(vw_lib::design_constraints(ws)?);
+            paths.extend(vw_lib::list_workspace_htcl_files(ws)?);
+            paths.push(ws.join("vw.toml").into_std_path_buf());
+            paths.push(ws.join("vw.lock").into_std_path_buf());
+        }
+        SourceSet::Driver => {
+            // `driver/` is the driver — the same rule that decides what gets
+            // synchronized to the helios instance, and the reason there is
+            // nothing to configure. It is a cargo workspace of its own, so
+            // everything under it, including the manifests and the lockfile,
+            // is an input.
+            let root = ws.join(cloud_sync::DRIVER);
+            if root.exists() {
+                collect_files(root.as_std_path(), &mut paths);
+            }
+        }
+    }
+
+    let mut relative: Vec<String> = paths
+        .iter()
+        .filter_map(|path| path.strip_prefix(ws.as_std_path()).ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        // Build output is not an input, whichever set asked.
+        .filter(|path| {
+            !path.starts_with("target/") && !path.contains("/target/")
+        })
+        .collect();
+    relative.sort();
+    relative.dedup();
+    Ok(relative)
+}
+
+/// Every file under `dir`, recursively, skipping build output and version
+/// control.
+fn collect_files(dir: &std::path::Path, into: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == "target" || name == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_files(&path, into);
+        } else {
+            into.push(path);
+        }
     }
 }
