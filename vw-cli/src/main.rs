@@ -102,10 +102,11 @@ enum DriverCommand {
         local: bool,
         #[arg(
             long,
+            env = "VW_ENV",
             value_name = "NAME",
             conflicts_with = "local",
-            help = "Cloud environment to build in. Only needed when you have \
-                    more than one."
+            help = "Cloud environment to build in. Defaults to $VW_ENV, and is only \
+                    needed when that is unset and you have more than one."
         )]
         env: Option<String>,
         #[arg(
@@ -183,10 +184,11 @@ enum Commands {
         local: bool,
         #[arg(
             long,
+            env = "VW_ENV",
             value_name = "NAME",
             conflicts_with = "local",
-            help = "Cloud environment to clean. Only needed when you have \
-                    more than one."
+            help = "Cloud environment to clean. Defaults to $VW_ENV, and is only \
+                    needed when that is unset and you have more than one."
         )]
         env: Option<String>,
         #[arg(
@@ -215,10 +217,11 @@ enum Commands {
         local: bool,
         #[arg(
             long,
+            env = "VW_ENV",
             value_name = "NAME",
             conflicts_with = "local",
-            help = "Cloud environment to run in. Only needed when you have \
-                    more than one."
+            help = "Cloud environment to run in. Defaults to $VW_ENV, and is only \
+                    needed when that is unset and you have more than one."
         )]
         env: Option<String>,
         #[arg(
@@ -278,10 +281,11 @@ enum Commands {
         local: bool,
         #[arg(
             long,
+            env = "VW_ENV",
             value_name = "NAME",
             conflicts_with = "local",
-            help = "Cloud environment to build in. Only needed when you have \
-                    more than one."
+            help = "Cloud environment to build in. Defaults to $VW_ENV, and is only \
+                    needed when that is unset and you have more than one."
         )]
         env: Option<String>,
         #[arg(
@@ -359,10 +363,11 @@ enum Commands {
         local: bool,
         #[arg(
             long,
+            env = "VW_ENV",
             value_name = "NAME",
             conflicts_with = "local",
-            help = "Cloud environment to run in. Only needed when you have \
-                    more than one."
+            help = "Cloud environment to run in. Defaults to $VW_ENV, and is only \
+                    needed when that is unset and you have more than one."
         )]
         env: Option<String>,
         #[arg(
@@ -454,10 +459,11 @@ enum Commands {
         local: bool,
         #[arg(
             long,
+            env = "VW_ENV",
             value_name = "NAME",
             conflicts_with = "local",
-            help = "Cloud environment to generate IP in. Only needed when \
-                    you have more than one."
+            help = "Cloud environment to generate IP in. Defaults to $VW_ENV, and is only \
+                    needed when that is unset and you have more than one."
         )]
         env: Option<String>,
         #[arg(
@@ -4132,6 +4138,70 @@ async fn ensure_ip_generated(
         }
     }
     run_result
+}
+
+#[cfg(test)]
+mod env_flag_tests {
+    use super::*;
+
+    /// The environment a command acts on, however it was arrived at.
+    fn env_of(cli: Cli) -> Option<String> {
+        match cli.command {
+            Commands::Run { env, .. }
+            | Commands::Check { env, .. }
+            | Commands::Bench { env, .. }
+            | Commands::Clean { env, .. }
+            | Commands::Repl { env, .. } => env,
+            Commands::Driver { command } => match command {
+                DriverCommand::Build { env, .. } => env,
+            },
+            _ => panic!("not a command that takes --env"),
+        }
+    }
+
+    /// `$VW_ENV` stands in for `--env`, and an explicit flag still wins.
+    ///
+    /// One test rather than several because the variable is process-global:
+    /// two tests setting it would race under the default parallel harness.
+    #[test]
+    fn the_environment_variable_fills_in_for_the_flag() {
+        std::env::set_var("VW_ENV", "from-the-variable");
+
+        // Every command that takes one reads it, so a developer sets it once
+        // and stops repeating themselves.
+        for argv in [
+            vec!["vw", "run"],
+            vec!["vw", "check"],
+            vec!["vw", "bench"],
+            vec!["vw", "clean"],
+            vec!["vw", "repl"],
+            vec!["vw", "driver", "build"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("should parse");
+            assert_eq!(
+                env_of(cli).as_deref(),
+                Some("from-the-variable"),
+                "{argv:?} should have taken the environment from $VW_ENV",
+            );
+        }
+
+        // And naming one explicitly overrides it, or there would be no way to
+        // act on a second environment without unsetting the variable.
+        let cli =
+            Cli::try_parse_from(["vw", "clean", "--env", "from-the-flag"])
+                .expect("should parse");
+        assert_eq!(env_of(cli).as_deref(), Some("from-the-flag"));
+
+        // `--local` is still refused alongside it. The variable being set must
+        // not turn that into a silent contradiction.
+        assert!(
+            Cli::try_parse_from(["vw", "clean", "--local", "--env", "x"])
+                .is_err(),
+            "--local and --env still conflict",
+        );
+
+        std::env::remove_var("VW_ENV");
+    }
 }
 
 #[cfg(test)]
