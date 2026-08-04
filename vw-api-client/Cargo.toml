@@ -18,3 +18,8 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 serde.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+http = "1"

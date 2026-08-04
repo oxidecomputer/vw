@@ -214,12 +214,12 @@ async fn clear(
     targets: &[Target],
 ) -> Result<(), CloudError> {
     for target in targets {
-        let result = session
-            .client
-            .sync_clear(environment, &target.kind)
-            .await
-            .map_err(|e| session.error(e))?
-            .into_inner();
+        let result = vw_api_client::retrying(|| {
+            session.client.sync_clear(environment, &target.kind)
+        })
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
 
         println!(
             "{} {} cleared ({} removed)",
@@ -243,12 +243,14 @@ async fn sync_once(
         let manifest = scan(target)
             .map_err(|e| CloudError::Scan(target.root.clone(), e))?;
 
-        let plan = session
-            .client
-            .sync_plan(environment, &target.kind, &manifest)
-            .await
-            .map_err(|e| session.error(e))?
-            .into_inner();
+        let plan = vw_api_client::retrying(|| {
+            session
+                .client
+                .sync_plan(environment, &target.kind, &manifest)
+        })
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
 
         // Uploaded several at a time. Each one is a whole round trip to the
         // service, and source files are small enough that the time is almost
@@ -269,16 +271,21 @@ async fn sync_once(
                     .read(path)
                     .map_err(|e| CloudError::ReadSource(path.to_owned(), e))?;
 
-                session
-                    .client
-                    .sync_blob(
+                // Cloned per attempt because the body is consumed by the
+                // request. That costs a copy of one file on the happy path,
+                // which is the price of an upload that survives a dropped
+                // connection — and these are workspace sources, not the
+                // hundreds of megabytes an artifact runs to.
+                vw_api_client::retrying(|| {
+                    session.client.sync_blob(
                         environment,
                         &target.kind,
                         digest.0.as_str(),
-                        contents,
+                        contents.clone(),
                     )
-                    .await
-                    .map_err(|e| session.error(e))?;
+                })
+                .await
+                .map_err(|e| session.error(e))?;
 
                 Ok::<(), CloudError>(())
             }
@@ -289,12 +296,14 @@ async fn sync_once(
             .try_collect::<Vec<()>>()
             .await?;
 
-        let result = session
-            .client
-            .sync_commit(environment, &target.kind, &manifest)
-            .await
-            .map_err(|e| session.error(e))?
-            .into_inner();
+        let result = vw_api_client::retrying(|| {
+            session
+                .client
+                .sync_commit(environment, &target.kind, &manifest)
+        })
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
 
         report(target, &manifest, plan.missing.len(), &result, announce);
     }
@@ -409,12 +418,12 @@ pub async fn clean(
     let targets = targets(&workspace);
 
     for target in &targets {
-        let result = session
-            .client
-            .clean_build_output(environment, &target.kind)
-            .await
-            .map_err(|e| session.error(e))?
-            .into_inner();
+        let result = vw_api_client::retrying(|| {
+            session.client.clean_build_output(environment, &target.kind)
+        })
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
 
         if result.existed {
             println!(

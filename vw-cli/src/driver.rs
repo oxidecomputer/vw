@@ -29,12 +29,16 @@ pub async fn build(
 ) -> Result<bool, CloudError> {
     let joined = (!args.is_empty()).then(|| args.join(" "));
 
-    let upgraded = session
-        .client
-        .driver_build(environment, joined.as_deref(), Some(release))
-        .await
-        .map_err(|e| session.error(e))?
-        .into_inner();
+    let upgraded = vw_api_client::retrying(|| {
+        session.client.driver_build(
+            environment,
+            joined.as_deref(),
+            Some(release),
+        )
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
 
     let mut socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
         upgraded,

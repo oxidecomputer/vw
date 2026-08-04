@@ -269,18 +269,21 @@ pub async fn run_benches_remotely(
     use futures::StreamExt;
 
     let ignored = (!ignore.is_empty()).then(|| ignore.join(","));
-    let upgraded = session
-        .client
-        .bench_session(
+    // Bound here rather than in the call: the closure runs once per attempt,
+    // and a `&` to a temporary built inside it would not outlive the future.
+    let vhdl = vhdl_std.to_string();
+    let upgraded = vw_api_client::retrying(|| {
+        session.client.bench_session(
             environment,
             concurrency.map(|n| n as u32),
             filter,
             ignored.as_deref(),
-            Some(&vhdl_std.to_string()),
+            Some(vhdl.as_str()),
         )
-        .await
-        .map_err(|e| session.error(e))?
-        .into_inner();
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
 
     let mut socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
         upgraded,

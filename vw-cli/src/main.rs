@@ -3123,26 +3123,16 @@ fn overload_specialization_mangle(
 /// the environment ready for them.
 ///
 /// The same shape as `vw run`'s: cloud first, synchronized before anything
-/// runs, and a service that cannot be reached falls back to this machine with
-/// a warning rather than a failure.
+/// runs. A service that cannot be reached is a failure: almost nobody can run
+/// vivado on their own machine, so quietly doing that instead is not a
+/// kindness. `--local` is how somebody who can, says so.
 async fn bench_site(
     named: Option<&str>,
     insecure: bool,
 ) -> Result<Option<(cloud::Session, String)>, Box<dyn std::error::Error>> {
     let session = cloud::Session::from_env(insecure)?;
 
-    let environment = match cloud::pick_environment(&session, named).await {
-        Ok(environment) => environment,
-        Err(e) if cloud::Session::unreachable(&e) => {
-            eprintln!(
-                "{} no vw service reachable ({e}); running the testbenches on \
-                 this machine",
-                "warning:".yellow(),
-            );
-            return Ok(None);
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let environment = cloud::pick_environment(&session, named).await?;
 
     cloud::sync_for_build(
         &session,
@@ -3168,18 +3158,7 @@ async fn remote_worker(
 ) -> Result<vw_repl::Worker, Box<dyn std::error::Error>> {
     let session = cloud::Session::from_env(insecure)?;
 
-    let environment = match cloud::pick_environment(&session, named).await {
-        Ok(environment) => environment,
-        Err(e) if cloud::Session::unreachable(&e) => {
-            eprintln!(
-                "{} no vw service reachable ({e}); running vivado on this \
-                 machine",
-                "warning:".yellow(),
-            );
-            return Ok(vw_repl::Worker::Local);
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let environment = cloud::pick_environment(&session, named).await?;
 
     // The instance builds what it was last given, so give it this before the
     // first eval can ask for it.
@@ -3230,32 +3209,16 @@ async fn driver_build(
 
     if !local {
         let session = cloud::Session::from_env(insecure)?;
-        match cloud::pick_environment(&session, named).await {
-            Ok(environment) => {
-                // The instance builds what it was last given.
-                cloud::sync_for_build(
-                    &session,
-                    &environment,
-                    Some(vw_api_types_versions::latest::TargetKind::Helios),
-                )
-                .await?;
-                return Ok(driver::build(
-                    &session,
-                    &environment,
-                    release,
-                    args,
-                )
-                .await?);
-            }
-            Err(e) if cloud::Session::unreachable(&e) => {
-                eprintln!(
-                    "{} no vw service reachable ({e}); building on this \
-                     machine",
-                    "warning:".yellow(),
-                );
-            }
-            Err(e) => return Err(e.into()),
-        }
+        let environment = cloud::pick_environment(&session, named).await?;
+
+        // The instance builds what it was last given.
+        cloud::sync_for_build(
+            &session,
+            &environment,
+            Some(vw_api_types_versions::latest::TargetKind::Helios),
+        )
+        .await?;
+        return Ok(driver::build(&session, &environment, release, args).await?);
     }
 
     Ok(driver::build_locally(&workspace, release, args).await?)
@@ -3277,19 +3240,9 @@ async fn clean(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !local {
         let session = cloud::Session::from_env(insecure)?;
-        match cloud::pick_environment(&session, named).await {
-            Ok(environment) => {
-                cloud::clean_build_output(&session, &environment).await?;
-                return Ok(());
-            }
-            Err(e) if cloud::Session::unreachable(&e) => {
-                eprintln!(
-                    "{} no vw service reachable ({e}); cleaning this machine",
-                    "warning:".yellow(),
-                );
-            }
-            Err(e) => return Err(e.into()),
-        }
+        let environment = cloud::pick_environment(&session, named).await?;
+        cloud::clean_build_output(&session, &environment).await?;
+        return Ok(());
     }
 
     let workspace = vw_lib::find_workspace_dir(cwd.as_std_path()).ok_or(
@@ -3316,27 +3269,20 @@ async fn clean(
 /// environment ready for it.
 ///
 /// Cloud first: if there is an environment, that is where the build goes,
-/// because that is where the machine with the memory and the licence is. A
-/// service that cannot be reached is not fatal — plenty of work happens on a
-/// train — but it is said out loud, since silently building here when you
-/// meant to build there is an afternoon nobody gets back.
+/// because that is where the machine with the memory and the licence is.
+///
+/// A service that cannot be reached ends the command. Falling back to this
+/// machine reads as helpful and is not: the vivado and toolchain requirements
+/// mean most people's machines cannot run the build at all, so the fallback
+/// trades a clear error for a confusing one several minutes later. Somebody
+/// who can build locally says so with `--local`.
 async fn cloud_site(
     named: Option<&str>,
     insecure: bool,
 ) -> Result<Option<(cloud::Session, String)>, Box<dyn std::error::Error>> {
     let session = cloud::Session::from_env(insecure)?;
 
-    let environment = match cloud::pick_environment(&session, named).await {
-        Ok(environment) => environment,
-        Err(e) if cloud::Session::unreachable(&e) => {
-            eprintln!(
-                "{} no vw service reachable ({e}); building on this machine",
-                "warning:".yellow(),
-            );
-            return Ok(None);
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let environment = cloud::pick_environment(&session, named).await?;
 
     // The instance builds what it was last given, so give it this.
     cloud::sync_for_build(

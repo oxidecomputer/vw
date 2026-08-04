@@ -5866,12 +5866,14 @@ name = "vw-api-client"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "http",
  "progenitor",
  "progenitor-client",
  "rand 0.8.7",
  "reqwest 0.13.4",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
  "uuid",
  "vw-api-types-versions",
 ]

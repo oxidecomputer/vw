@@ -23,17 +23,23 @@ use indicatif::ProgressBar;
 use std::time::{Duration, Instant};
 use vw_api_client::user::{types, Client};
 
-/// Where the service lives if the caller does not say otherwise. Matches
-/// `vw-svc`'s own default user API port.
-const DEFAULT_SERVICE_URL: &str = "http://localhost:2727";
+/// Where the service lives if the caller does not say otherwise.
+///
+/// The one people actually use, rather than a development service on this
+/// machine — nearly every `vw` invocation wants the shared one, and pointing
+/// somewhere else is the unusual case that can afford `--url` or
+/// `VW_SVC_URL`.
+const DEFAULT_SERVICE_URL: &str = "https://rhbs.eng.oxide.computer:2727";
 
 /// Where the administrative API lives if the caller does not say otherwise.
 ///
-/// A second listener on a second port rather than a path under the first one,
-/// so that whoever runs the service can decide separately who may reach it —
-/// the usual arrangement being that this one is not exposed outside the rack
-/// at all. That is also why it cannot be derived from `--url`.
-const DEFAULT_ADMIN_URL: &str = "http://localhost:2728";
+/// The same host as [`DEFAULT_SERVICE_URL`] but a second listener on a second
+/// port rather than a path under the first one, so that whoever runs the
+/// service can decide separately who may reach it. That separation is also why
+/// this is its own constant instead of being derived from `--url`: the two are
+/// free to live in different places, and on a development service they
+/// usually do.
+const DEFAULT_ADMIN_URL: &str = "https://rhbs.eng.oxide.computer:2728";
 
 /// How often `--wait` asks what an environment's instances are doing.
 ///
@@ -460,9 +466,7 @@ impl AdminSession {
 
 /// Every environment on the service, whoever owns it.
 async fn admin_list(session: &AdminSession) -> Result<(), CloudError> {
-    let page = session
-        .client
-        .get_environments()
+    let page = vw_api_client::retrying(|| session.client.get_environments())
         .await
         .map_err(|e| session.error(e))?;
     let mut environments = page.into_inner().items;
@@ -517,9 +521,7 @@ async fn admin_delete(
     // (`/environment/{user}/{name}`) rather than the order the spec lists the
     // parameters in. Getting this backwards produces a 404 naming an
     // environment that exists, which is a confusing thing to debug.
-    session
-        .client
-        .delete_environment(user, name)
+    vw_api_client::retrying(|| session.client.delete_environment(user, name))
         .await
         .map_err(|e| session.error(e))?;
 
@@ -639,9 +641,7 @@ fn with_causes(error: &dyn std::error::Error) -> String {
 async fn list(session: &Session) -> Result<(), CloudError> {
     // The endpoint takes no pagination parameters, so this one page is every
     // environment the caller owns.
-    let page = session
-        .client
-        .get_environments()
+    let page = vw_api_client::retrying(|| session.client.get_environments())
         .await
         .map_err(|e| session.error(e))?;
     let environments = page.into_inner().items;
@@ -672,12 +672,12 @@ async fn create(
     key_dir: Option<&Utf8Path>,
     wait: bool,
 ) -> Result<(), CloudError> {
-    let keys = session
-        .client
-        .create_environment(name, &images)
-        .await
-        .map_err(|e| session.error(e))?
-        .into_inner();
+    let keys = vw_api_client::retrying(|| {
+        session.client.create_environment(name, &images)
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
 
     println!(
         "{} Created cloud environment: {}",
@@ -727,12 +727,11 @@ async fn wait_for_instances(
 
     let deadline = Instant::now() + WAIT_LIMIT;
     loop {
-        let environment = session
-            .client
-            .get_environment(name)
-            .await
-            .map_err(|e| session.error(e))?
-            .into_inner();
+        let environment =
+            vw_api_client::retrying(|| session.client.get_environment(name))
+                .await
+                .map_err(|e| session.error(e))?
+                .into_inner();
 
         spinner.set_message(instance_summary(&environment));
 
@@ -790,11 +789,10 @@ async fn wait_for_instances(
 }
 
 async fn get(session: &Session, name: &str) -> Result<(), CloudError> {
-    let environment = session
-        .client
-        .get_environment(name)
-        .await
-        .map_err(|e| session.error(e))?;
+    let environment =
+        vw_api_client::retrying(|| session.client.get_environment(name))
+            .await
+            .map_err(|e| session.error(e))?;
     let environment = environment.into_inner();
 
     println!("{}", environment.name.cyan());
@@ -870,9 +868,7 @@ fn print_login_hints(environment: &types::Environment) {
 }
 
 async fn delete(session: &Session, name: &str) -> Result<(), CloudError> {
-    session
-        .client
-        .delete_environment(name)
+    vw_api_client::retrying(|| session.client.delete_environment(name))
         .await
         .map_err(|e| session.error(e))?;
     println!(
@@ -919,12 +915,11 @@ async fn fetch_keys(
     name: &str,
     dir: Option<&Utf8Path>,
 ) -> Result<(), CloudError> {
-    let keys = session
-        .client
-        .get_environment_keys(name)
-        .await
-        .map_err(|e| session.error(e))?
-        .into_inner();
+    let keys =
+        vw_api_client::retrying(|| session.client.get_environment_keys(name))
+            .await
+            .map_err(|e| session.error(e))?
+            .into_inner();
 
     let (private, public) = save_keys(name, &keys, dir)?;
     report_keys(&private, &public);
@@ -1058,18 +1053,18 @@ pub async fn open_vivado_session(
     environment: &str,
     params: vw_remote::SessionParams,
 ) -> Result<vw_remote::RemoteBackend<reqwest::Upgraded>, CloudError> {
-    let upgraded = session
-        .client
-        .vivado_session(
+    let upgraded = vw_api_client::retrying(|| {
+        session.client.vivado_session(
             environment,
             Some(params.info_with_stack),
             params.part.as_deref(),
             params.variant.as_deref(),
             Some(params.verbose),
         )
-        .await
-        .map_err(|e| session.error(e))?
-        .into_inner();
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
 
     let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
         upgraded,
@@ -1099,13 +1094,12 @@ pub async fn pick_environment(
         return Ok(name.to_owned());
     }
 
-    let environments = session
-        .client
-        .get_environments()
-        .await
-        .map_err(|e| session.error(e))?
-        .into_inner()
-        .items;
+    let environments =
+        vw_api_client::retrying(|| session.client.get_environments())
+            .await
+            .map_err(|e| session.error(e))?
+            .into_inner()
+            .items;
 
     match environments.len() {
         0 => Err(CloudError::NoEnvironments),
@@ -1133,16 +1127,6 @@ impl Session {
             || std::env::var("VW_SVC_INSECURE")
                 .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         Session::new(&url, insecure)
-    }
-
-    /// Whether the failure was the service being out of reach, rather than the
-    /// service saying no.
-    ///
-    /// The difference decides whether a bare `vw run` may quietly fall back to
-    /// building here: unreachable is a working-from-a-train problem, but a
-    /// service that answered and refused is telling us something.
-    pub fn unreachable(error: &CloudError) -> bool {
-        matches!(error, CloudError::Transport(_))
     }
 }
 
@@ -1193,12 +1177,11 @@ async fn artifacts(
         return clear_artifacts(session, environment).await;
     }
 
-    let available = session
-        .client
-        .get_artifacts(environment)
-        .await
-        .map_err(|e| session.error(e))?
-        .into_inner();
+    let available =
+        vw_api_client::retrying(|| session.client.get_artifacts(environment))
+            .await
+            .map_err(|e| session.error(e))?
+            .into_inner();
 
     let wanted: Vec<&vw_api_types_versions::latest::Artifact> = if all {
         available.iter().collect()
@@ -1288,12 +1271,11 @@ async fn clear_artifacts(
     session: &Session,
     environment: &str,
 ) -> Result<(), CloudError> {
-    let cleared = session
-        .client
-        .clear_artifacts(environment)
-        .await
-        .map_err(|e| session.error(e))?
-        .into_inner();
+    let cleared =
+        vw_api_client::retrying(|| session.client.clear_artifacts(environment))
+            .await
+            .map_err(|e| session.error(e))?
+            .into_inner();
 
     if cleared.removed == 0 {
         println!("{}", "nothing stored to clear".bright_black());
@@ -1377,11 +1359,13 @@ async fn download(
 ) -> Result<(), CloudError> {
     use futures::StreamExt;
 
-    let response = session
-        .client
-        .get_artifact(environment, &artifact.kind, &artifact.name)
-        .await
-        .map_err(|e| session.error(e))?;
+    let response = vw_api_client::retrying(|| {
+        session
+            .client
+            .get_artifact(environment, &artifact.kind, &artifact.name)
+    })
+    .await
+    .map_err(|e| session.error(e))?;
 
     // An artifact's name carries the stage that produced it — `synth/x.edif`
     // and `route/x.edif` are different netlists — so the structure is kept on
@@ -1470,12 +1454,12 @@ pub async fn fetch_generated_ip(
     environment: &str,
     workspace: &Utf8Path,
 ) -> Result<usize, CloudError> {
-    let manifest = session
-        .client
-        .generated_manifest(environment)
-        .await
-        .map_err(|e| session.error(e))?
-        .into_inner();
+    let manifest = vw_api_client::retrying(|| {
+        session.client.generated_manifest(environment)
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
 
     let mut written = 0usize;
     for entry in &manifest.entries {
@@ -1489,12 +1473,12 @@ pub async fn fetch_generated_ip(
             }
         }
 
-        let contents = session
-            .client
-            .generated_file(environment, &entry.path)
-            .await
-            .map_err(|e| session.error(e))?
-            .into_inner();
+        let contents = vw_api_client::retrying(|| {
+            session.client.generated_file(environment, &entry.path)
+        })
+        .await
+        .map_err(|e| session.error(e))?
+        .into_inner();
 
         let bytes = futures::TryStreamExt::try_fold(
             contents.into_inner(),

@@ -20,6 +20,7 @@
 use reqwest::header::{
     HeaderMap, HeaderValue, InvalidHeaderValue, AUTHORIZATION,
 };
+use std::time::Duration;
 
 /// Client for the vw user API.
 pub mod user {
@@ -73,6 +74,69 @@ pub mod admin {
     progenitor::generate_api!(
         "../openapi/vw-admin-api/vw-admin-api-latest.json"
     );
+}
+
+/// How many times a call is attempted before its failure is the answer.
+///
+/// The service is across a network from almost everybody who uses it, and a
+/// single dropped connection should not end a build that has been running for
+/// half an hour.
+pub const ATTEMPTS: usize = 10;
+
+/// How long to wait between attempts.
+///
+/// Flat rather than backing off. What this is riding out is a connection that
+/// failed to establish or a service that is restarting, both of which resolve
+/// in seconds — and ten evenly spaced tries covers that window while still
+/// giving up inside a time somebody will wait.
+pub const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Whether trying again could plausibly produce a different answer.
+///
+/// Anything that never reached a server, or reached one that was in no
+/// position to answer, is worth repeating. A request the service understood
+/// and refused is not: `401` will still be `401` ten seconds from now, and
+/// retrying it only delays telling somebody their token is wrong by ten
+/// seconds.
+pub fn retryable<E>(error: &progenitor_client::Error<E>) -> bool {
+    match error.status() {
+        // Never got an answer: connection refused, DNS, TLS, timeout.
+        None => true,
+        // The service is there and having a bad time. `429` is included
+        // because being told to slow down is a reason to wait, not to stop.
+        Some(status) => {
+            status.is_server_error()
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+    }
+}
+
+/// Call `attempt` until it succeeds, its failure turns out not to be worth
+/// repeating, or [`ATTEMPTS`] tries have been made.
+///
+/// Wraps the request only. Callers that stream a response body do so after
+/// this returns, which is deliberate: restarting a request whose body is
+/// already partly written to a file would corrupt what it had, and the retry
+/// belongs where it is still safe.
+pub async fn retrying<T, E, F, Fut>(
+    mut attempt: F,
+) -> Result<T, progenitor_client::Error<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, progenitor_client::Error<E>>>,
+{
+    // One short of the total, so the last try below is the tenth and its
+    // failure is returned rather than slept on.
+    for _ in 1..ATTEMPTS {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) if retryable(&error) => {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    attempt().await
 }
 
 /// Error conditions for constructing a client.
@@ -167,4 +231,93 @@ fn http_client(config: &ClientConfig<'_>) -> Result<reqwest::Client, Error> {
         // reason.
         .http1_only()
         .build()?)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::cell::Cell;
+
+    /// An error that never reached a server, so it has no status.
+    fn transport() -> progenitor_client::Error<()> {
+        progenitor_client::Error::InvalidRequest("no connection".to_owned())
+    }
+
+    /// An error carrying `status`, built the only way a status-bearing one can
+    /// be made outside the generated code.
+    fn answered(status: u16) -> progenitor_client::Error<()> {
+        let response = http::Response::builder()
+            .status(status)
+            .body("")
+            .expect("a response");
+        progenitor_client::Error::UnexpectedResponse(response.into())
+    }
+
+    #[test]
+    fn what_the_service_refused_is_not_tried_again() {
+        // The whole point of not blindly retrying: a token that is wrong stays
+        // wrong, and ten seconds of hoping helps nobody.
+        for status in [400, 401, 403, 404, 409] {
+            assert!(
+                !retryable(&answered(status)),
+                "{status} should be reported, not retried",
+            );
+        }
+    }
+
+    #[test]
+    fn what_never_got_an_answer_is_tried_again() {
+        assert!(retryable(&transport()));
+        for status in [500, 502, 503, 504] {
+            assert!(retryable(&answered(status)), "{status} is worth a retry");
+        }
+        // Being told to slow down is a reason to wait, not to stop.
+        assert!(retryable(&answered(429)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_comes_good_stops_being_retried() {
+        let calls = Cell::new(0);
+
+        let got: Result<&str, _> = retrying(|| async {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(transport())
+            } else {
+                Ok("answered")
+            }
+        })
+        .await;
+
+        assert_eq!(got.expect("should succeed"), "answered");
+        assert_eq!(calls.get(), 3, "should stop as soon as it works");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_never_comes_good_is_tried_exactly_ten_times() {
+        let calls = Cell::new(0);
+
+        let got: Result<(), _> = retrying(|| async {
+            calls.set(calls.get() + 1);
+            Err(transport())
+        })
+        .await;
+
+        assert!(got.is_err());
+        assert_eq!(calls.get(), ATTEMPTS, "should try ATTEMPTS times, no more");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_ends_it_on_the_first_try() {
+        let calls = Cell::new(0);
+
+        let got: Result<(), _> = retrying(|| async {
+            calls.set(calls.get() + 1);
+            Err(answered(401))
+        })
+        .await;
+
+        assert!(got.is_err());
+        assert_eq!(calls.get(), 1, "no point asking again");
+    }
 }
