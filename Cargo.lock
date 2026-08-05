@@ -2417,7 +2417,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ipxact"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/ipe?branch=ry%2Finit#2f18277e5760dda1346162ff9250caebc797d06c"
+source = "git+https://github.com/oxidecomputer/ipe?branch=main#73c5c6439ee5d0af0229872b95556ab07e17489e"
 dependencies = [
  "quick-xml 0.37.5",
  "serde",
