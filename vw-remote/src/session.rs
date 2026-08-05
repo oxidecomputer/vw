@@ -92,7 +92,7 @@ where
         // The client is owed a reason. It cannot see this instance's log, and
         // a session that simply closed would look like a network fault.
         let _ = events.send(SessionEvent::Fatal {
-            message: e.to_string(),
+            message: crate::causes(&e),
         });
     }
 
@@ -393,7 +393,15 @@ async fn start(
 /// Best effort: a failure here is reported and the run continues, because the
 /// run may not need the missing dependency and failing now would be a worse
 /// answer than failing where it is actually used.
-async fn fetch_dependencies(root: &Utf8Path, note: &impl Fn(String)) {
+///
+/// Shared with the bench path. Dependencies are a property of the workspace,
+/// not of the vivado session that happened to be the first thing to need
+/// them — an instance where only `vw bench` has ever run needs them just as
+/// much, and used not to get them.
+pub(crate) async fn fetch_dependencies(
+    root: &Utf8Path,
+    note: &impl Fn(String),
+) {
     if vw_lib::dependencies_present(root) {
         return;
     }

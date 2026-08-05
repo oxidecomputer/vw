@@ -35,7 +35,7 @@ tokio.workspace = true
 slog = "2.8.2"
 slog-bunyan = "2.5.0"
 slog-async = "2.8.0"
-slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", branch = "main" }
+slog-error-chain.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -82,6 +82,16 @@ impl From<CliLogLevel> for vw_vivado::LogLevel {
     }
 }
 
+/// Report a failure with everything under it.
+///
+/// `{e}` on a `thiserror` type prints only the outermost message, and the
+/// outermost message is usually the least informative part — "generating
+/// anodizer structs" says which step, never what went wrong in it. The cause
+/// chain is where the answer is, so it is always printed.
+fn report(error: &dyn std::error::Error) {
+    eprintln!("{} {}", "error:".bright_red(), vw_remote::causes(error));
+}
+
 #[derive(Parser)]
 #[command(name = "vw")]
 #[command(about = "A VHDL workspace management tool")]
@@ -685,7 +695,7 @@ async fn main() {
             if let Err(e) =
                 init_workspace(&cwd, name.clone(), target_part.clone())
             {
-                eprintln!("{} {e}", "error:".bright_red());
+                report(&e);
                 process::exit(1);
             }
             println!(
@@ -728,7 +738,7 @@ async fn main() {
                     );
                 }
                 Err(e) => {
-                    eprintln!("{} {e}", "error:".bright_red());
+                    report(&e);
                     process::exit(1);
                 }
             }
@@ -771,7 +781,7 @@ async fn main() {
                     );
                 }
                 Err(e) => {
-                    eprintln!("{} {e}", "error:".bright_red());
+                    report(&e);
                     process::exit(1);
                 }
             }
@@ -786,7 +796,7 @@ async fn main() {
                     );
                 }
                 Err(e) => {
-                    eprintln!("{} {e}", "error:".bright_red());
+                    report(&e);
                     process::exit(1);
                 }
             }
@@ -814,7 +824,7 @@ async fn main() {
                 // from cargo and has already been printed.
                 Ok(false) => process::exit(1),
                 Err(e) => {
-                    eprintln!("{} {e}", "error:".bright_red());
+                    report(&*e);
                     process::exit(1);
                 }
             }
@@ -825,7 +835,7 @@ async fn main() {
             insecure,
         } => {
             if let Err(e) = clean(&cwd, local, env.as_deref(), insecure).await {
-                eprintln!("{} {e}", "error:".bright_red());
+                report(&*e);
                 process::exit(1);
             }
         }
@@ -845,7 +855,7 @@ async fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("{} {e}", "error:".bright_red());
+                report(&e);
                 process::exit(1);
             }
         },
@@ -895,7 +905,7 @@ async fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("{} {e}", "error:".bright_red());
+                report(&e);
                 process::exit(1);
             }
         },
@@ -941,7 +951,7 @@ async fn main() {
                 )
                 .await
                 {
-                    eprintln!("{} {e}", "error:".bright_red());
+                    report(&e);
                     process::exit(1);
                 }
             } else if scaffold {
@@ -966,7 +976,7 @@ async fn main() {
                         name
                     ),
                     Err(e) => {
-                        eprintln!("{} {e}", "error:".bright_red());
+                        report(&e);
                         process::exit(1);
                     }
                 }
@@ -985,7 +995,7 @@ async fn main() {
                     match bench_site(env.as_deref(), insecure).await {
                         Ok(site) => site,
                         Err(e) => {
-                            eprintln!("{} {e}", "error:".bright_red());
+                            report(&*e);
                             process::exit(1);
                         }
                     }
@@ -1022,7 +1032,7 @@ async fn main() {
                 };
 
                 if let Err(e) = outcome {
-                    eprintln!("{} {e}", "error:".bright_red());
+                    report(&*e);
                     process::exit(1);
                 }
             }
@@ -1051,7 +1061,7 @@ async fn main() {
                 None => match discover_entry_file(&cwd) {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("{} {e}", "error:".bright_red());
+                        report(&*e);
                         process::exit(1);
                     }
                 },
@@ -1065,7 +1075,7 @@ async fn main() {
                 match cloud_site(env.as_deref(), insecure).await {
                     Ok(site) => site,
                     Err(e) => {
-                        eprintln!("{} {e}", "error:".bright_red());
+                        report(&*e);
                         process::exit(1);
                     }
                 }
@@ -1089,7 +1099,7 @@ async fn main() {
             )
             .await
             {
-                eprintln!("{} {e}", "error:".bright_red());
+                report(&*e);
                 process::exit(1);
             }
         }
@@ -1117,7 +1127,7 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {e}", "error:".bright_red());
+                    report(&*e);
                     process::exit(1);
                 }
             }
@@ -1209,7 +1219,7 @@ async fn main() {
                 {
                     Ok(worker) => worker,
                     Err(e) => {
-                        eprintln!("{} {e}", "error:".bright_red());
+                        report(&*e);
                         process::exit(1);
                     }
                 }
@@ -1228,7 +1238,7 @@ async fn main() {
             )
             .await
             {
-                eprintln!("{} {e}", "error:".bright_red());
+                report(&e);
                 process::exit(1);
             }
         }
@@ -1257,7 +1267,7 @@ async fn main() {
                 match cloud_site(env.as_deref(), insecure).await {
                     Ok(site) => site,
                     Err(e) => {
-                        eprintln!("{} {e}", "error:".bright_red());
+                        report(&*e);
                         process::exit(1);
                     }
                 }
@@ -1273,7 +1283,7 @@ async fn main() {
                 match discover_check_targets(&cwd) {
                     Ok(t) => t,
                     Err(e) => {
-                        eprintln!("{} {e}", "error:".bright_red());
+                        report(&*e);
                         process::exit(1);
                     }
                 }
@@ -1578,7 +1588,7 @@ async fn main() {
             )
             .await
             {
-                eprintln!("{} {e}", "error:".bright_red());
+                report(&*e);
                 process::exit(1);
             }
         }
@@ -1624,7 +1634,7 @@ async fn main() {
         },
         Commands::Cloud(args) => {
             if let Err(e) = cloud::run(args).await {
-                eprintln!("{} {e}", "error:".bright_red());
+                report(&e);
                 process::exit(1);
             }
         }

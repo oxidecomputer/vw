@@ -30,6 +30,7 @@ vw-sync = { path = "../vw-sync" }
 vw-api-types-versions = { path = "../vw-api-types/versions" }
 clap.workspace = true
 thiserror.workspace = true
+slog-error-chain.workspace = true
 colored = "2.0"
 tokio.workspace = true
 camino.workspace = true

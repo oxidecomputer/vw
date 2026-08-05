@@ -179,7 +179,7 @@ pub async fn run(
             // A failed sync is not a reason to stop watching. The next save
             // tries again, and an instance that is still coming up will be
             // there shortly.
-            eprintln!("{} {e}", "error:".bright_red());
+            crate::report(&e);
         }
     }
 }

@@ -57,7 +57,7 @@ pub async fn run_benches(
     }
 
     if let Err(e) = vw_bench::prepare(&ws, vhdl_std).await {
-        eprintln!("{} {e}", "error:".bright_red());
+        crate::report(&e);
         std::process::exit(1);
     }
 

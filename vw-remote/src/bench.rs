@@ -113,7 +113,7 @@ async fn run(
         Ok(names) => names,
         Err(e) => {
             let _ = events.send(BenchEvent::Fatal {
-                message: e.to_string(),
+                message: crate::causes(&e),
             });
             return;
         }
@@ -130,10 +130,22 @@ async fn run(
         return;
     }
 
-    if let Err(e) = vw_bench::prepare(root, standard).await {
-        let _ = events.send(BenchEvent::Fatal {
-            message: e.to_string(),
+    // Anodizer analyses the design with nvc, and the design uses packages that
+    // live in dependency repositories — so they have to be here first. An
+    // instance where only `vw bench` has ever run has never fetched them.
+    let note = |message: String| {
+        let _ = events.send(BenchEvent::Progress {
+            event: vw_bench::Event::Note { message },
         });
+    };
+    crate::session::fetch_dependencies(root, &note).await;
+
+    if let Err(e) = vw_bench::prepare(root, standard).await {
+        let reason = crate::causes(&e);
+        // Logged as well as relayed. A failure that only travels down the
+        // socket leaves nothing on the instance to look at afterwards.
+        tracing::error!("cannot prepare the workspace for benches: {reason}");
+        let _ = events.send(BenchEvent::Fatal { message: reason });
         return;
     }
 

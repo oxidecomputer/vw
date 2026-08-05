@@ -459,7 +459,7 @@ impl AdminSession {
                     message: response.into_inner().message,
                 }
             }
-            other => CloudError::Transport(with_causes(&other)),
+            other => CloudError::Transport(vw_remote::causes(&other)),
         }
     }
 }
@@ -613,29 +613,9 @@ impl Session {
                     message: response.into_inner().message,
                 }
             }
-            other => CloudError::Transport(with_causes(&other)),
+            other => CloudError::Transport(vw_remote::causes(&other)),
         }
     }
-}
-
-/// Flatten an error and everything underneath it onto one line.
-///
-/// The client's own `Display` stops at "error sending request", which hides
-/// the part worth reading — a certificate that did not verify, a refused
-/// connection. The causes are what tell someone what to do next.
-fn with_causes(error: &dyn std::error::Error) -> String {
-    let mut message = error.to_string();
-    let mut cause = error.source();
-    while let Some(error) = cause {
-        // Errors in this chain tend to embed their own cause in their
-        // `Display`, so only append what has not been said already.
-        let text = error.to_string();
-        if !message.contains(&text) {
-            message.push_str(&format!(": {text}"));
-        }
-        cause = error.source();
-    }
-    message
 }
 
 async fn list(session: &Session) -> Result<(), CloudError> {

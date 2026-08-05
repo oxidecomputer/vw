@@ -38,6 +38,7 @@ dropshot = "0.17.1"
 # Matched to dropshot's own features exactly. A second crypto provider
 # enabled here would make rustls' process default ambiguous and every
 # ServerConfig::builder() call panic, including dropshot's.
+slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", branch = "main" }
 rustls-pemfile = "2.2"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 tokio-tungstenite = "0.21"
