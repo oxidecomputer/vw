@@ -209,7 +209,9 @@ enum Commands {
     },
     #[command(about = "List workspace dependencies")]
     List,
-    #[command(about = "Generate deps.tcl file with all dependency VHDL files")]
+    #[command(
+        about = "Run VHDL and cosim testbenches with NVC, all in parallel"
+    )]
     Bench {
         #[arg(
             help = "Filter to testbenches whose name contains this substring; omit to run all"

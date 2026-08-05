@@ -15,7 +15,7 @@ The document covers:
 
 ## 1. What htcl is
 
-htcl — "**h**ardware Tcl" — is a small structured dialect of Tcl
+htcl — "**h**olistic Tcl" — is a small structured dialect of Tcl
 for HDL workflow scripting. It is the language `vw` uses to drive
 EDA backends (today, Vivado over a pipe) and to give engineers a
 source-controlled, reviewable, tool-checkable surface for everything
