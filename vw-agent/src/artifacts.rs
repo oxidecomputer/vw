@@ -39,19 +39,23 @@ const GATHERED: [(&str, &str); 5] = [
     ("route", "edif"),
 ];
 
-/// Where a mixed-signal bench leaves its results, and what to keep.
+/// Where a testbench leaves its results, and what to keep.
 ///
 /// Kept apart from [`GATHERED`] because the shape is different: each bench
 /// writes into a directory of its own under `target/bench`, so what matters is
 /// a level deeper than everything else and the flat walk above cannot see it.
 ///
-/// A run leaves the Xyce `.prn` it produced and the plots rendered from it,
-/// which are what somebody looks at afterwards to see what the analog side
-/// actually did. Digital benches build under `target/sim` instead and leave
-/// nothing here.
-const GATHERED_PER_BENCH: [&str; 2] = ["prn", "png"];
+/// The `fst` is the waveform, and it is the first thing anybody opens when a
+/// simulation did not do what they expected — so it is worth keeping even
+/// though it is the largest thing here. A mixed-signal run additionally leaves
+/// the Xyce `prn` and the plots rendered from it.
+///
+/// Not what nvc built to get there: that lives under `target/sim` and is a
+/// work library and object files, meaningless anywhere but the machine that
+/// made them.
+const GATHERED_PER_BENCH: [&str; 3] = ["fst", "prn", "png"];
 
-/// The directory holding one subdirectory per mixed-signal bench.
+/// The directory holding one subdirectory per bench that has run.
 const BENCH_OUTPUT: &str = "bench";
 
 /// The directory a build writes everything to, under the workspace.
@@ -474,6 +478,7 @@ mod test {
         build_output(&root, "bench/tx-eq/model.cir.prn", "xyce output");
         build_output(&root, "bench/tx-eq/eye.png", "a plot");
         build_output(&root, "bench/tx-eq/timeseries.png", "another plot");
+        build_output(&root, "bench/tx-eq/tx-eq.fst", "a waveform");
 
         let keys: Vec<String> =
             artifacts(&root).into_iter().map(|f| f.key).collect();
@@ -484,6 +489,7 @@ mod test {
                 "bench/tx-eq/eye.png",
                 "bench/tx-eq/model.cir.prn",
                 "bench/tx-eq/timeseries.png",
+                "bench/tx-eq/tx-eq.fst",
             ],
         );
     }
@@ -503,19 +509,34 @@ mod test {
         assert_eq!(keys, ["bench/rx-eq/eye.png", "bench/tx-eq/eye.png"]);
     }
 
-    /// Digital benches build under `target/sim`, and that is working state —
-    /// object files, the nvc library, waveforms that only mean anything next
-    /// to the design that made them.
+    /// The waveform is the point. When a simulation does not do what it was
+    /// supposed to, the `fst` is the first thing anybody opens — so it ships
+    /// even though it is the biggest thing a bench leaves behind.
     #[test]
-    fn a_digital_benchs_build_directory_is_not_shipped() {
+    fn a_waveform_is_gathered() {
         let (_dir, root) = scratch();
-        build_output(&root, "sim/dma_tb/dma_tb.fst", "a waveform");
-        build_output(&root, "bench/tx-eq/model.cir.prn", "xyce output");
+        build_output(&root, "bench/dma_tb/dma_tb.fst", "a waveform");
 
         let keys: Vec<String> =
             artifacts(&root).into_iter().map(|f| f.key).collect();
 
-        assert_eq!(keys, ["bench/tx-eq/model.cir.prn"]);
+        assert_eq!(keys, ["bench/dma_tb/dma_tb.fst"]);
+    }
+
+    /// What nvc built on the way there is not a result. `target/sim` holds a
+    /// work library and object files, which mean nothing off the machine that
+    /// made them.
+    #[test]
+    fn a_benchs_build_directory_is_not_shipped() {
+        let (_dir, root) = scratch();
+        build_output(&root, "sim/dma_tb/work/WORK.DMA_TB", "nvc library");
+        build_output(&root, "sim/dma_tb/_NVC_LIB", "more of it");
+        build_output(&root, "bench/dma_tb/dma_tb.fst", "a waveform");
+
+        let keys: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(keys, ["bench/dma_tb/dma_tb.fst"]);
     }
 
     #[test]
