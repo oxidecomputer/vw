@@ -4281,18 +4281,6 @@ fn get_cached_entities<'a>(
     }
 }
 
-fn make_path_portable(path: PathBuf) -> PathBuf {
-    if let Some(home_dir) = dirs::home_dir() {
-        if let Ok(relative_path) = path.strip_prefix(&home_dir) {
-            let joined = PathBuf::from("$HOME").join(relative_path);
-            // Normalize to forward slashes so files written on Windows
-            // remain readable on Linux (and vice versa).
-            return PathBuf::from(joined.to_string_lossy().replace('\\', "/"));
-        }
-    }
-    path
-}
-
 fn extract_repo_name(repo_url: &str) -> String {
     repo_url
         .trim_end_matches(".git")
