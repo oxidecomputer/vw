@@ -23,7 +23,7 @@ proc NAME { ARGS } TYPE { BODY }
 ```
 
 The args list and body keep their existing shapes (see
-[authoring-htcl-libraries.md](authoring-htcl-libraries.md) for
+[htcl.md](htcl.md) for
 the arg attribute grammar). The new `TYPE` slot is a single htcl
 word:
 

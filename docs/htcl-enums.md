@@ -15,7 +15,7 @@ canonical case being Vivado property values, where
 property dict.
 
 See also: [htcl-return-types.md](htcl-return-types.md) for the
-broader type system, [authoring-htcl-libraries.md](authoring-htcl-libraries.md)
+broader type system, [htcl.md](htcl.md)
 for the surrounding arg/return-type annotation grammar.
 
 ## Syntax
