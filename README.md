@@ -224,6 +224,6 @@ its checkpoint instead of running; a stage whose inputs changed discards its
 checkpoint and every downstream one. When a stage does not reuse its
 checkpoint, it says why.
 
-## Documentation
+## Further reading
 
 - [`docs/htcl.md`](docs/htcl.md) — the htcl language, and writing modules in it

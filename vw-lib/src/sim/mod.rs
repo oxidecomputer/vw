@@ -20,7 +20,7 @@ use crate::nvc_helpers::{run_nvc_analysis, run_nvc_cosim, run_nvc_elab};
 use crate::{
     analyze_ext_libraries, find_referenced_files, render_vhdl_ls_config,
     sort_files_by_dependencies, FileCache, MistConfig, RecordProcessor,
-    ToolsConfig, VhdlStandard, VwError,
+    VhdlStandard, VwError,
 };
 
 /// Information about an available mixed-signal test.
@@ -93,9 +93,8 @@ pub fn find_mist_configs(
 pub fn scaffold(
     bench_dir: &Utf8Path,
     mist_config: &MistConfig,
-    tools: &Option<ToolsConfig>,
 ) -> crate::Result<()> {
-    bridge::generate_scaffold(bench_dir.as_std_path(), mist_config, tools)
+    bridge::generate_scaffold(bench_dir.as_std_path(), mist_config)
 }
 
 /// Run a mixed-signal co-simulation test.
@@ -104,7 +103,6 @@ pub async fn run_analog_test(
     name: &str,
     bench_dir: &Utf8Path,
     mist_config: &MistConfig,
-    _tools: &Option<ToolsConfig>,
     vhdl_std: VhdlStandard,
     build_dir: &str,
 ) -> crate::Result<()> {

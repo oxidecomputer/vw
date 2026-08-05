@@ -39,6 +39,21 @@ const GATHERED: [(&str, &str); 5] = [
     ("route", "edif"),
 ];
 
+/// Where a mixed-signal bench leaves its results, and what to keep.
+///
+/// Kept apart from [`GATHERED`] because the shape is different: each bench
+/// writes into a directory of its own under `target/bench`, so what matters is
+/// a level deeper than everything else and the flat walk above cannot see it.
+///
+/// A run leaves the Xyce `.prn` it produced and the plots rendered from it,
+/// which are what somebody looks at afterwards to see what the analog side
+/// actually did. Digital benches build under `target/sim` instead and leave
+/// nothing here.
+const GATHERED_PER_BENCH: [&str; 2] = ["prn", "png"];
+
+/// The directory holding one subdirectory per mixed-signal bench.
+const BENCH_OUTPUT: &str = "bench";
+
 /// The directory a build writes everything to, under the workspace.
 const BUILD_OUTPUT: &str = "target";
 
@@ -260,7 +275,57 @@ fn artifacts(root: &Utf8Path) -> Vec<Found> {
         }
     }
 
+    found.extend(bench_artifacts(root));
+
     found.sort();
+    found
+}
+
+/// The results of every mixed-signal bench that has run here.
+///
+/// One directory deeper than everything else, so it gets its own walk. The
+/// bench's name stays in the key — two benches both producing an `eye.png`
+/// would otherwise be one object in the bucket, each overwriting the other.
+fn bench_artifacts(root: &Utf8Path) -> Vec<Found> {
+    let mut found = Vec::new();
+
+    let source = root.join(BUILD_OUTPUT).join(BENCH_OUTPUT);
+    let Ok(benches) = std::fs::read_dir(&source) else {
+        // No mixed-signal bench has run here, which is most workspaces.
+        return found;
+    };
+
+    for bench in benches
+        .flatten()
+        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.path()).ok())
+        .filter(|path| path.is_dir())
+    {
+        let Some(bench_name) = bench.file_name().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&bench) else {
+            continue;
+        };
+
+        for path in entries
+            .flatten()
+            .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.path()).ok())
+            .filter(|path| path.is_file())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|e| GATHERED_PER_BENCH.contains(&e))
+            })
+        {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            found.push(Found {
+                key: format!("{BENCH_OUTPUT}/{bench_name}/{name}"),
+                path,
+            });
+        }
+    }
+
     found
 }
 
@@ -398,6 +463,59 @@ mod test {
         let path = root.join(BUILD_OUTPUT).join(relative);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(path, contents).expect("write");
+    }
+
+    /// A mixed-signal bench writes a directory of its own, one level below
+    /// everything else. The flat walk that finds images and netlists cannot
+    /// see into it, so this is the thing that would silently ship nothing.
+    #[test]
+    fn a_mixed_signal_benchs_results_are_gathered() {
+        let (_dir, root) = scratch();
+        build_output(&root, "bench/tx-eq/model.cir.prn", "xyce output");
+        build_output(&root, "bench/tx-eq/eye.png", "a plot");
+        build_output(&root, "bench/tx-eq/timeseries.png", "another plot");
+
+        let keys: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(
+            keys,
+            [
+                "bench/tx-eq/eye.png",
+                "bench/tx-eq/model.cir.prn",
+                "bench/tx-eq/timeseries.png",
+            ],
+        );
+    }
+
+    /// The bench's name has to survive into the key. Two benches each
+    /// producing an `eye.png` would otherwise be one object, each overwriting
+    /// the other, and only the last one run would exist.
+    #[test]
+    fn two_benches_do_not_collide_in_the_bucket() {
+        let (_dir, root) = scratch();
+        build_output(&root, "bench/tx-eq/eye.png", "one");
+        build_output(&root, "bench/rx-eq/eye.png", "another");
+
+        let keys: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(keys, ["bench/rx-eq/eye.png", "bench/tx-eq/eye.png"]);
+    }
+
+    /// Digital benches build under `target/sim`, and that is working state —
+    /// object files, the nvc library, waveforms that only mean anything next
+    /// to the design that made them.
+    #[test]
+    fn a_digital_benchs_build_directory_is_not_shipped() {
+        let (_dir, root) = scratch();
+        build_output(&root, "sim/dma_tb/dma_tb.fst", "a waveform");
+        build_output(&root, "bench/tx-eq/model.cir.prn", "xyce output");
+
+        let keys: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(keys, ["bench/tx-eq/model.cir.prn"]);
     }
 
     #[test]

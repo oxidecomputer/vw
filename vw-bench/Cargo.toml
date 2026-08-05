@@ -12,3 +12,6 @@ serde.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 vw-lib = { path = "../vw-lib" }
+
+[dev-dependencies]
+tempfile.workspace = true

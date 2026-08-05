@@ -110,13 +110,28 @@ pub fn discover(
         .into_iter()
         .map(|t| t.name)
         .filter(|n| n.to_lowercase().ends_with("_tb"))
-        .filter(|n| {
-            request
-                .filter
-                .as_ref()
-                .is_none_or(|f| n.contains(f.as_str()))
-        })
         .collect();
+
+    // Mixed-signal benches are a directory holding a `mist.toml`, not a VHDL
+    // entity, so the entity walk above cannot see them and the `_tb` suffix
+    // rule does not apply — the name is the directory's. Without this they are
+    // invisible to `--list` and to a bare `vw bench`, even though
+    // `run_testbench` knows how to run one by name.
+    let mixed_signal = vw_lib::sim::find_mist_configs(&bench_dir)
+        .map_err(|e| BenchError::Discover(bench_dir.clone(), e))?;
+    names.extend(
+        mixed_signal
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| !ignore.contains(name)),
+    );
+
+    // Applied once, over both kinds, so a filter cannot silently mean
+    // different things depending on which sort of bench it matches.
+    if let Some(filter) = request.filter.as_deref() {
+        names.retain(|n| n.contains(filter));
+    }
+
     names.sort();
     names.dedup();
 
@@ -208,4 +223,95 @@ pub async fn run(
     }
 
     summary
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A workspace with one VHDL testbench and one mixed-signal bench.
+    fn workspace() -> (tempfile::TempDir, camino::Utf8PathBuf) {
+        let dir = tempfile::TempDir::new().expect("scratch");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8").to_owned();
+        let bench = root.join("bench");
+
+        std::fs::create_dir_all(&bench).expect("mkdir");
+        std::fs::write(
+            bench.join("widget_tb.vhd"),
+            "entity widget_tb is\nend entity;\n",
+        )
+        .expect("write");
+
+        // A mixed-signal bench is a directory with a `mist.toml` and no VHDL
+        // entity of its own.
+        let mixed = bench.join("tx-eq");
+        std::fs::create_dir_all(&mixed).expect("mkdir");
+        std::fs::write(
+            mixed.join("mist.toml"),
+            "netlist = \"analog/model.cir\"\nentity = \"TxEq\"\nclock = 26.5625e9\n",
+        )
+        .expect("write");
+
+        (dir, root)
+    }
+
+    fn found(root: &Utf8Path, request: Request) -> Vec<String> {
+        discover(root, &request).expect("discover")
+    }
+
+    #[test]
+    fn a_mixed_signal_bench_is_discovered() {
+        // It has no VHDL entity and its name does not end in `_tb`, so both of
+        // the rules that find an ordinary testbench miss it. It went missing
+        // from `--list` for exactly that reason once already.
+        let (_dir, root) = workspace();
+
+        assert_eq!(
+            found(&root, Request::default()),
+            ["tx-eq", "widget_tb"],
+            "both kinds of bench should be listed",
+        );
+    }
+
+    #[test]
+    fn a_filter_matches_either_kind() {
+        let (_dir, root) = workspace();
+
+        assert_eq!(
+            found(
+                &root,
+                Request {
+                    filter: Some("tx".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            ["tx-eq"],
+        );
+        assert_eq!(
+            found(
+                &root,
+                Request {
+                    filter: Some("widget".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            ["widget_tb"],
+        );
+    }
+
+    #[test]
+    fn an_ignored_directory_is_not_run_whichever_kind_it_is() {
+        let (_dir, root) = workspace();
+
+        assert_eq!(
+            found(
+                &root,
+                Request {
+                    ignore: vec!["tx-eq".to_owned()],
+                    ..Default::default()
+                },
+            ),
+            ["widget_tb"],
+        );
+    }
 }

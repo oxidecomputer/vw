@@ -5898,6 +5898,7 @@ version = "0.1.0"
 dependencies = [
  "camino",
  "serde",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "vw-lib",

@@ -85,8 +85,6 @@ pub struct WorkspaceConfig {
     /// don't publish their own supported-parts list.
     #[serde(default)]
     pub targets: Option<TargetsConfig>,
-    #[serde(default)]
-    pub tools: Option<ToolsConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -812,30 +810,6 @@ struct CargoPackage {
 }
 
 // ============================================================================
-// Tool Configuration (workspace-wide [tools] section)
-// ============================================================================
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ToolsConfig {
-    #[serde(default)]
-    pub xyce: Option<XyceConfig>,
-    #[serde(default, rename = "rust-cosim")]
-    pub rust_cosim: Option<RustCosimConfig>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct XyceConfig {
-    pub prefix: String,
-    #[serde(rename = "trilinos-prefix")]
-    pub trilinos_prefix: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct RustCosimConfig {
-    pub path: String,
-}
-
-// ============================================================================
 // Mixed-Signal Configuration (per-bench mist.toml)
 // ============================================================================
 
@@ -1052,7 +1026,6 @@ pub fn init_workspace(
         dependencies: HashMap::new(),
         test_dependencies: HashMap::new(),
         targets: None,
-        tools: None,
     };
 
     save_workspace_config(workspace_dir, &config)?;
@@ -1493,7 +1466,6 @@ pub async fn add_dependency_with_token(
                 dependencies: HashMap::new(),
                 test_dependencies: HashMap::new(),
                 targets: None,
-                tools: None,
             }
         });
 
@@ -3343,11 +3315,7 @@ pub fn ensure_bench_scaffolds(workspace_dir: &Utf8Path) -> Result<()> {
                     ),
                 }
             })?;
-        sim::scaffold(
-            &bench_test_dir,
-            &mist_config,
-            &ws_config.as_ref().unwrap().tools,
-        )?;
+        sim::scaffold(&bench_test_dir, &mist_config)?;
     }
     Ok(())
 }
@@ -3367,7 +3335,6 @@ pub async fn run_testbench(
     let bench_test_dir = workspace_dir.join("bench").join(&testbench_name);
     let mist_toml = bench_test_dir.join("mist.toml");
     if mist_toml.exists() {
-        let ws_config = load_workspace_config(workspace_dir)?;
         let mist_content =
             fs::read_to_string(&mist_toml).map_err(|e| VwError::Config {
                 message: format!("Failed to read mist.toml: {e}"),
@@ -3377,11 +3344,7 @@ pub async fn run_testbench(
                 message: format!("Failed to parse mist.toml: {e}"),
             })?;
         if scaffold {
-            return sim::scaffold(
-                &bench_test_dir,
-                &mist_config,
-                &ws_config.tools,
-            );
+            return sim::scaffold(&bench_test_dir, &mist_config);
         }
         // Auto-scaffold before simulating so `vw bench` works straight
         // from a clean checkout (`git clean -fdx` wipes the generated
@@ -3391,13 +3354,12 @@ pub async fn run_testbench(
         // regenerates only the boilerplate (the user-owned `src/lib.rs`
         // is left alone) and `write_file` is content-aware, so this is a
         // cheap no-op when nothing changed.
-        sim::scaffold(&bench_test_dir, &mist_config, &ws_config.tools)?;
+        sim::scaffold(&bench_test_dir, &mist_config)?;
         return sim::run_analog_test(
             workspace_dir,
             &testbench_name,
             &bench_test_dir,
             &mist_config,
-            &ws_config.tools,
             vhdl_std,
             build_dir,
         )
