@@ -9,10 +9,10 @@ use std::fmt;
 use std::process;
 
 use vw_lib::{
-    add_dependency_with_token, clear_cache, generate_deps_tcl,
-    get_access_credentials_for_repo, get_access_credentials_for_workspace,
-    init_workspace, list_dependencies, remove_dependency, run_testbench,
-    update_workspace_with_token, VersionInfo, VhdlStandard,
+    add_dependency_with_token, clear_cache, get_access_credentials_for_repo,
+    get_access_credentials_for_workspace, init_workspace, list_dependencies,
+    remove_dependency, run_testbench, update_workspace_with_token, VersionInfo,
+    VhdlStandard,
 };
 
 mod bench_runner;
@@ -210,10 +210,6 @@ enum Commands {
     #[command(about = "List workspace dependencies")]
     List,
     #[command(about = "Generate deps.tcl file with all dependency VHDL files")]
-    DepsToTcl,
-    #[command(
-        about = "Run VHDL/cosim testbenches with NVC — all in parallel, nextest-style"
-    )]
     Bench {
         #[arg(
             help = "Filter to testbenches whose name contains this substring; omit to run all"
@@ -895,18 +891,6 @@ async fn main() {
                         }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("{} {e}", "error:".bright_red());
-                process::exit(1);
-            }
-        },
-        Commands::DepsToTcl => match generate_deps_tcl(&cwd) {
-            Ok(()) => {
-                println!(
-                    "{} Generated deps.tcl with dependency VHDL files",
-                    "✓".bright_green()
-                );
             }
             Err(e) => {
                 eprintln!("{} {e}", "error:".bright_red());
