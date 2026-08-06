@@ -2088,7 +2088,7 @@ async fn ensure_workspace_deps(cwd: &Utf8Path) {
     if !vw_lib::dependencies_present(&ws) {
         println!("{} fetching missing dependencies…", "note:".bright_yellow());
         let creds = get_access_credentials_for_workspace(&ws, false);
-        if let Err(e) = update_workspace_with_token(&ws, creds).await {
+        if let Err(e) = vw_lib::install_locked_dependencies(&ws, creds).await {
             eprintln!(
                 "{} failed to fetch dependencies: {e}",
                 "error:".bright_red()

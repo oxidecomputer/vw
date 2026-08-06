@@ -1089,6 +1089,30 @@ pub async fn update_workspace_with_token(
     workspace_dir: &Utf8Path,
     credentials: Option<Credentials>,
 ) -> Result<UpdateResult> {
+    fetch(workspace_dir, credentials, Resolution::Fresh).await
+}
+
+/// Install exactly what `vw.lock` names, fetching whatever is missing.
+///
+/// What every implicit fetch should do: a build starting on a machine with a
+/// cold dependency cache must end up with the same dependencies as one on a
+/// warm machine, or the build is not reproducible and its checkpoints are
+/// worthless. Only `vw update` moves a pin.
+///
+/// A dependency the lockfile does not mention still resolves — that is a
+/// dependency somebody just added, and there is nothing to honour.
+pub async fn install_locked_dependencies(
+    workspace_dir: &Utf8Path,
+    credentials: Option<Credentials>,
+) -> Result<UpdateResult> {
+    fetch(workspace_dir, credentials, Resolution::Locked).await
+}
+
+async fn fetch(
+    workspace_dir: &Utf8Path,
+    credentials: Option<Credentials>,
+    resolution: Resolution,
+) -> Result<UpdateResult> {
     // Resolve and fetch the WHOLE transitive dependency graph. Cargo
     // model: the entry's `vw.lock` pins every dep — direct AND
     // deps-of-deps — so a transitive import like `src @vivado-cmd` from
@@ -1097,7 +1121,8 @@ pub async fn update_workspace_with_token(
     let creds = credentials
         .as_ref()
         .map(|c| (c.username.as_str(), c.password.as_str()));
-    let graph = build_dependency_graph(workspace_dir, true, creds).await?;
+    let graph =
+        build_dependency_graph(workspace_dir, true, creds, resolution).await?;
 
     let mut lock_file = LockFile {
         dependencies: BTreeMap::new(),
@@ -1169,11 +1194,40 @@ struct DepGraphNode {
 /// Only the entry's `[test-dependencies]` are followed (when
 /// `include_test`); a transitive dep's dev-deps stay private to it,
 /// mirroring [`transitive_dep_cache_paths_with_test`].
+/// Whether a fetch may move a dependency to a commit the lockfile does not
+/// name.
+///
+/// A dependency written as `branch = "main"` has no fixed commit in `vw.toml`;
+/// the commit it resolved to lives in `vw.lock`. Asking the remote what the
+/// branch points at *now* is therefore an update, and doing it implicitly
+/// means a dependency that gained a commit five minutes ago silently changes
+/// what a build is made of — which is what a lockfile exists to stop.
+///
+/// It matters most where it is least visible. Every CI job starts on a clean
+/// machine and fetches, so a push to a dependency partway through a pipeline
+/// would re-resolve, rewrite `vw.lock`, change the synth fingerprint, and
+/// throw away checkpoints from jobs that had already finished.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    /// Ask each remote where its branch points now. `vw update` only.
+    Fresh,
+    /// Take what `vw.lock` already pins, and resolve only what it does not
+    /// mention — a dependency just added, or one whose repository changed.
+    Locked,
+}
+
 async fn build_dependency_graph(
     entry: &Utf8Path,
     include_test: bool,
     credentials: Option<(&str, &str)>,
+    resolution: Resolution,
 ) -> Result<DiGraph<DepGraphNode, ()>> {
+    // Only consulted under `Resolution::Locked`, and absent on a workspace
+    // that has never been updated — in which case everything resolves fresh,
+    // which is the only thing it could do.
+    let locked = load_lock_file(entry).unwrap_or(LockFile {
+        dependencies: BTreeMap::new(),
+    });
     let deps_dir = deps_directory()?;
     let mut graph: DiGraph<DepGraphNode, ()> = DiGraph::new();
     // First-seen (entry-wins) node per dep name; also the cycle guard.
@@ -1217,19 +1271,34 @@ async fn build_dependency_graph(
                     commit,
                     submodules,
                 } => {
-                    let sha = resolve_dependency_commit(
-                        repo,
-                        branch,
-                        commit,
-                        credentials,
-                    )
-                    .await
-                    .map_err(|e| VwError::Dependency {
-                        message: format!(
-                            "Failed to resolve commit for dependency \
-                             '{name}': {e}"
-                        ),
-                    })?;
+                    // The lockfile wins when it has an opinion, unless the
+                    // caller explicitly asked for a fresh resolve. Matched on
+                    // the repository too: a dependency repointed at a
+                    // different repo in `vw.toml` has a lock entry that is
+                    // about something else.
+                    let pinned = (resolution == Resolution::Locked)
+                        .then(|| locked.dependencies.get(&name))
+                        .flatten()
+                        .filter(|entry| entry.repo == *repo)
+                        .map(|entry| entry.commit.clone());
+
+                    let sha =
+                        match pinned {
+                            Some(sha) => sha,
+                            None => resolve_dependency_commit(
+                                repo,
+                                branch,
+                                commit,
+                                credentials,
+                            )
+                            .await
+                            .map_err(|e| VwError::Dependency {
+                                message: format!(
+                                    "Failed to resolve commit for dependency \
+                                 '{name}': {e}"
+                                ),
+                            })?,
+                        };
                     let root = deps_dir.join(format!("{name}-{sha}"));
                     // A dir left by a PARTIAL/failed prior download
                     // (created but empty) must not count as cached.
@@ -5357,6 +5426,179 @@ async fn build_rust_library(
     }
 
     Ok(lib_path.into())
+}
+
+#[cfg(test)]
+mod locked_resolution_tests {
+    use super::*;
+
+    const SHA_A: &str = "1111111111111111111111111111111111111111";
+    const SHA_B: &str = "2222222222222222222222222222222222222222";
+
+    /// Point the dependency cache at a scratch directory, once for the whole
+    /// test binary so no test ever sees the variable change underneath it.
+    /// Cache directories are keyed `<name>-<sha>`, so tests stay out of each
+    /// other's way by using distinct dependency names.
+    fn deps_cache() -> &'static Utf8Path {
+        static CACHE: std::sync::OnceLock<Utf8PathBuf> =
+            std::sync::OnceLock::new();
+        CACHE.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let dir = Utf8PathBuf::from_path_buf(dir).unwrap();
+            std::env::set_var("VW_DEPS_DIR", dir.as_str());
+            dir
+        })
+    }
+
+    /// A dependency already downloaded: what every CI worker's cache looks
+    /// like once the first job in the pipeline has run.
+    fn seed_cache(name: &str, sha: &str) {
+        let root = deps_cache().join(format!("{name}-{sha}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("vw.toml"),
+            format!("[workspace]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+    }
+
+    /// A workspace whose only dependency is `name`, declared and locked as
+    /// given. `lock` of `None` writes no `vw.lock` at all.
+    fn workspace(
+        dir: &Utf8Path,
+        name: &str,
+        declared: &str,
+        lock: Option<(&str, &str)>,
+    ) {
+        fs::write(
+            dir.join("vw.toml"),
+            format!(
+                "[workspace]\nname = \"entry\"\nversion = \"0.1.0\"\n\
+                 [dependencies.{name}]\n{declared}"
+            ),
+        )
+        .unwrap();
+        if let Some((repo, commit)) = lock {
+            fs::write(
+                dir.join("vw.lock"),
+                format!(
+                    "[dependencies.{name}]\nrepo = \"{repo}\"\n\
+                     commit = \"{commit}\"\npath = \"{name}-{commit}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    /// The bug this all exists for: a branch dependency that gained a commit
+    /// partway through a CI run must not move under the jobs still to come.
+    /// The remote here does not exist, so reaching for it at all would fail.
+    #[tokio::test]
+    async fn a_locked_branch_dependency_is_not_re_resolved() {
+        deps_cache();
+        seed_cache("lockfix-quiet", SHA_A);
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        workspace(
+            ws,
+            "lockfix-quiet",
+            "repo = \"https://example.invalid/quiet.git\"\n\
+             branch = \"main\"\n",
+            Some(("https://example.invalid/quiet.git", SHA_A)),
+        );
+
+        let graph = build_dependency_graph(ws, false, None, Resolution::Locked)
+            .await
+            .expect("a locked dependency resolves without the network");
+
+        let dep = graph
+            .node_indices()
+            .map(|i| &graph[i])
+            .find(|n| n.name.as_deref() == Some("lockfix-quiet"))
+            .expect("the dependency is in the graph");
+        assert_eq!(dep.locked.as_ref().unwrap().commit, SHA_A);
+        assert!(dep.was_cached, "the seeded cache dir was reused");
+    }
+
+    /// `vw update` is the one caller that may move a pin, so it asks the
+    /// remote even when the lockfile has an answer and the tree is cached.
+    #[tokio::test]
+    async fn an_update_re_resolves_a_locked_branch_dependency() {
+        deps_cache();
+        seed_cache("lockfix-fresh", SHA_A);
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        workspace(
+            ws,
+            "lockfix-fresh",
+            "repo = \"https://example.invalid/fresh.git\"\n\
+             branch = \"main\"\n",
+            Some(("https://example.invalid/fresh.git", SHA_A)),
+        );
+
+        let e = build_dependency_graph(ws, false, None, Resolution::Fresh)
+            .await
+            .expect_err("a fresh resolve consults the remote");
+        assert!(
+            e.to_string().contains("resolve commit for dependency"),
+            "expected a failed branch resolution, got: {e}"
+        );
+    }
+
+    /// A pin is only about the repository it was taken from. Repoint a
+    /// dependency in `vw.toml` and its old commit means nothing.
+    #[tokio::test]
+    async fn a_lock_entry_for_another_repo_does_not_pin() {
+        deps_cache();
+        seed_cache("lockfix-moved", SHA_A);
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        workspace(
+            ws,
+            "lockfix-moved",
+            "repo = \"https://example.invalid/new.git\"\nbranch = \"main\"\n",
+            Some(("https://example.invalid/old.git", SHA_A)),
+        );
+
+        let e = build_dependency_graph(ws, false, None, Resolution::Locked)
+            .await
+            .expect_err("the stale pin is not reused for a new repo");
+        assert!(
+            e.to_string().contains("resolve commit for dependency"),
+            "expected a failed branch resolution, got: {e}"
+        );
+    }
+
+    /// A dependency somebody just added has nothing to honour, so it
+    /// resolves normally rather than failing for want of a lock entry.
+    #[tokio::test]
+    async fn a_dependency_absent_from_the_lock_still_resolves() {
+        deps_cache();
+        seed_cache("lockfix-added", SHA_B);
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        // Pinned by commit in the manifest, so resolution needs no remote.
+        workspace(
+            ws,
+            "lockfix-added",
+            &format!(
+                "repo = \"https://example.invalid/added.git\"\n\
+                 commit = \"{SHA_B}\"\n"
+            ),
+            None,
+        );
+
+        let graph = build_dependency_graph(ws, false, None, Resolution::Locked)
+            .await
+            .expect("an unlocked dependency resolves");
+
+        let dep = graph
+            .node_indices()
+            .map(|i| &graph[i])
+            .find(|n| n.name.as_deref() == Some("lockfix-added"))
+            .expect("the dependency is in the graph");
+        assert_eq!(dep.locked.as_ref().unwrap().commit, SHA_B);
+    }
 }
 
 #[cfg(test)]
