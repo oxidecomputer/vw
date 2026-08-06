@@ -10,7 +10,7 @@ use oxide::{
 };
 use slog::{info, warn, Logger};
 use vw_api_types_versions::latest::{
-    EnvironmentImages, ImageRef, OxideInstance,
+    EnvironmentImages, ImageRef, KeptImage, OxideInstance, RecycledImage,
 };
 
 use crate::reconciler::{InstanceKind, InstanceMap, UserInstance};
@@ -498,13 +498,79 @@ impl Session {
         helios: Option<&str>,
         artifact: Option<&str>,
     ) -> Result<EnvironmentImages, ImageError> {
-        let images = self.visible_images().await?;
+        let images = self.image_facts().await?;
 
         Ok(EnvironmentImages {
             vivado: choose_image(&images, InstanceKind::Vivado, vivado)?,
             helios: choose_image(&images, InstanceKind::Helios, helios)?,
             artifact: choose_image(&images, InstanceKind::Artifact, artifact)?,
         })
+    }
+
+    /// Every visible image, reduced to what this service acts on.
+    async fn image_facts(&self) -> Result<Vec<ImageFacts>, ImageError> {
+        Ok(self.visible_images().await?.iter().map(facts).collect())
+    }
+
+    /// Delete the service's images that nothing is using and nothing would
+    /// use, and report both halves of what that came to.
+    ///
+    /// The whole plan is worked out before the first deletion, so what gets
+    /// reported as kept is decided against the same picture of the rack as
+    /// what gets deleted — rather than "newest" moving as the list is walked.
+    /// See [`plan_recycle`] for what spares an image.
+    ///
+    /// A `dry_run` pass does everything except the deleting, and says so in
+    /// the report.
+    ///
+    /// One image failing to delete does not stop the pass: the images are
+    /// independent of each other, and stopping would leave the caller with a
+    /// report claiming deletions that came after the failure. A failed
+    /// deletion is logged and the image is reported as neither deleted nor
+    /// kept, which is the truth — it is still there, and not because anything
+    /// spared it.
+    pub(crate) async fn recycle_images(
+        &self,
+        in_use: &std::collections::BTreeMap<uuid::Uuid, Vec<String>>,
+        dry_run: bool,
+        log: &Logger,
+    ) -> Result<RecyclePlan, ImageError> {
+        let images = self.image_facts().await?;
+        let mut plan = plan_recycle(&images, in_use);
+
+        if dry_run {
+            return Ok(plan);
+        }
+
+        let mut deleted = Vec::with_capacity(plan.delete.len());
+        for image in plan.delete {
+            // By name rather than id: the delete endpoint takes either, and a
+            // name is what the log and the report are in terms of.
+            let result = self
+                .client
+                .image_delete()
+                .image(image.name.as_str())
+                .project(self.project.as_str())
+                .send()
+                .await;
+            match result {
+                Ok(_) => {
+                    info!(log, "recycled an image";
+                        "image" => &image.name,
+                        "id" => %image.id,
+                    );
+                    deleted.push(image);
+                }
+                Err(e) => warn!(log, "cannot delete an image";
+                    "image" => &image.name,
+                    "id" => %image.id,
+                    slog_error_chain::InlineErrorChain::new(&e),
+                ),
+            }
+        }
+        plan.delete = deleted;
+
+        Ok(plan)
     }
 
     /// Every image the service can see, from both the project and the silo.
@@ -859,15 +925,15 @@ pub(crate) fn parse_instance_name(name: &str) -> Option<UserInstance> {
 
 /// Pick the image for `kind`, either the one named or the newest match.
 fn choose_image(
-    images: &[types::Image],
+    images: &[ImageFacts],
     kind: InstanceKind,
     requested: Option<&str>,
 ) -> Result<ImageRef, ImageError> {
     if let Some(name) = requested {
         return images
             .iter()
-            .find(|image| image.name.as_str() == name)
-            .map(image_ref)
+            .find(|image| image.name == name)
+            .map(ImageFacts::as_ref)
             .ok_or_else(|| ImageError::NoSuchImage(name.to_owned()));
     }
 
@@ -876,19 +942,121 @@ fn choose_image(
     // is a convention.
     images
         .iter()
-        .filter(|image| image.name.as_str().starts_with(kind.image_prefix()))
-        .max_by_key(|image| image.time_created)
-        .map(image_ref)
+        .filter(|image| image.name.starts_with(kind.image_prefix()))
+        .max_by_key(|image| image.created)
+        .map(ImageFacts::as_ref)
         .ok_or_else(|| {
             ImageError::NoMatchingImage(kind.image_prefix().to_owned())
         })
 }
 
-fn image_ref(image: &types::Image) -> ImageRef {
-    ImageRef {
+/// The facts about an image that this service acts on.
+///
+/// A narrow view of [`types::Image`], and the only description of an image
+/// that resolution and recycling both work from — so what "the newest image
+/// of a kind" means cannot come apart between the code that boots one and the
+/// code that deletes one. Cheap to build in a test, which is the other half
+/// of why it exists.
+#[derive(Debug, Clone)]
+pub(crate) struct ImageFacts {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) name: String,
+    /// Whether the image lives in this service's project rather than being
+    /// published to the whole silo.
+    pub(crate) in_project: bool,
+    pub(crate) created: chrono::DateTime<chrono::Utc>,
+}
+
+impl ImageFacts {
+    fn as_ref(&self) -> ImageRef {
+        ImageRef {
+            id: self.id,
+            name: self.name.clone(),
+        }
+    }
+}
+
+/// What a recycle pass should do, worked out before anything is deleted.
+#[derive(Debug, Default)]
+pub(crate) struct RecyclePlan {
+    pub(crate) delete: Vec<RecycledImage>,
+    pub(crate) keep: Vec<KeptImage>,
+}
+
+/// Decide which images a recycle pass may delete.
+///
+/// Deleting an image cannot be undone and the images take the better part of
+/// an hour to rebuild, so this is written as four reasons to spare one rather
+/// than one reason to remove it. An image survives if any of them holds:
+///
+/// - it is not one of ours — its name does not match an [`InstanceKind`]
+///   prefix — so the rack's base images are never this service's to reclaim;
+/// - it is not in this service's project: a silo-scoped image is shared with
+///   everyone, and who else boots it is not a question answerable from here;
+/// - it is the newest of its kind, decided by asking [`choose_image`] rather
+///   than by a second implementation of "newest" that could drift from it, so
+///   what an environment created a moment from now would boot is exactly what
+///   cannot be taken away;
+/// - an environment names it, however old it is and however many newer
+///   images of its kind exist.
+///
+/// `in_use` maps an image id to the environments booting it, as `user/name`.
+pub(crate) fn plan_recycle(
+    images: &[ImageFacts],
+    in_use: &std::collections::BTreeMap<uuid::Uuid, Vec<String>>,
+) -> RecyclePlan {
+    // Asked of the function that answers it when an environment is created,
+    // over the same images, so the two cannot disagree about which image is
+    // the newest of a kind. A kind with no images has nothing to protect —
+    // and nothing to delete either.
+    let latest: std::collections::BTreeSet<uuid::Uuid> = InstanceKind::ALL
+        .iter()
+        .filter_map(|kind| choose_image(images, *kind, None).ok())
+        .map(|image| image.id)
+        .collect();
+
+    let mut plan = RecyclePlan::default();
+    for image in images {
+        // Not named like one of ours, or not ours to reach: skipped rather
+        // than reported, since a rack's image list is mostly this and burying
+        // the few images the pass is about in it helps nobody.
+        if !is_ours(&image.name) || !image.in_project {
+            continue;
+        }
+
+        let is_latest = latest.contains(&image.id);
+        let used_by = in_use.get(&image.id).cloned().unwrap_or_default();
+        if is_latest || !used_by.is_empty() {
+            plan.keep.push(KeptImage {
+                id: image.id,
+                name: image.name.clone(),
+                latest: is_latest,
+                used_by,
+            });
+        } else {
+            plan.delete.push(RecycledImage {
+                id: image.id,
+                name: image.name.clone(),
+            });
+        }
+    }
+    plan
+}
+
+fn facts(image: &types::Image) -> ImageFacts {
+    ImageFacts {
         id: image.id,
         name: image.name.to_string(),
+        in_project: image.project_id.is_some(),
+        created: image.time_created,
     }
+}
+
+/// Whether an image is one this service publishes and boots.
+fn is_ours(name: &str) -> bool {
+    InstanceKind::ALL
+        .iter()
+        .any(|kind| name.starts_with(kind.image_prefix()))
 }
 
 /// The fields of an `InstanceCreate` the reconciler does not set.
@@ -1201,5 +1369,178 @@ mod test {
             .expect("a well formed name");
         assert_eq!(instance.user, "foo-bar");
         assert_eq!(instance.hostname(), "vivado-darmok");
+    }
+}
+
+#[cfg(test)]
+mod recycle_test {
+    use super::*;
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
+
+    /// An image in this service's project, `minutes` after the epoch.
+    fn ours(name: &str, minutes: i64) -> ImageFacts {
+        ImageFacts {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            in_project: true,
+            created: chrono::DateTime::from_timestamp(minutes * 60, 0)
+                .expect("a representable time"),
+        }
+    }
+
+    /// The same, published to the whole silo rather than to our project.
+    fn silo(name: &str, minutes: i64) -> ImageFacts {
+        ImageFacts {
+            in_project: false,
+            ..ours(name, minutes)
+        }
+    }
+
+    fn names(images: &[RecycledImage]) -> Vec<&str> {
+        images.iter().map(|i| i.name.as_str()).collect()
+    }
+
+    fn kept_names(images: &[KeptImage]) -> Vec<&str> {
+        images.iter().map(|i| i.name.as_str()).collect()
+    }
+
+    /// A rack's worth of images: three generations of each of our kinds,
+    /// alongside the base images they were built from.
+    fn a_rack() -> Vec<ImageFacts> {
+        vec![
+            ours("vw-vivado-20260101000000", 1),
+            ours("vw-vivado-20260601000000", 2),
+            ours("vw-vivado-20260806000000", 3),
+            ours("vw-helios-20260101000000", 1),
+            ours("vw-helios-20260806000000", 3),
+            ours("vw-artifact-20260806000000", 3),
+            silo("ubuntu-24-04-20260108", 0),
+            silo("helios-3-base-20260509", 0),
+        ]
+    }
+
+    /// The guarantee: whatever else happens, the image an environment created
+    /// a moment from now would boot is still there afterwards.
+    #[test]
+    fn the_newest_of_each_kind_is_never_deleted() {
+        let images = a_rack();
+        let plan = plan_recycle(&images, &BTreeMap::new());
+
+        for kind in InstanceKind::ALL {
+            let newest = choose_image(&images, kind, None)
+                .expect("this rack has one of each kind");
+            assert!(
+                !plan.delete.iter().any(|i| i.id == newest.id),
+                "{} would have been deleted",
+                newest.name,
+            );
+            assert!(
+                plan.keep.iter().any(|i| i.id == newest.id && i.latest),
+                "{} is not reported as the newest",
+                newest.name,
+            );
+        }
+    }
+
+    /// The other guarantee, and the one an old environment depends on: age is
+    /// no reason to delete an image somebody is still booting.
+    #[test]
+    fn an_image_an_environment_boots_is_never_deleted() {
+        let images = a_rack();
+        // The oldest vivado image there is, with two newer ones above it.
+        let ancient = images[0].id;
+        let in_use = BTreeMap::from([(
+            ancient,
+            vec!["rcgoodfellow/tenagra".to_owned()],
+        )]);
+
+        let plan = plan_recycle(&images, &in_use);
+
+        assert!(!plan.delete.iter().any(|i| i.id == ancient));
+        let kept = plan
+            .keep
+            .iter()
+            .find(|i| i.id == ancient)
+            .expect("the image in use is kept");
+        assert!(!kept.latest, "it is not the newest — being in use is why");
+        assert_eq!(kept.used_by, ["rcgoodfellow/tenagra"]);
+    }
+
+    /// Nothing outside the service's own naming is a candidate, whether or
+    /// not anything is using it. The base images the rack publishes are the
+    /// case that matters: deleting one costs an upload nobody planned for.
+    #[test]
+    fn an_image_that_is_not_ours_is_never_touched() {
+        let images = a_rack();
+        let plan = plan_recycle(&images, &BTreeMap::new());
+
+        let mentioned: Vec<&str> = names(&plan.delete)
+            .into_iter()
+            .chain(kept_names(&plan.keep))
+            .collect();
+        for base in ["ubuntu-24-04-20260108", "helios-3-base-20260509"] {
+            assert!(
+                !mentioned.contains(&base),
+                "{base} should not even be considered",
+            );
+        }
+    }
+
+    /// Named like ours but published to the silo: shared with everyone, and
+    /// who else boots it is not a question answerable from here.
+    #[test]
+    fn a_silo_image_of_ours_is_never_deleted() {
+        let images = vec![
+            ours("vw-vivado-20260806000000", 3),
+            silo("vw-vivado-20260101000000", 1),
+        ];
+        let plan = plan_recycle(&images, &BTreeMap::new());
+
+        assert!(plan.delete.is_empty(), "{:?}", names(&plan.delete));
+    }
+
+    /// What the command is for.
+    #[test]
+    fn older_unused_images_of_ours_are_deleted() {
+        let plan = plan_recycle(&a_rack(), &BTreeMap::new());
+
+        assert_eq!(
+            names(&plan.delete),
+            [
+                "vw-vivado-20260101000000",
+                "vw-vivado-20260601000000",
+                "vw-helios-20260101000000",
+            ],
+        );
+    }
+
+    /// A kind with a single image has that image as its newest, so a pass
+    /// over a service that has only ever built once deletes nothing.
+    #[test]
+    fn a_kind_with_one_image_keeps_it() {
+        let images = vec![ours("vw-artifact-20260806000000", 3)];
+        let plan = plan_recycle(&images, &BTreeMap::new());
+
+        assert!(plan.delete.is_empty());
+        assert_eq!(kept_names(&plan.keep), ["vw-artifact-20260806000000"]);
+    }
+
+    /// Two images built in the same second — which the image names alone
+    /// cannot tell apart — must still leave exactly one of them protected,
+    /// and it must be the one an environment would boot.
+    #[test]
+    fn a_tie_on_creation_time_still_protects_what_would_boot() {
+        let images = vec![
+            ours("vw-helios-20260806220915", 7),
+            ours("vw-helios-20260806220915", 7),
+        ];
+        let would_boot = choose_image(&images, InstanceKind::Helios, None)
+            .expect("one of them wins");
+
+        let plan = plan_recycle(&images, &BTreeMap::new());
+
+        assert_eq!(plan.delete.len(), 1, "the other one goes");
+        assert!(!plan.delete.iter().any(|i| i.id == would_boot.id));
     }
 }

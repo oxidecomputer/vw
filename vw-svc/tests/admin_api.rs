@@ -53,7 +53,7 @@ impl TestServer {
             child,
             users: format!("http://127.0.0.1:{user_port}"),
             admin: format!("http://127.0.0.1:{admin_port}"),
-            client: reqwest::Client::new(),
+            client: versioned_client(),
         };
         server.wait_until_ready().await;
         server
@@ -108,6 +108,17 @@ impl TestServer {
             .send()
             .await
             .expect("delete environment")
+    }
+
+    /// Ask the admin API to reclaim unused images.
+    async fn recycle(&self, caller: &str, dry_run: bool) -> reqwest::Response {
+        self.client
+            .post(format!("{}/images/recycle", self.admin))
+            .query(&[("dry_run", dry_run)])
+            .header("x-vw-user", caller)
+            .send()
+            .await
+            .expect("recycle images")
     }
 
     /// Create an environment the ordinary way, as `user`.
@@ -173,6 +184,25 @@ impl Drop for TestServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// A client that names the API version, as every real client does.
+///
+/// The admin API has endpoints that only exist from a given version onwards,
+/// so the service routes on this header and refuses a request without it.
+fn versioned_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HeaderName::from_static(vw_api::API_VERSION_HEADER),
+        vw_api::latest_version()
+            .to_string()
+            .parse()
+            .expect("a version is a header value"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build a client")
 }
 
 fn free_port() -> u16 {
@@ -267,4 +297,56 @@ async fn a_service_with_no_environments_lists_none() {
     let (_dir, server) = server().await;
 
     assert!(server.everything().await.is_empty());
+}
+
+// Recycling images deletes things that take the better part of an hour to
+// rebuild, so who is allowed to ask for it matters as much as what it picks.
+// What it picks is decided by `plan_recycle`, and tested against a rack's
+// worth of images beside it; a service with no Oxide backend cannot be made
+// to have images here.
+
+#[tokio::test]
+async fn a_developer_cannot_recycle_images() {
+    let (_dir, server) = server().await;
+
+    for dry_run in [true, false] {
+        let refused = server.recycle(DEVELOPER, dry_run).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+/// The service can be run without a rack behind it, and then there are no
+/// images to reclaim. Saying so beats appearing to succeed at nothing.
+#[tokio::test]
+async fn recycling_without_an_oxide_backend_says_so() {
+    let (_dir, server) = server().await;
+
+    let response = server.recycle(ADMIN, true).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.expect("decode error");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("no oxide backend"),
+        "{body}",
+    );
+}
+
+/// The endpoint exists only from version 2 onwards, so a client that does not
+/// say which version it means is turned away rather than answered from one it
+/// may not have been built for.
+#[tokio::test]
+async fn a_request_that_names_no_api_version_is_refused() {
+    let (_dir, server) = server().await;
+
+    let unversioned = reqwest::Client::new()
+        .post(format!("{}/images/recycle", server.admin))
+        .header("x-vw-user", ADMIN)
+        .send()
+        .await
+        .expect("send unversioned request");
+
+    assert_eq!(unversioned.status(), StatusCode::BAD_REQUEST);
 }

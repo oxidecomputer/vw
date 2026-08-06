@@ -25,11 +25,15 @@ thiserror.workspace = true
 clap.workspace = true
 tokio.workspace = true
 oxide.workspace = true
+# The timestamp type the Oxide API reports image creation in.
+chrono = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 iddqd.workspace = true
 bytes = "1"
 futures.workspace = true
+# `HeaderName` for the API version header dropshot routes on.
+http = "1"
 http-body = "1"
 http-body-util = "0.1"
 tokio-stream = "0.1"
