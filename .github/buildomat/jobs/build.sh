@@ -2,16 +2,35 @@
 #:
 #: name = "build"
 #: variety = "basic"
-#: target = "helios-2.0"
+#: target = "helios-3.0"
 #: rust_toolchain = "stable"
 #: output_rules = [
 #:   "/work/release/*",
+#: ]
+#: access_repos = [
+#:   "oxidecomputer/ipe",
+#:   "oxidecomputer/anodizer"
 #: ]
 #:
 #: [[publish]]
 #: series = "illumos"
 #: name = "vw"
 #: from_output = "/work/release/vw"
+#: 
+#: [[publish]]
+#: series = "illumos"
+#: name = "vw-agent"
+#: from_output = "/work/release/vw-agent"
+#: 
+#: [[publish]]
+#: series = "illumos"
+#: name = "vw-svc"
+#: from_output = "/work/release/vw-svc"
+#:
+#: [[publish]]
+#: series = "illumos"
+#: name = "vw-analyzer"
+#: from_output = "/work/release/vw-analyzer"
 
 set -o errexit
 set -o pipefail
@@ -23,6 +42,9 @@ rustc --version
 
 export PKG_CONFIG_PATH=/opt/ooce/lib/amd64/pkgconfig
 
+banner "api"
+cargo xtask openapi generate
+
 banner "check"
 cargo fmt -- --check
 cargo clippy --all-targets -- --deny warnings
@@ -31,3 +53,6 @@ banner "build"
 cargo build --release
 mkdir -p /work/release/
 cp target/release/vw /work/release/
+cp target/release/vw-agent /work/release/
+cp target/release/vw-svc /work/release/
+cp target/release/vw-analyzer /work/release/

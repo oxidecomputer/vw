@@ -1,1 +1,6 @@
 /target
+*.jou
+*.log
+.srcs
+.claude
+*.redb

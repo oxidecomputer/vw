@@ -1,0 +1,25 @@
+[package]
+name = "vw-api-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Progenitor generated clients for the VW service APIs"
+keywords = ["vhdl", "workspace", "dependency-management"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+vw-api-types-versions = { path = "../vw-api-types/versions" }
+base64 = "0.22"
+progenitor = "0.14.0"
+progenitor-client = "0.14.0"
+rand = "0.8"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+http = "1"

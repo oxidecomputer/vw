@@ -1,0 +1,28 @@
+[package]
+name = "vw-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driving a Vivado worker that is on another machine"
+
+[dependencies]
+async-trait.workspace = true
+camino = { workspace = true, features = ["serde1"] }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+slog-error-chain.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+vw-eda = { path = "../vw-eda" }
+vw-lib = { path = "../vw-lib" }
+vw-bench = { path = "../vw-bench" }
+vw-vivado = { path = "../vw-vivado" }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }

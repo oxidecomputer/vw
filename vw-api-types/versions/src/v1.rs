@@ -1,0 +1,522 @@
+use iddqd::{bi_upcast, BiHashItem};
+use oxide::types::InstanceState;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// An environment is a collection of instances that work together
+/// to build, analyze and test vw designs.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct Environment {
+    /// The name of this environment.
+    pub name: String,
+    /// The images this environment's instances boot from, chosen when the
+    /// environment was created.
+    ///
+    /// Absent when the service has no Oxide backend configured, in which case
+    /// the environment is a bare record that will never be provisioned.
+    pub images: Option<EnvironmentImages>,
+    /// The Oxide instance id for the vivado instance.
+    pub vivado_instance: Option<OxideInstance>,
+    /// The Oxide instance id for the helios instance.
+    pub helios_instance: Option<OxideInstance>,
+    /// The Oxide instance id for the artifact instance.
+    pub artifact_instance: Option<OxideInstance>,
+}
+
+/// The images each of an environment's instances boots from.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EnvironmentImages {
+    /// Image the vivado instance boots from.
+    pub vivado: ImageRef,
+    /// Image the helios instance boots from.
+    pub helios: ImageRef,
+    /// Image the artifact instance boots from.
+    pub artifact: ImageRef,
+}
+
+/// An Oxide image an environment's instances are built from.
+///
+/// Pinned by id, so publishing a newer image does not silently change what an
+/// existing environment boots. The name is carried along for display.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ImageRef {
+    pub id: Uuid,
+    pub name: String,
+}
+
+/// Information about an Oxide instance that underpins a VW instance.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct OxideInstance {
+    /// The Oxide instance id, once the control plane has assigned one.
+    ///
+    /// Absent in the window between asking for an instance and hearing back
+    /// about it, which is long enough to be worth showing: an environment
+    /// mid-creation reports `creating` with no id rather than looking like
+    /// nothing has happened.
+    pub id: Option<Uuid>,
+    pub state: InstanceState,
+    /// The address to reach this instance on from outside the rack, once it
+    /// has one.
+    ///
+    /// Absent until the instance exists and the control plane has attached an
+    /// external address to it. This is what a developer's ssh goes to.
+    pub external_ip: Option<std::net::IpAddr>,
+    /// The instance's address on the rack's own network.
+    ///
+    /// What `vw-svc` sends source to, rather than the external address: the
+    /// internal path is a regional fabric rather than the public internet, and
+    /// the difference is most of the bandwidth.
+    pub internal_ip: Option<std::net::IpAddr>,
+}
+
+/// Which half of an environment a request is about.
+///
+/// Only the two that take source. The artifact instance holds build output and
+/// is reached as an object store, so there is nothing to synchronize to it.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    Vivado,
+    Helios,
+}
+
+impl std::fmt::Display for TargetKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Vivado => f.write_str("vivado"),
+            Self::Helios => f.write_str("helios"),
+        }
+    }
+}
+
+/// Which environment and half a synchronization request is for.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TargetPathParam {
+    /// The name of the environment.
+    pub name: String,
+    /// Which half of it.
+    pub kind: TargetKind,
+}
+
+/// Which piece of content is being delivered, and where.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TargetBlobPathParam {
+    pub name: String,
+    pub kind: TargetKind,
+    /// The digest of the content in the body, verified on arrival.
+    pub digest: Digest,
+}
+
+/// Body of a request to create an environment.
+///
+/// Every field is optional; an image left unset is resolved to the newest
+/// image the service can see whose name matches that instance kind's
+/// convention. An image named here must already exist, or the request is
+/// rejected.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct EnvironmentCreate {
+    /// Name of the image the vivado instance should boot from.
+    #[serde(default)]
+    pub vivado_image: Option<String>,
+    /// Name of the image the helios instance should boot from.
+    #[serde(default)]
+    pub helios_image: Option<String>,
+    /// Name of the image the artifact instance should boot from.
+    #[serde(default)]
+    pub artifact_image: Option<String>,
+}
+
+/// The ssh keypair that opens an environment's instances.
+///
+/// Generated by the service when the environment is created and handed out
+/// only to the environment's owner.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshKeyPair {
+    /// The private key, in OpenSSH format, ready to pass to `ssh -i`.
+    pub private_key: String,
+    /// The matching public key, as it appears in an `authorized_keys` file.
+    pub public_key: String,
+}
+
+/// Path parameters used to identify an environment in the user API.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EnvironmentPathParam {
+    /// The name of this environment to create.
+    pub name: String,
+}
+
+/// An environment together with the owner's username.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct UserEnvironment {
+    /// User the environment belongs to
+    pub user: String,
+    /// Environment info
+    pub environment: Environment,
+}
+
+/// Path parameters used to identify an environment in the admin API.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct UserEnvironmentPathParam {
+    /// User the environment belongs to
+    pub user: String,
+    /// The name of this environment to create.
+    pub name: String,
+}
+
+impl BiHashItem for UserEnvironment {
+    type K1<'a> = &'a str;
+    type K2<'a> = &'a str;
+
+    fn key1(&self) -> Self::K1<'_> {
+        self.user.as_str()
+    }
+
+    fn key2(&self) -> Self::K2<'_> {
+        self.environment.name.as_str()
+    }
+
+    bi_upcast!();
+}
+
+// -----------------------------------------------------------------------------
+// Source synchronization
+// -----------------------------------------------------------------------------
+//
+// A target's source tree is carried as a set of content-addressed files. The
+// sender describes the tree it wants to exist, the receiver answers with the
+// content it does not already hold, the sender uploads only that, and a commit
+// makes the receiver's filesystem match.
+//
+// Whole files rather than diffs, because build sources are small and content
+// addressing already collapses the unchanged ones — the same shape Bazel and
+// Buck2 arrived at. Complete manifests rather than changesets, because the
+// same environment may be synchronized from a different machine tomorrow, and
+// a changeset computed against one machine's state is meaningless against
+// another's.
+
+/// A BLAKE3 digest of a file's contents, lowercase hex.
+///
+/// BLAKE3 because the sender re-hashes changed files on every save, and it is
+/// several times faster than SHA-256 for that.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(transparent)]
+pub struct Digest(pub String);
+
+impl std::fmt::Display for Digest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Digest {
+    /// Whether this looks like a digest at all.
+    ///
+    /// Worth checking before a digest reaches the filesystem: it names a file
+    /// in the content store, so anything outside `[0-9a-f]{64}` is either a
+    /// bug or an attempt to escape the store's directory.
+    pub fn is_well_formed(&self) -> bool {
+        self.0.len() == 64
+            && self
+                .0
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+}
+
+/// One file in a synchronized tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FileEntry {
+    /// Where the file goes, relative to the tree root, `/`-separated.
+    pub path: String,
+    /// The digest of its contents.
+    pub digest: Digest,
+    /// Whether the execute bit is set. The only mode bit that survives the
+    /// trip, because it is the only one a build cares about.
+    pub executable: bool,
+}
+
+/// The complete desired state of a target's source tree.
+///
+/// Complete, not a changeset: a path absent from this is a path that should
+/// not exist, which is the only way deletions and renames can be expressed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TreeManifest {
+    pub entries: Vec<FileEntry>,
+}
+
+/// What the receiver still needs before a manifest can be applied.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SyncPlan {
+    /// Digests the receiver holds nowhere — neither in its content store nor
+    /// anywhere in the tree it already has.
+    ///
+    /// Content already present under a different path is not listed: a rename
+    /// or a move costs nothing, because the receiver copies it locally.
+    pub missing: Vec<Digest>,
+}
+
+/// What applying a manifest did.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
+)]
+pub struct CommitResult {
+    pub created: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    pub unchanged: usize,
+}
+
+/// What a build needs in order to fetch its dependencies.
+///
+/// Sources are synchronized from a developer's machine, but the things a build
+/// pulls from Github are not: they are fetched by the instance itself, which
+/// therefore needs credentials for them. These are the caller's own — the same
+/// token that authorized the request that carries them — so an instance can
+/// reach exactly what its owner can reach and nothing more.
+///
+/// Nothing keeps a copy. `vw-svc` reads these off the request it is already
+/// authorizing and passes them straight through.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Credentials {
+    /// The Github login the token belongs to.
+    pub user: String,
+    /// A Github access token.
+    pub token: String,
+}
+
+/// Written by hand so that debug formatting a request, a struct that contains
+/// one of these, or an error that quotes one cannot put a live credential in a
+/// log. The derived version would print the token.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("user", &self.user)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// How a client wants the vivado worker for a session set up.
+///
+/// Only what the instance cannot work out for itself. The tree, the workspace
+/// configuration and the dependency cache are all on its side already, so the
+/// two flags that select what to build are the whole of it — everything else
+/// is read from `vw.toml` where the sources are.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct VivadoSessionQuery {
+    /// `--part`, for a workspace that declares parts at the top level.
+    #[serde(default)]
+    pub part: Option<String>,
+    /// `--variant`, for a workspace that declares variants.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Attach the Tcl call stack to INFO messages, not only to warnings and
+    /// errors.
+    #[serde(default)]
+    pub info_with_stack: bool,
+    /// Forward vivado's unclassified chatter rather than discarding it.
+    #[serde(default)]
+    pub verbose: bool,
+}
+
+/// What removing an instance's build output came to.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+pub struct CleanResult {
+    /// Whether there was any build output to remove.
+    pub existed: bool,
+    /// How much space it was taking, measured before it went.
+    pub bytes: u64,
+}
+
+/// Which testbenches to run, and how.
+///
+/// Everything here is a choice the developer made on the command line.
+/// Discovery itself is not: it reads the tree, and the tree is on the
+/// instance.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct BenchQuery {
+    /// Substring match against a testbench's entity name. Absent runs all.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// The VHDL standard, as `nvc` spells it.
+    #[serde(default)]
+    pub standard: Option<String>,
+    /// How many benches run at once. Absent lets the instance decide from its
+    /// own processor count, which is the number that matters — it is the
+    /// machine doing the work.
+    #[serde(default)]
+    pub concurrency: Option<u32>,
+    /// Directory names to skip while looking for benches, comma separated.
+    ///
+    /// One string rather than a repeated parameter because a query parameter
+    /// has to be scalar, and because that is already how `--ignore` is
+    /// written on the command line.
+    #[serde(default)]
+    pub ignore: Option<String>,
+}
+
+impl BenchQuery {
+    /// The directory names to skip, as a list.
+    pub fn ignored(&self) -> Vec<String> {
+        self.ignore
+            .iter()
+            .flat_map(|joined| joined.split(','))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// How to reach an environment's object store, and the key that opens it.
+///
+/// Generated on the artifact instance and handed out from there, so the admin
+/// credential that minted it never leaves the machine that holds the store.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct S3Credentials {
+    /// The base URL of the S3 API, e.g. `http://172.30.0.7:3900`.
+    ///
+    /// Composed from [`port`](Self::port) and an address by whoever knows
+    /// which address the instance is reachable on. Each side supplies what it
+    /// knows: the instance cannot tell which of its addresses another machine
+    /// can use, and nobody else should be guessing which port it chose.
+    pub endpoint: String,
+    /// The port the store serves S3 on, as the instance running it configured
+    /// it.
+    pub port: u16,
+    /// The region the store answers to. Garage's own default is `garage`, and
+    /// signing fails against the wrong one.
+    pub region: String,
+    /// The bucket this environment's artifacts go in.
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// Written by hand so a secret cannot reach a log through a debug format.
+impl std::fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Credentials")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Which of an environment's buckets is being asked about.
+///
+/// One store holds a bucket per kind of instance that produces artifacts, and
+/// one key opens all of them — what differs between two callers is only which
+/// bucket is theirs to write to.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ObjectStoreQuery {
+    /// The instance kind whose bucket is wanted. Absent means vivado, which is
+    /// the one that produces images today.
+    #[serde(default)]
+    pub kind: Option<TargetKind>,
+}
+
+/// One artifact an environment's build produced.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct Artifact {
+    /// Which instance built it, and so which bucket it is in.
+    pub kind: TargetKind,
+    /// The file's name, which is its key in the bucket.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// When the store last accepted it, as the store reports it.
+    pub modified: Option<String>,
+}
+
+/// Which artifact is being fetched.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactPathParam {
+    pub name: String,
+    pub kind: TargetKind,
+    /// The artifact's file name.
+    pub artifact: String,
+}
+
+/// Which generated file is wanted.
+///
+/// A path rather than a path segment because these are nested several levels
+/// deep — vivado buries a stub inside its project — and a path with slashes in
+/// it is not something a route can carry.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct GeneratedFileQuery {
+    pub path: String,
+}
+
+/// How to build the driver.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DriverBuildQuery {
+    /// Build with optimizations.
+    #[serde(default)]
+    pub release: bool,
+    /// Anything else to put on cargo's command line, separated by spaces.
+    ///
+    /// One string because a query parameter has to be scalar. Split on
+    /// whitespace at the far end, so a value containing a space cannot be
+    /// expressed — no flag the driver build needs has one, and the
+    /// alternative is reimplementing half a shell's quoting rules.
+    #[serde(default)]
+    pub args: Option<String>,
+}
+
+impl DriverBuildQuery {
+    /// The extra arguments, as cargo will receive them.
+    pub fn arguments(&self) -> Vec<String> {
+        self.args
+            .iter()
+            .flat_map(|joined| joined.split_whitespace())
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// What clearing an environment's artifacts came to.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+pub struct ArtifactsCleared {
+    /// How many objects were removed.
+    pub removed: usize,
+    /// How much space they were taking.
+    pub bytes: u64,
+}

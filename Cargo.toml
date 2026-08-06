@@ -1,15 +1,47 @@
 [workspace]
 resolver = "2"
-members = ["vw-lib", "vw-cli"]
+members = [
+    "vw-core",
+    "vw-lib",
+    "vw-cli",
+    "vw-htcl",
+    "vw-eda",
+    "vw-vivado",
+    "vw-analyzer",
+    "vw-quote",
+    "vw-ip",
+    "vw-htcl-cmd",
+    "vw-repl",
+    "vw-remote",
+    "vw-bench",
+    "vw-svc",
+    "vw-agent",
+    "vw-sync",
+    "vw-sync-api",
+    "vw-api",
+    "vw-api-types",
+    "vw-api-client",
+    "vw-openapi-manager",
+    "xtask",
+    "vw-api-types/versions",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
-repository = "https://github.com/your-username/vw"
+repository = "https://github.com/oxidecomputer/vw"
 
 [workspace.dependencies]
 # Shared dependencies
+dropshot = "0.17.1"
+# Matched to dropshot's own features exactly. A second crypto provider
+# enabled here would make rustls' process default ambiguous and every
+# ServerConfig::builder() call panic, including dropshot's.
+slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain", branch = "main" }
+rustls-pemfile = "2.2"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+tokio-tungstenite = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
@@ -24,3 +56,34 @@ url = "2.5"
 glob = "0.3"
 petgraph = "0.8.3"
 plotters = "0.3"
+winnow = "0.6"
+async-trait = "0.1"
+tower-lsp = "0.20"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+portable-pty = "0.9"
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = { version = "0.7", default-features = false, features = ["crossterm", "ratatui"] }
+nucleo-matcher = "0.3"
+indicatif = "0.17"
+similar = { version = "2.6", features = ["inline"] }
+ipxact = { git = "https://github.com/oxidecomputer/ipe", branch = "main" }
+anodizer = { git = "https://github.com/oxidecomputer/anodizer", branch = "main" }
+schemars = "0.8.22"
+uuid = { version = "1.24.0", features = ["serde", "js", "v4"] }
+oxide = "0.17.0"
+clap = { version = "4.0", features = ["derive", "env"] }
+iddqd = { version = "0.4.6", features = ["daft"] }
+
+# Embedded VHDL LSP. Path deps while our
+# `new_with_config` / `set_config` patches are in flight against
+# rust_hdl/master; drop to crates.io once merged.
+vhdl_lang = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/embed-api" }
+vhdl_ls = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/embed-api" }
+#vhdl_lang = { path = "/home/ry/src/rust_hdl/vhdl_lang" }
+#vhdl_ls = { path = "/home/ry/src/rust_hdl/vhdl_ls" }
+
+[patch."https://github.com/oxidecomputer/vw/"]
+vw-core = { path = "vw-core" }

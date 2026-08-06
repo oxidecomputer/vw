@@ -9,6 +9,8 @@ keywords = ["vhdl", "workspace", "dependency-management"]
 categories = ["development-tools"]
 
 [dependencies]
+vw-core = { path = "../vw-core" }
+anodizer.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
@@ -23,7 +25,8 @@ url.workspace = true
 glob.workspace = true
 petgraph.workspace = true
 git2 = "0.18"
-vhdl_lang = "0.86"
+vhdl_lang.workspace = true
+# Used by sim/bridge.rs to codegen the Rust<->VHDL cosim bridge.
 quote = "1"
 proc-macro2 = "1"
 syn = "2"

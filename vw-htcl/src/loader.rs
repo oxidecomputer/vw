@@ -1,0 +1,738 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+//! Recursive `src` import resolution.
+//!
+//! Reads an entry-point .htcl file, parses it, resolves every `src`
+//! statement via [`crate::src_path::Resolver`], and recursively pulls
+//! in each imported module's contents. Idempotent on canonical
+//! (realpath'd) file paths — a file imported by N callers loads
+//! exactly once.
+//!
+//! The output is a single flat [`LoadedProgram`] carrying:
+//!
+//! - the concatenated source text (imports first, in topological
+//!   order, then the entry file's non-`src` content), which downstream
+//!   stages (lower, the analyzer, `vw run`) consume as if it were one
+//!   document;
+//! - the set of canonical paths that were loaded, for cache
+//!   invalidation and tooling.
+
+use std::collections::HashSet;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::ast::{CommandKind, Stmt};
+use crate::parser::parse;
+use crate::src_path::{ResolveError, Resolver};
+
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("reading {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("resolving `src {raw}` from {importer}: {source}")]
+    Resolve {
+        importer: PathBuf,
+        raw: String,
+        #[source]
+        source: ResolveError,
+    },
+    #[error(
+        "`src` import at {importer}:{line} has a non-literal path (it \
+         contains `$var` or `[cmd]` substitution); module paths must \
+         be a plain string"
+    )]
+    DynamicPath { importer: PathBuf, line: u32 },
+    #[error("parse errors in {path}")]
+    Parse {
+        path: PathBuf,
+        errors: Vec<crate::parser::ParseError>,
+    },
+}
+
+/// Hooks called as the loader makes progress. Lets the CLI surface
+/// real-time `Sourcing …` / `Checking …` lines without baking display
+/// concerns into the loader.
+///
+/// Events fire in dependency-first order, which matches Cargo's
+/// "compile deps before the top crate" convention: for each `src`
+/// import we hit, [`on_source`](Self::on_source) fires immediately,
+/// the import is loaded (recursing through *its* dependencies first),
+/// and only then does [`on_parsed`](Self::on_parsed) fire for that
+/// file. The entry file's `on_parsed` fires last.
+pub trait LoadObserver {
+    /// A `src <raw>` statement is about to be resolved and loaded.
+    /// `resolved` is the on-disk path the loader is about to read,
+    /// so the observer can render dep-relative labels like
+    /// `@cpm/cpm_pcie1_axibar2pcie` even when `raw` itself is a
+    /// relative path (`./cpm_pcie1_axibar2pcie`) inside a dep.
+    fn on_source(&mut self, _raw: &str, _resolved: &Path) {}
+    /// `file` finished parsing. `raw` is the original `src` text when
+    /// this file was reached through an import (so callers can render
+    /// `amd-htcl/cpm5` rather than the full filesystem path); `None`
+    /// for the entry file.
+    fn on_parsed(&mut self, _file: &Path, _raw: Option<&str>) {}
+}
+
+struct NoopObserver;
+impl LoadObserver for NoopObserver {}
+
+#[derive(Debug, Default)]
+pub struct LoadedProgram {
+    /// Flattened htcl source — every loaded file's non-`src` content,
+    /// concatenated. Downstream stages (lower, the analyzer in CLI
+    /// mode, `vw run`) consume this as if it were one document.
+    pub source: String,
+    /// Files seen, in the order [`load_file`] first visits them
+    /// (importer-first, depth-first). Each entry carries the file's
+    /// canonical path and its original on-disk text so callers can
+    /// map a span in [`source`](Self::source) back to a line/column
+    /// in the file it actually came from.
+    pub files: Vec<LoadedFile>,
+    /// Per-region map from byte ranges in [`source`](Self::source)
+    /// to `(file_index, file_offset)`. Regions are emitted in order
+    /// as content is concatenated, so the slice is sorted by
+    /// `flat_start` and non-overlapping — `locate` does a binary
+    /// search.
+    pub regions: Vec<SourceRegion>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedFile {
+    pub path: PathBuf,
+    pub source: String,
+    /// The `src` import that pulled this file in, or `None` for
+    /// the entry file the loader was started against. Captured at
+    /// load time so analyzers and the REPL can render call chains
+    /// like `failing.htcl:12  ←  importer.htcl:4 (src @dep/foo)
+    /// ←  entry.htcl:1 (src ip/cips)` — which is the htcl-level
+    /// equivalent of a stack trace.
+    pub imported_via: Option<ImportEdge>,
+    /// Modification time of the file at read time. Populated when
+    /// the fs metadata call succeeds; `None` when it doesn't
+    /// (unlikely on a file we just read, but the API allows it).
+    /// Used by the REPL's cross-batch loader cache: if the
+    /// current mtime differs from this stored one, the file
+    /// gets re-read on the next `src` — this is what makes
+    /// live-editing an already-sourced `.htcl` file work
+    /// interactively without a full restart.
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+/// An edge in the import graph: this file was loaded because the
+/// file at index [`Self::importer_file`] executed a `src` statement
+/// covering [`Self::src_span`] in the importer's source.
+#[derive(Debug, Clone, Copy)]
+pub struct ImportEdge {
+    pub importer_file: usize,
+    /// Span of the `src` statement in the **importer's file-local
+    /// source** (i.e. an offset into the importer's
+    /// [`LoadedFile::source`], *not* into the flattened
+    /// [`LoadedProgram::source`]).
+    pub src_span: crate::span::Span,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SourceRegion {
+    /// Inclusive byte start in the flattened source.
+    pub flat_start: u32,
+    /// Exclusive byte end in the flattened source.
+    pub flat_end: u32,
+    /// Index into [`LoadedProgram::files`].
+    pub file_index: u32,
+    /// Byte offset of the start of this region in the originating
+    /// file's source.
+    pub file_offset: u32,
+}
+
+impl LoadedProgram {
+    /// Map a byte offset in [`source`](Self::source) back to its
+    /// originating file's index and the byte offset within that file.
+    pub fn locate(&self, offset: u32) -> Option<(usize, u32)> {
+        // `regions` is sorted by `flat_start`; find the last region
+        // whose start is at or before `offset` and verify the offset
+        // falls inside it.
+        let idx = self.regions.partition_point(|r| r.flat_start <= offset);
+        if idx == 0 {
+            return None;
+        }
+        let region = &self.regions[idx - 1];
+        if offset >= region.flat_end {
+            return None;
+        }
+        Some((
+            region.file_index as usize,
+            region.file_offset + (offset - region.flat_start),
+        ))
+    }
+
+    /// Map a span in the flattened source to `(file_index,
+    /// file_local_span)`. Assumes the span lies within a single
+    /// originating file's contribution — true for diagnostics emitted
+    /// against a single word/command, which is the use case we care
+    /// about.
+    pub fn locate_span(
+        &self,
+        span: crate::span::Span,
+    ) -> Option<(usize, crate::span::Span)> {
+        let (file_index, file_start) = self.locate(span.start)?;
+        let length = span.end.saturating_sub(span.start);
+        Some((
+            file_index,
+            crate::span::Span::new(file_start, file_start + length),
+        ))
+    }
+
+    /// Walk the import chain from `file_index` toward the entry,
+    /// yielding each [`ImportEdge`] in order (nearest first). The
+    /// entry file has no edge and so produces no items.
+    pub fn ancestry(
+        &self,
+        file_index: usize,
+    ) -> impl Iterator<Item = ImportEdge> + '_ {
+        let mut cur = self.files.get(file_index).and_then(|f| f.imported_via);
+        std::iter::from_fn(move || {
+            let edge = cur?;
+            cur = self
+                .files
+                .get(edge.importer_file)
+                .and_then(|f| f.imported_via);
+            Some(edge)
+        })
+    }
+}
+
+/// Read `entry` and recursively resolve its imports. Each file is
+/// loaded at most once; circular imports (a → b → a) short-circuit on
+/// the second visit.
+pub fn load(
+    entry: &Path,
+    resolver: &Resolver,
+) -> Result<LoadedProgram, LoadError> {
+    let mut noop = NoopObserver;
+    load_with_observer(entry, resolver, &mut noop)
+}
+
+/// Like [`load`], but reports progress through `observer` so the CLI
+/// can print `Sourcing …` and `Checking …` lines.
+pub fn load_with_observer(
+    entry: &Path,
+    resolver: &Resolver,
+    observer: &mut dyn LoadObserver,
+) -> Result<LoadedProgram, LoadError> {
+    load_with_preloaded(
+        entry,
+        resolver,
+        observer,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// Same as [`load_with_observer`] but seeds the "already loaded"
+/// map with paths → mtime-at-load-time.
+///
+/// The REPL uses this to skip re-parsing files a prior batch has
+/// already sourced. Without it, `src ip/gtm` in a REPL session
+/// that just `--load prime.htcl`-ed the same file re-parses
+/// **every** transitive import from scratch — the loader's own
+/// `self.loaded` cache is per-load-call, so cross-batch
+/// redundancy explodes into O(minutes) for a large tree.
+///
+/// A preloaded path short-circuits ONLY when the file's current
+/// on-disk mtime matches the stored one. That's what lets a user
+/// edit `ip/gtm.htcl`, then re-run `src ip/gtm` at the REPL and
+/// actually see the change — the loader stats the target, sees
+/// the mtime bump, and re-reads + re-parses instead of taking
+/// the cached-empty path. A stat per hit is negligible next to
+/// what the re-parse would cost.
+///
+/// A missing mtime (`None`) on either side downgrades to
+/// "unknown → always reload" — safer than silently reusing
+/// possibly-stale content.
+pub fn load_with_preloaded(
+    entry: &Path,
+    resolver: &Resolver,
+    observer: &mut dyn LoadObserver,
+    preloaded: &std::collections::HashMap<PathBuf, std::time::SystemTime>,
+) -> Result<LoadedProgram, LoadError> {
+    let entry = entry.canonicalize().unwrap_or_else(|_| entry.to_path_buf());
+    let mut state = State {
+        program: LoadedProgram::default(),
+        // Seed `preloaded_mtimes` — the actual short-circuit
+        // check is inside `load_file` and gates on the mtime
+        // being unchanged since the prior batch stored it. The
+        // entry path itself is intentionally omitted even if the
+        // caller included it; that path is the batch's own
+        // scratch or the user's typed input, which the caller
+        // wants walked regardless.
+        preloaded_mtimes: preloaded
+            .iter()
+            .filter(|(p, _)| *p != &entry)
+            .map(|(p, t)| (p.clone(), *t))
+            .collect(),
+        loaded: HashSet::new(),
+        in_progress: HashSet::new(),
+        resolver,
+        observer,
+        entry_override: None,
+    };
+    state.load_file(&entry, None, None)?;
+    Ok(state.program)
+}
+
+/// Like [`load`], but the entry's content is supplied in memory rather
+/// than read from disk. `entry_path` is a synthetic path — it need not
+/// exist on disk; it only anchors the workspace/resolver (its parent
+/// dir is used for relative `src ./…` imports, and it feeds
+/// `LoadedProgram::files[0]`). `@name` imports still resolve through
+/// the resolver's dependency map and are read from disk normally.
+///
+/// This is what lets `vw check` build and run an in-memory
+/// `src @vw` + `vw::configure_ip` program without writing a temp file.
+pub fn load_source(
+    entry_source: &str,
+    entry_path: &Path,
+    resolver: &Resolver,
+) -> Result<LoadedProgram, LoadError> {
+    let mut noop = NoopObserver;
+    let mut state = State {
+        program: LoadedProgram::default(),
+        preloaded_mtimes: std::collections::HashMap::new(),
+        loaded: HashSet::new(),
+        in_progress: HashSet::new(),
+        resolver,
+        observer: &mut noop,
+        entry_override: Some((
+            entry_path.to_path_buf(),
+            entry_source.to_string(),
+        )),
+    };
+    state.load_file(entry_path, None, None)?;
+    Ok(state.program)
+}
+
+struct State<'r, 'o> {
+    program: LoadedProgram,
+    /// In-memory content for the entry file, when the load was
+    /// started via [`load_source`]. When the loader visits this exact
+    /// path it uses this string instead of reading from disk; every
+    /// other (`src @dep/…`) file is read normally. `None` for
+    /// disk-backed loads.
+    entry_override: Option<(PathBuf, String)>,
+    /// Files the loader has already read this call (its own dedup
+    /// tracking). Grows as `load_file` recurses.
+    loaded: HashSet<PathBuf>,
+    /// Cross-call preloaded set: path → mtime-when-prior-batch-
+    /// loaded-it. `load_file` short-circuits only when the entry
+    /// is here AND the current mtime matches. Never mutated
+    /// during a load call.
+    preloaded_mtimes: std::collections::HashMap<PathBuf, std::time::SystemTime>,
+    in_progress: HashSet<PathBuf>,
+    resolver: &'r Resolver,
+    observer: &'o mut dyn LoadObserver,
+}
+
+impl State<'_, '_> {
+    fn load_file(
+        &mut self,
+        path: &Path,
+        reached_via: Option<&str>,
+        imported_via: Option<ImportEdge>,
+    ) -> Result<(), LoadError> {
+        if self.loaded.contains(path) || self.in_progress.contains(path) {
+            return Ok(());
+        }
+        // Cross-batch cache: skip re-parse only when this file
+        // was preloaded by a prior batch AND its on-disk mtime
+        // hasn't budged. Any mismatch (unknown current mtime,
+        // different mtime, no stored mtime) forces a fresh
+        // read so live edits show up on the next `src`.
+        if let Some(stored_mtime) = self.preloaded_mtimes.get(path) {
+            let current_mtime =
+                fs::metadata(path).ok().and_then(|m| m.modified().ok());
+            if current_mtime == Some(*stored_mtime) {
+                return Ok(());
+            }
+        }
+        self.in_progress.insert(path.to_path_buf());
+
+        // A `load_source` entry is supplied in memory — use it instead
+        // of touching the disk (the synthetic path may not exist).
+        // Its mtime is `None` (nothing to stat), which the
+        // preloaded-cache path treats as "unknown → always reload".
+        let entry_override = match &self.entry_override {
+            Some((op, os)) if op.as_path() == path => Some(os.clone()),
+            _ => None,
+        };
+        let (source, mtime) = match entry_override {
+            Some(src) => (src, None),
+            None => {
+                let source =
+                    fs::read_to_string(path).map_err(|e| LoadError::Io {
+                        path: path.to_path_buf(),
+                        source: e,
+                    })?;
+                // Stat right after the read so the recorded mtime
+                // matches the source we just captured. Failing to
+                // stat (fs permissions, deleted between read and
+                // stat, etc.) downgrades to `None`, which the
+                // preloaded-cache path treats as "unknown → always
+                // reload".
+                let mtime =
+                    fs::metadata(path).ok().and_then(|m| m.modified().ok());
+                (source, mtime)
+            }
+        };
+        let parsed = parse(&source);
+        if !parsed.errors.is_empty() {
+            return Err(LoadError::Parse {
+                path: path.to_path_buf(),
+                errors: parsed.errors,
+            });
+        }
+
+        // Register the file up front so we have a stable index for
+        // every chunk we emit on its behalf.
+        let file_index = self.program.files.len() as u32;
+        self.program.files.push(LoadedFile {
+            path: path.to_path_buf(),
+            source: source.clone(),
+            imported_via,
+            mtime,
+        });
+
+        // Walk the parsed document, copying text in span order. Any
+        // `src` statement triggers a recursion so the imported content
+        // lands in the flat source before we continue the importer's
+        // remaining text. Each pushed slice gets a `SourceRegion`
+        // entry so locations in the flat source can be mapped back.
+        let mut cursor = 0usize;
+        let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        for stmt in &parsed.document.stmts {
+            let Stmt::Command(cmd) = stmt else { continue };
+            let CommandKind::Src(import) = &cmd.kind else {
+                continue;
+            };
+            self.emit_chunk(
+                &source,
+                cursor,
+                cmd.span.start as usize,
+                file_index,
+            );
+            cursor = cmd.span.end as usize;
+            // Skip the trailing newline that terminated the `src`
+            // command so we don't leave a stray blank line behind.
+            if source.as_bytes().get(cursor) == Some(&b'\n') {
+                cursor += 1;
+            }
+
+            let Some(raw) = import.path.as_deref() else {
+                let line = line_of(&source, cmd.span.start) + 1;
+                return Err(LoadError::DynamicPath {
+                    importer: path.to_path_buf(),
+                    line,
+                });
+            };
+            let resolved =
+                self.resolver.resolve(parent_dir, raw).map_err(|source| {
+                    LoadError::Resolve {
+                        importer: path.to_path_buf(),
+                        raw: raw.to_string(),
+                        source,
+                    }
+                })?;
+            if !self.loaded.contains(&resolved)
+                && !self.in_progress.contains(&resolved)
+            {
+                self.observer.on_source(raw, &resolved);
+            }
+            self.load_file(
+                &resolved,
+                Some(raw),
+                Some(ImportEdge {
+                    importer_file: file_index as usize,
+                    src_span: cmd.span,
+                }),
+            )?;
+        }
+        // Tail after the last `src`.
+        self.emit_chunk(&source, cursor, source.len(), file_index);
+        if !self.program.source.ends_with('\n') {
+            // Synthetic newline so subsequent files don't run on; no
+            // region for it — it didn't come from any input file.
+            self.program.source.push('\n');
+        }
+
+        self.in_progress.remove(path);
+        self.loaded.insert(path.to_path_buf());
+        self.observer.on_parsed(path, reached_via);
+        Ok(())
+    }
+
+    /// Push `source[start..end]` onto the flat source and record a
+    /// region mapping that byte range back to the file it came from.
+    fn emit_chunk(
+        &mut self,
+        source: &str,
+        start: usize,
+        end: usize,
+        file_index: u32,
+    ) {
+        if start >= end {
+            return;
+        }
+        let flat_start = self.program.source.len() as u32;
+        self.program.source.push_str(&source[start..end]);
+        let flat_end = self.program.source.len() as u32;
+        self.program.regions.push(SourceRegion {
+            flat_start,
+            flat_end,
+            file_index,
+            file_offset: start as u32,
+        });
+    }
+}
+
+fn line_of(source: &str, byte: u32) -> u32 {
+    source[..(byte as usize).min(source.len())]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn workspace() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn loads_a_single_file_unchanged() {
+        let dir = workspace();
+        let entry = dir.path().join("main.htcl");
+        fs::write(&entry, "puts hi\n").unwrap();
+        let prog = load(&entry, &Resolver::new()).unwrap();
+        assert_eq!(prog.source.trim(), "puts hi");
+        assert_eq!(prog.files.len(), 1);
+    }
+
+    #[test]
+    fn load_source_splices_in_memory_entry_and_resolves_named_dep() {
+        // The dep lives on disk under a cache root; the entry is
+        // supplied in memory and never written — mirroring the
+        // `src @vw` + `vw::configure_ip` pre-pass.
+        let dep = workspace();
+        fs::write(dep.path().join("module.htcl"), "proc vw::go {} {}\n")
+            .unwrap();
+        let resolver = Resolver::new().with_dep("vw", dep.path().to_path_buf());
+        // Synthetic entry path inside a (real) workspace dir, but with
+        // no file behind it.
+        let ws = workspace();
+        let entry = ws.path().join(".vw-configure-ip.htcl");
+        let prog = load_source("src @vw\nvw::go\n", &entry, &resolver).unwrap();
+        // Dep content spliced first, entry's own command last.
+        assert_eq!(prog.source, "proc vw::go {} {}\nvw::go\n");
+        // Entry (in-memory) + the dep file.
+        assert_eq!(prog.files.len(), 2);
+        assert_eq!(prog.files[0].path, entry);
+        assert_eq!(prog.files[0].mtime, None, "synthetic entry has no mtime");
+    }
+
+    #[test]
+    fn imports_local_file_and_drops_src_statement() {
+        let dir = workspace();
+        fs::write(dir.path().join("lib.htcl"), "proc f {} { puts hi }\n")
+            .unwrap();
+        let entry = dir.path().join("main.htcl");
+        fs::write(&entry, "src lib\nf\n").unwrap();
+
+        let prog = load(&entry, &Resolver::new()).unwrap();
+        // Imported content first, no `src` statement, then the importer.
+        assert_eq!(
+            prog.source, "proc f {} { puts hi }\nf\n",
+            "actual: {:?}",
+            prog.source
+        );
+        assert_eq!(prog.files.len(), 2);
+    }
+
+    #[test]
+    fn idempotent_across_diamond_imports() {
+        // main → a, b ; a → c ; b → c — c must load exactly once.
+        let dir = workspace();
+        fs::write(dir.path().join("c.htcl"), "proc c {} {}\n").unwrap();
+        fs::write(dir.path().join("a.htcl"), "src c\nproc a {} {}\n").unwrap();
+        fs::write(dir.path().join("b.htcl"), "src c\nproc b {} {}\n").unwrap();
+        let entry = dir.path().join("main.htcl");
+        fs::write(&entry, "src a\nsrc b\n").unwrap();
+
+        let prog = load(&entry, &Resolver::new()).unwrap();
+        let occurrences = prog.source.matches("proc c {}").count();
+        assert_eq!(occurrences, 1, "c loaded multiple times: {}", prog.source);
+    }
+
+    #[test]
+    fn cycle_does_not_loop_forever() {
+        let dir = workspace();
+        fs::write(dir.path().join("a.htcl"), "src b\nproc a {} {}\n").unwrap();
+        fs::write(dir.path().join("b.htcl"), "src a\nproc b {} {}\n").unwrap();
+        let entry = dir.path().join("main.htcl");
+        fs::write(&entry, "src a\n").unwrap();
+        let prog = load(&entry, &Resolver::new()).unwrap();
+        assert!(prog.source.contains("proc a"));
+        assert!(prog.source.contains("proc b"));
+    }
+
+    #[test]
+    fn named_dependency_resolves_through_the_cache() {
+        let dir = workspace();
+        let dep_root = dir.path().join("cache").join("xilinx-ip-deadbeef");
+        fs::create_dir_all(&dep_root).unwrap();
+        fs::write(dep_root.join("cpm5.htcl"), "proc create_cpm5 {} {}\n")
+            .unwrap();
+        let resolver = Resolver::new().with_dep("xilinx-ip", dep_root);
+        let entry = dir.path().join("main.htcl");
+        fs::write(&entry, "src @xilinx-ip/cpm5\ncreate_cpm5\n").unwrap();
+        let prog = load(&entry, &resolver).unwrap();
+        assert!(prog.source.contains("proc create_cpm5"));
+        assert!(prog.source.contains("\ncreate_cpm5\n"));
+    }
+
+    #[test]
+    fn observer_fires_in_dependency_order() {
+        // entry → a → c ; entry → b
+        // Expect: source a, parse a (after source c, parse c),
+        //         source b, parse b, parse entry.
+        let dir = workspace();
+        fs::write(dir.path().join("c.htcl"), "proc c {} {}\n").unwrap();
+        fs::write(dir.path().join("a.htcl"), "src c\nproc a {} {}\n").unwrap();
+        fs::write(dir.path().join("b.htcl"), "proc b {} {}\n").unwrap();
+        let entry = dir.path().join("main.htcl");
+        fs::write(&entry, "src a\nsrc b\n").unwrap();
+
+        #[derive(Default)]
+        struct Recorder {
+            events: Vec<String>,
+        }
+        impl LoadObserver for Recorder {
+            fn on_source(&mut self, raw: &str, _resolved: &Path) {
+                self.events.push(format!("source {raw}"));
+            }
+            fn on_parsed(&mut self, file: &Path, raw: Option<&str>) {
+                let label = match raw {
+                    Some(r) => r.to_string(),
+                    None => file
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                };
+                self.events.push(format!("parse {label}"));
+            }
+        }
+
+        let mut rec = Recorder::default();
+        load_with_observer(&entry, &Resolver::new(), &mut rec).unwrap();
+        assert_eq!(
+            rec.events,
+            vec![
+                "source a",
+                "source c",
+                "parse c",
+                "parse a",
+                "source b",
+                "parse b",
+                "parse main",
+            ]
+        );
+    }
+
+    #[test]
+    fn observer_suppresses_source_for_already_loaded_imports() {
+        // Diamond: main → a → c ; main → b → c. `c` is encountered
+        // twice via `src` but only loaded once, so "Sourcing c"
+        // should fire exactly once.
+        let dir = workspace();
+        fs::write(dir.path().join("c.htcl"), "proc c {} {}\n").unwrap();
+        fs::write(dir.path().join("a.htcl"), "src c\nproc a {} {}\n").unwrap();
+        fs::write(dir.path().join("b.htcl"), "src c\nproc b {} {}\n").unwrap();
+        let entry = dir.path().join("main.htcl");
+        fs::write(&entry, "src a\nsrc b\n").unwrap();
+
+        #[derive(Default)]
+        struct Counter {
+            source_c: usize,
+            parse_c: usize,
+        }
+        impl LoadObserver for Counter {
+            fn on_source(&mut self, raw: &str, _resolved: &Path) {
+                if raw == "c" {
+                    self.source_c += 1;
+                }
+            }
+            fn on_parsed(&mut self, file: &Path, _raw: Option<&str>) {
+                if file.file_stem().and_then(|s| s.to_str()) == Some("c") {
+                    self.parse_c += 1;
+                }
+            }
+        }
+        let mut counter = Counter::default();
+        load_with_observer(&entry, &Resolver::new(), &mut counter).unwrap();
+        assert_eq!(counter.source_c, 1);
+        assert_eq!(counter.parse_c, 1);
+    }
+
+    #[test]
+    fn regions_map_each_byte_back_to_its_originating_file() {
+        // entry uses `set` from one local file and `puts` from another.
+        let dir = workspace();
+        fs::write(dir.path().join("a.htcl"), "proc a {} {}\n").unwrap();
+        fs::write(dir.path().join("b.htcl"), "proc b {} {}\n").unwrap();
+        let entry = dir.path().join("main.htcl");
+        fs::write(&entry, "src a\nputs hello\nsrc b\nputs done\n").unwrap();
+        let prog = load(&entry, &Resolver::new()).unwrap();
+
+        // Pick a byte in the middle of `puts hello` — should map back
+        // to the entry file (main.htcl).
+        let puts_hello_at_flat =
+            prog.source.find("puts hello").expect("puts hello in flat") as u32;
+        let (idx, file_offset) =
+            prog.locate(puts_hello_at_flat).expect("locate puts hello");
+        assert_eq!(
+            prog.files[idx].path.file_name().and_then(|s| s.to_str()),
+            Some("main.htcl")
+        );
+        // In main.htcl the line `puts hello` sits right after `src a\n`,
+        // so file_offset is at byte 6 (`s`=0,1,2,r=3,c=4,a=5,\n=6).
+        // Actually 'src a\n' = 6 bytes (s,r,c,space,a,\n), so puts starts at 6.
+        assert_eq!(file_offset, 6);
+
+        // Pick a byte in the middle of `proc a` — should map to a.htcl.
+        let proc_a_at_flat =
+            prog.source.find("proc a").expect("proc a in flat") as u32;
+        let (idx_a, _) = prog.locate(proc_a_at_flat).expect("locate proc a");
+        assert_eq!(
+            prog.files[idx_a].path.file_name().and_then(|s| s.to_str()),
+            Some("a.htcl")
+        );
+    }
+
+    #[test]
+    fn unknown_dep_surfaces_helpful_error() {
+        let dir = workspace();
+        let entry = dir.path().join("main.htcl");
+        fs::write(&entry, "src @nope/cpm5\n").unwrap();
+        let err = load(&entry, &Resolver::new()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown dependency"), "{msg}");
+    }
+}

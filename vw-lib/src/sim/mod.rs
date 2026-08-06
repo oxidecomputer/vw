@@ -18,9 +18,9 @@ use camino::Utf8Path;
 
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_cosim, run_nvc_elab};
 use crate::{
-    analyze_ext_libraries, find_referenced_files, load_existing_vhdl_ls_config,
+    analyze_ext_libraries, find_referenced_files, render_vhdl_ls_config,
     sort_files_by_dependencies, FileCache, MistConfig, RecordProcessor,
-    ToolsConfig, VhdlStandard, VwError,
+    VhdlStandard, VwError,
 };
 
 /// Information about an available mixed-signal test.
@@ -93,9 +93,8 @@ pub fn find_mist_configs(
 pub fn scaffold(
     bench_dir: &Utf8Path,
     mist_config: &MistConfig,
-    tools: &Option<ToolsConfig>,
 ) -> crate::Result<()> {
-    bridge::generate_scaffold(bench_dir.as_std_path(), mist_config, tools)
+    bridge::generate_scaffold(bench_dir.as_std_path(), mist_config)
 }
 
 /// Run a mixed-signal co-simulation test.
@@ -104,20 +103,21 @@ pub async fn run_analog_test(
     name: &str,
     bench_dir: &Utf8Path,
     mist_config: &MistConfig,
-    _tools: &Option<ToolsConfig>,
     vhdl_std: VhdlStandard,
+    build_dir: &str,
 ) -> crate::Result<()> {
-    let vhdl_ls_config = load_existing_vhdl_ls_config(workspace_dir)?;
+    let vhdl_ls_config = render_vhdl_ls_config(workspace_dir, None, false)?;
     let mut processor = RecordProcessor::new(vhdl_std);
     let mut cache = FileCache::new();
 
-    fs::create_dir_all(crate::BUILD_DIR)?;
+    fs::create_dir_all(build_dir)?;
 
     // Analyze external libraries
     analyze_ext_libraries(
         &vhdl_ls_config,
         &mut processor,
         vhdl_std,
+        build_dir,
         &mut cache,
     )
     .await?;
@@ -156,30 +156,36 @@ pub async fn run_analog_test(
     files.push(entity_file.to_string_lossy().to_string());
 
     // Compile VHDL
-    run_nvc_analysis(vhdl_std, crate::BUILD_DIR, "work", &files, false).await?;
-    run_nvc_elab(vhdl_std, crate::BUILD_DIR, "work", entity_name, false)
-        .await?;
+    run_nvc_analysis(vhdl_std, build_dir, "work", &files, false).await?;
+    run_nvc_elab(vhdl_std, build_dir, "work", entity_name, false).await?;
 
     // Build the bridge crate
     let bridge_lib =
         build_bridge_library(bench_dir.as_std_path(), name).await?;
     let bridge_lib_str = bridge_lib.to_string_lossy().to_string();
 
+    // Per-bench output directory under target/. The Xyce bridge writes its
+    // `.prn` straight here (via rust_cosim::output_dir() -> Xyce's `-o` flag),
+    // so nothing is copied out of the source tree afterward.
+    let output_dir = crate::bench_output_dir(workspace_dir, name);
+    fs::create_dir_all(&output_dir)?;
+    let output_dir_abs = output_dir
+        .canonicalize_utf8()
+        .unwrap_or_else(|_| output_dir.clone());
+
     // Run co-simulation
     run_nvc_cosim(
         vhdl_std,
-        crate::BUILD_DIR,
+        build_dir,
         "work",
         entity_name,
         &bridge_lib_str,
+        output_dir_abs.as_str(),
         false,
     )
     .await?;
 
-    // Collect output
-    let output_dir = bench_dir.as_std_path().join("output");
-    fs::create_dir_all(&output_dir)?;
-
+    // Xyce has written <netlist>.prn into output_dir; generate plots from it.
     let netlist_path = bench_dir.as_std_path().join(&mist_config.netlist);
     let prn_name = netlist_path
         .file_name()
@@ -187,28 +193,16 @@ pub async fn run_analog_test(
         .to_string_lossy()
         .to_string()
         + ".prn";
-    let prn_source = netlist_path.with_extension(
-        netlist_path
-            .extension()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-            + ".prn",
-    );
 
-    if prn_source.exists() {
-        let prn_dest = output_dir.join(&prn_name);
-        fs::copy(&prn_source, &prn_dest)?;
-    }
-
-    // Auto-generate plots
     #[cfg(feature = "plot")]
     {
-        let prn_path = output_dir.join(&prn_name);
+        let prn_path = output_dir.as_std_path().join(&prn_name);
         if prn_path.exists() {
-            if let Err(e) =
-                plot::generate_plots(&netlist_path, &prn_path, &output_dir)
-            {
+            if let Err(e) = plot::generate_plots(
+                &netlist_path,
+                &prn_path,
+                output_dir.as_std_path(),
+            ) {
                 eprintln!("Warning: plot generation failed: {e}");
             }
         }

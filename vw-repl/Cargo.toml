@@ -1,0 +1,40 @@
+[package]
+name = "vw-repl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Interactive REPL for htcl scripts, driven by a long-lived Vivado worker"
+
+[dependencies]
+vw-htcl = { path = "../vw-htcl" }
+vw-eda = { path = "../vw-eda" }
+vw-vivado = { path = "../vw-vivado" }
+vw-lib = { path = "../vw-lib" }
+camino.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tui-textarea.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+futures.workspace = true
+tracing.workspace = true
+arboard = "3"
+base64 = "0.22"
+winnow.workspace = true
+nucleo-matcher.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+# Unix-only. Used by the Ctrl-C eval-interrupt path in `app.rs` —
+# `libc::kill(pid, SIGINT)` sends SIGINT directly to the Vivado
+# child (cached pid from `WorkerEvent::Started`) so cancellation
+# fires immediately even while `worker_task` is blocked in
+# `backend.eval().await` on the very eval we're trying to cancel.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "vw-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Content-addressed source tree synchronization for vw"
+keywords = ["vhdl", "workspace", "dependency-management"]
+categories = ["development-tools"]
+
+[dependencies]
+vw-api-types-versions = { path = "../vw-api-types/versions" }
+camino.workspace = true
+thiserror.workspace = true
+blake3 = "1"
+ignore = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,19 @@
+[dependencies.vivado-cmd]
+repo = "https://github.com/oxidecomputer/vivado-cmd.htcl"
+commit = "90ffd540e999170cda2a98022f130e9da78d165d"
+src = []
+path = "vivado-cmd-90ffd540e999170cda2a98022f130e9da78d165d"
+recursive = false
+sim_only = false
+submodules = false
+exclude = []
+
+[dependencies.clk-wizard]
+repo = "https://github.com/oxidecomputer/clk-wizard.htcl"
+commit = "75c2685d33903b9bf269076252285a1b7e72d014"
+src = []
+path = "clk-wizard-75c2685d33903b9bf269076252285a1b7e72d014"
+recursive = false
+sim_only = false
+submodules = false
+exclude = []

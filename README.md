@@ -1,168 +1,229 @@
-# vw - VHDL Workspace
+# vw
 
-`vw` is a command-line tool for managing VHDL workspaces, dependencies, and testbench execution,
-similar in spirit to Rust's `cargo`. It focuses on dependency management, language server
-integration, and intelligent testbench simulation using NVC.
+`vw` builds designs made of VHDL, Vivado IP, testbenches, and a Rust kernel
+driver. It resolves dependencies, drives the Vivado flow, runs testbenches,
+builds the driver, and does that work on Oxide Cloud build instances.
 
-## Features
+## Install
 
-- **Dependency Management**: Add, remove, and update VHDL dependencies from git repositories
-- **Smart Caching**: Dependencies are cached locally to avoid repeated downloads
-- **Language Server Integration**: Automatically generates `vhdl_ls.toml` configuration
-- **Testbench Execution**: Intelligent NVC-based testbench simulation with dependency analysis
-- **Flexible Source Paths**: Specify directories, individual files, or glob patterns to select VHDL sources
-- **Lock File Support**: Tracks exact dependency versions with `vw.lock`
-
-## Installation
-
-Build from source:
-
-```bash
-cargo install --path .
+```sh
+cargo install --git https://github.com/oxidecomputer/vw
 ```
 
-## Quick Start
+vw reads a GitHub token from `~/.netrc` — entries for `github.com` and
+`api.github.com`. It fetches private dependencies with it and identifies you to
+the build service with it.
 
-1. **Initialize a new workspace:**
-   ```bash
-   vw init my-project
-   ```
+```
+machine github.com
+  login <your-github-username>
+  password <a personal access token>
+```
 
-2. **Add a dependency:**
-   ```bash
-   vw add https://github.com/user/repo --branch main --src hdl/src
-   ```
+## Quickstart
 
-3. **Update dependencies:**
-   ```bash
-   vw update
-   ```
+Vivado and the illumos toolchain run on cloud instances, not on your machine.
+Create an environment, then work in your workspace as normal:
 
-4. **Run testbenches:**
-   ```bash
-   # List available testbenches
-   vw test --list
-   
-   # Run a specific testbench
-   vw test my_design_tb
-   
-   # Run with specific VHDL standard
-   vw test my_design_tb --std 2008
-   ```
-## Configuration Files
+```sh
+vw cloud create my-env --wait     # vivado, helios and artifact cloud instances
+export VW_ENV=my-env              # or pass --env to each command
 
-### `vw.toml`
-Example workspace configuration file:
+vw check                          # parse and analyze the design
+vw run                            # build the FPGA image
+vw bench                          # run testbenches
+vw driver build --release         # build the kernel driver
+
+vw cloud artifacts my-env --all   # download build output
+vw cloud delete my-env            # release the instances
+```
+
+`vw run`, `vw check`, `vw bench` and `vw driver build` synchronize the
+workspace to the environment before they run, and stream output back as it
+happens. Pass `--local` to any of them to run on this machine instead, which
+needs the toolchains installed locally.
+
+By default the vw client talks to the Redhawk vw build service at
+`https://rhbs.eng.oxide.computer:2727`. A different service can be selected by
+setting the environment variable `VW_SVC_URL`, or with `--url` on `vw cloud`.
+
+`vw --help` lists every command, and `vw <command> --help` its options.
+
+## Workspace layout
+
+```
+vw.toml              workspace configuration and dependencies
+vw.lock              resolved dependency commits
+design.htcl          build entry point
+flow/*.htcl          individual flow stages
+ip/**/*.htcl         IP configuration
+hdl/**/*.vhd         VHDL design sources
+bench/               testbenches
+driver/              Rust kernel driver, its own cargo workspace
+constraints/         XDC and SDC, optionally per-stage under synth/ place/ route/
+target/              build output — never synchronized, never committed
+```
+
+vw finds every source from this layout, so nothing else has to be configured.
+`vw sources design` and `vw sources driver` print the exact file list a build
+reads.
+
+## The REPL
+
+`vw repl` is an interactive htcl session against a live Vivado worker. It
+sources the workspace's `design.htcl` on start, or `--load <file>` to source a
+different one.
+
+This is usually what you want while working on the design. `vw run` is a
+one-shot build; the REPL keeps Vivado up with the design still loaded, so when
+something fails or synthesizes into something you did not expect, every Vivado
+analysis command is available against the design as it stands — timing, cells,
+nets, clocks, utilization, DRC. Fix the htcl or VHDL, re-source, and go again
+without paying for another elaboration.
+
+It can also start from a checkpoint rather than from source:
+
+```sh
+vw repl --from-synth-checkpoint     # or --from-place-checkpoint, --from-route-checkpoint
+```
+
+That opens the saved checkpoint for that stage and drops you at a prompt with
+the design loaded, which is the fastest way to look at the result of a run that
+has already happened.
+
+## Testbenches
+
+`vw bench` runs the workspace's testbenches with NVC, as many at once as there
+are cores.
+
+```sh
+vw bench                     # everything
+vw bench parser              # only names containing "parser"
+vw bench --list
+```
+
+Testbenches are built on
+[rust-cosim](https://github.com/oxidecomputer/rust-cosim): the stimulus and
+checking are a Rust program driving the VHDL, rather than a VHDL harness.
+
+Types cross the boundary rather than being maintained twice. A VHDL record
+carrying the `serialize_rust` attribute gets a matching Rust type generated by
+[anodizer](https://github.com/oxidecomputer/anodizer), so the testbench sees
+the same record the design does. It regenerates when the design sources change.
+
+Mixed-mode digital/analog simulation runs against
+[Xyce](https://xyce.sandia.gov/). A bench directory containing a `mist.toml`
+gets a bridge crate connecting NVC to Xyce over VHPI, so a testbench can drive
+an analog model alongside the digital design.
+
+All of that is prepared by vw before the testbenches run — the generated types,
+the Rust builds, and the mixed-signal scaffolding.
+
+## Cloud builds
+
+A build needs at least two machines: Linux with Vivado for FPGA images, and
+illumos for the kernel driver. `vw-svc` manages environments of those machines
+on an Oxide Cloud Computer, and `vw` drives them.
+
+```
+                       ┌───────────────────────────────────────────────┐
+                       │             Oxide Cloud Computer              │
+                       │                                               │
+                       │              ┌───────────────────────────┐    │
+                       │              │        environment        ├┐   │
+               src,    │              │ ┌──────────┐ ┌──────────┐ │├┐  │
+┌────────┐   commands  │  ┌────────┐  │ │  vivado  │ │  helios  │ │││  │
+│        │─────────────┼─▶│        │  │ │ instance │ │ instance │ │││  │
+│ vw-cli │             │  │ vw-svc │  │ └──────────┘ └──────────┘ │││  │
+│        │◀────────────┼─ │        │  │       ┌──────────┐        │││  │
+└────────┘   results   │  └────────┘  │       │ artifact │        │││  │
+                       │              │       │ instance │        │││  │
+                       │              │       └──────────┘        │││  │
+                       │              └┬──────────────────────────┘││  │
+                       │               └┬──────────────────────────┘│  │
+                       │                └───────────────────────────┘  │
+                       │                                               │
+                       └───────────────────────────────────────────────┘
+```
+
+An environment is three instances. The **vivado** instance runs the Vivado
+flow, testbenches and htcl. The **helios** instance builds the driver. The
+**artifact** instance runs an S3 server holding build output and the
+intermediate artifacts the other two share.
+
+`vw` never talks to an instance directly. It sends source and commands to
+`vw-svc`, which decides who owns the environment and relays to a `vw-agent` on
+each instance. Long-running commands are relayed over websockets, so a
+synth/place/route run streams output as it happens and Ctrl-C interrupts it.
+
+Synchronization is content-addressed: a sync sends only file contents the
+instance does not already have. Driver code goes to the helios instance and
+everything else to the vivado instance. `target/` is never sent in either
+direction, which is what lets Vivado checkpoints on an instance survive from
+one command to the next.
+
+Build output lands in the artifact instance's S3 store as it is produced.
+`vw cloud artifacts <env>` lists it and `--get <pattern>` downloads by glob
+(`'*.edif'`, `'reports/*place*'`), streamed through `vw-svc` so clients never
+need to reach the artifact instance themselves.
+
+```sh
+vw cloud list                       # your environments
+vw cloud get <env>                  # instance states and addresses
+vw cloud keys <env>                 # ssh key for the instances
+vw cloud sync <env> [--watch]       # push the workspace explicitly
+vw cloud artifacts <env> --get '*.pdi'
+vw cloud admin list                 # every environment, for administrators
+```
+
+Running the service is documented in [`vw-svc/dist/`](vw-svc/dist).
+
+## Dependencies
 
 ```toml
 [workspace]
-name = "my-project"
+name = "my-design"
 version = "0.1.0"
 
-# Directory-based dependency (with optional recursive flag)
-[dependencies.quartz]
+# htcl library — no `src`, the whole repository is the module
+[dependencies.vivado-cmd]
+repo = "https://github.com/oxidecomputer/vivado-cmd.htcl"
+branch = "main"
+
+# VHDL sources — `src` selects directories, files, or globs
+[dependencies.quartz_common]
 repo = "https://github.com/oxidecomputer/quartz"
 branch = "main"
-src = "hdl/ip/vhd"
-recursive = true  # Include subdirectories (default: false)
-
-# Single file dependency
-[dependencies.uart-lib]
-repo = "https://github.com/user/vhdl-libs"
-commit = "abc123..."
-src = "src/uart_pkg.vhd"
-
-# Glob pattern dependency (matches multiple files/directories)
-[dependencies.common-utils]
-repo = "https://github.com/user/common"
-branch = "main"
-src = "lib/**/*_pkg.vhd"  # All package files in lib/ subdirectories
+src = ["hdl/ip/vhd/common/utils", "hdl/ip/vhd/fifos"]
+exclude = ["**/sims/**", "**/*_tb.vhd"]
 ```
 
-The `src` property supports three formats:
-- **Directory**: `"hdl/src"` - All VHDL files in the directory (use `recursive = true` for subdirectories)
-- **Single file**: `"hdl/src/uart.vhd"` - One specific file
-- **Glob pattern**: `"hdl/**/*.vhd"` or `"src/*_pkg.vhd"` - Pattern matching files
+`vw update` resolves branches to commits, records them in `vw.lock`, and caches
+sources under `~/.vw/deps/<name>-<commit>/`. A build fetches what the lockfile
+names, so an instance gets exactly what your machine would.
 
-### `vw.lock`
-Lock file tracking exact dependency versions:
+Variants build the same sources for different boards:
 
 ```toml
-[dependencies.quartz]
-repo = "https://github.com/oxidecomputer/quartz"
-commit = "3084a34e3c83f8b45cda7ea428f8fcc8f17484c2"
-src = "hdl/ip/vhd"
-path = "$HOME/.vw/deps/quartz-3084a34e3c83f8b45cda7ea428f8fcc8f17484c2"
+[[workspace.variants]]
+name = "vpk120"
+part = "xcvp1202-vsva2785-2MHP-e-S"
+top = "top_vpk120"
+default = true
+exclusive = ["hdl/top-vpk120.vhd", "hdl/ethernet-vpk120.vhd"]
 ```
 
-### `vhdl_ls.toml`
-Automatically generated configuration for the vhdl_ls language server:
+Select one with `--variant <name>`. An `exclusive` file belongs only to its
+variant.
 
-```toml
-[libraries.quartz]
-files = [
-    "$HOME/.vw/deps/quartz-3084a34e3c83f8b45cda7ea428f8fcc8f17484c2/common/utils/calc_pkg.vhd",
-    # ... more files
-]
-```
+## Build caching
 
-## How It Works
+Each flow stage fingerprints its inputs by content and writes a Vivado
+checkpoint next to that fingerprint. A stage whose inputs are unchanged reads
+its checkpoint instead of running; a stage whose inputs changed discards its
+checkpoint and every downstream one. When a stage does not reuse its
+checkpoint, it says why.
 
-### Dependency Management
+## Further reading
 
-1. **Dependency Resolution**: When you run `vw update`, the tool resolves branch names to specific commit hashes
-2. **Caching**: Dependencies are downloaded to `$HOME/.vw/deps/<name>-<commit>/`
-3. **File Filtering**: Only VHDL files (`.vhd` and `.vhdl`) matching the `src` pattern are cached
-   - Directories: All VHDL files in the directory (optionally recursive)
-   - Single files: Just that specific file
-   - Glob patterns: All files matching the pattern (e.g., `hdl/**/*.vhd`, `src/*_pkg.vhd`)
-4. **Language Server Config**: The tool merges dependency information with any existing `vhdl_ls.toml` configuration
-
-#### Common Glob Patterns
-
-- `"hdl/**/*.vhd"` - All `.vhd` files recursively under `hdl/`
-- `"src/*_pkg.vhd"` - All package files directly in `src/`
-- `"lib/**/{uart,spi}*.vhd"` - UART and SPI files anywhere under `lib/`
-- `"*.vhd"` - All `.vhd` files in the repository root
-- `"hdl/*/pkg/*.vhd"` - Package files in any subdirectory of `hdl/*/pkg/`
-
-### Testbench Execution
-
-`vw test` provides intelligent testbench execution using NVC simulator:
-
-1. **Smart Dependency Analysis**: Analyzes VHDL files to find only the dependencies actually needed:
-   - Detects `use work.package_name` statements
-   - Finds direct entity instantiations like `entity work.entity_name`
-   - Follows component declarations and instantiations
-   - Recursively resolves dependency chains
-
-2. **Intelligent Filtering**:
-   - Includes only referenced files from your source code
-   - Excludes other testbenches while allowing common bench utilities
-   - Uses proper topological sorting for correct compilation order
-
-3. **NVC Integration**:
-   - Analyzes external libraries first with proper library names
-   - Compiles and runs testbenches with optimized file sets
-   - Generates FST waveform files for debugging
-   - Provides clear error messages with exact commands run
-
-## Directory Structure
-
-```
-my-project/
-├── vw.toml              # Workspace configuration
-├── vw.lock              # Dependency lock file  
-├── vhdl_ls.toml         # Language server configuration (auto-generated)
-├── src/
-│   ├── my_design.vhd    # Your VHDL source files
-│   └── my_package.vhd   # VHDL packages
-└── bench/
-    ├── my_design_tb.vhd # Testbenches
-    ├── other_tb.vhd     # Additional testbenches
-    └── test_utils.vhd   # Common test utilities
-```
-
-## Examples
-
-See the `example/` directory for a sample workspace configuration.
+- [`docs/htcl.md`](docs/htcl.md) — the htcl language, and writing modules in it

@@ -1,0 +1,18 @@
+[package]
+name = "vw-ip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ipxact.workspace = true
+vw-htcl = { path = "../vw-htcl" }
+vw-quote = { path = "../vw-quote" }
+thiserror.workspace = true
+serde.workspace = true
+quick-xml = { version = "0.37", features = ["serialize"] }
+regex.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "vw-api-types-versions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VW service API"
+keywords = ["vhdl", "workspace", "dependency-management"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+schemars.workspace = true
+serde.workspace = true
+uuid.workspace = true
+oxide.workspace = true
+clap.workspace = true
+iddqd.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "vw-vivado"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vivado EDA backend: spawns a long-lived Vivado worker and drives it via the vw-eda wire protocol"
+
+[dependencies]
+vw-eda = { path = "../vw-eda" }
+vw-lib = { path = "../vw-lib" }
+vw-htcl = { path = "../vw-htcl" }
+camino.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+portable-pty.workspace = true
+similar.workspace = true
+colored = "2.0"
+
+# Unix-only. Used for `libc::kill(pid, SIGINT)` in
+# `VivadoBackend::interrupt` — the eval-cancellation path documented on
+# that method. Windows falls back to a no-op.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

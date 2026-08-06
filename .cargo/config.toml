@@ -1,0 +1,7 @@
+[net]
+git-fetch-with-cli = true
+
+[alias]
+# Every development task, including the OpenAPI documents under `openapi/`.
+# One entry point, so `cargo xtask` on its own lists what there is to do.
+xtask = "run --quiet -p xtask --"

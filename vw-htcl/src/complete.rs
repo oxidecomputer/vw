@@ -1,0 +1,858 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+//! Code completion for htcl.
+//!
+//! Two contexts, both keyed off [`cmdline::analyze`]:
+//!
+//! - **Command position** (typing the first word) → the names of
+//!   `proc`s declared in the document.
+//! - **Argument position** (after a known proc's name) → that proc's
+//!   `-flag` arguments, minus any already supplied.
+//!
+//! Pure analysis: returns structured [`Completion`]s referencing the
+//! document; the LSP backend maps them to `CompletionItem`s and the
+//! REPL will render them its own way. Vivado builtins are not offered
+//! yet — that needs the UG835 command database (project-plan Phase 8).
+
+use std::fmt::Write;
+
+use crate::ast::{
+    Attribute, AttributeValue, CommandKind, Document, ProcArg, ProcSignature,
+    Stmt,
+};
+use crate::cmdline::{self, CmdLine};
+use crate::span::Span;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionKind {
+    /// A `proc` name in command position.
+    Proc,
+    /// A `-flag` keyword argument of a known proc.
+    Flag,
+    /// A value from a flag's `@enum(...)` constraint.
+    EnumValue,
+    /// A constructor call inferred from a `Construct with [path]` doc
+    /// hint on the target arg — inserts a multi-line command-
+    /// substitution block with the cursor positioned to start typing
+    /// the constructor's own flags.
+    Constructor,
+}
+
+#[derive(Clone, Debug)]
+pub struct Completion {
+    /// Text shown in the list (`greet`, `-name`, or the constructor
+    /// path for `Constructor` kind). Also used as the inserted text
+    /// unless `insert_text` overrides it.
+    pub label: String,
+    pub kind: CompletionKind,
+    /// Short, single-line annotation shown inline next to the label.
+    pub detail: Option<String>,
+    /// Longer markdown shown in the item's documentation popup.
+    pub documentation: Option<String>,
+    /// Source range the inserted text replaces (the partial word, or a
+    /// zero-width insertion point between words).
+    pub replace: Span,
+    /// Text to insert instead of `label` — used by snippet-shaped
+    /// completions (`Constructor`) whose visible label is a plain
+    /// name but whose insertion is a multi-line block. When `None`
+    /// the LSP layer inserts `label` verbatim.
+    pub insert_text: Option<String>,
+    /// If true, `insert_text` uses LSP snippet syntax (`$0`, `${1:foo}`,
+    /// etc.) and the LSP layer sets `InsertTextFormat::SNIPPET`.
+    pub snippet: bool,
+}
+
+struct ProcInfo<'a> {
+    /// Qualified name as it would be called — bare proc name for
+    /// top-level declarations, `<ns>::<name>` for procs declared
+    /// inside `namespace eval` blocks.
+    name: String,
+    doc_comments: &'a [String],
+    signature: Option<&'a ProcSignature>,
+}
+
+/// Completions available at `offset`.
+pub fn complete_at(
+    document: &Document,
+    source: &str,
+    offset: u32,
+) -> Vec<Completion> {
+    complete_at_with_extras(document, source, offset, &[])
+}
+
+/// Same as [`complete_at`] but also considers a workspace-side
+/// document as an extra source of proc definitions.
+///
+/// The LSP calls this way so it can:
+/// - use the **current** local text (`document` + `source`) for
+///   cmdline-scan context — so what the user *just typed* is what
+///   drives `in_command_position` / `partial` / `-flag` detection;
+/// - AND still pick up cross-file proc names (`gtwiz_versal::configure`,
+///   etc.) from a stale but recently-committed workspace parse
+///   (`workspace_document`).
+///
+/// Local procs shadow workspace ones on name collision. `workspace_
+/// document` should be a document parsed from the merged workspace
+/// view (local + all transitive imports); the local prefix will
+/// duplicate the local file's procs, so the shadowing rule dedupes
+/// them without extra bookkeeping.
+///
+/// Passing `None` is exactly equivalent to `complete_at` — no
+/// workspace symbols get added.
+pub fn complete_at_with_extras(
+    document: &Document,
+    source: &str,
+    offset: u32,
+    workspace_documents: &[&Document],
+) -> Vec<Completion> {
+    // Inside a proc's argument-declaration braces, command/flag
+    // completion is meaningless (attribute completion will live here
+    // later). Stay quiet rather than offer nonsense.
+    if in_proc_args(&document.stmts, offset) {
+        return Vec::new();
+    }
+
+    let line = cmdline::analyze(source, offset);
+    let mut procs = collect_procs(document);
+    // Merge in workspace-provided procs. Local procs already in
+    // `procs` shadow workspace ones — we only append a workspace
+    // proc when no local proc with the same qualified name exists.
+    for ws in workspace_documents {
+        let ws_procs = collect_procs(ws);
+        for wp in ws_procs {
+            if !procs.iter().any(|p| p.name == wp.name) {
+                procs.push(wp);
+            }
+        }
+    }
+
+    if line.in_command_position() {
+        return complete_proc_names(&procs, &line);
+    }
+
+    // If the previous complete word is a `-flag`, the cursor is in
+    // value position — even if the partial is empty (user just hit
+    // space after the flag). Offer the flag's `@enum(...)` choices
+    // when it has them; otherwise stay silent so the user can type a
+    // free-form value (string, int, etc.) without a flag list popping
+    // up in front of it.
+    //
+    // If the partial *starts with* `-` we step back into flag-typing
+    // mode regardless — the user is clearly typing a new flag.
+    let last_word_is_flag = line.words.len() >= 2
+        && line.words.last().is_some_and(|w| w.starts_with('-'));
+    if last_word_is_flag && !line.partial.starts_with('-') {
+        // In value position, offer only value-shaped completions —
+        // enum choices and `Construct with [...]` snippets. Never
+        // fall through to flag completion: a free-form value slot
+        // has no reason to pop a flag list in front of what the user
+        // is typing.
+        let mut items = complete_enum_values(&procs, &line);
+        items.extend(complete_constructor(&procs, &line));
+        return items;
+    }
+
+    complete_flags(&procs, &line)
+}
+
+/// If the flag currently in value position has a `Construct with
+/// [path]` hint in its doc comment, emit a single snippet completion
+/// that inserts a multi-line command-substitution block calling that
+/// constructor. The cursor lands after the constructor name so the
+/// user can immediately start typing its own `-flag value` pairs.
+///
+/// Empty when the flag has no such hint (so the caller can fall
+/// through to normal flag/value handling).
+fn complete_constructor(
+    procs: &[ProcInfo<'_>],
+    line: &CmdLine<'_>,
+) -> Vec<Completion> {
+    let Some(name) = line.command_name() else {
+        return Vec::new();
+    };
+    let Some(proc) = procs.iter().find(|p| p.name == name) else {
+        return Vec::new();
+    };
+    let Some(sig) = proc.signature else {
+        return Vec::new();
+    };
+    let Some(last) = line.words.last() else {
+        return Vec::new();
+    };
+    let Some(flag) = last.strip_prefix('-') else {
+        return Vec::new();
+    };
+    let Some(arg) = sig.find(flag) else {
+        return Vec::new();
+    };
+    let Some(path) = extract_constructor_hint(&arg.doc_comments) else {
+        return Vec::new();
+    };
+    // Only offer when the partial (what the user has typed after the
+    // flag) is either empty or a prefix of the constructor path — a
+    // free-form value like `$my_var` shouldn't fight the constructor
+    // suggestion.
+    if !line.partial.is_empty() && !path.starts_with(line.partial) {
+        return Vec::new();
+    }
+    // Constructor invocation, multi-line for readability, `$0` sets
+    // the LSP cursor after the constructor name so `-flag` completion
+    // picks up next.
+    let insert = format!("[\n    {path} $0\n]");
+    vec![Completion {
+        label: path.clone(),
+        kind: CompletionKind::Constructor,
+        detail: Some(format!("constructor for -{}", arg.name)),
+        documentation: Some(format!(
+            "Insert a `\\[{path} ...\\]` command-substitution block \
+             for the `-{}` slot.",
+            arg.name
+        )),
+        replace: line.partial_span,
+        insert_text: Some(insert),
+        snippet: true,
+    }]
+}
+
+/// Scan doc comments for the `Construct with [path::name]` idiom and
+/// return the bracketed path if found. Matches on any line the doc
+/// author put it on; case-insensitive on the `construct with` phrase
+/// so `Construct` / `construct` / `CONSTRUCT` all work.
+fn extract_constructor_hint(doc_comments: &[String]) -> Option<String> {
+    for line in doc_comments {
+        let lower = line.to_ascii_lowercase();
+        let mut cursor = 0;
+        while let Some(rel) = lower[cursor..].find("construct with [") {
+            let start = cursor + rel + "construct with [".len();
+            if let Some(end_rel) = line[start..].find(']') {
+                let path = &line[start..start + end_rel];
+                if is_valid_path(path) {
+                    return Some(path.to_string());
+                }
+                cursor = start + end_rel + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn is_valid_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        && s.chars().next().is_some_and(|c| !c.is_ascii_digit())
+}
+
+/// `@enum(…)` value completions when the cursor sits in value
+/// position. Returns empty when the flag has no `@enum` (so the
+/// caller can fall back to flag completion).
+fn complete_enum_values(
+    procs: &[ProcInfo<'_>],
+    line: &CmdLine<'_>,
+) -> Vec<Completion> {
+    let Some(name) = line.command_name() else {
+        return Vec::new();
+    };
+    let Some(proc) = procs.iter().find(|p| p.name == name) else {
+        return Vec::new();
+    };
+    let Some(sig) = proc.signature else {
+        return Vec::new();
+    };
+    // The flag whose value we're completing is the last word on the
+    // line; if it isn't a `-flag`, the user is between options and
+    // there's nothing to enum-complete.
+    let Some(last) = line.words.last() else {
+        return Vec::new();
+    };
+    let Some(flag) = last.strip_prefix('-') else {
+        return Vec::new();
+    };
+    let Some(arg) = sig.find(flag) else {
+        return Vec::new();
+    };
+    let Some(enum_attr) = arg.attribute("enum") else {
+        return Vec::new();
+    };
+
+    let needle = line.partial;
+    enum_attr
+        .values
+        .iter()
+        .filter_map(|v| {
+            let raw = enum_value_text(v);
+            // Filter by either the bare or quoted form so a user typing
+            // `Mas` matches the value `Master Mode` whose insert form
+            // is `"Master Mode"`.
+            if !raw.starts_with(needle)
+                && !quote_for_completion(&raw).starts_with(needle)
+            {
+                return None;
+            }
+            let insert = quote_for_completion(&raw);
+            Some(Completion {
+                label: insert.clone(),
+                kind: CompletionKind::EnumValue,
+                detail: Some(format!("value for -{}", arg.name)),
+                documentation: crate::doc::brief(&arg.doc_comments),
+                replace: line.partial_span,
+                insert_text: None,
+                snippet: false,
+            })
+        })
+        .collect()
+}
+
+fn enum_value_text(v: &AttributeValue) -> String {
+    match v {
+        AttributeValue::Integer { value, .. } => value.to_string(),
+        AttributeValue::Ident { value, .. }
+        | AttributeValue::String { value, .. } => value.clone(),
+        // `key=value` in an @enum(…) doesn't make semantic sense —
+        // enum values are positional. Render the whole thing as
+        // the literal `key=value` string.
+        AttributeValue::Keyed { .. } => v.to_tcl_literal(),
+    }
+}
+
+/// Quote `s` for use as a value on a call site if it can't ride as a
+/// bare word. Mirrors the rule [`crate::emit::Word::lit`] uses: bare
+/// when safe, double-quoted with `\`/`"` escapes otherwise.
+fn quote_for_completion(s: &str) -> String {
+    let needs = s.is_empty()
+        || s.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ';' | '"' | '\\' | '[' | ']' | '{' | '}' | '$' | '#'
+                )
+        });
+    if needs {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
+    }
+}
+
+fn complete_proc_names(
+    procs: &[ProcInfo<'_>],
+    line: &CmdLine<'_>,
+) -> Vec<Completion> {
+    procs
+        .iter()
+        .filter(|p| p.name.starts_with(line.partial))
+        .map(|p| Completion {
+            label: p.name.to_string(),
+            kind: CompletionKind::Proc,
+            detail: first_doc_line(p.doc_comments),
+            documentation: proc_documentation(p),
+            replace: line.partial_span,
+            insert_text: None,
+            snippet: false,
+        })
+        .collect()
+}
+
+fn complete_flags(
+    procs: &[ProcInfo<'_>],
+    line: &CmdLine<'_>,
+) -> Vec<Completion> {
+    let Some(name) = line.command_name() else {
+        return Vec::new();
+    };
+    let Some(proc) = procs.iter().find(|p| p.name == name) else {
+        return Vec::new();
+    };
+    let Some(sig) = proc.signature else {
+        return Vec::new();
+    };
+
+    let used: Vec<&str> = line.used_flags().collect();
+    let needle = line.partial;
+    let bare_needle = needle.trim_start_matches('-');
+
+    sig.args
+        .iter()
+        .filter_map(|arg| {
+            let label = format!("-{}", arg.name);
+            // Don't re-offer a flag already on the line, unless it's
+            // the very word being typed.
+            if used.iter().any(|u| *u == label) && needle != label {
+                return None;
+            }
+            // Match either the dashed form (`-na`) or the bare name
+            // (`na`); an empty needle matches everything.
+            if !label.starts_with(needle) && !arg.name.starts_with(bare_needle)
+            {
+                return None;
+            }
+            Some(Completion {
+                label,
+                kind: CompletionKind::Flag,
+                detail: flag_detail(arg),
+                documentation: Some(arg_documentation(arg)),
+                replace: line.partial_span,
+                insert_text: None,
+                snippet: false,
+            })
+        })
+        .collect()
+}
+
+fn collect_procs(document: &Document) -> Vec<ProcInfo<'_>> {
+    let mut out = Vec::new();
+    collect_procs_in(&document.stmts, "", &mut out);
+    out
+}
+
+fn collect_procs_in<'a>(
+    stmts: &'a [Stmt],
+    prefix: &str,
+    out: &mut Vec<ProcInfo<'a>>,
+) {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        match &cmd.kind {
+            CommandKind::Proc(proc) => {
+                let Some(name) = proc.name.as_deref() else {
+                    continue;
+                };
+                let qualified = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}::{name}")
+                };
+                out.push(ProcInfo {
+                    name: qualified,
+                    doc_comments: &cmd.doc_comments,
+                    signature: proc.signature.as_ref(),
+                });
+            }
+            CommandKind::NamespaceEval(ns) => {
+                let Some(name) = ns.name.as_deref() else {
+                    continue;
+                };
+                let nested = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}::{name}")
+                };
+                collect_procs_in(&ns.body, &nested, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True if `offset` is inside any proc's argument-declaration braces,
+/// at any nesting depth.
+fn in_proc_args(stmts: &[Stmt], offset: u32) -> bool {
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        let CommandKind::Proc(proc) = &cmd.kind else {
+            continue;
+        };
+        if proc.args_span.contains(offset) {
+            return true;
+        }
+        if in_proc_args(&proc.body, offset) {
+            return true;
+        }
+    }
+    false
+}
+
+fn first_doc_line(docs: &[String]) -> Option<String> {
+    crate::doc::brief(docs)
+}
+
+fn proc_documentation(p: &ProcInfo<'_>) -> Option<String> {
+    // Use `extended` (body only) here because the call site populates
+    // `CompletionItem::detail` with the brief sentence separately —
+    // shipping the full reflowed text would duplicate that sentence at
+    // the top of every popup.
+    let mut out = String::new();
+    if let Some(ext) = crate::doc::extended(p.doc_comments) {
+        out.push_str(&ext);
+    }
+    if let Some(sig) = p.signature {
+        if !sig.args.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            for arg in &sig.args {
+                write!(out, "- `-{}`", arg.name).unwrap();
+                if let Some(d) = crate::doc::brief(&arg.doc_comments) {
+                    write!(out, " — {d}").unwrap();
+                }
+                out.push('\n');
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn arg_documentation(arg: &ProcArg) -> String {
+    // `extended` only — the brief sentence is handled by the caller's
+    // `detail` field; see `proc_documentation` for the rationale.
+    let mut out = String::new();
+    if let Some(ext) = crate::doc::extended(&arg.doc_comments) {
+        out.push_str(&ext);
+    }
+    for attr in &arg.attributes {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        write!(out, "- `{}`", render_attribute(attr)).unwrap();
+    }
+    out
+}
+
+/// Single-line label shown inline next to the flag in the completion
+/// popup. We prepend any `@enum(...)` / `@default(...)` constraint —
+/// rendered with its actual values rather than the bare attribute
+/// name — so the user sees *what's allowed* without having to expand
+/// the documentation pane. The doc-brief, if any, follows after a
+/// dash.
+fn flag_detail(arg: &ProcArg) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for attr in &arg.attributes {
+        parts.push(render_attribute(attr));
+    }
+    let brief = crate::doc::brief(&arg.doc_comments);
+    match (parts.is_empty(), brief) {
+        (true, b) => b,
+        (false, None) => Some(parts.join(" ")),
+        (false, Some(b)) => Some(format!("{} — {b}", parts.join(" "))),
+    }
+}
+
+/// `@name(value, value, ...)` if the attribute carries values,
+/// `@name` otherwise. Values are rendered via
+/// [`AttributeValue::to_tcl_literal`] so strings get quoted and
+/// integers/idents render as-is — same convention `proc_args` uses
+/// when echoing back a defaulted call site.
+fn render_attribute(attr: &Attribute) -> String {
+    if attr.values.is_empty() {
+        format!("@{}", attr.name)
+    } else {
+        let vals: Vec<String> = attr
+            .values
+            .iter()
+            .map(AttributeValue::to_tcl_literal)
+            .collect();
+        format!("@{}({})", attr.name, vals.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse;
+
+    /// Build `src` plus a cursor at the `|` marker, returning the
+    /// marker-free source and the byte offset of the cursor.
+    fn cursor(src_with_marker: &str) -> (String, u32) {
+        let offset = src_with_marker.find('|').expect("no cursor marker");
+        let src = src_with_marker.replacen('|', "", 1);
+        (src, offset as u32)
+    }
+
+    fn labels(src_with_marker: &str) -> Vec<String> {
+        let (src, off) = cursor(src_with_marker);
+        let parsed = parse(&src);
+        complete_at(&parsed.document, &src, off)
+            .into_iter()
+            .map(|c| c.label)
+            .collect()
+    }
+
+    #[test]
+    fn proc_names_in_command_position() {
+        let src = "\
+proc greet {} { }\n\
+proc grumble {} { }\n\
+gr|\n";
+        let mut got = labels(src);
+        got.sort();
+        assert_eq!(got, vec!["greet", "grumble"]);
+    }
+
+    #[test]
+    fn proc_names_filtered_by_prefix() {
+        let src = "\
+proc greet {} { }\n\
+proc grumble {} { }\n\
+gree|\n";
+        assert_eq!(labels(src), vec!["greet"]);
+    }
+
+    #[test]
+    fn flags_in_argument_position() {
+        let src = "\
+proc cfg {\n  width\n  depth\n} { }\n\
+cfg |\n";
+        let mut got = labels(src);
+        got.sort();
+        assert_eq!(got, vec!["-depth", "-width"]);
+    }
+
+    #[test]
+    fn flags_filtered_by_partial() {
+        let src = "\
+proc cfg {\n  width\n  depth\n} { }\n\
+cfg -w|\n";
+        assert_eq!(labels(src), vec!["-width"]);
+    }
+
+    #[test]
+    fn already_used_flag_is_not_reoffered() {
+        let src = "\
+proc cfg {\n  width\n  depth\n} { }\n\
+cfg -width 8 |\n";
+        assert_eq!(labels(src), vec!["-depth"]);
+    }
+
+    #[test]
+    fn completes_call_inside_proc_body() {
+        let src = "\
+proc helper {} { }\n\
+proc outer {} {\n  hel|\n}\n";
+        assert_eq!(labels(src), vec!["helper"]);
+    }
+
+    #[test]
+    fn no_completion_inside_arg_decls() {
+        let src = "\
+proc greet {} { }\n\
+proc cfg {\n  wi|\n} { }\n";
+        assert!(labels(src).is_empty());
+    }
+
+    #[test]
+    fn enum_value_position_offers_choices() {
+        // `2.5_GT/s` etc. aren't valid `attribute_value_ident`s, so
+        // the IP generator quotes them in `@enum(…)` — the proc-args
+        // grammar parses them as strings. The completion labels come
+        // back bare here because no whitespace requires re-quoting.
+        let src = "\
+proc cfg {\n  @enum(\"2.5_GT/s\", \"5.0_GT/s\", \"8.0_GT/s\") max_link_speed\n} { }\n\
+cfg -max_link_speed |\n";
+        let mut got = labels(src);
+        got.sort();
+        assert_eq!(got, vec!["2.5_GT/s", "5.0_GT/s", "8.0_GT/s"]);
+    }
+
+    #[test]
+    fn enum_values_filter_by_partial() {
+        let src = "\
+proc cfg {\n  @enum(\"2.5_GT/s\", \"5.0_GT/s\", \"8.0_GT/s\") max_link_speed\n} { }\n\
+cfg -max_link_speed 5|\n";
+        assert_eq!(labels(src), vec!["5.0_GT/s"]);
+    }
+
+    #[test]
+    fn enum_completion_kind_marks_items() {
+        let src = "\
+proc cfg {\n  @enum(target, controller) kind\n} { }\n\
+cfg -kind |\n";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        assert!(items.iter().all(|c| c.kind == CompletionKind::EnumValue));
+    }
+
+    #[test]
+    fn enum_value_with_spaces_gets_quoted() {
+        let src = "\
+proc cfg {\n  @enum(\"Master Mode\", \"Slave Mode\") role\n} { }\n\
+cfg -role |\n";
+        let mut got = labels(src);
+        got.sort();
+        assert_eq!(got, vec!["\"Master Mode\"", "\"Slave Mode\""]);
+    }
+
+    #[test]
+    fn flag_without_enum_offers_no_completions_at_value_position() {
+        // For a flag with no `@enum` the user is expected to type a
+        // free-form value. Popping a flag list there is wrong; it
+        // gets in the way of the actual value the user is typing.
+        let src = "\
+proc cfg {\n  @default(0) width\n  @default(0) depth\n} { }\n\
+cfg -width |\n";
+        assert!(labels(src).is_empty(), "{:?}", labels(src));
+    }
+
+    #[test]
+    fn flag_completion_returns_after_value_is_typed() {
+        // After the value is typed, the cursor is between args again
+        // — show the next flags.
+        let src = "\
+proc cfg {\n  @default(0) width\n  @default(0) depth\n} { }\n\
+cfg -width 8 |\n";
+        let mut got = labels(src);
+        got.sort();
+        assert_eq!(got, vec!["-depth"]);
+    }
+
+    #[test]
+    fn dash_partial_keeps_flag_completion() {
+        // Typing `-` after a complete flag should still mean "new
+        // flag," not "enum value."
+        let src = "\
+proc cfg {\n  @enum(a, b) mode\n  @default(0) width\n} { }\n\
+cfg -mode -|\n";
+        let got = labels(src);
+        assert!(got.contains(&"-width".to_string()), "{got:?}");
+        assert!(!got.contains(&"a".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn unknown_command_offers_no_flags() {
+        let src = "puts |\n";
+        assert!(labels(src).is_empty());
+    }
+
+    #[test]
+    fn flag_completion_carries_doc_and_detail() {
+        // Multi-sentence doc: the brief sentence joins the attribute
+        // summary in `detail`, the rest goes in `documentation`. They
+        // must NOT overlap — an LSP client renders both, and a
+        // repeated leading sentence reads as a duplicate.
+        let src = "\
+proc cfg {
+  ## Bus width in bits. Must be a power of two.
+  @default(8) width
+} { }
+cfg |
+";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        let item = items.iter().find(|c| c.label == "-width").unwrap();
+        assert_eq!(item.kind, CompletionKind::Flag);
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("@default(8) — Bus width in bits.")
+        );
+        let doc = item.documentation.as_deref().unwrap();
+        assert!(doc.contains("Must be a power of two."), "{doc}");
+        assert!(
+            !doc.contains("Bus width in bits."),
+            "documentation should not repeat the brief: {doc}"
+        );
+        assert!(doc.contains("@default(8)"), "{doc}");
+    }
+
+    #[test]
+    fn flag_detail_renders_enum_alternatives_and_default() {
+        // The whole point: a user scanning the completion list sees
+        // exactly which values are allowed (`@enum(...)`) and what
+        // ships by default (`@default(...)`) without having to expand
+        // the doc pane.
+        let src = "\
+proc cfg {
+  @enum(LOW, HIGH, OPTIMIZED) @default(OPTIMIZED) bandwidth
+} { }
+cfg |
+";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        let item = items.iter().find(|c| c.label == "-bandwidth").unwrap();
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("@enum(LOW, HIGH, OPTIMIZED) @default(OPTIMIZED)")
+        );
+        let doc = item.documentation.as_deref().unwrap();
+        assert!(doc.contains("@enum(LOW, HIGH, OPTIMIZED)"), "{doc}");
+        assert!(doc.contains("@default(OPTIMIZED)"), "{doc}");
+    }
+
+    #[test]
+    fn constructor_hint_offers_snippet_in_value_position() {
+        // A doc line of the form `Construct with [namespaced::path]`
+        // on the target arg turns into a snippet completion in value
+        // position — the label is the constructor path, the insert
+        // text is a `[\n    path $0\n]` block with cursor placed
+        // after the constructor name.
+        let src = "\
+namespace eval demo {}\n\
+proc demo::child { -x: int } {}\n\
+proc parent {\n  ## Construct with [demo::child].\n  child: any\n} { }\n\
+parent -child |\n";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        let item = items
+            .iter()
+            .find(|c| c.kind == CompletionKind::Constructor)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no constructor completion; got {:?}",
+                    items
+                        .iter()
+                        .map(|c| (&c.label, c.kind))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(item.label, "demo::child");
+        assert!(item.snippet);
+        let insert = item.insert_text.as_deref().unwrap();
+        assert!(insert.contains("demo::child"), "insert={insert:?}");
+        assert!(insert.contains("$0"), "insert={insert:?}");
+        assert!(insert.starts_with('['), "insert={insert:?}");
+        assert!(insert.trim_end().ends_with(']'), "insert={insert:?}");
+    }
+
+    #[test]
+    fn constructor_hint_absent_produces_no_extra_completion() {
+        // No `Construct with ...` doc → no constructor completion.
+        // Value position on a non-enum, non-hinted flag returns empty.
+        let src = "\
+proc parent {\n  ## An arbitrary slot.\n  child: any\n} { }\n\
+parent -child |\n";
+        assert!(labels(src).is_empty());
+    }
+
+    #[test]
+    fn constructor_hint_case_insensitive() {
+        let src = "\
+proc parent {\n  ## construct with [foo::bar]\n  slot: any\n} { }\n\
+parent -slot |\n";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        assert!(items
+            .iter()
+            .any(|c| c.kind == CompletionKind::Constructor
+                && c.label == "foo::bar"));
+    }
+
+    #[test]
+    fn flag_detail_quotes_string_enum_values() {
+        // Values that started life as a quoted string in the source
+        // must stay quoted in the detail line — `"Master Mode"` not
+        // `Master Mode` — so the displayed text is what the user
+        // would type back as the value.
+        let src = "\
+proc cfg {
+  @enum(\"Master Mode\", \"Slave Mode\") role
+} { }
+cfg |
+";
+        let (s, off) = cursor(src);
+        let parsed = parse(&s);
+        let items = complete_at(&parsed.document, &s, off);
+        let item = items.iter().find(|c| c.label == "-role").unwrap();
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("@enum(\"Master Mode\", \"Slave Mode\")")
+        );
+    }
+}
