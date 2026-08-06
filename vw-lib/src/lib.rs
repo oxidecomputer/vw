@@ -785,6 +785,15 @@ pub struct LockFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockedDependency {
     pub repo: String,
+    /// The branch `commit` was resolved from, when the declaration named one.
+    ///
+    /// Without it the lock cannot say what question its commit is the answer
+    /// to, so a dependency moved to another branch in `vw.toml` would keep
+    /// building the old one. Absent for a commit-pinned dependency, and for
+    /// entries written before the field existed — those are taken at face
+    /// value, and name their branch the next time the lock is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub commit: String,
     #[serde(default)]
     pub src: Vec<String>,
@@ -1212,8 +1221,57 @@ enum Resolution {
     /// Ask each remote where its branch points now. `vw update` only.
     Fresh,
     /// Take what `vw.lock` already pins, and resolve only what it does not
-    /// mention — a dependency just added, or one whose repository changed.
+    /// answer — a dependency just added, or one whose declaration has moved
+    /// out from under its entry (see [`lock_entry_matches`]).
     Locked,
+}
+
+/// Whether a lock entry is still an answer to what `vw.toml` asks for.
+///
+/// A pin only means something as the answer to a specific question. Repoint a
+/// dependency at another repository or another branch and the commit recorded
+/// against its name describes something nobody asked for.
+///
+/// Both the gate that decides whether to fetch at all
+/// ([`dependencies_present`], [`workspace_has_unlocked_git_deps`]) and the
+/// fetch that decides whether to re-resolve go through here, so they cannot
+/// reach different conclusions — a gate that says "nothing to do" about an
+/// entry the fetch would have replaced is how an edit to `vw.toml` goes
+/// silently unbuilt.
+///
+/// Not covered: `src`, `exclude`, `recursive`. Those change which files a
+/// dependency contributes, not which commit it is at, and the cache is keyed
+/// by commit alone — so agreeing here would let the lock claim a file set the
+/// tree on disk does not have.
+fn lock_entry_matches(dep: &Dependency, locked: &LockedDependency) -> bool {
+    let DependencySource::Git {
+        repo,
+        branch,
+        commit,
+        ..
+    } = &dep.source
+    else {
+        // A path dep has no commit to pin, so any entry under its name is
+        // left over from before the switch.
+        return false;
+    };
+    if *repo != locked.repo {
+        return false;
+    }
+    match (branch, commit) {
+        // Pinned by hand: the manifest is the more specific statement, and an
+        // entry that disagrees with it is stale however it got that way.
+        (_, Some(commit)) => *commit == locked.commit,
+        // Resolved from a branch: only an entry resolved from the same branch
+        // answers it. One that predates the field is taken at face value —
+        // rejecting it would re-resolve every dependency in every lockfile
+        // written before today, which is the behaviour being fixed.
+        (Some(branch), None) => {
+            locked.branch.as_deref().is_none_or(|b| b == branch)
+        }
+        // Says neither. Nothing to be an answer to; let resolution report it.
+        (None, None) => false,
+    }
 }
 
 async fn build_dependency_graph(
@@ -1271,15 +1329,13 @@ async fn build_dependency_graph(
                     commit,
                     submodules,
                 } => {
-                    // The lockfile wins when it has an opinion, unless the
-                    // caller explicitly asked for a fresh resolve. Matched on
-                    // the repository too: a dependency repointed at a
-                    // different repo in `vw.toml` has a lock entry that is
-                    // about something else.
+                    // The lockfile wins when it still answers what the
+                    // manifest asks, unless the caller explicitly asked for a
+                    // fresh resolve.
                     let pinned = (resolution == Resolution::Locked)
                         .then(|| locked.dependencies.get(&name))
                         .flatten()
-                        .filter(|entry| entry.repo == *repo)
+                        .filter(|entry| lock_entry_matches(&dep, entry))
                         .map(|entry| entry.commit.clone());
 
                     let sha =
@@ -1345,6 +1401,7 @@ async fn build_dependency_graph(
                         was_cached,
                         locked: Some(LockedDependency {
                             repo: repo.clone(),
+                            branch: branch.clone(),
                             commit: sha.clone(),
                             src: dep.src.clone(),
                             path: PathBuf::from(format!("{name}-{sha}")),
@@ -1410,23 +1467,27 @@ pub fn dependencies_present(workspace_dir: &Utf8Path) -> bool {
         // missing; let the check itself surface any real problem.
         return true;
     };
-    // (a) Every DECLARED git dep must have a lock entry. A dep freshly
-    // added to vw.toml but never `vw update`d won't appear in the
-    // transitive walk below (which reads the lock), so catch it here.
-    let declared_git: Vec<String> = config
+    // (a) Every DECLARED git dep must have a lock entry that still answers
+    // its declaration. A dep freshly added to vw.toml but never `vw update`d
+    // won't appear in the transitive walk below (which reads the lock), so
+    // catch it here — as well as one whose declaration has since moved to
+    // another repo, branch, or commit, whose entry is on disk and complete
+    // and describes the wrong thing.
+    let declared_git: Vec<(&String, &Dependency)> = config
         .dependencies
         .iter()
         .chain(config.test_dependencies.iter())
         .filter(|(_, d)| matches!(d.source, DependencySource::Git { .. }))
-        .map(|(n, _)| n.clone())
         .collect();
     if !declared_git.is_empty() {
         match load_lock_file(workspace_dir) {
             Ok(lock) => {
-                if declared_git
-                    .iter()
-                    .any(|n| !lock.dependencies.contains_key(n))
-                {
+                let unanswered = declared_git.iter().any(|(name, dep)| {
+                    lock.dependencies
+                        .get(*name)
+                        .is_none_or(|entry| !lock_entry_matches(dep, entry))
+                });
+                if unanswered {
                     return false;
                 }
             }
@@ -1865,12 +1926,12 @@ pub fn vhdl_dependency_sources(
     vhdl_dependency_sources_ext(workspace_dir, false, false)
 }
 
-/// Detect whether the workspace has any git deps declared in
-/// vw.toml but missing from vw.lock — the state where the user
-/// hasn't yet run `vw update`, or the lockfile has been
-/// truncated / wiped. Cheap check (loads the config + lockfile
-/// once, no network); consumers use it to decide whether to
-/// auto-invoke [`update_workspace`].
+/// Detect whether the workspace has any git dep declared in vw.toml that
+/// vw.lock does not answer — missing outright (the user hasn't yet run
+/// `vw update`, or the lockfile has been truncated / wiped), or pinned
+/// against a declaration that has since changed. Cheap check (loads the
+/// config + lockfile once, no network); consumers use it to decide whether to
+/// auto-invoke [`install_locked_dependencies`].
 ///
 /// `include_test` mirrors the same flag on the enumeration side
 /// so a test-deps-only unlocked entry is caught when the caller
@@ -1880,20 +1941,21 @@ pub fn workspace_has_unlocked_git_deps(
     include_test: bool,
 ) -> Result<bool> {
     let cfg = load_workspace_config(workspace_dir)?;
-    let git_names: Vec<&str> = cfg
+    let git_deps: Vec<(&String, &Dependency)> = cfg
         .dependencies
         .iter()
         .chain(cfg.test_dependencies.iter().filter(|_| include_test))
         .filter(|(_, dep)| matches!(dep.source, DependencySource::Git { .. }))
-        .map(|(name, _)| name.as_str())
         .collect();
-    if git_names.is_empty() {
+    if git_deps.is_empty() {
         return Ok(false);
     }
     match load_lock_file(workspace_dir) {
-        Ok(lock) => Ok(git_names
-            .iter()
-            .any(|n| !lock.dependencies.contains_key(*n))),
+        Ok(lock) => Ok(git_deps.iter().any(|(name, dep)| {
+            lock.dependencies
+                .get(*name)
+                .is_none_or(|entry| !lock_entry_matches(dep, entry))
+        })),
         // No lockfile at all: every git dep is unlocked.
         Err(_) => Ok(true),
     }
@@ -5463,12 +5525,14 @@ mod locked_resolution_tests {
     }
 
     /// A workspace whose only dependency is `name`, declared and locked as
-    /// given. `lock` of `None` writes no `vw.lock` at all.
+    /// given. `lock` is `(repo, branch, commit)`, where a branch of `None`
+    /// writes the pre-`branch` lock format still sitting in checked-in
+    /// lockfiles; `lock` of `None` writes no `vw.lock` at all.
     fn workspace(
         dir: &Utf8Path,
         name: &str,
         declared: &str,
-        lock: Option<(&str, &str)>,
+        lock: Option<(&str, Option<&str>, &str)>,
     ) {
         fs::write(
             dir.join("vw.toml"),
@@ -5478,11 +5542,14 @@ mod locked_resolution_tests {
             ),
         )
         .unwrap();
-        if let Some((repo, commit)) = lock {
+        if let Some((repo, branch, commit)) = lock {
+            let branch = branch
+                .map(|b| format!("branch = \"{b}\"\n"))
+                .unwrap_or_default();
             fs::write(
                 dir.join("vw.lock"),
                 format!(
-                    "[dependencies.{name}]\nrepo = \"{repo}\"\n\
+                    "[dependencies.{name}]\nrepo = \"{repo}\"\n{branch}\
                      commit = \"{commit}\"\npath = \"{name}-{commit}\"\n"
                 ),
             )
@@ -5490,9 +5557,27 @@ mod locked_resolution_tests {
         }
     }
 
+    /// The commit `name` resolved to in `graph`.
+    fn resolved(graph: &DiGraph<DepGraphNode, ()>, name: &str) -> String {
+        graph
+            .node_indices()
+            .map(|i| &graph[i])
+            .find(|n| n.name.as_deref() == Some(name))
+            .expect("the dependency is in the graph")
+            .locked
+            .as_ref()
+            .expect("a git dependency is pinned")
+            .commit
+            .clone()
+    }
+
     /// The bug this all exists for: a branch dependency that gained a commit
     /// partway through a CI run must not move under the jobs still to come.
     /// The remote here does not exist, so reaching for it at all would fail.
+    ///
+    /// Locked here in the pre-`branch` format, which is what every lockfile
+    /// committed before that field existed looks like — including the one
+    /// this bug was reported against.
     #[tokio::test]
     async fn a_locked_branch_dependency_is_not_re_resolved() {
         deps_cache();
@@ -5504,7 +5589,7 @@ mod locked_resolution_tests {
             "lockfix-quiet",
             "repo = \"https://example.invalid/quiet.git\"\n\
              branch = \"main\"\n",
-            Some(("https://example.invalid/quiet.git", SHA_A)),
+            Some(("https://example.invalid/quiet.git", None, SHA_A)),
         );
 
         let graph = build_dependency_graph(ws, false, None, Resolution::Locked)
@@ -5518,6 +5603,139 @@ mod locked_resolution_tests {
             .expect("the dependency is in the graph");
         assert_eq!(dep.locked.as_ref().unwrap().commit, SHA_A);
         assert!(dep.was_cached, "the seeded cache dir was reused");
+        assert_eq!(
+            dep.locked.as_ref().unwrap().branch.as_deref(),
+            Some("main"),
+            "the branch is recorded, so the next fetch can tell it changed"
+        );
+    }
+
+    /// Move a dependency to another branch and its old pin is an answer to a
+    /// question nobody is asking any more — even though the name, the repo,
+    /// and the cached tree are all still there.
+    #[tokio::test]
+    async fn a_lock_entry_for_another_branch_does_not_pin() {
+        deps_cache();
+        seed_cache("lockfix-branch", SHA_A);
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        workspace(
+            ws,
+            "lockfix-branch",
+            "repo = \"https://example.invalid/branch.git\"\n\
+             branch = \"feature\"\n",
+            Some(("https://example.invalid/branch.git", Some("main"), SHA_A)),
+        );
+
+        let e = build_dependency_graph(ws, false, None, Resolution::Locked)
+            .await
+            .expect_err("the pin from the old branch is not reused");
+        assert!(
+            e.to_string().contains("resolve commit for dependency"),
+            "expected a failed branch resolution, got: {e}"
+        );
+    }
+
+    /// A commit written by hand in `vw.toml` is the most specific thing
+    /// anyone has said about the dependency, so it outranks a lock entry that
+    /// disagrees — which is what an edited pin looks like until the next
+    /// fetch catches up.
+    #[tokio::test]
+    async fn a_manifest_commit_outranks_a_stale_lock_entry() {
+        deps_cache();
+        seed_cache("lockfix-pinned", SHA_B);
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        workspace(
+            ws,
+            "lockfix-pinned",
+            &format!(
+                "repo = \"https://example.invalid/pinned.git\"\n\
+                 commit = \"{SHA_B}\"\n"
+            ),
+            Some(("https://example.invalid/pinned.git", None, SHA_A)),
+        );
+
+        let graph = build_dependency_graph(ws, false, None, Resolution::Locked)
+            .await
+            .expect("an explicitly pinned dependency needs no remote");
+        assert_eq!(resolved(&graph, "lockfix-pinned"), SHA_B);
+    }
+
+    /// The gate and the pin have to agree. If `vw check` decides everything
+    /// is present, no fetch runs at all and the altered declaration is never
+    /// looked at — so the same drift that rejects a pin must also fail the
+    /// gate, and agreement must leave it alone.
+    #[test]
+    fn a_changed_declaration_fails_the_present_check() {
+        deps_cache();
+        seed_cache("lockfix-gate", SHA_A);
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        let declared = "repo = \"https://example.invalid/gate.git\"\n\
+                        branch = \"feature\"\n";
+        let repo = "https://example.invalid/gate.git";
+
+        // Agrees: the tree is cached and the entry answers the declaration.
+        workspace(
+            ws,
+            "lockfix-gate",
+            declared,
+            Some((repo, Some("feature"), SHA_A)),
+        );
+        assert!(dependencies_present(ws), "nothing to do");
+        assert!(!workspace_has_unlocked_git_deps(ws, true).unwrap());
+
+        // Branch moved on.
+        workspace(
+            ws,
+            "lockfix-gate",
+            declared,
+            Some((repo, Some("main"), SHA_A)),
+        );
+        assert!(!dependencies_present(ws), "the branch changed");
+        assert!(workspace_has_unlocked_git_deps(ws, true).unwrap());
+
+        // Repo moved on.
+        workspace(
+            ws,
+            "lockfix-gate",
+            declared,
+            Some(("https://example.invalid/old.git", Some("feature"), SHA_A)),
+        );
+        assert!(!dependencies_present(ws), "the repo changed");
+        assert!(workspace_has_unlocked_git_deps(ws, true).unwrap());
+
+        // Pinned commit edited by hand.
+        workspace(
+            ws,
+            "lockfix-gate",
+            &format!("repo = \"{repo}\"\ncommit = \"{SHA_B}\"\n"),
+            Some((repo, None, SHA_A)),
+        );
+        assert!(!dependencies_present(ws), "the pinned commit changed");
+        assert!(workspace_has_unlocked_git_deps(ws, true).unwrap());
+    }
+
+    /// A lockfile written before the branch was recorded says nothing about
+    /// which branch it came from, and rejecting it would re-resolve every
+    /// dependency of every workspace that has one — the exact behaviour being
+    /// fixed. It is taken at face value until the next write names its branch.
+    #[test]
+    fn a_legacy_lock_entry_still_satisfies_the_present_check() {
+        deps_cache();
+        seed_cache("lockfix-legacy", SHA_A);
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        workspace(
+            ws,
+            "lockfix-legacy",
+            "repo = \"https://example.invalid/legacy.git\"\n\
+             branch = \"main\"\n",
+            Some(("https://example.invalid/legacy.git", None, SHA_A)),
+        );
+        assert!(dependencies_present(ws));
+        assert!(!workspace_has_unlocked_git_deps(ws, true).unwrap());
     }
 
     /// `vw update` is the one caller that may move a pin, so it asks the
@@ -5533,7 +5751,7 @@ mod locked_resolution_tests {
             "lockfix-fresh",
             "repo = \"https://example.invalid/fresh.git\"\n\
              branch = \"main\"\n",
-            Some(("https://example.invalid/fresh.git", SHA_A)),
+            Some(("https://example.invalid/fresh.git", Some("main"), SHA_A)),
         );
 
         let e = build_dependency_graph(ws, false, None, Resolution::Fresh)
@@ -5557,7 +5775,7 @@ mod locked_resolution_tests {
             ws,
             "lockfix-moved",
             "repo = \"https://example.invalid/new.git\"\nbranch = \"main\"\n",
-            Some(("https://example.invalid/old.git", SHA_A)),
+            Some(("https://example.invalid/old.git", Some("main"), SHA_A)),
         );
 
         let e = build_dependency_graph(ws, false, None, Resolution::Locked)
@@ -7463,6 +7681,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
     fn a_lockfile_serializes_the_same_way_every_time() {
         let dep = |n: &str| LockedDependency {
             repo: format!("oxidecomputer/{n}"),
+            branch: Some("main".to_owned()),
             commit: "0f7c1d2e".to_owned(),
             src: Vec::new(),
             path: PathBuf::from(format!("/deps/{n}")),
