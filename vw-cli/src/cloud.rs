@@ -257,6 +257,22 @@ pub enum AdminCommand {
         #[arg(help = "Environment name")]
         name: String,
     },
+    #[command(
+        about = "Delete images nothing is using and nothing would use",
+        long_about = "Delete the service's images that nothing is using and \
+                      nothing would use.\n\nEach kind keeps its newest image \
+                      — what an environment created now would boot — and \
+                      every image an environment is booting, however old. \
+                      Only the service's own images in its project are ever \
+                      candidates, so the rack's base images are not at risk."
+    )]
+    ImageRecycle {
+        #[arg(
+            long,
+            help = "Report what would be deleted without deleting anything"
+        )]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -348,6 +364,9 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             AdminCommand::List => admin_list(&session).await,
             AdminCommand::Delete { user, name } => {
                 admin_delete(&session, &user, &name).await
+            }
+            AdminCommand::ImageRecycle { dry_run } => {
+                admin_image_recycle(&session, dry_run).await
             }
         };
     }
@@ -531,6 +550,63 @@ async fn admin_delete(
         user.bright_white(),
         name.cyan(),
     );
+    Ok(())
+}
+
+/// Reclaim the images nothing is using and nothing would use.
+///
+/// What was kept is printed as well as what went, and first: the question an
+/// administrator has after running this is usually about an image that is
+/// still there. On a dry run it is the whole answer.
+async fn admin_image_recycle(
+    session: &AdminSession,
+    dry_run: bool,
+) -> Result<(), CloudError> {
+    let report = vw_api_client::retrying(|| {
+        session.client.recycle_images(Some(dry_run))
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
+
+    for image in &report.kept {
+        let why = match (image.latest, image.used_by.as_slice()) {
+            (true, []) => "newest of its kind".to_owned(),
+            (true, used) => {
+                format!("newest of its kind; in use by {}", used.join(", "))
+            }
+            (false, used) => format!("in use by {}", used.join(", ")),
+        };
+        println!("{} {} - {}", "keep".green(), image.name.cyan(), why);
+    }
+
+    for image in &report.deleted {
+        let verb = if dry_run { "would delete" } else { "deleted" };
+        println!("{} {}", verb.yellow(), image.name.cyan());
+    }
+
+    if report.deleted.is_empty() {
+        println!(
+            "\nNothing to recycle; {} image{} kept.",
+            report.kept.len(),
+            if report.kept.len() == 1 { "" } else { "s" },
+        );
+    } else if dry_run {
+        println!(
+            "\n{} image{} would be deleted. Run without {} to do it.",
+            report.deleted.len(),
+            if report.deleted.len() == 1 { "" } else { "s" },
+            "--dry-run".bright_white(),
+        );
+    } else {
+        println!(
+            "\n{} Deleted {} image{}.",
+            "✓".bright_green(),
+            report.deleted.len(),
+            if report.deleted.len() == 1 { "" } else { "s" },
+        );
+    }
+
     Ok(())
 }
 

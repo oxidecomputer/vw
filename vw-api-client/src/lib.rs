@@ -18,7 +18,7 @@
 //! without one.
 
 use reqwest::header::{
-    HeaderMap, HeaderValue, InvalidHeaderValue, AUTHORIZATION,
+    HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue, AUTHORIZATION,
 };
 use std::time::Duration;
 
@@ -210,6 +210,15 @@ pub fn agent_client(base_url: &str) -> Result<agent::Client, Error> {
 /// every request.
 fn http_client(config: &ClientConfig<'_>) -> Result<reqwest::Client, Error> {
     let mut headers = HeaderMap::new();
+
+    // What this client was generated against. The service routes on it, so a
+    // request without it is refused rather than answered from a version this
+    // client may not understand.
+    headers.insert(
+        HeaderName::from_static(vw_api::API_VERSION_HEADER),
+        HeaderValue::from_str(&vw_api::latest_version().to_string())?,
+    );
+
     if let Some(token) = config.token {
         let mut authorization =
             HeaderValue::from_str(&format!("Bearer {token}"))?;

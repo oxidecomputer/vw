@@ -1043,7 +1043,7 @@ async fn vhdl_dependency_sources(
     if unlocked {
         tracing::info!(
             workspace = %ws,
-            "auto-updating workspace: git deps missing from vw.lock",
+            "installing dependencies: git deps missing from vw.lock",
         );
         // Look up netrc credentials the same way `vw update` does
         // so a workspace with private git deps (e.g. an
@@ -1053,9 +1053,9 @@ async fn vhdl_dependency_sources(
         // unauthenticated clone.
         let creds =
             vw_lib::get_access_credentials_for_workspace(&ws, include_test);
-        vw_lib::update_workspace_with_token(&ws, creds)
+        vw_lib::install_locked_dependencies(&ws, creds)
             .await
-            .map_err(|e| format!("auto-updating workspace: {e}"))?;
+            .map_err(|e| format!("installing dependencies: {e}"))?;
     }
     let sources = vw_lib::vhdl_dependency_sources_ext(
         &ws,

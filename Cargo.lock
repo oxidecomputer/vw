@@ -5869,6 +5869,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "uuid",
+ "vw-api",
  "vw-api-types-versions",
 ]
 
@@ -6077,10 +6078,12 @@ dependencies = [
  "blake3",
  "bytes",
  "camino",
+ "chrono",
  "clap",
  "daft",
  "dropshot",
  "futures",
+ "http",
  "http-body",
  "http-body-util",
  "iddqd",

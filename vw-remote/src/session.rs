@@ -419,7 +419,7 @@ pub(crate) async fn fetch_dependencies(
         );
     }
 
-    if let Err(e) = vw_lib::update_workspace_with_token(root, credentials).await
+    if let Err(e) = vw_lib::install_locked_dependencies(root, credentials).await
     {
         note(format!("could not fetch dependencies: {e}"));
     }

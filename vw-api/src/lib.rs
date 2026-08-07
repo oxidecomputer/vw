@@ -19,6 +19,7 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (2, IMAGE_RECYCLE),
     (1, INITIAL),
 ]);
 
@@ -33,6 +34,14 @@ api_versions!([
 //
 // Then you could use `VERSION_INITIAL` as the version in which endpoints were
 // added or removed.
+
+/// Header a client names the API version it is written against in.
+///
+/// The admin API has endpoints that exist only from a given version onwards,
+/// so a request has to say which version it means. `vw-api-client` sends this
+/// on every request; a client that omits it is turned away rather than
+/// silently given a version it was not built for.
+pub const API_VERSION_HEADER: &str = "api-version";
 
 /// User API. For all endpoints, the caller is identified by a Github access
 /// token in the authorization header of the request.
@@ -325,4 +334,21 @@ pub trait VwAdminApi {
         rqctx: RequestContext<Self::Context>,
         path_params: Path<latest::UserEnvironmentPathParam>,
     ) -> Result<HttpResponseDeleted, HttpError>;
+
+    /// Delete the service's images that nothing is using and nothing would
+    /// use.
+    ///
+    /// Each image kind keeps its newest — what an environment created now
+    /// would boot — and every image any environment is booting, however old.
+    /// Only the service's own images in its project are ever candidates, so
+    /// the base images the rack publishes are not at risk.
+    #[endpoint {
+        method = POST,
+        path = "/images/recycle",
+        versions = VERSION_IMAGE_RECYCLE..,
+    }]
+    async fn recycle_images(
+        rqctx: RequestContext<Self::Context>,
+        query: Query<latest::ImageRecycleQuery>,
+    ) -> Result<HttpResponseOk<latest::ImageRecycleReport>, HttpError>;
 }

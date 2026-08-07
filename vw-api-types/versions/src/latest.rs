@@ -26,3 +26,8 @@ pub use crate::v1::TreeManifest;
 pub use crate::v1::UserEnvironment;
 pub use crate::v1::UserEnvironmentPathParam;
 pub use crate::v1::VivadoSessionQuery;
+
+pub use crate::v2::ImageRecycleQuery;
+pub use crate::v2::ImageRecycleReport;
+pub use crate::v2::KeptImage;
+pub use crate::v2::RecycledImage;
