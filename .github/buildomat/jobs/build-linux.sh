@@ -41,12 +41,17 @@ sudo apt-get install build-essential pkg-config libssl-dev libfontconfig-dev -y
 cargo --version
 rustc --version
 
+cargo install cargo-nextest --locked
+
 banner "api"
 cargo xtask openapi generate
 
 banner "check"
 cargo fmt -- --check
 cargo clippy --all-targets -- --deny warnings
+
+banner "test"
+cargo nextest run
 
 banner "build"
 cargo build --release

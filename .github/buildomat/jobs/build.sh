@@ -36,11 +36,13 @@ set -o errexit
 set -o pipefail
 set -o xtrace
 
-
 cargo --version
 rustc --version
 
+cargo install cargo-nextest --locked
+
 export PKG_CONFIG_PATH=/opt/ooce/lib/amd64/pkgconfig
+export LD_LIBRARY_PATH=/opt/ooce/lib/amd64
 
 banner "api"
 cargo xtask openapi generate
@@ -48,6 +50,9 @@ cargo xtask openapi generate
 banner "check"
 cargo fmt -- --check
 cargo clippy --all-targets -- --deny warnings
+
+banner "test"
+cargo nextest run
 
 banner "build"
 cargo build --release
