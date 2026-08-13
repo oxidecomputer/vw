@@ -4964,9 +4964,6 @@ async fn download_dependency(
     tokio::time::timeout(
         std::time::Duration::from_secs(120),
         tokio::task::spawn_blocking(move || {
-            // Set up clone options with authentication
-            let mut builder = git2::build::RepoBuilder::new();
-
             // Always set a credentials callback so git2 doesn't fail with "no callback set".
             // The callback will try explicit credentials first, then fall back to git's
             // credential helper system (which includes .netrc support).
@@ -5022,32 +5019,71 @@ async fn download_dependency(
                 },
             );
 
-            let mut fetch_options = git2::FetchOptions::new();
-            fetch_options.depth(1); // shallow clone — only need one commit
-            fetch_options.remote_callbacks(callbacks);
-            builder.fetch_options(fetch_options);
-
-            // Clone the repository
-            let repo = builder
-                .clone(&normalized_repo_url, &temp_path)
-                .map_err(|e| VwError::Git {
-                    message: format!("Failed to clone repository: {e}"),
-                })?;
-
-            // Parse the commit SHA
+            // Parse the commit SHA before reaching the network, so a typo in
+            // `vw.lock` is not reported as a download failure.
             let commit_oid =
                 git2::Oid::from_str(&commit).map_err(|e| VwError::Git {
                     message: format!("Invalid commit SHA '{commit}': {e}"),
                 })?;
 
+            // Ask for the commit itself rather than cloning a branch and
+            // hoping the commit is on the end of it.
+            //
+            // Cloning at `depth(1)` gets exactly one commit — the tip of the
+            // default branch — so any pin that is not currently that tip is
+            // absent from the result, and the checkout below fails with
+            // "object not found". Every dependency here is pinned by
+            // `vw.lock`, and upstream moves on, so that described most of
+            // them: what made it look like it worked was resolving each
+            // branch to its HEAD immediately before downloading it, which
+            // meant the pin was always the tip by construction.
+            //
+            // Fetching the object by name is both correct and no more
+            // expensive; the server sends the history it needs to and
+            // nothing else.
+            let repo = git2::Repository::init(&temp_path).map_err(|e| {
+                VwError::Git {
+                    message: format!("Failed to create repository: {e}"),
+                }
+            })?;
+            let mut remote = repo
+                .remote_anonymous(&normalized_repo_url)
+                .map_err(|e| VwError::Git {
+                    message: format!("Failed to add remote: {e}"),
+                })?;
+
+            let mut fetch_options = git2::FetchOptions::new();
+            fetch_options.depth(1); // just this commit, not its history
+            fetch_options.remote_callbacks(callbacks);
+
+            remote
+                .fetch(&[commit.as_str()], Some(&mut fetch_options), None)
+                .map_err(|e| VwError::Git {
+                    message: format!(
+                        "Failed to fetch commit '{commit}' from \
+                         {normalized_repo_url}: {e}"
+                    ),
+                })?;
+
             // Find the commit object
             let commit_obj =
                 repo.find_commit(commit_oid).map_err(|e| VwError::Git {
-                    message: format!("Commit '{commit}' not found: {e}"),
+                    message: format!(
+                        "Commit '{commit}' is not in {normalized_repo_url}. \
+                         The repository may have been rewritten since \
+                         vw.lock recorded it; `vw update` will re-resolve it. \
+                         ({e})"
+                    ),
                 })?;
 
-            // Checkout the specific commit
-            repo.checkout_tree(commit_obj.as_object(), None)
+            // Checkout the specific commit.
+            //
+            // Forced because the fetch leaves an empty working tree with no
+            // HEAD to be safe about: a default checkout has nothing to
+            // compare against and writes nothing.
+            let mut checkout = git2::build::CheckoutBuilder::new();
+            checkout.force();
+            repo.checkout_tree(commit_obj.as_object(), Some(&mut checkout))
                 .map_err(|e| VwError::Git {
                     message: format!(
                         "Failed to checkout commit '{commit}': {e}"
@@ -8194,5 +8230,182 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             place_dcp.as_path()
         )
         .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    /// Build a repository whose default branch does NOT contain the commit
+    /// being pinned, and return `(url, pinned, tip)`.
+    ///
+    /// A stand-in for the real failure, which cannot be staged locally:
+    /// libgit2 ignores shallow depth over the local transport, so a `depth(1)`
+    /// clone of a `file://` remote quietly brings the whole history and the
+    /// truncation never happens. Putting the pin off the default branch
+    /// instead makes cloning-then-searching miss it for a different reason,
+    /// which exercises the same difference — asking the remote for the commit
+    /// by name rather than hoping a cloned branch happens to contain it.
+    fn repo_with_pin_off_the_default_branch(
+        root: &Utf8Path,
+    ) -> (String, String, String) {
+        let repo = root.join("origin");
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "vw")
+                .env("GIT_AUTHOR_EMAIL", "vw@example.invalid")
+                .env("GIT_COMMITTER_NAME", "vw")
+                .env("GIT_COMMITTER_EMAIL", "vw@example.invalid")
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+
+        git(&["init", "--quiet", "--initial-branch=main", "."]);
+        fs::write(repo.join("root.htcl"), "## root\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "root"]);
+
+        // The pinned revision, on a branch that is then removed: the object
+        // survives, but nothing under refs/heads leads to it.
+        git(&["checkout", "--quiet", "-b", "pinned"]);
+        fs::write(repo.join("module.htcl"), "## pinned\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "pinned"]);
+        let pinned = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/pins/held", &pinned]);
+
+        git(&["checkout", "--quiet", "main"]);
+        fs::write(repo.join("later.htcl"), "## later\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "later"]);
+        let tip = git(&["rev-parse", "HEAD"]);
+        git(&["branch", "--quiet", "-D", "pinned"]);
+
+        (format!("file://{repo}"), pinned, tip)
+    }
+
+    /// What lands in the cache is the pinned revision, not whatever the
+    /// branch has moved on to.
+    ///
+    /// Note what this does NOT establish. The failure it was written for --
+    /// a `depth(1)` clone bringing only the branch tip, so the pinned commit
+    /// is missing -- cannot be staged against a local remote at all: libgit2
+    /// serves `file://` through its local transport, which copies the whole
+    /// object database and ignores the requested depth, so every commit is
+    /// present however the download asks for it. Confirmed by putting the old
+    /// implementation back and watching this pass unchanged. The truncation
+    /// itself is covered by
+    /// [`a_commit_behind_the_branch_tip_downloads_from_a_real_remote`], which
+    /// needs the network and is ignored by default.
+    #[tokio::test]
+    async fn the_pinned_revision_is_what_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap();
+        let (url, first, tip) = repo_with_pin_off_the_default_branch(root);
+        assert_ne!(first, tip);
+
+        let dest = root.join("cache");
+        download_dependency(
+            &url,
+            &first,
+            &[],
+            dest.as_std_path(),
+            false,
+            &[],
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("an older commit is still fetchable");
+
+        assert!(
+            dest.join("module.htcl").exists(),
+            "the pinned tree is there"
+        );
+        assert!(
+            !dest.join("later.htcl").exists(),
+            "and it is the pinned revision, not the tip"
+        );
+    }
+
+    /// A pin that no longer exists upstream — force-pushed away, or simply
+    /// mistyped — is the one case that cannot be satisfied, and the message
+    /// has to say which dependency and what to do rather than "object not
+    /// found ... class=Odb".
+    #[tokio::test]
+    async fn a_commit_that_is_not_there_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap();
+        let (url, _, _) = repo_with_pin_off_the_default_branch(root);
+
+        let e = download_dependency(
+            &url,
+            "0000000000000000000000000000000000000000",
+            &[],
+            root.join("cache").as_std_path(),
+            false,
+            &[],
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a commit that is not there cannot be downloaded");
+
+        let message = e.to_string();
+        assert!(
+            message.contains("vw update")
+                || message.contains("Failed to fetch"),
+            "expected an actionable message, got: {message}"
+        );
+    }
+
+    /// The regression, against a real remote: a dependency pinned behind its
+    /// branch tip still downloads.
+    ///
+    /// Ignored because it needs the network, and run deliberately:
+    ///
+    /// ```text
+    /// cargo test -p vw-lib -- --ignored
+    /// ```
+    ///
+    /// The fixture is the failure as reported -- `quartz` pinned at a commit
+    /// that was its `main` when `vw.lock` was written and was several commits
+    /// back by the time anybody fetched it. A public repository, so no
+    /// credentials are needed; if it is ever rewritten this test starts
+    /// failing for a reason that is not a regression, and the pin below is
+    /// what to update.
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn a_commit_behind_the_branch_tip_downloads_from_a_real_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap();
+        let dest = root.join("cache");
+
+        download_dependency(
+            "https://github.com/oxidecomputer/quartz",
+            "c13739a3a61455fb323ed914d7685cdf40671f04",
+            &["hdl/ip/vhd/synchronizers".to_owned()],
+            dest.as_std_path(),
+            false,
+            &[],
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a commit behind the tip is still fetchable");
+
+        assert!(
+            dest.join("meta_sync.vhd").exists(),
+            "the pinned revision's sources are in the cache"
+        );
     }
 }
