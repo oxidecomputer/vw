@@ -273,7 +273,14 @@ impl LanguageServer for Analyzer {
         // registration lets each backend pick its own patterns —
         // today the VHDL backend needs `vw.toml`, `vw.lock`, and
         // `ip/**/*.htcl` to reflect `vw update` and IP-config
-        // edits back into the wrapped `vhdl_ls::VHDLServer`.
+        // edits back into the wrapped `vhdl_ls::VHDLServer`, plus
+        // `**/*.vhd{,l}` because that server's config is a concrete
+        // file list: a source added or removed on disk changes the
+        // library mapping, and until the config is re-rendered the
+        // new file resolves nothing (`No primary unit '<pkg>'
+        // within library 'work'`). The VHDL backend also re-checks
+        // membership on open/save, so this registration failing
+        // degrades rather than breaks.
         //
         // Registration failures (client that doesn't advertise
         // dynamic registration, or refuses this specific one) are
@@ -290,6 +297,14 @@ impl LanguageServer for Analyzer {
             },
             FileSystemWatcher {
                 glob_pattern: GlobPattern::String("**/ip/**/*.htcl".into()),
+                kind: None,
+            },
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/*.vhd".into()),
+                kind: None,
+            },
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/*.vhdl".into()),
                 kind: None,
             },
         ];

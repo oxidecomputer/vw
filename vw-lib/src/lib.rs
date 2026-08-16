@@ -5859,6 +5859,20 @@ mod locked_resolution_tests {
 mod dependency_source_tests {
     use super::*;
 
+    /// A temp dir plus the *canonical* form of its path.
+    ///
+    /// Dep resolution canonicalizes the paths it hands back (see
+    /// `transitive_dep_cache_paths`), so a test that builds its
+    /// expected paths from the raw `TempDir::path()` compares two
+    /// spellings of one directory. Only bites where the temp root
+    /// crosses a symlink — macOS puts `$TMPDIR` under
+    /// `/var` → `/private/var`; Linux's `/tmp` is a real directory.
+    fn temp_root() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        (dir, root)
+    }
+
     #[test]
     fn manifest_path_dep_wins_over_stale_git_lock_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6016,10 +6030,10 @@ your_instance_name : primary_clock\n\
         // metroid → cips → vivado-cmd.  Asking for metroid's deps
         // transitively should return cips AND vivado-cmd, even though
         // metroid only declares cips.
-        let dir = tempfile::tempdir().unwrap();
-        let metroid = dir.path().join("metroid");
-        let cips = dir.path().join("cips");
-        let vivado_cmd = dir.path().join("vivado-cmd");
+        let (_dir, root) = temp_root();
+        let metroid = root.join("metroid");
+        let cips = root.join("cips");
+        let vivado_cmd = root.join("vivado-cmd");
         std::fs::create_dir_all(&metroid).unwrap();
         std::fs::create_dir_all(&cips).unwrap();
         std::fs::create_dir_all(&vivado_cmd).unwrap();
@@ -6062,12 +6076,12 @@ your_instance_name : primary_clock\n\
         // `shared` is whichever was inserted first; entry itself
         // doesn't declare `shared`, so the test just asserts we got
         // *one* deterministic answer rather than a panic / duplicate.
-        let dir = tempfile::tempdir().unwrap();
-        let entry = dir.path().join("entry");
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        let shared_v1 = dir.path().join("shared-v1");
-        let shared_v2 = dir.path().join("shared-v2");
+        let (_dir, root) = temp_root();
+        let entry = root.join("entry");
+        let a = root.join("a");
+        let b = root.join("b");
+        let shared_v1 = root.join("shared-v1");
+        let shared_v2 = root.join("shared-v2");
         for d in [&entry, &a, &b, &shared_v1, &shared_v2] {
             std::fs::create_dir_all(d).unwrap();
         }

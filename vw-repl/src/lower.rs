@@ -884,6 +884,13 @@ impl ScratchFile {
         let path = dir.join(name);
         let mut f = std::fs::File::create(&path)?;
         f.write_all(contents.as_bytes())?;
+        // The loader canonicalizes every path it records, so hold the
+        // canonical form: `file.path == scratch_path` is what marks a
+        // frame as "the line you just typed" rather than a file, and
+        // under a workspace path that crosses a symlink the two
+        // spellings never match — every REPL error would then cite
+        // `.vw-repl-input-<pid>.htcl` as its source file.
+        let path = path.canonicalize().unwrap_or(path);
         Ok(Self { path })
     }
 }
