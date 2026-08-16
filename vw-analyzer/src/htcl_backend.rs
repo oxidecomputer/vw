@@ -601,7 +601,10 @@ async fn reindex_importers_of(
                 analysis
                     .as_ref()
                     .filter(|a| {
-                        a.view.imports.iter().any(|i| &i.file_uri == changed)
+                        a.view
+                            .imports
+                            .iter()
+                            .any(|i| same_file(&i.file_uri, changed))
                     })
                     .map(|_| u.clone())
             })
@@ -1511,7 +1514,7 @@ impl HtclBackend {
             };
             // For the origin file, prefer the in-memory analysis
             // text so unsaved edits round-trip.
-            let text = if file_uri == *origin {
+            let text = if same_file(&file_uri, origin) {
                 if let Some(analysis) = self.analysis_for(&file_uri).await {
                     analysis.local_text.clone()
                 } else {
@@ -1583,6 +1586,36 @@ fn uri_under_roots(uri: &Url, roots: &[std::path::PathBuf]) -> bool {
         let canonical_root = r.canonicalize().unwrap_or_else(|_| r.clone());
         canonical_path.starts_with(&canonical_root)
     })
+}
+
+/// True when two file URIs name the same file on disk.
+///
+/// Import URIs are built from resolver output, which canonicalizes;
+/// document URIs come from the editor, which does not — Helix hands
+/// back whatever path the user opened. Any path crossing a symlink
+/// (`$TMPDIR` on macOS, a checkout under a symlinked home) gives the
+/// two sides different spellings of one file, and a plain `==` then
+/// answers "different file": the fan-out reindex stops firing, so an
+/// edit to an imported file never reaches the open importer. Compare
+/// canonical forms, falling back to the raw path when
+/// canonicalization fails (deleted file, permission error).
+fn same_file(a: &Url, b: &Url) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Ok(pa), Ok(pb)) = (a.to_file_path(), b.to_file_path()) else {
+        return false;
+    };
+    // Cheap prune before touching the filesystem: two spellings of
+    // one file always agree on the final component. The fan-out
+    // scan runs this against every import of every open doc — a
+    // vivado-cmd tree is ~900 of them — and nearly all differ right
+    // here, so this keeps the syscalls to the handful that could
+    // plausibly match.
+    if pa.file_name() != pb.file_name() {
+        return false;
+    }
+    pa.canonicalize().unwrap_or(pa) == pb.canonicalize().unwrap_or(pb)
 }
 
 fn walk_htcl_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -2306,6 +2339,21 @@ mod tests {
         fn uri(&self) -> Url {
             self.uri.clone()
         }
+    }
+
+    /// A temp dir plus the *canonical* form of its path.
+    ///
+    /// Everything the analyzer resolves through the loader comes
+    /// back canonicalized, so a test that builds its expected URIs
+    /// from the raw `TempDir::path()` is comparing two spellings of
+    /// one file. That only shows up where the temp root crosses a
+    /// symlink — which is exactly what macOS does, with `$TMPDIR`
+    /// under `/var` → `/private/var`, and what Linux's `/tmp`
+    /// happens not to do. Build test paths from this root instead.
+    fn temp_root() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        (dir, root)
     }
 
     #[tokio::test]
