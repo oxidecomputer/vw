@@ -601,7 +601,10 @@ async fn reindex_importers_of(
                 analysis
                     .as_ref()
                     .filter(|a| {
-                        a.view.imports.iter().any(|i| &i.file_uri == changed)
+                        a.view
+                            .imports
+                            .iter()
+                            .any(|i| same_file(&i.file_uri, changed))
                     })
                     .map(|_| u.clone())
             })
@@ -1511,7 +1514,7 @@ impl HtclBackend {
             };
             // For the origin file, prefer the in-memory analysis
             // text so unsaved edits round-trip.
-            let text = if file_uri == *origin {
+            let text = if same_file(&file_uri, origin) {
                 if let Some(analysis) = self.analysis_for(&file_uri).await {
                     analysis.local_text.clone()
                 } else {
@@ -1583,6 +1586,36 @@ fn uri_under_roots(uri: &Url, roots: &[std::path::PathBuf]) -> bool {
         let canonical_root = r.canonicalize().unwrap_or_else(|_| r.clone());
         canonical_path.starts_with(&canonical_root)
     })
+}
+
+/// True when two file URIs name the same file on disk.
+///
+/// Import URIs are built from resolver output, which canonicalizes;
+/// document URIs come from the editor, which does not — Helix hands
+/// back whatever path the user opened. Any path crossing a symlink
+/// (`$TMPDIR` on macOS, a checkout under a symlinked home) gives the
+/// two sides different spellings of one file, and a plain `==` then
+/// answers "different file": the fan-out reindex stops firing, so an
+/// edit to an imported file never reaches the open importer. Compare
+/// canonical forms, falling back to the raw path when
+/// canonicalization fails (deleted file, permission error).
+fn same_file(a: &Url, b: &Url) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Ok(pa), Ok(pb)) = (a.to_file_path(), b.to_file_path()) else {
+        return false;
+    };
+    // Cheap prune before touching the filesystem: two spellings of
+    // one file always agree on the final component. The fan-out
+    // scan runs this against every import of every open doc — a
+    // vivado-cmd tree is ~900 of them — and nearly all differ right
+    // here, so this keeps the syscalls to the handful that could
+    // plausibly match.
+    if pa.file_name() != pb.file_name() {
+        return false;
+    }
+    pa.canonicalize().unwrap_or(pa) == pb.canonicalize().unwrap_or(pb)
 }
 
 fn walk_htcl_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -2234,6 +2267,21 @@ mod tests {
 
     fn uri() -> Url {
         Url::parse("file:///tmp/x.htcl").unwrap()
+    }
+
+    /// A temp dir plus the *canonical* form of its path.
+    ///
+    /// Everything the analyzer resolves through the loader comes
+    /// back canonicalized, so a test that builds its expected URIs
+    /// from the raw `TempDir::path()` is comparing two spellings of
+    /// one file. That only shows up where the temp root crosses a
+    /// symlink — which is exactly what macOS does, with `$TMPDIR`
+    /// under `/var` → `/private/var`, and what Linux's `/tmp`
+    /// happens not to do. Build test paths from this root instead.
+    fn temp_root() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        (dir, root)
     }
 
     #[tokio::test]
@@ -2955,15 +3003,15 @@ proc make_widget {} dict<string,bd_cell> { return {} }\n";
         Url, // main.htcl
         Url, // lib.htcl
     ) {
-        let dir = tempfile::tempdir().unwrap();
-        let lib_path = dir.path().join("lib.htcl");
+        let (dir, root) = temp_root();
+        let lib_path = root.join("lib.htcl");
         std::fs::write(
             &lib_path,
             "## Greet someone.\n\
 proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         )
         .unwrap();
-        let main_path = dir.path().join("main.htcl");
+        let main_path = root.join("main.htcl");
         let main_src = "src lib\ngreet -who world\n";
         std::fs::write(&main_path, main_src).unwrap();
 
@@ -3327,8 +3375,8 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
     /// the real vivado-cmd tree still returned nothing.
     #[tokio::test]
     async fn goto_finds_sibling_workspace_dep_via_nested_src() {
-        let dir = tempfile::tempdir().unwrap();
-        let amd = dir.path().join("amd");
+        let (_dir, root) = temp_root();
+        let amd = root.join("amd");
         let cpm5 = amd.join("cpm5");
         let vivado_cmd = amd.join("vivado-cmd");
         let vivado_cmd_cmd = vivado_cmd.join("cmd");
@@ -3413,8 +3461,8 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
     /// I'm in a vw-tracked dependency."
     #[tokio::test]
     async fn goto_finds_sibling_workspace_dep() {
-        let dir = tempfile::tempdir().unwrap();
-        let amd = dir.path().join("amd");
+        let (_dir, root) = temp_root();
+        let amd = root.join("amd");
         let cpm5 = amd.join("cpm5");
         let vivado_cmd = amd.join("vivado-cmd");
         std::fs::create_dir_all(&cpm5).unwrap();
@@ -3611,10 +3659,10 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         // error-free. workspace_diagnostics must report the lib's
         // diagnostic against the LIB's URI so the editor's
         // workspace picker points to the right file.
-        let dir = tempfile::tempdir().unwrap();
-        let lib_path = dir.path().join("broken.htcl");
+        let (_dir, root) = temp_root();
+        let lib_path = root.join("broken.htcl");
         std::fs::write(&lib_path, "proc broken {} { return 42 }\n").unwrap();
-        let main_path = dir.path().join("main.htcl");
+        let main_path = root.join("main.htcl");
         let main_src = "src broken\n";
         std::fs::write(&main_path, main_src).unwrap();
         let backend = HtclBackend::new();
@@ -3622,9 +3670,7 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         let lib_uri = Url::from_file_path(&lib_path).unwrap();
         // Set the editor's workspace root to the temp dir so the
         // filter accepts the lib file (which lives inside it).
-        backend
-            .set_workspace_roots(vec![dir.path().to_path_buf()])
-            .await;
+        backend.set_workspace_roots(vec![root.clone()]).await;
         backend
             .set_text_sync(main_uri.clone(), main_src.into())
             .await;
@@ -3652,18 +3698,16 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         // That empty payload is what the editor overwrites its
         // cached "had errors" state with; without it, the
         // stale errors linger in `space-D` even after the fix.
-        let dir = tempfile::tempdir().unwrap();
-        let lib_path = dir.path().join("lib.htcl");
+        let (_dir, root) = temp_root();
+        let lib_path = root.join("lib.htcl");
         std::fs::write(&lib_path, "proc broken {} { return 42 }\n").unwrap();
-        let main_path = dir.path().join("main.htcl");
+        let main_path = root.join("main.htcl");
         let main_src = "src lib\n";
         std::fs::write(&main_path, main_src).unwrap();
         let backend = HtclBackend::new();
         let main_uri = Url::from_file_path(&main_path).unwrap();
         let lib_uri = Url::from_file_path(&lib_path).unwrap();
-        backend
-            .set_workspace_roots(vec![dir.path().to_path_buf()])
-            .await;
+        backend.set_workspace_roots(vec![root.clone()]).await;
         backend
             .set_text_sync(main_uri.clone(), main_src.into())
             .await;
@@ -3855,14 +3899,11 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
         // entry-point set. Without this, Helix's space-D picker
         // would show nothing for warnings in files the user
         // hasn't visited.
-        let dir = tempfile::tempdir().unwrap();
+        let (_dir, root) = temp_root();
         // Minimal vw.toml to make this a valid workspace root
         // (workspace-discovery walks up looking for it).
-        std::fs::write(
-            dir.path().join("vw.toml"),
-            "[workspace]\nname = \"t\"\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("vw.toml"), "[workspace]\nname = \"t\"\n")
+            .unwrap();
         // design.htcl carries a stub proc with a `@default(0)`
         // arg; the redundant-default warning fires on the call
         // site below.
@@ -3870,19 +3911,17 @@ proc greet {\n  ## Who to greet.\n  who\n} { puts \"hi $who\" }\n",
 proc use_it { @default(0) count } unit { puts $count }
 use_it -count 0
 ";
-        let design_path = dir.path().join("design.htcl");
+        let design_path = root.join("design.htcl");
         std::fs::write(&design_path, design_src).unwrap();
         let design_uri = Url::from_file_path(&design_path).unwrap();
         // Open a DIFFERENT file — `other.htcl` — that does NOT
         // src design.htcl. Without preload, design.htcl wouldn't
         // appear in the docs map at all.
-        let other_path = dir.path().join("other.htcl");
+        let other_path = root.join("other.htcl");
         std::fs::write(&other_path, "puts hi\n").unwrap();
         let other_uri = Url::from_file_path(&other_path).unwrap();
         let backend = HtclBackend::new();
-        backend
-            .set_workspace_roots(vec![dir.path().to_path_buf()])
-            .await;
+        backend.set_workspace_roots(vec![root.clone()]).await;
         backend
             .set_text_sync(other_uri.clone(), "puts hi\n".into())
             .await;
@@ -3922,25 +3961,20 @@ use_it -count 0
         // hasn't committed at that instant; the assertion is
         // that `workspace_diagnostics` still returns the warning
         // (having awaited the commit internally).
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("vw.toml"),
-            "[workspace]\nname = \"t\"\n",
-        )
-        .unwrap();
+        let (_dir, root) = temp_root();
+        std::fs::write(root.join("vw.toml"), "[workspace]\nname = \"t\"\n")
+            .unwrap();
         let warn_src = "\
 proc use_it { @default(0) count } unit { puts $count }
 use_it -count 0
 ";
-        let warn_path = dir.path().join("design.htcl");
+        let warn_path = root.join("design.htcl");
         std::fs::write(&warn_path, warn_src).unwrap();
         let warn_uri = Url::from_file_path(&warn_path).unwrap();
         let backend = HtclBackend::new();
         // set_workspace_roots kicks off the preload but returns
         // BEFORE any preload indexer commits.
-        backend
-            .set_workspace_roots(vec![dir.path().to_path_buf()])
-            .await;
+        backend.set_workspace_roots(vec![root.clone()]).await;
         // Straight to workspace_diagnostics — no
         // wait_until_analysis_present. This is the racey path.
         let ws: std::collections::HashMap<Url, Vec<Diagnostic>> =
