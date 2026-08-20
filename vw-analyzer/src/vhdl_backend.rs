@@ -34,10 +34,10 @@ use tower_lsp::lsp_types::{
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, InitializeParams, Location,
     LogMessageParams, MessageType, PartialResultParams, Position,
-    PublishDiagnosticsParams, ShowMessageParams, SignatureHelp,
-    SymbolInformation, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceEdit,
+    PublishDiagnosticsParams, ReferenceContext, ReferenceParams, RenameParams,
+    ShowMessageParams, SignatureHelp, SymbolInformation,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceEdit,
 };
 use tower_lsp::Client;
 use tracing::warn;
@@ -79,6 +79,8 @@ enum Message {
         DocumentSymbolParams,
         oneshot::Sender<Option<DocumentSymbolResponse>>,
     ),
+    Rename(RenameParams, oneshot::Sender<Option<WorkspaceEdit>>),
+    References(ReferenceParams, oneshot::Sender<Vec<Location>>),
     /// Pull-based diagnostics for a single file. Since `vhdl_ls`
     /// pushes diagnostics asynchronously through
     /// `publishDiagnostics`, this returns whatever the cache holds
@@ -247,6 +249,14 @@ fn workspace_thread(
             }
             Message::DocumentSymbols(p, reply) => {
                 let r = server.document_symbol(&p);
+                let _ = reply.send(r);
+            }
+            Message::Rename(p, reply) => {
+                let r = server.rename(&p);
+                let _ = reply.send(r);
+            }
+            Message::References(p, reply) => {
+                let r = server.text_document_references(&p);
                 let _ = reply.send(r);
             }
             Message::UpdateConfig(cfg) => {
@@ -553,20 +563,58 @@ impl LanguageBackend for VhdlBackend {
 
     async fn rename(
         &self,
-        _uri: &Url,
-        _position: Position,
-        _new_name: &str,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
     ) -> Option<WorkspaceEdit> {
-        None
+        let ws = self.ensure_workspace(uri).await?;
+        let params = RenameParams {
+            text_document_position: text_document_position(
+                uri.clone(),
+                position,
+            ),
+            new_name: new_name.to_string(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let (tx, rx) = oneshot::channel();
+        if ws.tx.send(Message::Rename(params, tx)).is_err() {
+            return None;
+        }
+        rx.await.ok().flatten()
     }
 
     async fn references(
         &self,
-        _uri: &Url,
-        _position: Position,
-        _include_declaration: bool,
+        uri: &Url,
+        position: Position,
+        include_declaration: bool,
     ) -> Vec<Location> {
-        Vec::new()
+        let Some(ws) = self.ensure_workspace(uri).await else {
+            return Vec::new();
+        };
+        // `include_declaration` is passed through verbatim rather
+        // than post-filtered: `vhdl_ls` builds its answer from
+        // `Project::find_all_references`, which always includes the
+        // declaration's own span, and the embedding API gives us no
+        // way to tell which returned `Location` is the decl. Vanilla
+        // vhdl_ls has the same behavior — matching it keeps the
+        // proxy honest instead of guessing at a span to drop.
+        let params = ReferenceParams {
+            text_document_position: text_document_position(
+                uri.clone(),
+                position,
+            ),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: ReferenceContext {
+                include_declaration,
+            },
+        };
+        let (tx, rx) = oneshot::channel();
+        if ws.tx.send(Message::References(params, tx)).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 }
 
