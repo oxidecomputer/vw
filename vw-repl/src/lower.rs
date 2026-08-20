@@ -898,6 +898,24 @@ impl Drop for ScratchFile {
 mod tests {
     use super::*;
 
+    /// A temp dir plus its **canonicalized** path, standing in for
+    /// the REPL's cwd.
+    ///
+    /// `prepare` decides "this command came from the user's input,
+    /// not from a file" by comparing the loader's path against the
+    /// scratch file's — and the loader canonicalizes. In the real
+    /// REPL the cwd comes from `std::env::current_dir()`, which is
+    /// already symlink-resolved, so the two always agree. A raw
+    /// `TempDir::path()` is the one path shape production never
+    /// hands us: on macOS it's `/var/folders/…` where the loader
+    /// reports `/private/var/folders/…`, so every origin looks
+    /// file-backed. Derive test cwds from the returned `PathBuf`.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        (dir, path)
+    }
+
     fn empty_session() -> Session {
         Session::new()
     }
@@ -923,10 +941,10 @@ mod tests {
         // error so the lowering returns `Err` and nothing ships
         // to Vivado — the user is forced to either `src` a
         // wrapper module or write `extern::create_project`.
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let err = prepare(
             "set proj [\n  create_project\n    -in_memory 1\n    -name foo\n]\n",
-            dir.path(),
+            dir.as_path(),
             &empty_session(),
         )
         .unwrap_err();
@@ -962,8 +980,8 @@ namespace eval demo {
   }
 }
 ";
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("demo.htcl");
+        let (_tmp, dir) = canonical_tempdir();
+        let path = dir.as_path().join("demo.htcl");
         std::fs::write(&path, src).unwrap();
         let program =
             vw_htcl::load_program(&path, &vw_htcl::Resolver::new()).unwrap();
@@ -1033,10 +1051,10 @@ namespace eval demo {
         // raw Tcl call, no wrapper required. Lowering strips the
         // prefix so the bare native resolves through Tcl's global
         // namespace at runtime — no rename plumbing, no prelude.
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let prep = prepare(
             "extern::create_project -name foo\n",
-            dir.path(),
+            dir.as_path(),
             &empty_session(),
         )
         .unwrap();
@@ -1057,7 +1075,7 @@ namespace eval demo {
         // to the analyzer/lowering when we lower a bare call in
         // the next batch — and the new batch should ship only
         // its own statement (not re-emit the wrapper).
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let mut session = Session::new();
         // Batch 1: declare the wrapper. Commit so it joins the
         // session — same flow the App follows on successful eval.
@@ -1072,7 +1090,7 @@ namespace eval demo {
                   return [{*}$cmd]\n  \
                 }\n\
               }\n",
-            dir.path(),
+            dir.as_path(),
             &session,
         )
         .unwrap();
@@ -1095,7 +1113,8 @@ namespace eval demo {
         // prelude), with no rewriting and no re-emission of the
         // prior batch's declaration.
         let prep =
-            prepare("vivado::current_project\n", dir.path(), &session).unwrap();
+            prepare("vivado::current_project\n", dir.as_path(), &session)
+                .unwrap();
         let cmds = user_commands(&prep);
         assert_eq!(cmds.len(), 1, "{:?}", cmds);
         assert!(
@@ -1115,11 +1134,11 @@ namespace eval demo {
     #[test]
     fn known_keyword_call_is_not_errored() {
         // When the called proc IS in scope, no error fires.
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let prep = prepare(
             "proc create_project { @default(\"\") name } { }\n\
              set proj [ create_project -name foo ]\n",
-            dir.path(),
+            dir.as_path(),
             &empty_session(),
         )
         .unwrap();
@@ -1128,8 +1147,9 @@ namespace eval demo {
 
     #[test]
     fn lowers_plain_proc_call_to_tcl() {
-        let dir = tempfile::tempdir().unwrap();
-        let prep = prepare("puts hello", dir.path(), &empty_session()).unwrap();
+        let (_tmp, dir) = canonical_tempdir();
+        let prep =
+            prepare("puts hello", dir.as_path(), &empty_session()).unwrap();
         let cmds = user_commands(&prep);
         assert_eq!(cmds.len(), 1);
         assert!(cmds[0].tcl.contains("puts hello"));
@@ -1141,10 +1161,13 @@ namespace eval demo {
 
     #[test]
     fn each_statement_gets_its_own_origin() {
-        let dir = tempfile::tempdir().unwrap();
-        let prep =
-            prepare("set x 1\nset y 2\nset z 3", dir.path(), &empty_session())
-                .unwrap();
+        let (_tmp, dir) = canonical_tempdir();
+        let prep = prepare(
+            "set x 1\nset y 2\nset z 3",
+            dir.as_path(),
+            &empty_session(),
+        )
+        .unwrap();
         let cmds = user_commands(&prep);
         assert_eq!(cmds.len(), 3);
         assert_eq!(cmds[0].origin.line, 1);
@@ -1158,8 +1181,8 @@ namespace eval demo {
         // `{`** as line 1 — so a `(procedure "ip::check" line 2)`
         // frame should point at the first content line of the body,
         // not the line after it.
-        let dir = tempfile::tempdir().unwrap();
-        let dep = dir.path().join("dep");
+        let (_tmp, dir) = canonical_tempdir();
+        let dep = dir.as_path().join("dep");
         std::fs::create_dir_all(&dep).unwrap();
         // Lines 1-2: blank + the namespace header; line 3 has `{`
         // (the proc body opener); content lives on lines 4+.
@@ -1169,7 +1192,7 @@ namespace eval demo {
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("vw.toml"),
+            dir.as_path().join("vw.toml"),
             format!(
                 "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n\n\
                  [dependencies.dep]\npath = \"{}\"\n",
@@ -1177,7 +1200,8 @@ namespace eval demo {
             ),
         )
         .unwrap();
-        let prep = prepare("src @dep", dir.path(), &empty_session()).unwrap();
+        let prep =
+            prepare("src @dep", dir.as_path(), &empty_session()).unwrap();
         let loc = prep
             .batch
             .procs
@@ -1201,16 +1225,16 @@ namespace eval demo {
     fn origin_via_chain_walks_back_through_src_imports() {
         // entry → mid → leaf, all via `src`. A command in `leaf`
         // should carry a 2-frame via chain (mid → entry/input).
-        let dir = tempfile::tempdir().unwrap();
-        let mid_dep = dir.path().join("mid_dep");
-        let leaf_dep = dir.path().join("leaf_dep");
+        let (_tmp, dir) = canonical_tempdir();
+        let mid_dep = dir.as_path().join("mid_dep");
+        let leaf_dep = dir.as_path().join("leaf_dep");
         std::fs::create_dir_all(&mid_dep).unwrap();
         std::fs::create_dir_all(&leaf_dep).unwrap();
         std::fs::write(leaf_dep.join("module.htcl"), "set leaf_var 1\n")
             .unwrap();
         std::fs::write(mid_dep.join("module.htcl"), "src @leaf\n").unwrap();
         std::fs::write(
-            dir.path().join("vw.toml"),
+            dir.as_path().join("vw.toml"),
             format!(
                 "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n\n\
                  [dependencies.mid]\npath = \"{}\"\n\
@@ -1221,7 +1245,8 @@ namespace eval demo {
         )
         .unwrap();
 
-        let prep = prepare("src @mid", dir.path(), &empty_session()).unwrap();
+        let prep =
+            prepare("src @mid", dir.as_path(), &empty_session()).unwrap();
         let cmds = user_commands(&prep);
         assert_eq!(cmds.len(), 1);
         let origin = &cmds[0].origin;
@@ -1251,8 +1276,8 @@ namespace eval demo {
 
     #[test]
     fn src_imported_statements_resolve_to_imported_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let dep = dir.path().join("dep");
+        let (_tmp, dir) = canonical_tempdir();
+        let dep = dir.as_path().join("dep");
         std::fs::create_dir_all(&dep).unwrap();
         std::fs::write(
             dep.join("module.htcl"),
@@ -1260,7 +1285,7 @@ namespace eval demo {
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("vw.toml"),
+            dir.as_path().join("vw.toml"),
             format!(
                 "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n\n\
                  [dependencies.dep]\npath = \"{}\"\n",
@@ -1269,7 +1294,8 @@ namespace eval demo {
         )
         .unwrap();
 
-        let prep = prepare("src @dep", dir.path(), &empty_session()).unwrap();
+        let prep =
+            prepare("src @dep", dir.as_path(), &empty_session()).unwrap();
         // Two commands from the imported file: `proc hello` and the
         // bare `hello` call. Both must carry the imported file's
         // path as origin.
@@ -1291,8 +1317,8 @@ namespace eval demo {
         // loader to re-parse the dep's files. We assert by hooking
         // the loader's per-file observer and counting parses on
         // each batch.
-        let dir = tempfile::tempdir().unwrap();
-        let dep = dir.path().join("dep");
+        let (_tmp, dir) = canonical_tempdir();
+        let dep = dir.as_path().join("dep");
         std::fs::create_dir_all(&dep).unwrap();
         std::fs::write(
             dep.join("module.htcl"),
@@ -1302,7 +1328,7 @@ namespace eval demo {
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("vw.toml"),
+            dir.as_path().join("vw.toml"),
             format!(
                 "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n\n\
                  [dependencies.dep]\npath = \"{}\"\n",
@@ -1328,7 +1354,7 @@ namespace eval demo {
         let mut counter = Counter::default();
         let first = prepare_with_observer(
             "src @dep\n",
-            dir.path(),
+            dir.as_path(),
             &session,
             &mut counter,
         )
@@ -1348,7 +1374,7 @@ namespace eval demo {
         let mut counter = Counter::default();
         let _second = prepare_with_observer(
             "lib::f -x 1\n",
-            dir.path(),
+            dir.as_path(),
             &session,
             &mut counter,
         )
@@ -1378,8 +1404,8 @@ namespace eval demo {
         // proc-location lookup must resolve to the REAL .htcl
         // file the wrapper came from — not the disposable scratch
         // path of either batch.
-        let dir = tempfile::tempdir().unwrap();
-        let dep = dir.path().join("vivado_cmd");
+        let (_tmp, dir) = canonical_tempdir();
+        let dep = dir.as_path().join("vivado_cmd");
         std::fs::create_dir_all(&dep).unwrap();
         std::fs::write(
             dep.join("module.htcl"),
@@ -1394,7 +1420,7 @@ namespace eval demo {
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("vw.toml"),
+            dir.as_path().join("vw.toml"),
             format!(
                 "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n\n\
                  [dependencies.vivado-cmd]\npath = \"{}\"\n",
@@ -1405,7 +1431,8 @@ namespace eval demo {
 
         let mut session = Session::new();
         // Batch A: pull the wrapper in.
-        let first = prepare("src @vivado-cmd\n", dir.path(), &session).unwrap();
+        let first =
+            prepare("src @vivado-cmd\n", dir.as_path(), &session).unwrap();
         session.commit(first.batch);
 
         // Batch B: call the wrapper. Look up its location through
@@ -1413,7 +1440,7 @@ namespace eval demo {
         // renderer takes when resolving a Tcl drill-down frame.
         let _second = prepare(
             "vivado::create_bd_design -name metroid\n",
-            dir.path(),
+            dir.as_path(),
             &session,
         )
         .unwrap();
@@ -1447,7 +1474,7 @@ namespace eval demo {
 
     #[test]
     fn typed_proc_call_wraps_with_repr_dispatch() {
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         // A proc annotated dict<string,string>, called bare. The
         // wrap should:
         //   - capture the call's result into __vw_result
@@ -1456,7 +1483,7 @@ namespace eval demo {
         let prep = prepare(
             "proc props {} dict<string,string> { return {} }\n\
              props\n",
-            dir.path(),
+            dir.as_path(),
             &empty_session(),
         )
         .unwrap();
@@ -1517,11 +1544,11 @@ namespace eval demo {
         // so its type is whatever `props` returns. The wrap should
         // bind `$cips` correctly AND dispatch on the inner call's
         // declared type.
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let prep = prepare(
             "proc props {} dict<string,string> { return {} }\n\
              set x [props]\n",
-            dir.path(),
+            dir.as_path(),
             &empty_session(),
         )
         .unwrap();
@@ -1548,11 +1575,11 @@ namespace eval demo {
     fn unannotated_call_is_not_wrapped() {
         // No return type → no wrap, no `__vw_result` capture,
         // and `expected_return_type` is None.
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let prep = prepare(
             "proc plain {} { puts whatever }\n\
              plain\n",
-            dir.path(),
+            dir.as_path(),
             &empty_session(),
         )
         .unwrap();
@@ -1575,11 +1602,11 @@ namespace eval demo {
         // returns the empty string from `unit::repr`. The App's
         // EvalDone handler is what suppresses the Result push;
         // the lowerer is uniform.
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let prep = prepare(
             "proc do_thing {} unit { puts hi }\n\
              do_thing\n",
-            dir.path(),
+            dir.as_path(),
             &empty_session(),
         )
         .unwrap();
@@ -1602,10 +1629,10 @@ namespace eval demo {
 
     #[test]
     fn enum_decl_ships_namespace_eval_prelude() {
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let prep = prepare(
             "enum Direction = {\n  North\n  South\n}\n",
-            dir.path(),
+            dir.as_path(),
             &empty_session(),
         )
         .unwrap();
@@ -1624,12 +1651,12 @@ namespace eval demo {
 
     #[test]
     fn overload_set_ships_dispatcher_and_mangled_specializations() {
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let prep = prepare(
             "enum E = {\n  A: string\n  B: int\n}\n\
              proc f {v: E::A} string { return $v }\n\
              proc f {v: E::B} string { return $v }\n",
-            dir.path(),
+            dir.as_path(),
             &empty_session(),
         )
         .unwrap();
@@ -1694,7 +1721,7 @@ namespace eval demo {
         // couldn't see Properties; the recursion didn't fire;
         // dict_string_string::repr was never emitted; the
         // user's body errored with `invalid command name`.
-        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, dir) = canonical_tempdir();
         let mut session = Session::new();
         let first = prepare(
             "type Properties = {dict<string,string>}\n\
@@ -1702,7 +1729,7 @@ namespace eval demo {
              proc Properties::from {v} { return $v }\n\
              proc Properties::to {v} { return $v }\n\
              proc get_props {} Properties { return {a 1 b 2} }\n",
-            dir.path(),
+            dir.as_path(),
             &session,
         )
         .unwrap();
@@ -1710,7 +1737,7 @@ namespace eval demo {
 
         // Batch 2: just the call. parsed.document doesn't have
         // the type decl — it must come from `session`.
-        let second = prepare("get_props\n", dir.path(), &session).unwrap();
+        let second = prepare("get_props\n", dir.as_path(), &session).unwrap();
         let call = second
             .commands
             .iter()

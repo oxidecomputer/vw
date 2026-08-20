@@ -5859,6 +5859,21 @@ mod locked_resolution_tests {
 mod dependency_source_tests {
     use super::*;
 
+    /// A temp dir plus its **canonicalized** path — see the
+    /// identically-named helper in `vw-analyzer`'s htcl_backend
+    /// tests for the full story. Short version: on macOS `$TMPDIR`
+    /// lives under `/var/folders/…`, a symlink to
+    /// `/private/var/folders/…`. Dependency resolution
+    /// canonicalizes the paths it walks, so a test comparing a
+    /// resolved path against one built from the raw `TempDir`
+    /// path compares two spellings of the same directory and
+    /// fails. Derive test paths from the returned `PathBuf`.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        (dir, path)
+    }
+
     #[test]
     fn manifest_path_dep_wins_over_stale_git_lock_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6016,10 +6031,10 @@ your_instance_name : primary_clock\n\
         // metroid → cips → vivado-cmd.  Asking for metroid's deps
         // transitively should return cips AND vivado-cmd, even though
         // metroid only declares cips.
-        let dir = tempfile::tempdir().unwrap();
-        let metroid = dir.path().join("metroid");
-        let cips = dir.path().join("cips");
-        let vivado_cmd = dir.path().join("vivado-cmd");
+        let (_tmp, dir) = canonical_tempdir();
+        let metroid = dir.as_path().join("metroid");
+        let cips = dir.as_path().join("cips");
+        let vivado_cmd = dir.as_path().join("vivado-cmd");
         std::fs::create_dir_all(&metroid).unwrap();
         std::fs::create_dir_all(&cips).unwrap();
         std::fs::create_dir_all(&vivado_cmd).unwrap();
@@ -6062,12 +6077,12 @@ your_instance_name : primary_clock\n\
         // `shared` is whichever was inserted first; entry itself
         // doesn't declare `shared`, so the test just asserts we got
         // *one* deterministic answer rather than a panic / duplicate.
-        let dir = tempfile::tempdir().unwrap();
-        let entry = dir.path().join("entry");
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        let shared_v1 = dir.path().join("shared-v1");
-        let shared_v2 = dir.path().join("shared-v2");
+        let (_tmp, dir) = canonical_tempdir();
+        let entry = dir.as_path().join("entry");
+        let a = dir.as_path().join("a");
+        let b = dir.as_path().join("b");
+        let shared_v1 = dir.as_path().join("shared-v1");
+        let shared_v2 = dir.as_path().join("shared-v2");
         for d in [&entry, &a, &b, &shared_v1, &shared_v2] {
             std::fs::create_dir_all(d).unwrap();
         }
