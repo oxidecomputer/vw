@@ -36,6 +36,7 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (3, ANODIZE),
     (2, ARTIFACT_FLUSH),
     (1, INITIAL),
 ]);
@@ -297,6 +298,23 @@ pub trait VwSyncApi {
         rqctx: RequestContext<Self::Context>,
         path_params: Path<EnvironmentPathParam>,
         query: Query<latest::DriverBuildQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
+
+    /// Run the anodizer over this workspace, on purpose.
+    ///
+    /// A websocket because the interesting half is a cargo build of a bench
+    /// against what was just generated, and a build's output is worth seeing
+    /// as it happens.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{environment}/anodize",
+        versions = VERSION_ANODIZE..
+    }]
+    async fn anodize(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+        query: Query<latest::AnodizeQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
 

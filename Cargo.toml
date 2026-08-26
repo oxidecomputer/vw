@@ -87,3 +87,8 @@ vhdl_ls = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/emb
 
 [patch."https://github.com/oxidecomputer/vw/"]
 vw-core = { path = "vw-core" }
+
+# Local while the subtype/array work in anodizer is unmerged. Drop this once
+# it lands and bump the dependency instead.
+[patch."https://github.com/oxidecomputer/anodizer"]
+anodizer = { path = "../anodizer/anodizer" }

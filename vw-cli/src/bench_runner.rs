@@ -1,4 +1,4 @@
-//! `vw bench` on this machine, and the display both machines feed.
+//! `vw bench run` on this machine, and the display both machines feed.
 //!
 //! The orchestration — what to run, in what order, how many at once — lives in
 //! `vw-bench`, because an instance running the same benches has to make the
@@ -61,9 +61,10 @@ pub async fn run_benches(
         std::process::exit(1);
     }
 
-    // One `vw bench <name> --build-dir …` per bench. The child is this same
-    // binary: it already knows how to run exactly one bench into an isolated
-    // directory, which is what the internal `--build-dir` mode is for.
+    // One `vw bench run <name> --build-dir …` per bench. The child is this
+    // same binary: it already knows how to run exactly one bench into an
+    // isolated directory, which is what the internal `--build-dir` mode is
+    // for.
     let exe = std::env::current_exe()?;
     let standard = vhdl_std.to_string();
     let launch: vw_bench::Launch =
@@ -71,6 +72,7 @@ pub async fn run_benches(
             let mut command = tokio::process::Command::new(&exe);
             command.args([
                 "bench",
+                "run",
                 name,
                 "--build-dir",
                 build_dir,

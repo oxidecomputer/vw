@@ -4,11 +4,11 @@
 
 //! Running a workspace's testbenches.
 //!
-//! One orchestrator, used from both sides. A developer running `vw bench` on
-//! their own machine and an agent running it on an instance discover the same
-//! benches, prepare the workspace the same way and fan out the same number at
-//! a time — because it is the same code, not because two copies were kept in
-//! step.
+//! One orchestrator, used from both sides. A developer running `vw bench run`
+//! on their own machine and an agent running it on an instance discover the
+//! same benches, prepare the workspace the same way and fan out the same
+//! number at a time — because it is the same code, not because two copies
+//! were kept in step.
 //!
 //! What differs between the two is only how a single bench is launched and
 //! where the progress goes, so those are the two things passed in. Everything
@@ -112,17 +112,22 @@ pub fn discover(
         .filter(|n| n.to_lowercase().ends_with("_tb"))
         .collect();
 
-    // Mixed-signal benches are a directory holding a `mist.toml`, not a VHDL
-    // entity, so the entity walk above cannot see them and the `_tb` suffix
-    // rule does not apply — the name is the directory's. Without this they are
-    // invisible to `--list` and to a bare `vw bench`, even though
-    // `run_testbench` knows how to run one by name.
+    // A bench that drives a design entity directly — mixed-signal, or Rust
+    // cosim with no VHDL harness — is a directory holding a `mist.toml` or a
+    // `cosim.toml`, not a VHDL entity. The entity walk above cannot see one
+    // and the `_tb` suffix rule does not apply: the name is the directory's.
+    // Without this they are invisible to `vw bench list` and to a bare
+    // `vw bench run`, even though `run_testbench` knows how to run one by
+    // name.
     let mixed_signal = vw_lib::sim::find_mist_configs(&bench_dir)
+        .map_err(|e| BenchError::Discover(bench_dir.clone(), e))?;
+    let direct = vw_lib::cosim::find_cosim_configs(&bench_dir)
         .map_err(|e| BenchError::Discover(bench_dir.clone(), e))?;
     names.extend(
         mixed_signal
             .into_iter()
             .map(|(name, _)| name)
+            .chain(direct.into_iter().map(|(name, _)| name))
             .filter(|name| !ignore.contains(name)),
     );
 

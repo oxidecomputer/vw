@@ -1,0 +1,466 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "VW admin API",
+    "description": "Manage every user's vw build environments. Restricted to the operators named in the service's --admin-users argument.",
+    "version": "4.0.0"
+  },
+  "paths": {
+    "/environment/{user}/{name}": {
+      "delete": {
+        "summary": "Delete an environment with the specified name for the specified user.",
+        "operationId": "delete_environment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of this environment to create.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user",
+            "description": "User the environment belongs to",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "successful deletion"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environments": {
+      "get": {
+        "summary": "Return a list of all environments.",
+        "operationId": "get_environments",
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserEnvironmentResultsPage"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/images/recycle": {
+      "post": {
+        "summary": "Delete the service's images that nothing is using and nothing would",
+        "description": "use.\n\nEach image kind keeps its newest — what an environment created now would boot — and every image any environment is booting, however old. Only the service's own images in its project are ever candidates, so the base images the rack publishes are not at risk.",
+        "operationId": "recycle_images",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "dry_run",
+            "description": "Work out what would be deleted and report it, without deleting anything.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageRecycleReport"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Environment": {
+        "description": "An environment is a collection of instances that work together to build, analyze and test vw designs.",
+        "type": "object",
+        "properties": {
+          "artifact_instance": {
+            "nullable": true,
+            "description": "The Oxide instance id for the artifact instance.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OxideInstance"
+              }
+            ]
+          },
+          "helios_instance": {
+            "nullable": true,
+            "description": "The Oxide instance id for the helios instance.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OxideInstance"
+              }
+            ]
+          },
+          "images": {
+            "nullable": true,
+            "description": "The images this environment's instances boot from, chosen when the environment was created.\n\nAbsent when the service has no Oxide backend configured, in which case the environment is a bare record that will never be provisioned.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EnvironmentImages"
+              }
+            ]
+          },
+          "name": {
+            "description": "The name of this environment.",
+            "type": "string"
+          },
+          "vivado_instance": {
+            "nullable": true,
+            "description": "The Oxide instance id for the vivado instance.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OxideInstance"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "EnvironmentImages": {
+        "description": "The images each of an environment's instances boots from.",
+        "type": "object",
+        "properties": {
+          "artifact": {
+            "description": "Image the artifact instance boots from.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ImageRef"
+              }
+            ]
+          },
+          "helios": {
+            "description": "Image the helios instance boots from.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ImageRef"
+              }
+            ]
+          },
+          "vivado": {
+            "description": "Image the vivado instance boots from.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ImageRef"
+              }
+            ]
+          }
+        },
+        "required": [
+          "artifact",
+          "helios",
+          "vivado"
+        ]
+      },
+      "Error": {
+        "description": "Error information from a response.",
+        "type": "object",
+        "properties": {
+          "error_code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "request_id"
+        ]
+      },
+      "ImageRecycleReport": {
+        "description": "What a recycle pass did, and what it left alone.\n\nBoth halves are reported because the interesting question after running this is usually not \"what went\" but \"why is that one still here\".",
+        "type": "object",
+        "properties": {
+          "deleted": {
+            "description": "Images deleted, or that would have been on a real pass.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecycledImage"
+            }
+          },
+          "dry_run": {
+            "description": "Whether this was a dry run, echoed back so a report cannot be mistaken for the other kind.",
+            "type": "boolean"
+          },
+          "kept": {
+            "description": "Images considered and spared, each with what spared it.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeptImage"
+            }
+          }
+        },
+        "required": [
+          "deleted",
+          "dry_run",
+          "kept"
+        ]
+      },
+      "ImageRef": {
+        "description": "An Oxide image an environment's instances are built from.\n\nPinned by id, so publishing a newer image does not silently change what an existing environment boots. The name is carried along for display.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "InstanceState": {
+        "description": "Running state of an Instance (primarily: booted or stopped)\n\nThis typically reflects whether it's starting, running, stopping, or stopped, but also includes states related to the Instance's lifecycle\n\n<details><summary>JSON schema</summary>\n\n```json { \"description\": \"Running state of an Instance (primarily: booted or stopped)\\n\\nThis typically reflects whether it's starting, running, stopping, or stopped, but also includes states related to the Instance's lifecycle\", \"oneOf\": [ { \"description\": \"The instance is being created.\", \"type\": \"string\", \"enum\": [ \"creating\" ] }, { \"description\": \"The instance is currently starting up.\", \"type\": \"string\", \"enum\": [ \"starting\" ] }, { \"description\": \"The instance is currently running.\", \"type\": \"string\", \"enum\": [ \"running\" ] }, { \"description\": \"The instance has been requested to stop and a transition to \\\"Stopped\\\" is imminent.\", \"type\": \"string\", \"enum\": [ \"stopping\" ] }, { \"description\": \"The instance is currently stopped.\", \"type\": \"string\", \"enum\": [ \"stopped\" ] }, { \"description\": \"The instance is in the process of rebooting - it will remain in the \\\"rebooting\\\" state until the VM is starting once more.\", \"type\": \"string\", \"enum\": [ \"rebooting\" ] }, { \"description\": \"The instance is in the process of migrating - it will remain in the \\\"migrating\\\" state until the migration process is complete and the destination propolis is ready to continue execution.\", \"type\": \"string\", \"enum\": [ \"migrating\" ] }, { \"description\": \"The instance is attempting to recover from a failure.\", \"type\": \"string\", \"enum\": [ \"repairing\" ] }, { \"description\": \"The instance has encountered a failure.\", \"type\": \"string\", \"enum\": [ \"failed\" ] }, { \"description\": \"The instance has been deleted.\", \"type\": \"string\", \"enum\": [ \"destroyed\" ] } ] } ``` </details>",
+        "oneOf": [
+          {
+            "description": "The instance is being created.",
+            "type": "string",
+            "enum": [
+              "creating"
+            ]
+          },
+          {
+            "description": "The instance is currently starting up.",
+            "type": "string",
+            "enum": [
+              "starting"
+            ]
+          },
+          {
+            "description": "The instance is currently running.",
+            "type": "string",
+            "enum": [
+              "running"
+            ]
+          },
+          {
+            "description": "The instance has been requested to stop and a transition to \"Stopped\" is imminent.",
+            "type": "string",
+            "enum": [
+              "stopping"
+            ]
+          },
+          {
+            "description": "The instance is currently stopped.",
+            "type": "string",
+            "enum": [
+              "stopped"
+            ]
+          },
+          {
+            "description": "The instance is in the process of rebooting - it will remain in the \"rebooting\" state until the VM is starting once more.",
+            "type": "string",
+            "enum": [
+              "rebooting"
+            ]
+          },
+          {
+            "description": "The instance is in the process of migrating - it will remain in the \"migrating\" state until the migration process is complete and the destination propolis is ready to continue execution.",
+            "type": "string",
+            "enum": [
+              "migrating"
+            ]
+          },
+          {
+            "description": "The instance is attempting to recover from a failure.",
+            "type": "string",
+            "enum": [
+              "repairing"
+            ]
+          },
+          {
+            "description": "The instance has encountered a failure.",
+            "type": "string",
+            "enum": [
+              "failed"
+            ]
+          },
+          {
+            "description": "The instance has been deleted.",
+            "type": "string",
+            "enum": [
+              "destroyed"
+            ]
+          }
+        ]
+      },
+      "KeptImage": {
+        "description": "An image a recycle pass considered and left alone.\n\nAt least one of `latest` and `used_by` says why. Both can be true at once — the newest image of a kind is usually also the one environments are booting — and neither is reported in preference to the other, because an administrator asking why an image survived is owed the whole answer.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "latest": {
+            "description": "The newest image of its kind: what an environment created now would boot if it did not name an image.",
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "used_by": {
+            "description": "Environments booting this image, as `user/name`.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "latest",
+          "name",
+          "used_by"
+        ]
+      },
+      "OxideInstance": {
+        "description": "Information about an Oxide instance that underpins a VW instance.",
+        "type": "object",
+        "properties": {
+          "external_ip": {
+            "nullable": true,
+            "description": "The address to reach this instance on from outside the rack, once it has one.\n\nAbsent until the instance exists and the control plane has attached an external address to it. This is what a developer's ssh goes to.",
+            "type": "string",
+            "format": "ip"
+          },
+          "id": {
+            "nullable": true,
+            "description": "The Oxide instance id, once the control plane has assigned one.\n\nAbsent in the window between asking for an instance and hearing back about it, which is long enough to be worth showing: an environment mid-creation reports `creating` with no id rather than looking like nothing has happened.",
+            "type": "string",
+            "format": "uuid"
+          },
+          "internal_ip": {
+            "nullable": true,
+            "description": "The instance's address on the rack's own network.\n\nWhat `vw-svc` sends source to, rather than the external address: the internal path is a regional fabric rather than the public internet, and the difference is most of the bandwidth.",
+            "type": "string",
+            "format": "ip"
+          },
+          "state": {
+            "$ref": "#/components/schemas/InstanceState"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "RecycledImage": {
+        "description": "An image a recycle pass removed.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "UserEnvironment": {
+        "description": "An environment together with the owner's username.",
+        "type": "object",
+        "properties": {
+          "environment": {
+            "description": "Environment info",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Environment"
+              }
+            ]
+          },
+          "user": {
+            "description": "User the environment belongs to",
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment",
+          "user"
+        ]
+      },
+      "UserEnvironmentResultsPage": {
+        "description": "A single page of results",
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "list of items on this page of results",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserEnvironment"
+            }
+          },
+          "next_page": {
+            "nullable": true,
+            "description": "token used to fetch the next page of results (if any)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "items"
+        ]
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

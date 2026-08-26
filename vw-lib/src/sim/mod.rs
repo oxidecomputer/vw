@@ -16,12 +16,8 @@ use std::{fs, io};
 
 use camino::Utf8Path;
 
-use crate::nvc_helpers::{run_nvc_analysis, run_nvc_cosim, run_nvc_elab};
-use crate::{
-    analyze_ext_libraries, find_referenced_files, render_vhdl_ls_config,
-    sort_files_by_dependencies, FileCache, MistConfig, RecordProcessor,
-    VhdlStandard, VwError,
-};
+use crate::nvc_helpers::run_nvc_cosim;
+use crate::{MistConfig, VhdlStandard, VwError};
 
 /// Information about an available mixed-signal test.
 pub struct MistTestInfo {
@@ -106,58 +102,18 @@ pub async fn run_analog_test(
     vhdl_std: VhdlStandard,
     build_dir: &str,
 ) -> crate::Result<()> {
-    let vhdl_ls_config = render_vhdl_ls_config(workspace_dir, None, false)?;
-    let mut processor = RecordProcessor::new(vhdl_std);
-    let mut cache = FileCache::new();
-
-    fs::create_dir_all(build_dir)?;
-
-    // Analyze external libraries
-    analyze_ext_libraries(
-        &vhdl_ls_config,
-        &mut processor,
+    // The entity is the top level here too — a mixed-signal bench is a
+    // direct-drive cosim bench with a Xyce circuit attached — so the two
+    // share how the design is compiled and elaborated.
+    let entity_name = &mist_config.entity;
+    crate::cosim::elaborate_entity_as_top(
+        workspace_dir,
+        entity_name,
         vhdl_std,
         build_dir,
-        &mut cache,
+        &std::collections::BTreeMap::new(),
     )
     .await?;
-
-    // Get all defaultlib files
-    let defaultlib_files = vhdl_ls_config
-        .libraries
-        .get("defaultlib")
-        .map(|lib| lib.files.clone())
-        .unwrap_or_default();
-
-    // Find the entity source file in defaultlib
-    let entity_name = &mist_config.entity;
-    let entity_file = find_entity_file(
-        workspace_dir.as_std_path(),
-        &defaultlib_files,
-        entity_name,
-        &mut cache,
-    )?;
-
-    // Find referenced files
-    let mut referenced_files =
-        find_referenced_files(&entity_file, &defaultlib_files, &mut cache)?;
-
-    // Topological sort
-    sort_files_by_dependencies(
-        &mut processor,
-        &mut referenced_files,
-        &mut cache,
-    )?;
-
-    let mut files: Vec<String> = referenced_files
-        .iter()
-        .map(|s| s.to_string_lossy().to_string())
-        .collect();
-    files.push(entity_file.to_string_lossy().to_string());
-
-    // Compile VHDL
-    run_nvc_analysis(vhdl_std, build_dir, "work", &files, false).await?;
-    run_nvc_elab(vhdl_std, build_dir, "work", entity_name, false).await?;
 
     // Build the bridge crate
     let bridge_lib =
@@ -209,38 +165,6 @@ pub async fn run_analog_test(
     }
 
     Ok(())
-}
-
-/// Find a VHDL entity source file by searching through defaultlib files.
-fn find_entity_file(
-    workspace_dir: &Path,
-    defaultlib_files: &[PathBuf],
-    entity_name: &str,
-    cache: &mut FileCache,
-) -> crate::Result<PathBuf> {
-    for file_path in defaultlib_files {
-        let absolute_path = if file_path.is_relative() {
-            workspace_dir.join(file_path)
-        } else {
-            file_path.clone()
-        };
-        if !absolute_path.exists() {
-            continue;
-        }
-        let entities = cache.get_entities(&absolute_path)?.clone();
-        for entity in &entities {
-            if entity.eq_ignore_ascii_case(entity_name) {
-                return Ok(absolute_path);
-            }
-        }
-    }
-
-    Err(VwError::Simulation {
-        message: format!(
-            "Entity '{}' not found in defaultlib files",
-            entity_name,
-        ),
-    })
 }
 
 /// Build the bridge Rust crate in a bench directory.

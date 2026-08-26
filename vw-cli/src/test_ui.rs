@@ -1,5 +1,5 @@
 //! Shared cargo-nextest-style runner UI, used by both `vw test` (HTCL) and
-//! `vw bench` (VHDL/cosim testbenches) so the two look identical.
+//! `vw bench run` (VHDL/cosim testbenches) so the two look identical.
 //!
 //! [`NextestPanel`] drives an [`indicatif::MultiProgress`] live display: a
 //! `Running` progress bar with running/passed/failed counts, one live row

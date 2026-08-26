@@ -396,7 +396,7 @@ async fn start(
 ///
 /// Shared with the bench path. Dependencies are a property of the workspace,
 /// not of the vivado session that happened to be the first thing to need
-/// them — an instance where only `vw bench` has ever run needs them just as
+/// them — an instance where only `vw bench run` has ever run needs them just as
 /// much, and used not to get them.
 pub(crate) async fn fetch_dependencies(
     root: &Utf8Path,

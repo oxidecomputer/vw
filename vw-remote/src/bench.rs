@@ -132,7 +132,7 @@ async fn run(
 
     // Anodizer analyses the design with nvc, and the design uses packages that
     // live in dependency repositories — so they have to be here first. An
-    // instance where only `vw bench` has ever run has never fetched them.
+    // instance where only `vw bench run` has ever run has never fetched them.
     let note = |message: String| {
         let _ = events.send(BenchEvent::Progress {
             event: vw_bench::Event::Note { message },

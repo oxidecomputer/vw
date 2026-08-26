@@ -8,6 +8,7 @@ use colored::*;
 use std::fmt;
 use std::process;
 
+use vw_lib::bench_init::remove::BenchKind;
 use vw_lib::{
     add_dependency_with_token, clear_cache, get_access_credentials_for_repo,
     get_access_credentials_for_workspace, init_workspace, list_dependencies,
@@ -16,6 +17,7 @@ use vw_lib::{
 };
 
 mod analyze;
+mod anodize;
 mod bench_runner;
 mod cloud;
 mod cloud_sync;
@@ -135,6 +137,266 @@ enum DriverCommand {
     },
 }
 
+// What can be done with the workspace's testbenches.
+//
+// `run` and `list` are what `vw bench` and `vw bench --list` used to be.
+// `init` is here rather than beside them because creating a testbench and
+// running one are the same activity from the developer's side, and having to
+// remember a different top-level command to start one would be one more thing
+// between an idea and a bench.
+#[derive(Subcommand)]
+enum BenchCommand {
+    #[command(
+        about = "Run VHDL and cosim testbenches with NVC, all in parallel"
+    )]
+    Run {
+        #[arg(
+            help = "Filter to testbenches whose name contains this substring; omit to run all"
+        )]
+        testbench: Option<String>,
+        #[arg(
+            long,
+            help = "Run the testbenches on this machine instead of in a cloud \
+                    environment"
+        )]
+        local: bool,
+        #[arg(
+            long,
+            env = "VW_ENV",
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to run in. Defaults to $VW_ENV, and is only \
+                    needed when that is unset and you have more than one."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+        #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
+        std: CliVhdlStandard,
+        #[arg(
+            long,
+            help = "Maximum number of testbenches to run concurrently (default: CPU count)"
+        )]
+        concurrency: Option<usize>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Ignore directories matching these names (comma-separated or use multiple times)"
+        )]
+        ignore: Vec<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Runtime flags to pass to NVC (comma-separated or use multiple times)"
+        )]
+        runtime_flags: Vec<String>,
+        #[arg(long, help = "Build Rust library for testbench before running")]
+        build_rust: bool,
+        #[arg(
+            long,
+            help = "Generate/regenerate mixed-signal scaffolding from mist.toml",
+            requires = "testbench"
+        )]
+        scaffold: bool,
+        /// Internal: run exactly one testbench into this isolated nvc build
+        /// dir. Used by the parallel runner to fan out per-bench; when set,
+        /// `testbench` is an exact name (not a filter) and anodization is
+        /// assumed already done.
+        #[arg(long, hide = true, requires = "testbench")]
+        build_dir: Option<String>,
+    },
+    #[command(about = "List the workspace's testbenches")]
+    List {
+        #[arg(
+            help = "Filter to testbenches whose name contains this substring; omit to list all"
+        )]
+        testbench: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Ignore directories matching these names (comma-separated or use multiple times)"
+        )]
+        ignore: Vec<String>,
+    },
+    #[command(
+        about = "Create a pure VHDL testbench",
+        long_about = "Create a pure VHDL testbench: one file under bench/ \
+                      holding a portless `<name>_tb` entity and an \
+                      architecture that drives it.\n\n\
+                      With --dut the design's interface is read out of the \
+                      workspace and wired up — a signal per port, the generic \
+                      map, the port map — so what is left to write is the \
+                      checks."
+    )]
+    Init {
+        #[arg(help = "Name for the testbench; a trailing _tb is optional")]
+        name: String,
+        #[arg(
+            long,
+            value_name = "ENTITY",
+            help = "Design entity to instantiate and wire up"
+        )]
+        dut: Option<String>,
+        #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
+        std: CliVhdlStandard,
+    },
+    #[command(about = "Delete a pure VHDL testbench")]
+    Remove {
+        #[arg(help = "Name of the testbench; a trailing _tb is optional")]
+        name: String,
+        #[arg(
+            short,
+            long,
+            help = "Delete without asking. Required when there is no terminal \
+                    to ask at."
+        )]
+        force: bool,
+    },
+}
+
+// What can be done with Rust cosim testbenches.
+#[derive(Subcommand)]
+enum CosimCommand {
+    #[command(
+        about = "Create a Rust cosim testbench",
+        long_about = "Create a Rust cosim testbench: a cdylib crate that \
+                      drives a design entity over VHPI, a cosim.toml naming \
+                      that entity, and a registration in the bench cargo \
+                      workspace.\n\n\
+                      The entity is the top level — nvc elaborates it as it \
+                      stands and there is no VHDL harness — so the driver \
+                      supplies everything the design sees, its clock \
+                      included.\n\n\
+                      With --dut the driver comes out with a handle for every \
+                      port, a clock, a reset and the inputs quiesced."
+    )]
+    Init {
+        #[arg(help = "Name for the testbench directory under bench/")]
+        name: String,
+        #[arg(
+            long,
+            value_name = "ENTITY",
+            help = "Design entity to drive; its ports become the driver's \
+                    signal handles"
+        )]
+        dut: Option<String>,
+        #[arg(
+            long,
+            value_name = "HZ",
+            help = "Clock frequency in Hz, e.g. 250e6 (default: 100e6)"
+        )]
+        clock: Option<f64>,
+        #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
+        std: CliVhdlStandard,
+    },
+    #[command(about = "Delete a Rust cosim testbench")]
+    Remove {
+        #[arg(help = "Name of the testbench directory under bench/")]
+        name: String,
+        #[arg(
+            short,
+            long,
+            help = "Delete without asking. Required when there is no terminal \
+                    to ask at."
+        )]
+        force: bool,
+    },
+    #[command(
+        about = "Regenerate the anodizer's Rust structs and build a bench \
+                 against them",
+        long_about = "Run the anodizer over the design's \
+                      `serialize_rust`-tagged VHDL records and compile a \
+                      bench against what it produced.\n\n\
+                      `vw bench run` already does this on its own, cached \
+                      against the design sources and silent when there is \
+                      nothing to do — which is right for a build and no use \
+                      for working on the anodizer. This runs the same \
+                      generator with the cache off and reports what it \
+                      found.\n\n\
+                      Building the bench is the half that matters: the \
+                      anodizer failing is easy to see, and the anodizer \
+                      emitting Rust that does not compile is not."
+    )]
+    Anodize {
+        #[arg(
+            help = "Bench to compile against the generated structs. Omit to \
+                    run the generator and stop there."
+        )]
+        bench: Option<String>,
+        #[arg(
+            long,
+            help = "Anodize on this machine instead of in a cloud environment"
+        )]
+        local: bool,
+        #[arg(
+            long,
+            env = "VW_ENV",
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to anodize in. Defaults to $VW_ENV, and \
+                    is only needed when that is unset and you have more than \
+                    one."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+        #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
+        std: CliVhdlStandard,
+    },
+}
+
+// What can be done with mixed-signal testbenches.
+#[derive(Subcommand)]
+enum MistCommand {
+    #[command(
+        about = "Create a mixed-signal (VHDL + Xyce) testbench",
+        long_about = "Create a mixed-signal testbench: a mist.toml, a Xyce \
+                      circuit with a DAC per mapped port, and the generated \
+                      NVC-to-Xyce bridge crate.\n\n\
+                      A mixed-signal bench has no wrapper entity — the design \
+                      entity named by --entity is the top level, and the \
+                      bridge reads its outputs each cycle to drive the \
+                      circuit."
+    )]
+    Init {
+        #[arg(help = "Name for the testbench directory under bench/")]
+        name: String,
+        #[arg(
+            long,
+            value_name = "ENTITY",
+            help = "Design entity to co-simulate; its outputs become the \
+                    circuit's DAC inputs"
+        )]
+        entity: Option<String>,
+        #[arg(
+            long,
+            value_name = "HZ",
+            help = "Clock frequency in Hz, e.g. 26.5625e9 (default: 100e6)"
+        )]
+        clock: Option<f64>,
+        #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
+        std: CliVhdlStandard,
+    },
+    #[command(about = "Delete a mixed-signal testbench")]
+    Remove {
+        #[arg(help = "Name of the testbench directory under bench/")]
+        name: String,
+        #[arg(
+            short,
+            long,
+            help = "Delete without asking. Required when there is no terminal \
+                    to ask at."
+        )]
+        force: bool,
+    },
+}
+
 /// Which build's inputs [`Commands::Sources`] should list.
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 enum SourceSet {
@@ -220,72 +482,20 @@ enum Commands {
     },
     #[command(about = "List workspace dependencies")]
     List,
-    #[command(
-        about = "Run VHDL and cosim testbenches with NVC, all in parallel"
-    )]
+    #[command(about = "Run, list and create testbenches")]
     Bench {
-        #[arg(
-            help = "Filter to testbenches whose name contains this substring; omit to run all"
-        )]
-        testbench: Option<String>,
-        #[arg(
-            long,
-            help = "Run the testbenches on this machine instead of in a cloud \
-                    environment"
-        )]
-        local: bool,
-        #[arg(
-            long,
-            env = "VW_ENV",
-            value_name = "NAME",
-            conflicts_with = "local",
-            help = "Cloud environment to run in. Defaults to $VW_ENV, and is only \
-                    needed when that is unset and you have more than one."
-        )]
-        env: Option<String>,
-        #[arg(
-            long,
-            help = "Accept the service's TLS certificate without verifying it"
-        )]
-        insecure: bool,
-        #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
-        std: CliVhdlStandard,
-        #[arg(
-            long,
-            help = "List matching testbenches instead of running them"
-        )]
-        list: bool,
-        #[arg(
-            long,
-            help = "Maximum number of testbenches to run concurrently (default: CPU count)"
-        )]
-        concurrency: Option<usize>,
-        #[arg(
-            long,
-            value_delimiter = ',',
-            help = "Ignore directories matching these names (comma-separated or use multiple times)"
-        )]
-        ignore: Vec<String>,
-        #[arg(
-            long,
-            value_delimiter = ',',
-            help = "Runtime flags to pass to NVC (comma-separated or use multiple times)"
-        )]
-        runtime_flags: Vec<String>,
-        #[arg(long, help = "Build Rust library for testbench before running")]
-        build_rust: bool,
-        #[arg(
-            long,
-            help = "Generate/regenerate mixed-signal scaffolding from mist.toml",
-            requires = "testbench"
-        )]
-        scaffold: bool,
-        /// Internal: run exactly one testbench into this isolated nvc build
-        /// dir. Used by the parallel runner to fan out per-bench; when set,
-        /// `testbench` is an exact name (not a filter) and anodization is
-        /// assumed already done.
-        #[arg(long, hide = true, requires = "testbench")]
-        build_dir: Option<String>,
+        #[command(subcommand)]
+        command: BenchCommand,
+    },
+    #[command(about = "Rust cosim testbenches")]
+    Cosim {
+        #[command(subcommand)]
+        command: CosimCommand,
+    },
+    #[command(about = "Mixed-signal (VHDL + Xyce) testbenches")]
+    Mist {
+        #[command(subcommand)]
+        command: MistCommand,
     },
     #[command(about = "Run an htcl script against a Vivado worker. \
                      With no file, discovers `<workspace>/design.htcl`.")]
@@ -979,24 +1189,25 @@ async fn main() {
             }
         },
         Commands::Bench {
-            testbench,
-            local,
-            env,
-            insecure,
-            std,
-            list,
-            concurrency,
-            ignore,
-            runtime_flags,
-            build_rust,
-            scaffold,
-            build_dir,
+            command:
+                BenchCommand::Run {
+                    testbench,
+                    local,
+                    env,
+                    insecure,
+                    std,
+                    concurrency,
+                    ignore,
+                    runtime_flags,
+                    build_rust,
+                    scaffold,
+                    build_dir,
+                },
         } => {
-            // Self-heal a fresh checkout like `vw check`. Skip the
-            // internal `--build-dir` subprocess (the parent runner
-            // already fetched — re-fetching per bench would race) and
-            // `--list` (pure metadata, no deps needed).
-            if build_dir.is_none() && !list {
+            // Self-heal a fresh checkout like `vw check`. Skipped for the
+            // internal `--build-dir` subprocess: the parent runner already
+            // fetched, and re-fetching per bench would race.
+            if build_dir.is_none() {
                 ensure_workspace_deps(&cwd).await;
             }
             if let Some(bd) = build_dir {
@@ -1052,13 +1263,7 @@ async fn main() {
             } else {
                 // Parallel nextest-style runner: no positional runs every
                 // testbench; a positional filters by name substring.
-                //
-                // `--list` is answered from this machine's own tree even when
-                // the workspace builds in the cloud. It is a question about
-                // source, the source here is what the developer is editing,
-                // and a network round trip to be told the same answer would
-                // only be slower.
-                let cloud = if local || list {
+                let cloud = if local {
                     None
                 } else {
                     match bench_site(env.as_deref(), insecure).await {
@@ -1091,7 +1296,7 @@ async fn main() {
                         bench_runner::run_benches(
                             &cwd,
                             testbench.as_deref(),
-                            list,
+                            false,
                             conc,
                             std.into(),
                             &ignore,
@@ -1102,6 +1307,136 @@ async fn main() {
 
                 if let Err(e) = outcome {
                     report(&*e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Bench {
+            command: BenchCommand::List { testbench, ignore },
+        } => {
+            // Answered from this machine's own tree even when the workspace
+            // builds in the cloud. It is a question about source, the source
+            // here is what the developer is editing, and a network round trip
+            // to be told the same answer would only be slower. Nothing is
+            // fetched for it either — it is pure metadata.
+            if let Err(e) = bench_runner::run_benches(
+                &cwd,
+                testbench.as_deref(),
+                true,
+                1,
+                CliVhdlStandard::Vhdl2019.into(),
+                &ignore,
+            )
+            .await
+            {
+                report(&*e);
+                process::exit(1);
+            }
+        }
+        Commands::Bench {
+            command: BenchCommand::Init { name, dut, std },
+        } => {
+            let ws = workspace_or_exit(&cwd);
+            match vw_lib::bench_init::vhdl::init(
+                &ws,
+                &name,
+                dut.as_deref(),
+                std.into(),
+            ) {
+                Ok(created) => report_created(&ws, &created),
+                Err(e) => {
+                    report(&e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Cosim {
+            command:
+                CosimCommand::Init {
+                    name,
+                    dut,
+                    clock,
+                    std,
+                },
+        } => {
+            let ws = workspace_or_exit(&cwd);
+            match vw_lib::bench_init::cosim::init(
+                &ws,
+                &name,
+                dut.as_deref(),
+                clock,
+                std.into(),
+            ) {
+                Ok(created) => report_created(&ws, &created),
+                Err(e) => {
+                    report(&e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Bench {
+            command: BenchCommand::Remove { name, force },
+        } => remove_bench(&cwd, BenchKind::Vhdl, &name, force),
+        Commands::Cosim {
+            command: CosimCommand::Remove { name, force },
+        } => remove_bench(&cwd, BenchKind::Cosim, &name, force),
+        Commands::Cosim {
+            command:
+                CosimCommand::Anodize {
+                    bench,
+                    local,
+                    env,
+                    insecure,
+                    std,
+                },
+        } => {
+            // Self-heal a fresh checkout the way every build path does: the
+            // anodizer reads the design's `src @dep` imports like any other
+            // consumer of the source set.
+            ensure_workspace_deps(&cwd).await;
+            match anodize(
+                &cwd,
+                bench.as_deref(),
+                local,
+                env.as_deref(),
+                insecure,
+                std.into(),
+            )
+            .await
+            {
+                Ok(true) => {}
+                // A failed anodization is the answer, not a vw failure; what
+                // went wrong has already been printed.
+                Ok(false) => process::exit(1),
+                Err(e) => {
+                    report(&*e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Mist {
+            command: MistCommand::Remove { name, force },
+        } => remove_bench(&cwd, BenchKind::Mist, &name, force),
+        Commands::Mist {
+            command:
+                MistCommand::Init {
+                    name,
+                    entity,
+                    clock,
+                    std,
+                },
+        } => {
+            let ws = workspace_or_exit(&cwd);
+            match vw_lib::bench_init::mist::init(
+                &ws,
+                &name,
+                entity.as_deref(),
+                clock,
+                std.into(),
+            ) {
+                Ok(created) => report_created(&ws, &created),
+                Err(e) => {
+                    report(&e);
                     process::exit(1);
                 }
             }
@@ -3258,6 +3593,154 @@ fn overload_specialization_mangle(
 
 /// Thin loader wrapper: resolve the entry's `src` imports into one
 /// flattened program, then hand it to [`run_loaded_program`].
+/// Run the anodizer, wherever this workspace builds.
+///
+/// Cloud first, like everything else that needs a toolchain: anodization is
+/// an nvc pass over the design, and the design is on the instance.
+async fn anodize(
+    cwd: &Utf8Path,
+    bench: Option<&str>,
+    local: bool,
+    named: Option<&str>,
+    insecure: bool,
+    std: vw_lib::VhdlStandard,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let workspace = workspace_or_exit(cwd);
+
+    if local {
+        return Ok(anodize::run_locally(&workspace, bench, std).await?);
+    }
+
+    let session = cloud::Session::from_env(insecure)?;
+    let environment = cloud::pick_environment(&session, named).await?;
+
+    // The instance anodizes what it was last given, so it has to have been
+    // given it — the same contract every other cloud build works under.
+    cloud::sync_for_build(
+        &session,
+        &environment,
+        Some(vw_api_types_versions::latest::TargetKind::Vivado),
+    )
+    .await?;
+
+    Ok(anodize::run(&session, &environment, bench, std).await?)
+}
+
+/// The workspace `cwd` is in, or a message saying it is not in one.
+///
+/// The `init` commands write into `bench/`, which is a fixed place relative
+/// to the workspace root and nowhere relative to where the developer happens
+/// to be standing.
+fn workspace_or_exit(cwd: &Utf8Path) -> Utf8PathBuf {
+    match vw_lib::find_workspace_dir(cwd.as_std_path()) {
+        Some(ws) => ws,
+        None => {
+            eprintln!(
+                "{} not in a vw workspace (no vw.toml in the parent chain)",
+                "error:".bright_red(),
+            );
+            process::exit(1);
+        }
+    }
+}
+
+/// Say what an `init` wrote and what is left to do.
+///
+/// The file list is the point: a cosim bench is five files in three places
+/// plus an edit to the bench workspace manifest, and a developer who cannot
+/// see what appeared has to go looking for it before they can start.
+fn report_created(workspace: &Utf8Path, created: &vw_lib::bench_init::Created) {
+    println!(
+        "{} created testbench {}",
+        "✓".bright_green(),
+        created.name.cyan(),
+    );
+    for file in &created.files {
+        // Relative to the workspace: an absolute path here is mostly the
+        // developer's home directory repeated once per line.
+        let shown = file.strip_prefix(workspace).unwrap_or(file);
+        println!("  {}", shown.as_str().dimmed());
+    }
+    if created.registered {
+        println!("  {}", "bench/Cargo.toml (workspace member added)".dimmed());
+    }
+    if !created.next_steps.is_empty() {
+        println!("\n{}", "next:".bold());
+        for step in &created.next_steps {
+            println!("  - {step}");
+        }
+    }
+}
+
+/// Delete a testbench, having said what that means and asked.
+///
+/// The plan is built and shown before anything is touched. A bench holds
+/// hand-written test code, and `--force` exists so a script can say it means
+/// it — not so the question can be skipped by default.
+fn remove_bench(cwd: &Utf8Path, kind: BenchKind, name: &str, force: bool) {
+    let ws = workspace_or_exit(cwd);
+    let removal = match vw_lib::bench_init::remove::plan(&ws, kind, name) {
+        Ok(removal) => removal,
+        Err(e) => {
+            report(&e);
+            process::exit(1);
+        }
+    };
+
+    println!("{} would delete:", "remove".bold());
+    for path in &removal.paths {
+        let shown = path.strip_prefix(&ws).unwrap_or(path);
+        let suffix = if path.is_dir() { "/" } else { "" };
+        println!("  {}{}", shown.as_str().dimmed(), suffix.dimmed());
+    }
+    println!(
+        "  {} file{}",
+        removal.file_count,
+        if removal.file_count == 1 { "" } else { "s" },
+    );
+    if removal.member.is_some() {
+        println!("  {}", "and its member entry in bench/Cargo.toml".dimmed());
+    }
+
+    if !force && !confirm("Delete it?") {
+        println!("nothing removed");
+        return;
+    }
+
+    if let Err(e) = vw_lib::bench_init::remove::apply(&ws, &removal) {
+        report(&e);
+        process::exit(1);
+    }
+    println!("{} removed {}", "✓".bright_green(), removal.name.cyan());
+}
+
+/// Ask a yes/no question, defaulting to no.
+///
+/// With no terminal to ask at there is no answer to wait for, so the question
+/// is refused rather than assumed: a script that means to delete something
+/// says so with `--force`.
+fn confirm(question: &str) -> bool {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "{} not a terminal — pass {} to delete without asking",
+            "error:".bright_red(),
+            "--force".bold(),
+        );
+        process::exit(1);
+    }
+
+    print!("\n{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+}
+
 /// Work out whether the testbenches belong on a cloud environment, and get
 /// the environment ready for them.
 ///
@@ -4282,9 +4765,14 @@ mod env_flag_tests {
         match cli.command {
             Commands::Run { env, .. }
             | Commands::Check { env, .. }
-            | Commands::Bench { env, .. }
             | Commands::Clean { env, .. }
             | Commands::Repl { env, .. } => env,
+            Commands::Bench {
+                command: BenchCommand::Run { env, .. },
+            } => env,
+            Commands::Cosim {
+                command: CosimCommand::Anodize { env, .. },
+            } => env,
             Commands::Driver { command } => match command {
                 DriverCommand::Build { env, .. } => env,
             },
@@ -4305,7 +4793,8 @@ mod env_flag_tests {
         for argv in [
             vec!["vw", "run"],
             vec!["vw", "check"],
-            vec!["vw", "bench"],
+            vec!["vw", "bench", "run"],
+            vec!["vw", "cosim", "anodize"],
             vec!["vw", "clean"],
             vec!["vw", "repl"],
             vec!["vw", "driver", "build"],
