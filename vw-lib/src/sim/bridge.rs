@@ -135,6 +135,30 @@ fn main() {{
     let xyce_prefix = "{xyce_prefix}";
     let trilinos_prefix = "{trilinos_prefix}";
 
+    // Xyce is a heavyweight install, and a machine that has no use for it is
+    // the normal case — the digital benches in this workspace do not need it
+    // and neither does an editor. Without it, do nothing.
+    //
+    // The alternative is what used to happen: this build script fails, cargo
+    // abandons the whole build-script pass for the workspace, and every other
+    // crate in it loses its build data. `cargo check` stops working and
+    // rust-analyzer reports "failed to run build scripts of some packages"
+    // across benches that have nothing to do with Xyce.
+    //
+    // Running a mixed-signal bench still needs Xyce; that fails at link, with
+    // the missing symbols naming what is absent.
+    if !std::path::Path::new(xyce_prefix)
+        .join("include/N_CIR_Xyce.h")
+        .exists()
+    {{
+        println!(
+            "cargo:warning=Xyce is not installed at {{xyce_prefix}}, so this \
+             mixed-signal bench is not built. Nothing else in the workspace \
+             is affected. Install Xyce there to run it."
+        );
+        return;
+    }}
+
     // Compile the C++ shim that provides the xyce_* C interface.
     cc::Build::new()
         .cpp(true)
