@@ -55,9 +55,6 @@ use super::entity::{DesignTypes, EntityInterface, Instance, Interface, Reach};
 use super::{write_file, write_new_file, Created};
 use crate::{Result, VhdlStandard, VwError};
 
-/// Default clock for a bench that did not say: 100 MHz.
-const DEFAULT_CLOCK_HZ: f64 = 100e6;
-
 /// The link flags every cosim crate needs, and the only thing in one.
 ///
 /// Regenerated rather than checked in: it is identical in every bench, it is
@@ -132,7 +129,6 @@ pub fn init(
     name: &str,
     dut: Option<&str>,
     components: &[String],
-    clock_hz: Option<f64>,
     vhdl_std: VhdlStandard,
 ) -> Result<Created> {
     // The name is a directory and a crate name, never a VHDL entity — the
@@ -152,8 +148,7 @@ pub fn init(
         super::check_available(&bench_dir)?;
     }
 
-    let config =
-        merge_config(name, existing.as_ref(), dut, components, clock_hz)?;
+    let config = merge_config(name, existing.as_ref(), dut, components)?;
     let updating = existing.is_some();
 
     let mut files = super::workspace::ensure_bench_workspace(workspace_dir)?;
@@ -179,7 +174,7 @@ pub fn init(
         files.push(lib);
     }
 
-    files.extend(ensure_generated(&bench_dir, &config, &dut_interface)?);
+    files.extend(ensure_generated(&bench_dir, &dut_interface)?);
     files.extend(ensure_scaffold(&bench_dir)?);
 
     let registered = super::workspace::register_member(workspace_dir, name)?;
@@ -205,22 +200,17 @@ fn merge_config(
     existing: Option<&crate::cosim::CosimConfig>,
     dut: Option<&str>,
     components: &[String],
-    clock_hz: Option<f64>,
 ) -> Result<crate::cosim::CosimConfig> {
     let mut config = existing.cloned().unwrap_or(crate::cosim::CosimConfig {
         // A placeholder rather than a blank: `vw bench run` reports a missing
         // entity by name, which reads as an instruction.
         entity: format!("TODO_{name}_entity"),
-        clock: None,
         rust_components: Vec::new(),
         generics: Default::default(),
     });
 
     if let Some(dut) = dut {
         config.entity = dut.to_string();
-    }
-    if clock_hz.is_some() {
-        config.clock = clock_hz;
     }
     // Added rather than replaced: the point of re-running is to grow the
     // list. Taking one back out is a matter of deleting it from the file,
@@ -293,7 +283,6 @@ fn resolve(
 /// edit.
 fn ensure_generated(
     bench_dir: &Utf8Path,
-    config: &crate::cosim::CosimConfig,
     resolved: &Resolved,
 ) -> Result<Vec<Utf8PathBuf>> {
     let path = bench_dir.join("src").join("generated.rs");
@@ -301,7 +290,6 @@ fn ensure_generated(
         resolved.dut.as_ref(),
         &resolved.components,
         &resolved.types,
-        config.clock.unwrap_or(DEFAULT_CLOCK_HZ),
     )?;
     Ok(if write_file(&path, &contents)? {
         vec![path]
@@ -326,7 +314,7 @@ pub fn ensure_all_generated(
     {
         let bench_dir = workspace_dir.join("bench").join(&name);
         let resolved = resolve(workspace_dir, &config, vhdl_std)?;
-        ensure_generated(&bench_dir, &config, &resolved)?;
+        ensure_generated(&bench_dir, &resolved)?;
     }
     Ok(())
 }
@@ -639,15 +627,6 @@ fn render_config(
     }
     out.push_str(&format!("entity = \"{}\"\n", config.entity));
 
-    if let Some(clock) = config.clock {
-        out.push_str(&format!(
-            "\n# Clock frequency in Hz. The driver ticks at half this \
-             period.\n\
-             clock = {}\n",
-            super::mist::format_hz(clock),
-        ));
-    }
-
     if !config.rust_components.is_empty() {
         out.push_str(
             "\n# Instances the driver implements rather than observes — a \
@@ -802,8 +781,8 @@ fn render_lib(config: &crate::cosim::CosimConfig) -> String {
     format!(
         r#"//! Cosim testbench for `{entity}`.
 //!
-//! This file is yours. `src/generated.rs` holds the handles, the clock and
-//! the entry point, and is rewritten whenever the design changes or another
+//! This file is yours. `src/generated.rs` holds the signal handles and the
+//! entry point, and is rewritten whenever the design changes or another
 //! `--rust-component` is added — so nothing written here is at risk from
 //! either.
 
@@ -815,11 +794,25 @@ use rust_cosim::TestError;
 
 /// What this bench checks.
 ///
-/// Called once, after the design has been quiesced and released from reset.
+/// Called once, after the design has been quiesced.
 ///
-/// TODO: this is the part that is yours. Drive an input with `tb.drive()`,
-/// step time with `tb.tick()`, and read an output with `tb.read_bit()` or
-/// `tb.read_int()`.
+/// TODO: this is the part that is yours. Drive a signal with `tb.drive()`,
+/// read one with `tb.read_bit()` or `tb.read_int()`, and step time with
+/// `tick()`:
+///
+/// ```ignore
+/// // A period in femtoseconds: 1e15 / 250e6 is 250 MHz. See `tick`.
+/// const PERIOD: u64 = 4_000_000;
+///
+/// for _ in 0..8 {{
+///     tick(&tb.some_clock, PERIOD).await;
+/// }}
+/// ```
+///
+/// Nothing generates a clock for you — which of a design's signals this bench
+/// should drive, at what rate, and whether two of them run together is the
+/// test's business. Two clock domains means two `tick` loops under a
+/// `futures::join!`, not two calls in a row.
 ///
 /// Returning `Err` is what fails the bench. A panic is reported as a crash,
 /// and an `assert!` that fires is a panic.
@@ -835,15 +828,8 @@ fn render_generated(
     dut: Option<&EntityInterface>,
     components: &[Instance],
     types: &DesignTypes,
-    clock_hz: f64,
 ) -> Result<String> {
     let entity = dut.map(|d| d.name.as_str()).unwrap_or("the design");
-
-    // nvc's time step is a femtosecond, and `Timer` counts steps. Getting
-    // this wrong by a factor of a thousand is a bench that looks like it runs
-    // and is a thousand times the wrong speed.
-    let half_period_fs =
-        Literal::u64_unsuffixed((0.5e15 / clock_hz).round() as u64);
 
     let header = module_doc(&format!(
         "Generated from `{entity}` and `cosim.toml`. Do not edit — \
@@ -867,7 +853,7 @@ fn render_generated(
     ));
 
     let body = match dut {
-        Some(dut) => with_dut(dut, components, types, &half_period_fs),
+        Some(dut) => with_dut(dut, components, types),
         None => without_dut(),
     };
 
@@ -889,6 +875,40 @@ fn render_generated(
             message: format!("generated driver does not parse: {e}"),
         })?;
     Ok(prettyplease::unparse(&file))
+}
+
+/// Toggling a signal, which is how a bench makes time pass.
+///
+/// One free function rather than a method, so it works on any handle — a port
+/// of the design, or one belonging to an instance the driver implements —
+/// without going through whatever struct happens to hold it.
+///
+/// Generated rather than left to the developer for one reason: the unit.
+/// `Timer` counts nvc's time step, which is a femtosecond, and a bench that
+/// assumes picoseconds runs perfectly happily at a thousand times the wrong
+/// speed without ever saying so.
+fn tick_fn() -> TokenStream {
+    let docs = doc("Drive one period of `clk`.\n\
+         \n\
+         `period_fs` is femtoseconds, which is nvc's time step — 250 MHz is\n\
+         `1e15 / 250e6`, or 4_000_000. Assuming picoseconds gives a bench \
+         that\n\
+         runs a thousand times too fast and never complains about it.\n\
+         \n\
+         Nothing else drives the signal, so time advances when this is called\n\
+         and not otherwise. Two clocks running together is two of these under\n\
+         a `futures::join!`; two calls in a row is one clock and then the\n\
+         other.");
+    quote! {
+        #docs
+        pub async fn tick(clk: &SimHandle, period_fs: u64) {
+            let half = period_fs / 2;
+            clk.set_value_binstr("1", SetAction::NoDelay);
+            Timer::new(half).await;
+            clk.set_value_binstr("0", SetAction::NoDelay);
+            Timer::new(half).await;
+        }
+    }
 }
 
 /// The part of the driver that exists whether or not there is a design to
@@ -913,6 +933,7 @@ fn prime_fn() -> TokenStream {
 
 fn without_dut() -> TokenStream {
     let prime = prime_fn();
+    let tick = tick_fn();
     let docs = doc("The design under test, once `cosim.toml` names one.\n\
          \n\
          TODO: it does not yet. Set `entity`, or re-run `vw cosim init` with\n\
@@ -930,6 +951,7 @@ fn without_dut() -> TokenStream {
         }
 
         #prime
+        #tick
 
         #[no_mangle]
         pub fn testbench_main(
@@ -954,20 +976,12 @@ fn with_dut(
     dut: &EntityInterface,
     components: &[Instance],
     types: &DesignTypes,
-    half_period_fs: &Literal,
 ) -> TokenStream {
     let handles = plan_handles(dut, Side::Consumer, types);
     let parts: Vec<ComponentPart> = components
         .iter()
         .map(|component| ComponentPart::new(component, types))
         .collect();
-    let clock = dut
-        .clock()
-        .and_then(|c| handles.iter().find(|h| h.signal == c.name));
-    let reset = dut.reset().and_then(|r| {
-        handles.iter().find(|h| h.signal == r.name).map(|h| (r, h))
-    });
-
     let struct_docs = doc(&format!("Handles to `{}`'s signals.", dut.name));
     let fields = handles.iter().map(|handle| {
         let field = format_ident!("{}", handle.field);
@@ -1010,24 +1024,19 @@ fn with_dut(
     let component_fields = parts.iter().map(ComponentPart::field);
     let component_lookups = parts.iter().map(ComponentPart::lookup);
     let component_quiesce = parts.iter().map(ComponentPart::quiesce_call);
-    let component_structs = parts.iter().map(|p| p.definition(half_period_fs));
+    let component_structs = parts.iter().map(ComponentPart::definition);
 
     let new_docs = doc("Look every signal up by name.\n\
          \n\
          A record element is reached through its port — `bus.field`, not\n\
          `bus_field` — because that is where the simulator keeps it.");
     let quiesce = quiesce_fn(&handles);
-    let tick = clock.map(|clock| tick_fn(clock, half_period_fs));
-    let reset_fn = reset
-        .filter(|_| clock.is_some())
-        .map(|(port, handle)| reset_fn(port, handle));
     let helpers = helper_fns();
     let prime = prime_fn();
+    let tick = tick_fn();
 
     let starting = Literal::string(&format!("{} starting", dut.name));
     let complete = Literal::string(&format!("{} complete", dut.name));
-    let reset_call = reset_fn.is_some().then(|| quote! { tb.reset().await; });
-
     quote! {
         #struct_docs
         pub struct Tb {
@@ -1045,14 +1054,13 @@ fn with_dut(
             }
 
             #quiesce
-            #tick
-            #reset_fn
             #helpers
         }
 
         #(#component_structs)*
 
         #prime
+        #tick
 
         #[no_mangle]
         pub fn testbench_main(
@@ -1070,7 +1078,6 @@ fn with_dut(
                 prime().await;
                 tb.quiesce();
                 #(#component_quiesce)*
-                #reset_call
 
                 // The test itself lives in `lib.rs`, which this file is
                 // regenerated around rather than over.
@@ -1133,7 +1140,7 @@ impl ComponentPart {
         quote! { tb.#field.quiesce(); }
     }
 
-    fn definition(&self, half_period_fs: &Literal) -> TokenStream {
+    fn definition(&self) -> TokenStream {
         let name = &self.name;
         let docs = doc(&format!(
             "The `{}` instance of `{}`.\n\
@@ -1187,8 +1194,6 @@ impl ComponentPart {
 
         let quiesce = quiesce_fn(&self.handles);
         let helpers = helper_fns();
-        let _ = half_period_fs;
-
         quote! {
             #docs
             pub struct #name {
@@ -1228,50 +1233,6 @@ fn quiesce_fn(handles: &[Handle]) -> TokenStream {
         #docs
         pub fn quiesce(&self) {
             #(#writes)*
-        }
-    }
-}
-
-fn tick_fn(clock: &Handle, half_period_fs: &Literal) -> TokenStream {
-    let field = format_ident!("{}", clock.field);
-    let docs = doc("Drive one clock period.\n\
-         \n\
-         Nothing else drives the design's clock — it is the top level — so\n\
-         simulation time advances when this is called and not otherwise. \
-         Inputs\n\
-         set before it are what the design sees on the rising edge.");
-    quote! {
-        #docs
-        pub async fn tick(&self) {
-            self.#field.set_value_binstr("1", SetAction::NoDelay);
-            Timer::new(#half_period_fs).await;
-            self.#field.set_value_binstr("0", SetAction::NoDelay);
-            Timer::new(#half_period_fs).await;
-        }
-    }
-}
-
-fn reset_fn(port: &Interface, handle: &Handle) -> TokenStream {
-    let field = format_ident!("{}", handle.field);
-    let (asserted, released) = if port.is_active_low_reset() {
-        ("0", "1")
-    } else {
-        ("1", "0")
-    };
-    let asserted = Literal::string(asserted);
-    let released = Literal::string(released);
-    let docs = doc(
-        "Hold the design in reset for four clock periods, then release it.",
-    );
-    quote! {
-        #docs
-        pub async fn reset(&self) {
-            self.#field.set_value_binstr(#asserted, SetAction::NoDelay);
-            for _ in 0..4 {
-                self.tick().await;
-            }
-            self.#field.set_value_binstr(#released, SetAction::NoDelay);
-            self.tick().await;
         }
     }
 }
@@ -1402,7 +1363,7 @@ mod tests {
     }
 
     fn driver() -> String {
-        render_generated(Some(&dut()), &[], &types(), 100e6).unwrap()
+        render_generated(Some(&dut()), &[], &types()).unwrap()
     }
 
     /// The generated file has to be valid Rust. It is built as a token tree
@@ -1421,7 +1382,7 @@ mod tests {
         assert!(
             text.contains("//! Generated from `flit_fifo` and `cosim.toml`.")
         );
-        assert!(text.contains("/// Drive one clock period."));
+        assert!(text.contains("/// Drive one period of `clk`."));
         // The part that is the developer's says so, in the file that is
         // theirs rather than the one that gets rewritten.
         let lib = render_lib(&config("flit_fifo", &[]));
@@ -1458,20 +1419,13 @@ mod tests {
         assert!(text.contains("let width = signal.get_range().max(1);"));
     }
 
-    /// nvc counts in femtoseconds and `Timer` counts nvc's steps. A factor of
-    /// a thousand here is a bench that runs at the wrong speed and looks fine.
+    /// The generated `tick` halves the period it is given, so a caller
+    /// thinks in the unit it named — a period, not a half-period.
     #[test]
-    fn the_clock_period_is_in_femtoseconds() {
-        let text =
-            render_generated(Some(&dut()), &[], &types(), 100e6).unwrap();
-        assert!(
-            text.contains("Timer::new(5000000)"),
-            "100 MHz is a 5 ns half period, which is 5e6 fs",
-        );
-
-        let text =
-            render_generated(Some(&dut()), &[], &types(), 26.5625e9).unwrap();
-        assert!(text.contains("Timer::new(18824)"));
+    fn tick_takes_a_period_and_halves_it() {
+        let text = driver();
+        assert!(text.contains("let half = period_fs / 2;"));
+        assert!(text.contains("Timer::new(half).await;"));
     }
 
     /// The first thing awaited must be a timed callback: without one the
@@ -1499,19 +1453,21 @@ mod tests {
         assert!(!text.contains("self.level.set_value_int"));
     }
 
-    /// An active-low reset is asserted low and released high. Backwards, the
-    /// design never leaves reset and the bench hangs.
+    /// Time passes by toggling a signal, and the unit is the thing worth
+    /// generating: `Timer` counts femtoseconds, and a bench that assumes
+    /// picoseconds runs a thousand times too fast without ever saying so.
     #[test]
-    fn reset_polarity_follows_the_port_name() {
+    fn ticking_is_offered_but_never_decided() {
         let text = driver();
-        let reset = text.find("pub async fn reset").expect("reset");
-        let asserted = text[reset..]
-            .find(r#"self.rstn.set_value_binstr("0""#)
-            .expect("asserted");
-        let released = text[reset..]
-            .find(r#"self.rstn.set_value_binstr("1""#)
-            .expect("released");
-        assert!(asserted < released);
+
+        assert!(
+            text.contains("pub async fn tick(clk: &SimHandle, period_fs: u64)")
+        );
+        assert!(text.contains("`period_fs` is femtoseconds"));
+
+        // Nothing picks a clock. A design has as many as it has, with names
+        // that say nothing about which is which, so the test says.
+        assert!(!text.contains("async fn tick_"));
     }
 
     /// A generic with no default has to be set somewhere, and with no wrapper
@@ -1566,8 +1522,7 @@ mod tests {
         assert!(parsed.entity.starts_with("TODO_"));
 
         let driver =
-            render_generated(None, &[], &DesignTypes::default(), 100e6)
-                .unwrap();
+            render_generated(None, &[], &DesignTypes::default()).unwrap();
         syn::parse_file(&driver).expect("generated driver parses");
         assert!(driver.contains("prime().await;"));
     }
@@ -1603,7 +1558,6 @@ mod tests {
     fn config(entity: &str, components: &[&str]) -> crate::cosim::CosimConfig {
         crate::cosim::CosimConfig {
             entity: entity.to_string(),
-            clock: Some(100e6),
             rust_components: components.iter().map(|s| s.to_string()).collect(),
             generics: Default::default(),
         }
@@ -1625,7 +1579,6 @@ mod tests {
             Some(&dut()),
             std::slice::from_ref(&wrapper()),
             &types(),
-            100e6,
         )
         .unwrap()
     }

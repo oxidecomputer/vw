@@ -246,7 +246,6 @@ mod tests {
             "fifo",
             None,
             &[],
-            None,
             VhdlStandard::Vhdl2019,
         )
         .unwrap();
@@ -255,7 +254,6 @@ mod tests {
             "other",
             None,
             &[],
-            None,
             VhdlStandard::Vhdl2019,
         )
         .unwrap();
@@ -303,7 +301,6 @@ mod tests {
             "fifo",
             None,
             &[],
-            None,
             VhdlStandard::Vhdl2019,
         )
         .unwrap();

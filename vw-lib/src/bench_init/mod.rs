@@ -449,15 +449,9 @@ mod tests {
         std::fs::write(ws.join("vw.toml"), "[workspace]\nname = \"d\"\n")
             .unwrap();
 
-        let created = cosim::init(
-            &ws,
-            "fifo",
-            None,
-            &[],
-            None,
-            crate::VhdlStandard::Vhdl2019,
-        )
-        .unwrap();
+        let created =
+            cosim::init(&ws, "fifo", None, &[], crate::VhdlStandard::Vhdl2019)
+                .unwrap();
 
         assert_eq!(created.name, "fifo");
         assert!(created.registered);
@@ -481,15 +475,8 @@ mod tests {
         assert!(manifest.contains("\"fifo\""));
 
         // ...and a second bench joins it rather than replacing it.
-        cosim::init(
-            &ws,
-            "other",
-            None,
-            &[],
-            None,
-            crate::VhdlStandard::Vhdl2019,
-        )
-        .unwrap();
+        cosim::init(&ws, "other", None, &[], crate::VhdlStandard::Vhdl2019)
+            .unwrap();
         let manifest =
             std::fs::read_to_string(ws.join("bench/Cargo.toml")).unwrap();
         assert!(manifest.contains("\"fifo\""));
@@ -507,37 +494,23 @@ mod tests {
         std::fs::write(ws.join("vw.toml"), "[workspace]\nname = \"d\"\n")
             .unwrap();
 
-        cosim::init(
-            &ws,
-            "fifo",
-            None,
-            &[],
-            None,
-            crate::VhdlStandard::Vhdl2019,
-        )
-        .unwrap();
+        cosim::init(&ws, "fifo", None, &[], crate::VhdlStandard::Vhdl2019)
+            .unwrap();
         std::fs::write(ws.join("bench/fifo/src/lib.rs"), "// my test").unwrap();
 
         // Running again is not an error, and does not touch what is mine.
-        cosim::init(
-            &ws,
-            "fifo",
-            None,
-            &[],
-            Some(250e6),
-            crate::VhdlStandard::Vhdl2019,
-        )
-        .unwrap();
+        cosim::init(&ws, "fifo", None, &[], crate::VhdlStandard::Vhdl2019)
+            .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(ws.join("bench/fifo/src/lib.rs")).unwrap(),
             "// my test",
             "the test is written once and then left alone",
         );
-        // ...while what the command line said is recorded and acted on.
+        // ...while the config still says what the bench is.
         let config =
             std::fs::read_to_string(ws.join("bench/fifo/cosim.toml")).unwrap();
-        assert!(config.contains("clock = 2.5e8"), "{config}");
+        assert!(config.contains("entity ="), "{config}");
         // The generated half is there and is not the file I edited.
         assert!(ws.join("bench/fifo/src/generated.rs").exists());
     }
@@ -559,7 +532,6 @@ mod tests {
             "fifo",
             None,
             &[],
-            None,
             crate::VhdlStandard::Vhdl2019,
         )
         .is_err());

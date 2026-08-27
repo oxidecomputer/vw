@@ -41,9 +41,6 @@ use crate::{
 pub struct CosimConfig {
     /// The design entity to elaborate and drive.
     pub entity: String,
-    /// Clock frequency in Hz, for the period the generated driver ticks at.
-    #[serde(default)]
-    pub clock: Option<f64>,
     /// Instantiation labels inside `entity` that the driver implements rather
     /// than observes.
     ///

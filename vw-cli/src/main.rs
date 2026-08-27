@@ -271,7 +271,11 @@ enum CosimCommand {
                       supplies everything the design sees, its clock \
                       included.\n\n\
                       With --dut the driver comes out with a handle for every \
-                      port, a clock, a reset and the inputs quiesced.\n\n\
+                      port and the inputs quiesced. Which signals it clocks \
+                      is declared under [clocks] in the bench's cosim.toml — \
+                      a real design has many, and which one a bench should \
+                      drive is not something a name can be trusted to \
+                      say.\n\n\
                       --rust-component names an instance inside the design \
                       that the driver implements rather than observes — a \
                       vivado IP wrapper with no simulation model, say. Its \
@@ -299,12 +303,6 @@ enum CosimCommand {
                     --dut is only needed the first time."
         )]
         rust_component: Vec<String>,
-        #[arg(
-            long,
-            value_name = "HZ",
-            help = "Clock frequency in Hz, e.g. 250e6 (default: 100e6)"
-        )]
-        clock: Option<f64>,
         #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
         std: CliVhdlStandard,
     },
@@ -1372,7 +1370,6 @@ async fn main() {
                     name,
                     dut,
                     rust_component,
-                    clock,
                     std,
                 },
         } => {
@@ -1382,7 +1379,6 @@ async fn main() {
                 &name,
                 dut.as_deref(),
                 &rust_component,
-                clock,
                 std.into(),
             ) {
                 Ok(created) => report_created(&ws, &created),
