@@ -54,6 +54,24 @@ pub use vw_core::{
 };
 pub use vw_core::{mapping, nvc_helpers, visitor};
 
+/// Start a `cargo` that resolves its own toolchain.
+///
+/// A bench workspace pins its toolchain — anodizer's output needs nightly —
+/// and rustup resolves that from the directory being built in. But cargo
+/// exports these to anything it spawns, and `RUSTUP_TOOLCHAIN` beats the
+/// directory: inherited, a bench builds with whatever toolchain launched
+/// `vw` instead of the one it asked for, and fails on a `#![feature]` that
+/// is perfectly legal where it is written. Nothing sets them outside a cargo
+/// invocation, so clearing them costs nothing and restores the pin when
+/// something does.
+pub fn cargo_command() -> std::process::Command {
+    let mut command = std::process::Command::new("cargo");
+    for leaked in ["RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "CARGO"] {
+        command.env_remove(leaked);
+    }
+    command
+}
+
 /// Workspace-relative directory for vw's own testbench simulation build (the
 /// nvc `work` + dependency libraries). Kept under `target/` so all generated
 /// output lives there. (anodizer's separate build is `target/anodizer/build`.)
@@ -5598,7 +5616,7 @@ async fn build_rust_library(
     // Run cargo build in the testbench directory
     let testbench_dir_owned = testbench_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("cargo")
+        let output = cargo_command()
             .arg("build")
             .current_dir(&testbench_dir_owned)
             .output()

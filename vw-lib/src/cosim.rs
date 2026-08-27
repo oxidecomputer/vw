@@ -41,6 +41,17 @@ use crate::{
 pub struct CosimConfig {
     /// The design entity to elaborate and drive.
     pub entity: String,
+    /// Clock frequency in Hz, for the period the generated driver ticks at.
+    #[serde(default)]
+    pub clock: Option<f64>,
+    /// Instantiation labels inside `entity` that the driver implements rather
+    /// than observes.
+    ///
+    /// This is the list, not the command line: `vw cosim init` adds to it and
+    /// regeneration reads it, so a bench grows a component at a time without
+    /// the flags having to be repeated. Removing one means deleting it here.
+    #[serde(default, rename = "rust-components")]
+    pub rust_components: Vec<String>,
     /// Elaboration-time generic overrides.
     ///
     /// The entity is the top level, so its generics take their declared
@@ -284,7 +295,7 @@ async fn build_driver_library(
     let dir = crate_dir.to_owned();
     let package_name = crate_name.clone();
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("cargo")
+        let output = crate::cargo_command()
             .args(["build", "-p", &package_name])
             .current_dir(dir.as_std_path())
             .output()

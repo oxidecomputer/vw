@@ -97,6 +97,7 @@ pub fn init(
         name: name.to_string(),
         files,
         registered,
+        updated: false,
         next_steps: next_steps(name, dut.as_ref()),
     })
 }
@@ -272,7 +273,7 @@ fn seconds(t: f64) -> String {
 
 /// Render a frequency the way a person would write it, so the file reads as
 /// `26.5625e9` rather than `26562500000`.
-fn format_hz(hz: f64) -> String {
+pub(super) fn format_hz(hz: f64) -> String {
     let text = format!("{hz:e}");
     // `{:e}` gives `1e8`; TOML wants a fractional part to read as a float and
     // `serde` wants one to parse it back as one.

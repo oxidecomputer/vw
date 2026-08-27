@@ -59,6 +59,7 @@ pub fn init(
         name: entity,
         files: vec![path],
         registered: false,
+        updated: false,
         next_steps: next_steps(&base, dut.as_ref()),
     })
 }

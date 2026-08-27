@@ -53,6 +53,10 @@ pub struct Created {
     pub files: Vec<Utf8PathBuf>,
     /// Whether the bench cargo workspace gained a member.
     pub registered: bool,
+    /// Whether this brought an existing bench up to date rather than making
+    /// a new one. `vw cosim init` is re-runnable, and saying "created" about
+    /// a bench somebody has been working in for a week reads as a warning.
+    pub updated: bool,
     /// What is left for the developer to do, in the order to do it.
     pub next_steps: Vec<String>,
 }
@@ -445,9 +449,15 @@ mod tests {
         std::fs::write(ws.join("vw.toml"), "[workspace]\nname = \"d\"\n")
             .unwrap();
 
-        let created =
-            cosim::init(&ws, "fifo", None, None, crate::VhdlStandard::Vhdl2019)
-                .unwrap();
+        let created = cosim::init(
+            &ws,
+            "fifo",
+            None,
+            &[],
+            None,
+            crate::VhdlStandard::Vhdl2019,
+        )
+        .unwrap();
 
         assert_eq!(created.name, "fifo");
         assert!(created.registered);
@@ -471,39 +481,88 @@ mod tests {
         assert!(manifest.contains("\"fifo\""));
 
         // ...and a second bench joins it rather than replacing it.
-        cosim::init(&ws, "other", None, None, crate::VhdlStandard::Vhdl2019)
-            .unwrap();
+        cosim::init(
+            &ws,
+            "other",
+            None,
+            &[],
+            None,
+            crate::VhdlStandard::Vhdl2019,
+        )
+        .unwrap();
         let manifest =
             std::fs::read_to_string(ws.join("bench/Cargo.toml")).unwrap();
         assert!(manifest.contains("\"fifo\""));
         assert!(manifest.contains("\"other\""));
     }
 
-    /// Re-running against a name that is taken changes nothing.
+    /// A bench grows a piece at a time. Re-running adds what was asked for
+    /// and regenerates, and the test written against the last one survives —
+    /// which is the whole reason the generated half is a separate file.
     #[test]
-    fn a_second_init_of_the_same_name_is_refused() {
+    fn a_second_init_adds_to_the_bench_rather_than_replacing_it() {
         let guard = tempfile::tempdir().unwrap();
         let ws =
             Utf8PathBuf::from_path_buf(guard.path().to_path_buf()).unwrap();
         std::fs::write(ws.join("vw.toml"), "[workspace]\nname = \"d\"\n")
             .unwrap();
 
-        cosim::init(&ws, "fifo", None, None, crate::VhdlStandard::Vhdl2019)
+        cosim::init(
+            &ws,
+            "fifo",
+            None,
+            &[],
+            None,
+            crate::VhdlStandard::Vhdl2019,
+        )
+        .unwrap();
+        std::fs::write(ws.join("bench/fifo/src/lib.rs"), "// my test").unwrap();
+
+        // Running again is not an error, and does not touch what is mine.
+        cosim::init(
+            &ws,
+            "fifo",
+            None,
+            &[],
+            Some(250e6),
+            crate::VhdlStandard::Vhdl2019,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(ws.join("bench/fifo/src/lib.rs")).unwrap(),
+            "// my test",
+            "the test is written once and then left alone",
+        );
+        // ...while what the command line said is recorded and acted on.
+        let config =
+            std::fs::read_to_string(ws.join("bench/fifo/cosim.toml")).unwrap();
+        assert!(config.contains("clock = 2.5e8"), "{config}");
+        // The generated half is there and is not the file I edited.
+        assert!(ws.join("bench/fifo/src/generated.rs").exists());
+    }
+
+    /// A directory that is not a cosim bench is still refused: only one this
+    /// command made is one it may add to.
+    #[test]
+    fn init_will_not_adopt_a_directory_it_did_not_make() {
+        let guard = tempfile::tempdir().unwrap();
+        let ws =
+            Utf8PathBuf::from_path_buf(guard.path().to_path_buf()).unwrap();
+        std::fs::write(ws.join("vw.toml"), "[workspace]\nname = \"d\"\n")
             .unwrap();
-        std::fs::write(ws.join("bench/fifo/src/lib.rs"), "// my work").unwrap();
+        std::fs::create_dir_all(ws.join("bench/fifo").as_std_path()).unwrap();
+        std::fs::write(ws.join("bench/fifo/notes.md"), "mine").unwrap();
 
         assert!(cosim::init(
             &ws,
             "fifo",
             None,
+            &[],
             None,
             crate::VhdlStandard::Vhdl2019,
         )
         .is_err());
-        assert_eq!(
-            std::fs::read_to_string(ws.join("bench/fifo/src/lib.rs")).unwrap(),
-            "// my work",
-        );
     }
 
     /// The repair pass finds benches wherever they are filed, since they are

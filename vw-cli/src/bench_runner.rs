@@ -22,6 +22,28 @@ pub struct BenchResult {
     output: String,
 }
 
+/// Say where the output went, once, after the results.
+///
+/// Every bench writes its whole output next to its waveform whether it passed
+/// or not. Without a line saying so, a `println!` that came out of a passing
+/// bench looks like it went nowhere — which is how it looked before there was
+/// anywhere for it to go.
+fn note_logs(ws: &Utf8Path, names: &[String]) {
+    let path = match names {
+        [] => return,
+        // The common case while working on one bench: give the real path,
+        // not a pattern to fill in.
+        [only] => vw_bench::log_path(ws, only),
+        _ => vw_lib::bench_output_dir(ws, "*").join("output.log"),
+    };
+    let shown = path.strip_prefix(ws).unwrap_or(&path);
+    println!(
+        "{} {}",
+        "output:".bright_black(),
+        shown.as_str().bright_black()
+    );
+}
+
 /// Run every matching testbench in parallel, here.
 ///
 /// `filter` is a substring match against the testbench entity name
@@ -83,6 +105,7 @@ pub async fn run_benches(
         });
 
     let overall = Instant::now();
+    let ran = names.clone();
     let panel = Arc::new(NextestPanel::new(names.len() as u64, "testbenches"));
     let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
 
@@ -107,6 +130,7 @@ pub async fn run_benches(
         }
     }
     print_result_line(panel.passed(), panel.failed(), overall.elapsed());
+    note_logs(&ws, &ran);
     if summary.failed > 0 {
         std::process::exit(1);
     }
@@ -198,6 +222,17 @@ fn print_bench_failure(f: &BenchResult) {
         let start = lines.len().saturating_sub(40);
         for l in &lines[start..] {
             println!("  {}", demangle_line(l));
+        }
+        if lines.len() > 40 {
+            println!(
+                "  {}",
+                format!(
+                    "... {} earlier lines in target/bench/{}/output.log",
+                    lines.len() - 40,
+                    f.name,
+                )
+                .bright_black(),
+            );
         }
     }
     println!("{}\n", bar.red());

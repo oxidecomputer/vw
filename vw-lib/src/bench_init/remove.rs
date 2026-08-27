@@ -245,6 +245,7 @@ mod tests {
             &ws,
             "fifo",
             None,
+            &[],
             None,
             VhdlStandard::Vhdl2019,
         )
@@ -253,6 +254,7 @@ mod tests {
             &ws,
             "other",
             None,
+            &[],
             None,
             VhdlStandard::Vhdl2019,
         )
@@ -300,6 +302,7 @@ mod tests {
             &ws,
             "fifo",
             None,
+            &[],
             None,
             VhdlStandard::Vhdl2019,
         )

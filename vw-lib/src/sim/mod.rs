@@ -175,7 +175,7 @@ async fn build_bridge_library(
     let bench_dir_owned = bench_dir.to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("cargo")
+        let output = crate::cargo_command()
             .arg("build")
             .arg("--release")
             .current_dir(&bench_dir_owned)

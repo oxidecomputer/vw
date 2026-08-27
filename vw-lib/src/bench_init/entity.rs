@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 
 use camino::Utf8Path;
 use vhdl_lang::ast::{
-    AnyDesignUnit, AnyPrimaryUnit, InterfaceDeclaration, InterfaceList, Mode,
+    AnyDesignUnit, AnyPrimaryUnit, AnySecondaryUnit, ConcurrentStatement,
+    InstantiatedUnit, InterfaceDeclaration, InterfaceList, Mode,
     ModeIndication, TypeDeclaration, TypeDefinition,
 };
 use vhdl_lang::VHDLParser;
@@ -332,6 +333,212 @@ impl Visitor for TypeCollector<'_> {
         }
         VisitorResult::Continue
     }
+}
+
+// ===========================================================================
+// Instances
+// ===========================================================================
+
+/// Something instantiated inside a design, and what its ports are.
+///
+/// Named for what it is used for: a driver that implements this instance in
+/// Rust needs the label the simulator knows it by, and the interface it has
+/// to present.
+#[derive(Clone, Debug)]
+pub struct Instance {
+    /// The instantiation label, as written.
+    pub label: String,
+    /// The interface of whatever is instantiated there.
+    pub interface: EntityInterface,
+}
+
+/// Find the instance labelled `label` in `dut`'s architecture.
+///
+/// Only labels directly inside the entity's own architecture: an instance
+/// further down would need a path rather than a name, and nothing has wanted
+/// one yet.
+pub fn find_instance(
+    workspace_dir: &Utf8Path,
+    dut: &EntityInterface,
+    label: &str,
+    vhdl_std: VhdlStandard,
+) -> Result<Instance> {
+    let parser = VHDLParser::new(vhdl_std.into());
+    let mut diagnostics = Vec::new();
+    let (_, design_file) =
+        parser.parse_design_file(&dut.file, &mut diagnostics)?;
+
+    // The architecture of the entity in question, which is normally in the
+    // same file it is.
+    let architecture = design_file
+        .design_units
+        .iter()
+        .find_map(|(_, unit)| match unit {
+            AnyDesignUnit::Secondary(AnySecondaryUnit::Architecture(arch))
+                if arch
+                    .entity_name
+                    .item
+                    .item
+                    .name_utf8()
+                    .eq_ignore_ascii_case(&dut.name) =>
+            {
+                Some(arch)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| VwError::Config {
+            message: format!(
+                "no architecture for '{}' in {} — an instance can only be \
+                 found in the architecture that declares it",
+                dut.name,
+                dut.file.display(),
+            ),
+        })?;
+
+    let instantiated = architecture
+        .statements
+        .iter()
+        .find_map(|statement| {
+            let name = statement.label.tree.as_ref()?;
+            if !name.item.name_utf8().eq_ignore_ascii_case(label) {
+                return None;
+            }
+            match &statement.statement.item {
+                ConcurrentStatement::Instance(instance) => Some(&instance.unit),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| {
+            let labels: Vec<String> = architecture
+                .statements
+                .iter()
+                .filter(|s| {
+                    matches!(s.statement.item, ConcurrentStatement::Instance(_))
+                })
+                .filter_map(|s| Some(s.label.tree.as_ref()?.item.name_utf8()))
+                .collect();
+            VwError::Config {
+                message: format!(
+                    "no instance labelled '{label}' in {}. It instantiates: {}",
+                    dut.name,
+                    if labels.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        labels.join(", ")
+                    },
+                ),
+            }
+        })?;
+
+    let (unit_name, is_component) = match instantiated {
+        InstantiatedUnit::Entity(name, _) => (&name.item, false),
+        InstantiatedUnit::Component(name) => (&name.item, true),
+        InstantiatedUnit::Configuration(name) => (&name.item, false),
+    };
+    let unit_name =
+        vw_core::mapping::type_mark_name(unit_name).ok_or_else(|| {
+            VwError::Config {
+                message: format!("could not read what '{label}' instantiates"),
+            }
+        })?;
+
+    // An entity first, wherever it lives — an IP wrapper is in the `ip`
+    // library, not the design's own. Failing that, a component declaration,
+    // which is all there is for a black box with no entity behind it.
+    let interface = match find_entity_anywhere(workspace_dir, &unit_name) {
+        Ok(file) => read_entity(&file, &unit_name, vhdl_std)?,
+        Err(e) if is_component => {
+            component_interface(&design_file, &unit_name, &dut.file).ok_or(e)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    Ok(Instance {
+        label: label.to_string(),
+        interface,
+    })
+}
+
+/// A component declaration's ports, for a black box with no entity.
+fn component_interface(
+    design_file: &vhdl_lang::ast::DesignFile,
+    name: &str,
+    file: &Path,
+) -> Option<EntityInterface> {
+    use vhdl_lang::ast::Declaration;
+
+    for (_, unit) in &design_file.design_units {
+        let AnyDesignUnit::Secondary(AnySecondaryUnit::Architecture(arch)) =
+            unit
+        else {
+            continue;
+        };
+        for declaration in &arch.decl {
+            let Declaration::Component(component) = &declaration.item else {
+                continue;
+            };
+            if !component
+                .ident
+                .tree
+                .item
+                .name_utf8()
+                .eq_ignore_ascii_case(name)
+            {
+                continue;
+            }
+            return Some(EntityInterface {
+                name: component.ident.tree.item.name_utf8(),
+                file: file.to_path_buf(),
+                context: Vec::new(),
+                generics: interfaces(component.generic_list.as_ref()),
+                ports: interfaces(component.port_list.as_ref()),
+            });
+        }
+    }
+    None
+}
+
+/// The source declaring `entity_name`, in any library the workspace can see.
+///
+/// Unlike [`find_design_entity`] this looks beyond `defaultlib`: an IP
+/// wrapper vivado generated lives in the `ip` library, and a design that
+/// instantiates one is entitled to have it found.
+pub fn find_entity_anywhere(
+    workspace_dir: &Utf8Path,
+    entity_name: &str,
+) -> Result<PathBuf> {
+    let config = crate::render_vhdl_ls_config(workspace_dir, None, false)?;
+    // The workspace's own sources first: a name that appears in both is the
+    // design's, not a dependency's.
+    let mut libraries: Vec<&String> = config.libraries.keys().collect();
+    libraries.sort_by_key(|name| name.as_str() != "defaultlib");
+
+    for library in libraries {
+        let files = &config.libraries[library].files;
+        for file in files {
+            let absolute = if file.is_relative() {
+                workspace_dir.as_std_path().join(file)
+            } else {
+                file.clone()
+            };
+            let Ok(contents) = std::fs::read_to_string(&absolute) else {
+                continue;
+            };
+            if vw_core::parse_entities(&contents)?
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(entity_name))
+            {
+                return Ok(absolute);
+            }
+        }
+    }
+
+    Err(VwError::Config {
+        message: format!(
+            "no entity '{entity_name}' in the workspace or any library it \
+             uses"
+        ),
+    })
 }
 
 /// Read `entity_name`'s interface out of the workspace's design sources.

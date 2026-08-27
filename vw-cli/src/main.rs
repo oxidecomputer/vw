@@ -271,7 +271,12 @@ enum CosimCommand {
                       supplies everything the design sees, its clock \
                       included.\n\n\
                       With --dut the driver comes out with a handle for every \
-                      port, a clock, a reset and the inputs quiesced."
+                      port, a clock, a reset and the inputs quiesced.\n\n\
+                      --rust-component names an instance inside the design \
+                      that the driver implements rather than observes — a \
+                      vivado IP wrapper with no simulation model, say. Its \
+                      signals are reached through the instance, so they do \
+                      not have to be ports of anything."
     )]
     Init {
         #[arg(help = "Name for the testbench directory under bench/")]
@@ -283,6 +288,17 @@ enum CosimCommand {
                     signal handles"
         )]
         dut: Option<String>,
+        #[arg(
+            long,
+            value_name = "LABEL",
+            help = "An instance inside --dut for the driver to implement, by \
+                    its instantiation label. Its signals get a struct of \
+                    their own, with the directions the other way round: the \
+                    driver is the component. Repeat for several. On an \
+                    existing bench the entity comes from its cosim.toml, so \
+                    --dut is only needed the first time."
+        )]
+        rust_component: Vec<String>,
         #[arg(
             long,
             value_name = "HZ",
@@ -1355,6 +1371,7 @@ async fn main() {
                 CosimCommand::Init {
                     name,
                     dut,
+                    rust_component,
                     clock,
                     std,
                 },
@@ -1364,6 +1381,7 @@ async fn main() {
                 &ws,
                 &name,
                 dut.as_deref(),
+                &rust_component,
                 clock,
                 std.into(),
             ) {
@@ -3651,8 +3669,13 @@ fn workspace_or_exit(cwd: &Utf8Path) -> Utf8PathBuf {
 /// see what appeared has to go looking for it before they can start.
 fn report_created(workspace: &Utf8Path, created: &vw_lib::bench_init::Created) {
     println!(
-        "{} created testbench {}",
+        "{} {} testbench {}",
         "✓".bright_green(),
+        if created.updated {
+            "updated"
+        } else {
+            "created"
+        },
         created.name.cyan(),
     );
     for file in &created.files {
