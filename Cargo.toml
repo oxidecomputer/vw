@@ -70,7 +70,7 @@ nucleo-matcher = "0.3"
 indicatif = "0.17"
 similar = { version = "2.6", features = ["inline"] }
 ipxact = { git = "https://github.com/oxidecomputer/ipe", branch = "main" }
-anodizer = { git = "https://github.com/oxidecomputer/anodizer", branch = "main" }
+anodizer = { git = "https://github.com/oxidecomputer/anodizer", branch = "ry/subtype-serialization" }
 schemars = "0.8.22"
 uuid = { version = "1.24.0", features = ["serde", "js", "v4"] }
 oxide = "0.17.0"
@@ -87,8 +87,3 @@ vhdl_ls = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/emb
 
 [patch."https://github.com/oxidecomputer/vw/"]
 vw-core = { path = "vw-core" }
-
-# Local while the subtype/array work in anodizer is unmerged. Drop this once
-# it lands and bump the dependency instead.
-[patch."https://github.com/oxidecomputer/anodizer"]
-anodizer = { path = "../anodizer/anodizer" }

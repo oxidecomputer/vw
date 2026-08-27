@@ -35,6 +35,7 @@ dependencies = [
 [[package]]
 name = "anodizer"
 version = "0.1.0"
+source = "git+https://github.com/oxidecomputer/anodizer?branch=ry%2Fsubtype-serialization#e1d72d0823956cd88476bc02a755656bf78aa13c"
 dependencies = [
  "camino",
  "clap",
