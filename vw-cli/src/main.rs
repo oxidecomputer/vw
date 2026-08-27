@@ -1204,9 +1204,9 @@ async fn main() {
                     build_dir,
                 },
         } => {
-            // Self-heal a fresh checkout like `vw check`. Skipped for the
-            // internal `--build-dir` subprocess: the parent runner already
-            // fetched, and re-fetching per bench would race.
+            // Self-heal a fresh checkout like `vw check`. Skip the
+            // internal `--build-dir` subprocess (the parent runner
+            // already fetched — re-fetching per bench would race).
             if build_dir.is_none() {
                 ensure_workspace_deps(&cwd).await;
             }

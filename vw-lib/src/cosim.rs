@@ -121,6 +121,7 @@ pub async fn elaborate_entity_as_top(
 
     fs::create_dir_all(build_dir)?;
 
+    // Analyze external libraries
     analyze_ext_libraries(
         &vhdl_ls_config,
         &mut processor,
@@ -130,12 +131,14 @@ pub async fn elaborate_entity_as_top(
     )
     .await?;
 
+    // Get all defaultlib files
     let defaultlib_files = vhdl_ls_config
         .libraries
         .get("defaultlib")
         .map(|lib| lib.files.clone())
         .unwrap_or_default();
 
+    // Find the entity source file in defaultlib
     let entity_file = find_entity_file(
         workspace_dir.as_std_path(),
         &defaultlib_files,
@@ -143,8 +146,11 @@ pub async fn elaborate_entity_as_top(
         &mut cache,
     )?;
 
+    // Find referenced files
     let mut referenced_files =
         find_referenced_files(&entity_file, &defaultlib_files, &mut cache)?;
+
+    // Topological sort
     sort_files_by_dependencies(
         &mut processor,
         &mut referenced_files,
@@ -157,6 +163,7 @@ pub async fn elaborate_entity_as_top(
         .collect();
     files.push(entity_file.to_string_lossy().to_string());
 
+    // Compile VHDL
     run_nvc_analysis(vhdl_std, build_dir, "work", &files, false).await?;
 
     let generics: Vec<(String, String)> = generics
@@ -176,7 +183,7 @@ pub async fn elaborate_entity_as_top(
     Ok(())
 }
 
-/// Find a design entity's source file among `defaultlib`'s.
+/// Find a VHDL entity source file by searching through defaultlib files.
 pub fn find_entity_file(
     workspace_dir: &Path,
     defaultlib_files: &[PathBuf],
