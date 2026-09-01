@@ -31,9 +31,10 @@ use vw_api_types_versions::latest::S3Credentials;
 /// `synth`, `place` and `route` each produce an `edif` and they are different
 /// netlists, which is why what goes in the bucket is keyed by the directory
 /// too rather than by file name alone.
-const GATHERED: [(&str, &str); 5] = [
+const GATHERED: [(&str, &str); 6] = [
     ("image", "pdi"),
     ("reports", "rpt"),
+    ("reports", "csv"),
     ("synth", "edif"),
     ("place", "edif"),
     ("route", "edif"),
