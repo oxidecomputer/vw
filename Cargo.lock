@@ -5771,6 +5771,7 @@ dependencies = [
  "ratatui",
  "reqwest 0.13.4",
  "rustc-demangle",
+ "serde",
  "serde_json",
  "slog-error-chain",
  "tempfile",

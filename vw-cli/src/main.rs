@@ -15,6 +15,7 @@ use vw_lib::{
     VhdlStandard,
 };
 
+mod analyze;
 mod bench_runner;
 mod cloud;
 mod cloud_sync;
@@ -594,6 +595,74 @@ enum Commands {
     HtclCmd(HtclCmdCommand),
     #[command(about = "Manage remote build environments on a vw service")]
     Cloud(cloud::CloudArgs),
+    #[command(subcommand, about = "Analyze implementation reports")]
+    Analyze(AnalyzeCommand),
+}
+
+#[derive(Subcommand)]
+enum AnalyzeCommand {
+    #[command(
+        about = "Summarize the near-critical path population in a \
+                 worst-paths CSV. Two files compare before/after.",
+        long_about = "Summarize the near-critical path population in a \
+                      worst-paths CSV.\n\nThe input is the CSV written \
+                      by the `vw::worst_paths` htcl function, which dumps \
+                      one row per timing endpoint under a slack threshold \
+                      from an open post-route design. `vw::report` runs \
+                      it as part of the post-route sweep and leaves it at \
+                      <workspace>/target/reports/worst-paths.csv; to \
+                      write one directly from a checkpoint:\n\n    \
+                      vw::worst_paths -thresh 0.200 -out_path \
+                      worst-paths.csv\n\nGiven two CSVs every table \
+                      gains before/after/delta columns, with the first \
+                      file as the baseline. Given one, it reports that \
+                      file alone."
+    )]
+    Timing {
+        #[arg(
+            help = "One or two worst-paths CSVs, as written by \
+                    `vw::worst_paths`. With two, the first is the \
+                    baseline and the second is compared against it.",
+            num_args = 1..=2,
+            required = true,
+            value_name = "CSV"
+        )]
+        files: Vec<Utf8PathBuf>,
+        #[arg(long, help = "Emit the three tables as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Restrict to one path group, e.g. \
+                    clkout1_primitive_1. Default: every group in the \
+                    file."
+        )]
+        group: Option<String>,
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 2,
+            help = "Hierarchy levels to fold endpoints into for the \
+                    block table"
+        )]
+        block_depth: usize,
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 10,
+            help = "Blocks to print. JSON always carries all of them."
+        )]
+        top: usize,
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Total setup endpoints in the clock group, from the \
+                    intra-clock table of report_timing_summary. Not in \
+                    the CSV, so the near-critical fraction is only \
+                    reported when this is given. Repeat once per CSV."
+        )]
+        total_endpoints: Vec<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1628,6 +1697,28 @@ async fn main() {
                     constraints.as_deref(),
                 ) {
                     eprintln!("{} {e}", "error:".bright_red());
+                    process::exit(1);
+                }
+            }
+        },
+        Commands::Analyze(cmd) => match cmd {
+            AnalyzeCommand::Timing {
+                files,
+                json,
+                group,
+                block_depth,
+                top,
+                total_endpoints,
+            } => {
+                if let Err(e) = analyze::run_timing(analyze::TimingArgs {
+                    files: &files,
+                    json,
+                    group: group.as_deref(),
+                    block_depth,
+                    top,
+                    total_endpoints: &total_endpoints,
+                }) {
+                    report(&e);
                     process::exit(1);
                 }
             }
