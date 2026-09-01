@@ -1452,6 +1452,11 @@ catch {::vw::install_proc_body_wrap}
 # user's actual results.
 catch {set_param tcl.statsThreshold 9999999}
 
+# Many vivado commands will return an error if more than 500 elements
+# are returned. This does not really work for large designs. Turn off
+# the display limit.
+catch {set_param tcl.collectionResultDisplayLimit 0}
+
 while {1} {
     if {[gets $sock line] < 0} {
         if {[eof $sock]} {
