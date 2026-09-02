@@ -2258,6 +2258,56 @@ mod tests {
         Url::parse("file:///tmp/x.htcl").unwrap()
     }
 
+    /// The smallest thing `find_workspace_dir` will stop at.
+    const MANIFEST: &str =
+        "[workspace]\nname = \"test\"\nversion = \"0.1.0\"\n";
+
+    /// A workspace of its own, holding the one document a test is about.
+    ///
+    /// The cross-file targets — procs, types, enum variants — do not answer
+    /// from the open document alone. They walk up from it for a `vw.toml` and
+    /// then scan every `.htcl` underneath, so a test pointing at a fixed path
+    /// like `/tmp` is at the mercy of whatever else is on the machine: one
+    /// stray `vw.toml` above it and one stray `.htcl` below are enough
+    /// between them to make the document under test drop out of its own
+    /// rename, and the test fails somewhere with nothing wrong with it.
+    /// Carrying its own manifest stops that search inside this directory, so
+    /// nothing above it can reach the test.
+    ///
+    /// Canonicalized because macOS hands out `/var/…` temp directories that
+    /// are really `/private/var/…`, and the walk canonicalizes every path it
+    /// finds. An origin spelled the other way would not match the file the
+    /// walk turned up — the same failure again, by a shorter route.
+    ///
+    /// The document is written to disk as well as handed to the backend: it
+    /// has to be there for the walk to find it at all, which is the path
+    /// these tests exist to cover.
+    struct Workspace {
+        _dir: tempfile::TempDir,
+        uri: Url,
+    }
+
+    impl Workspace {
+        fn holding(source: &str) -> Workspace {
+            let dir = tempfile::TempDir::new().expect("scratch directory");
+            let root = dir
+                .path()
+                .canonicalize()
+                .expect("canonical scratch directory");
+            std::fs::write(root.join("vw.toml"), MANIFEST)
+                .expect("write a manifest");
+            let document = root.join("x.htcl");
+            std::fs::write(&document, source).expect("write the document");
+            let uri =
+                Url::from_file_path(&document).expect("a file url for it");
+            Workspace { _dir: dir, uri }
+        }
+
+        fn uri(&self) -> Url {
+            self.uri.clone()
+        }
+    }
+
     #[tokio::test]
     async fn handles_htcl_extension() {
         let backend = HtclBackend::new();
@@ -2395,11 +2445,12 @@ proc f {} {
   return $mode
 }
 ";
-        backend.set_text_sync(uri(), src.into()).await;
+        let ws = Workspace::holding(src);
+        backend.set_text_sync(ws.uri(), src.into()).await;
         // Cursor on the `m` of `set mode` (line 1, column 6). 0-indexed.
         let workspace_edit = backend
             .rename(
-                &uri(),
+                &ws.uri(),
                 Position {
                     line: 1,
                     character: 6,
@@ -2409,7 +2460,7 @@ proc f {} {
             .await
             .expect("rename should succeed");
         let changes = workspace_edit.changes.expect("expected changes");
-        let text_edits = changes.get(&uri()).expect("edits for this file");
+        let text_edits = changes.get(&ws.uri()).expect("edits for this file");
         assert_eq!(text_edits.len(), 3, "{text_edits:?}");
         // Apply edits from tail to head to preserve earlier offsets.
         let mut renamed = src.to_string();
@@ -2434,13 +2485,13 @@ proc f {} {
     #[tokio::test]
     async fn rename_proc_name_via_lsp_covers_decl_and_call() {
         let backend = HtclBackend::new();
-        backend
-            .set_text_sync(uri(), "proc greet {} { puts hi }\ngreet\n".into())
-            .await;
+        let source = "proc greet {} { puts hi }\ngreet\n";
+        let workspace = Workspace::holding(source);
+        backend.set_text_sync(workspace.uri(), source.into()).await;
         // Cursor on the `g` of the proc's own name.
         let result = backend
             .rename(
-                &uri(),
+                &workspace.uri(),
                 Position {
                     line: 0,
                     character: 5,
@@ -2450,23 +2501,22 @@ proc f {} {
             .await;
         let ws = result.expect("expected an edit set");
         let changes = ws.changes.expect("expected changes map");
-        let edits = changes.get(&uri()).expect("edits for the local uri");
+        let edits = changes
+            .get(&workspace.uri())
+            .expect("edits for the local uri");
         assert_eq!(edits.len(), 2, "decl + one call site");
     }
 
     #[tokio::test]
     async fn references_returns_all_local_call_sites() {
         let backend = HtclBackend::new();
-        backend
-            .set_text_sync(
-                uri(),
-                "proc greet {} { puts hi }\ngreet\nproc other {} { greet }\n"
-                    .into(),
-            )
-            .await;
+        let source =
+            "proc greet {} { puts hi }\ngreet\nproc other {} { greet }\n";
+        let ws = Workspace::holding(source);
+        backend.set_text_sync(ws.uri(), source.into()).await;
         let locs = backend
             .references(
-                &uri(),
+                &ws.uri(),
                 Position {
                     line: 0,
                     character: 5,
@@ -2477,24 +2527,20 @@ proc f {} {
         // 3 hits: decl name + top-level call + nested call in `other`.
         assert_eq!(locs.len(), 3, "{locs:?}");
         for loc in &locs {
-            assert_eq!(loc.uri, uri());
+            assert_eq!(loc.uri, ws.uri());
         }
     }
 
     #[tokio::test]
     async fn references_on_type_covers_annotations() {
         let backend = HtclBackend::new();
-        backend
-            .set_text_sync(
-                uri(),
-                "type MyThing = string\nproc a {v: MyThing} MyThing { }\nproc b {v: MyThing} { }\n"
-                    .into(),
-            )
-            .await;
+        let source = "type MyThing = string\nproc a {v: MyThing} MyThing { }\nproc b {v: MyThing} { }\n";
+        let ws = Workspace::holding(source);
+        backend.set_text_sync(ws.uri(), source.into()).await;
         // Cursor on `MyThing` at the type decl (char 5..12 = "MyThing").
         let locs = backend
             .references(
-                &uri(),
+                &ws.uri(),
                 Position {
                     line: 0,
                     character: 5,
@@ -2509,16 +2555,12 @@ proc f {} {
     #[tokio::test]
     async fn rename_type_covers_all_annotations() {
         let backend = HtclBackend::new();
-        backend
-            .set_text_sync(
-                uri(),
-                "type MyThing = string\nproc a {v: MyThing} MyThing { }\n"
-                    .into(),
-            )
-            .await;
+        let source = "type MyThing = string\nproc a {v: MyThing} MyThing { }\n";
+        let workspace = Workspace::holding(source);
+        backend.set_text_sync(workspace.uri(), source.into()).await;
         let ws = backend
             .rename(
-                &uri(),
+                &workspace.uri(),
                 Position {
                     line: 0,
                     character: 5,
@@ -2528,7 +2570,7 @@ proc f {} {
             .await
             .expect("edit set");
         let changes = ws.changes.expect("changes");
-        let edits = changes.get(&uri()).expect("local edits");
+        let edits = changes.get(&workspace.uri()).expect("local edits");
         // Same 3 hits: decl + arg-type + return-type.
         assert_eq!(edits.len(), 3, "{edits:?}");
         for e in edits {
