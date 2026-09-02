@@ -618,6 +618,59 @@ impl VwUserApi for UserApi {
         ))
     }
 
+    async fn flush_artifacts(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::EnvironmentPathParam,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<vw_api_types_versions::latest::ArtifactFlush>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let name = path_params.into_inner().name;
+
+        // The vivado instance is the only one that fills the store; helios
+        // does not produce artifacts and the artifact instance holds them
+        // rather than making them.
+        let target = vw_api_types_versions::latest::TargetPathParam {
+            name: name.clone(),
+            kind: vw_api_types_versions::latest::TargetKind::Vivado,
+        };
+        let agent = relay::Agent::resolve(
+            &caller.name,
+            &name,
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            &args,
+        )
+        .inspect_err(|e| log_relay_failure(&log, &target, e))?;
+
+        let flushed = agent
+            .client
+            .flush_artifacts(&agent.environment)
+            .await
+            .map_err(|e| agent.failed(e))
+            .inspect_err(|e| log_relay_failure(&log, &target, e))?
+            .into_inner();
+
+        info!(log, "flushed an environment's artifacts";
+            "environment" => &name,
+            "uploaded" => flushed.uploaded,
+            "settled" => flushed.settled,
+        );
+
+        // The client's generated type and the API's own are different types
+        // with the same shape, so it is copied across rather than passed on.
+        Ok(dropshot::HttpResponseOk(
+            vw_api_types_versions::latest::ArtifactFlush {
+                uploaded: flushed.uploaded as usize,
+                settled: flushed.settled,
+            },
+        ))
+    }
+
     async fn get_artifacts(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
@@ -874,12 +927,27 @@ pub async fn start_server(
     let lg = log.new(o!("component" => "user_api"));
     let api = api_description();
 
+    // This API has endpoints that exist only from a given version onwards, so
+    // each request has to say which version it is written against — dropshot
+    // will not start a server that mixes versioned endpoints with no way to
+    // pick between them. No default for a missing header: every client is
+    // built from this repository and sends one, and answering a request that
+    // did not say what it expects is how a client silently gets a version it
+    // was not written for.
+    let versions = dropshot::VersionPolicy::Dynamic(Box::new(
+        dropshot::ClientSpecifiesVersionInHeader::new(
+            http::header::HeaderName::from_static(vw_api::API_VERSION_HEADER),
+            vw_api::latest_version(),
+        ),
+    ));
+
     // Shared rather than owned so that the certificate can be replaced under a
     // server that is already running. Dropping the last handle shuts the
     // server down, so this one outlives the follower task below.
     let server = Arc::new(
         dropshot::ServerBuilder::new(api, context, lg.clone())
             .config(cfg)
+            .version_policy(versions)
             .tls(crate::tls::initial(tls.as_ref()))
             .start()?,
     );

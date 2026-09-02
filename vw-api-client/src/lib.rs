@@ -175,7 +175,7 @@ pub struct ClientConfig<'a> {
 pub fn user_client(config: &ClientConfig<'_>) -> Result<user::Client, Error> {
     Ok(user::Client::new_with_client(
         config.base_url,
-        http_client(config)?,
+        http_client(config, vw_api::latest_version())?,
     ))
 }
 
@@ -186,7 +186,7 @@ pub fn user_client(config: &ClientConfig<'_>) -> Result<user::Client, Error> {
 pub fn admin_client(config: &ClientConfig<'_>) -> Result<admin::Client, Error> {
     Ok(admin::Client::new_with_client(
         config.base_url,
-        http_client(config)?,
+        http_client(config, vw_api::latest_version())?,
     ))
 }
 
@@ -195,28 +195,41 @@ pub fn admin_client(config: &ClientConfig<'_>) -> Result<admin::Client, Error> {
 /// No credentials: the agents sit on the rack's internal network behind
 /// `vw-svc`, which has already decided whether the caller owns the environment
 /// by the time anything reaches here.
+///
+/// Versioned against the agent API rather than the user API. They are separate
+/// documents with separate version histories that happen to share a header
+/// name, and sending one's version to the other is only harmless for as long
+/// as the numbers coincide — at which point it stops being harmless without
+/// anything having changed.
 pub fn agent_client(base_url: &str) -> Result<agent::Client, Error> {
     Ok(agent::Client::new_with_client(
         base_url,
-        http_client(&ClientConfig {
-            base_url,
-            token: None,
-            insecure: false,
-        })?,
+        http_client(
+            &ClientConfig {
+                base_url,
+                token: None,
+                insecure: false,
+            },
+            vw_sync_api::latest_version(),
+        )?,
     ))
 }
 
 /// An http client that presents the configured token, if there is one, on
-/// every request.
-fn http_client(config: &ClientConfig<'_>) -> Result<reqwest::Client, Error> {
+/// every request, and names `version` as the API version it speaks.
+fn http_client(
+    config: &ClientConfig<'_>,
+    version: impl std::fmt::Display,
+) -> Result<reqwest::Client, Error> {
     let mut headers = HeaderMap::new();
 
     // What this client was generated against. The service routes on it, so a
     // request without it is refused rather than answered from a version this
     // client may not understand.
     headers.insert(
+        // Both APIs spell it the same way; only the value differs.
         HeaderName::from_static(vw_api::API_VERSION_HEADER),
-        HeaderValue::from_str(&vw_api::latest_version().to_string())?,
+        HeaderValue::from_str(&version.to_string())?,
     );
 
     if let Some(token) = config.token {

@@ -31,3 +31,5 @@ pub use crate::v2::ImageRecycleQuery;
 pub use crate::v2::ImageRecycleReport;
 pub use crate::v2::KeptImage;
 pub use crate::v2::RecycledImage;
+
+pub use crate::v3::ArtifactFlush;

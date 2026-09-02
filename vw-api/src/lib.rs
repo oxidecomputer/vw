@@ -19,6 +19,7 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (3, ARTIFACT_FLUSH),
     (2, IMAGE_RECYCLE),
     (1, INITIAL),
 ]);
@@ -263,6 +264,34 @@ pub trait VwUserApi {
         rqctx: RequestContext<Self::Context>,
         path_params: Path<latest::EnvironmentPathParam>,
     ) -> Result<HttpResponseOk<Vec<latest::Artifact>>, HttpError>;
+
+    /// Wait for this environment's finished artifacts to reach its store.
+    ///
+    /// The instance uploads what a build produces on a timer, noticing a
+    /// finished artifact a second or two after the last byte is written. That
+    /// gap is invisible to a person, who takes minutes to think about
+    /// collecting, and is exactly the wrong size for a script, which collects
+    /// in under a second and gets a listing that is short by however many
+    /// artifacts were still on their way. Nothing about the result says so.
+    ///
+    /// So this exists to be called before [`Self::get_artifacts`], by the
+    /// callers that would otherwise lose the race. It is not called on the
+    /// caller's behalf, because it costs the seconds the uploader takes to
+    /// come to rest and most listings are somebody looking rather than a
+    /// build collecting.
+    ///
+    /// Names nothing: the instance runs the walk it already runs until a pass
+    /// finds nothing left to do, so a build stage added later is covered
+    /// without this changing.
+    #[endpoint {
+        method = POST,
+        path = "/environment/{name}/artifact-flush",
+        versions = VERSION_ARTIFACT_FLUSH..,
+    }]
+    async fn flush_artifacts(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<latest::ArtifactFlush>, HttpError>;
 
     /// Remove every artifact an environment has stored.
     ///
