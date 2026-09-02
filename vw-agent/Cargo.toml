@@ -30,6 +30,7 @@ vw-api-types-versions = { path = "../vw-api-types/versions" }
 camino.workspace = true
 clap.workspace = true
 dropshot.workspace = true
+http = "1"
 thiserror.workspace = true
 tokio.workspace = true
 slog = "2.8.2"

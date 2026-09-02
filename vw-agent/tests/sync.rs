@@ -19,7 +19,86 @@ use vw_api_types_versions::latest::{
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many times to try for a port before calling it a real failure.
+const STARTUP_ATTEMPTS: usize = 5;
 const ENVIRONMENT: &str = "darmok";
+
+/// Start an agent on `port`, with everything it needs under `base`.
+fn spawn_agent(
+    base: &Utf8Path,
+    root: &Utf8Path,
+    netrc: &Utf8Path,
+    port: u16,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_vw-agent"))
+        .arg("serve")
+        .args(["--address", "127.0.0.1"])
+        .args(["--port", &port.to_string()])
+        .args(["--environment", ENVIRONMENT])
+        .args(["--root", root.as_str()])
+        .args(["--store", base.join("store").as_str()])
+        .args(["--netrc", netrc.as_str()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn vw-agent")
+}
+
+/// Whether an agent came up and answered.
+///
+/// `false` when it exited instead, which in practice means it lost the race
+/// for its port. Any answer at all counts as up — this one is a `404` until
+/// somebody says where artifacts go, which is the state an agent starts in.
+async fn listening(
+    client: &reqwest::Client,
+    base_url: &str,
+    child: &mut Child,
+) -> bool {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if client
+            .get(format!(
+                "{base_url}/environment/{ENVIRONMENT}/artifact-target"
+            ))
+            .send()
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        if child.try_wait().expect("check on vw-agent").is_some() {
+            return false;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "vw-agent never started listening on {base_url}",
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A client that says which version of the agent API it speaks.
+///
+/// The agent serves endpoints that exist only from a given version onwards, so
+/// it refuses a request that does not say — exactly as it would refuse one
+/// from a `vw-svc` too old to know about them, which is the point of asking.
+fn versioned_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HeaderName::from_static(
+            vw_sync_api::API_VERSION_HEADER,
+        ),
+        reqwest::header::HeaderValue::from_str(
+            &vw_sync_api::latest_version().to_string(),
+        )
+        .expect("a version is a valid header value"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build a client")
+}
 
 /// A running agent with a tree and a content store of its own.
 struct Agent {
@@ -34,58 +113,38 @@ struct Agent {
 impl Agent {
     async fn start() -> Agent {
         let dir = TempDir::new().expect("scratch directory");
-        let base = Utf8Path::from_path(dir.path()).expect("utf8 temp dir");
+        let base = Utf8Path::from_path(dir.path())
+            .expect("utf8 temp dir")
+            .to_owned();
         let root = base.join("tree");
         let netrc = base.join("home/.netrc");
-        let port = free_port();
+        let client = versioned_client();
 
-        let child = Command::new(env!("CARGO_BIN_EXE_vw-agent"))
-            .arg("serve")
-            .args(["--address", "127.0.0.1"])
-            .args(["--port", &port.to_string()])
-            .args(["--environment", ENVIRONMENT])
-            .args(["--root", root.as_str()])
-            .args(["--store", base.join("store").as_str()])
-            .args(["--netrc", netrc.as_str()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn vw-agent");
+        // A port is chosen by binding one and letting it go, so two agents
+        // starting at the same moment can be handed the same one and whichever
+        // gets there second fails to bind. Nothing is wrong when that happens
+        // and there is nothing to do about it but pick another.
+        for _ in 0..STARTUP_ATTEMPTS {
+            let port = free_port();
+            let mut child = spawn_agent(&base, &root, &netrc, port);
+            let base_url = format!("http://127.0.0.1:{port}");
 
-        let mut agent = Agent {
-            child,
-            base_url: format!("http://127.0.0.1:{port}"),
-            client: reqwest::Client::new(),
-            _dir: dir,
-            root,
-            netrc,
-        };
-        agent.wait_until_ready().await;
-        agent
-    }
-
-    async fn wait_until_ready(&mut self) {
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
-        loop {
-            if self
-                .plan_raw(ENVIRONMENT, &TreeManifest::default())
-                .await
-                .is_ok()
-            {
-                return;
+            if listening(&client, &base_url, &mut child).await {
+                return Agent {
+                    child,
+                    base_url,
+                    client,
+                    _dir: dir,
+                    root,
+                    netrc,
+                };
             }
-            if let Some(status) =
-                self.child.try_wait().expect("check on vw-agent")
-            {
-                panic!("vw-agent exited during startup: {status}");
-            }
-            assert!(
-                Instant::now() < deadline,
-                "vw-agent never started listening on {}",
-                self.base_url,
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+
+            let _ = child.kill();
+            let _ = child.wait();
         }
+
+        panic!("vw-agent exited during startup {STARTUP_ATTEMPTS} times");
     }
 
     async fn plan_raw(
@@ -381,6 +440,54 @@ async fn committing_before_delivering_is_refused() {
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert!(agent.paths().is_empty());
+}
+
+/// A request that does not say which version of the API it speaks is refused
+/// rather than guessed at.
+///
+/// The agent has endpoints that exist only from a given version onwards. A
+/// `vw-svc` too old to know about them says so, and gets what it was written
+/// for; one that said nothing would be handed the newest of everything on the
+/// assumption that it could cope, which is the kind of assumption that is
+/// right until it is not.
+#[tokio::test]
+async fn a_request_that_names_no_api_version_is_refused() {
+    let agent = Agent::start().await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/environment/{ENVIRONMENT}/sync/plan",
+            agent.base_url
+        ))
+        .json(&TreeManifest::default())
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// The flush endpoint exists, and says plainly that it has nowhere to send
+/// anything until somebody says where artifacts go.
+///
+/// An agent that answered a flush cheerfully in that state would tell whoever
+/// asked that the store was up to date, which is the one thing a flush must
+/// never do wrongly — the caller is about to collect on the strength of it.
+#[tokio::test]
+async fn flushing_before_anyone_said_where_artifacts_go_is_refused() {
+    let agent = Agent::start().await;
+
+    let response = agent
+        .client
+        .post(format!(
+            "{}/environment/{ENVIRONMENT}/artifact-flush",
+            agent.base_url
+        ))
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

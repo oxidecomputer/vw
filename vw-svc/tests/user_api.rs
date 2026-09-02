@@ -48,7 +48,7 @@ impl TestServer {
         let mut server = TestServer {
             child,
             base_url: format!("http://127.0.0.1:{user_port}"),
-            client: reqwest::Client::new(),
+            client: versioned_client(),
         };
         server.wait_until_ready().await;
         server
@@ -173,6 +173,25 @@ impl Drop for TestServer {
 
 /// A port nothing is listening on, obtained by binding an ephemeral port and
 /// immediately releasing it.
+/// A client that names the API version, as every real client does.
+///
+/// The user API has endpoints that only exist from a given version onwards, so
+/// the service routes on this header and refuses a request without it.
+fn versioned_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HeaderName::from_static(vw_api::API_VERSION_HEADER),
+        vw_api::latest_version()
+            .to_string()
+            .parse()
+            .expect("a version is a header value"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build a client")
+}
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
@@ -495,4 +514,21 @@ async fn deleting_an_environment_takes_its_key_with_it() {
         .await
         .expect("decode keys");
     assert!(keys.public_key.starts_with("ssh-ed25519 "));
+}
+
+/// The flush endpoint exists only from version 3 onwards, so a client that
+/// does not say which version it means is turned away rather than answered
+/// from one it may not have been built for.
+#[tokio::test]
+async fn a_request_that_names_no_api_version_is_refused() {
+    let dir = TempDir::new().expect("scratch directory");
+    let server = TestServer::start(&dir.path().join("vw-svc.redb")).await;
+
+    let unversioned = reqwest::Client::new()
+        .post(format!("{}/environments", server.base_url))
+        .send()
+        .await
+        .expect("send unversioned request");
+
+    assert_eq!(unversioned.status(), StatusCode::BAD_REQUEST);
 }

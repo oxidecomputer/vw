@@ -10,6 +10,7 @@ categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 vw-api = { path = "../vw-api" }
+vw-sync-api = { path = "../vw-sync-api" }
 vw-api-types-versions = { path = "../vw-api-types/versions" }
 base64 = "0.22"
 progenitor = "0.14.0"

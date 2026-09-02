@@ -173,6 +173,12 @@ pub struct Context {
     >,
     /// Where that answer is kept across restarts.
     artifact_target_path: Utf8PathBuf,
+    /// How to ask the uploader to send everything it has and say when it is
+    /// done.
+    ///
+    /// `None` on an instance that does not build anything, which has no
+    /// uploader to ask.
+    flushes: Option<tokio::sync::mpsc::Sender<artifacts::Flush>>,
     /// The object store this instance runs, if it is the one that runs it.
     ///
     /// Held so garage lives as long as the agent does, and so the key can be
@@ -386,6 +392,76 @@ impl VwSyncApi for Agent {
         };
 
         Ok(HttpResponseOk(current))
+    }
+
+    async fn flush_artifacts(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+    ) -> Result<
+        HttpResponseOk<vw_api_types_versions::latest::ArtifactFlush>,
+        HttpError,
+    > {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        // Only an instance that builds has an uploader running. Asking one
+        // that does not is a mistake worth naming rather than a request to
+        // answer with a cheerful nothing, which would read as "flushed" to
+        // whoever is about to collect.
+        let Some(flushes) = ctx.flushes.as_ref() else {
+            return Err(HttpError::for_not_found(
+                None,
+                String::from(
+                    "this instance does not produce artifacts, so it has \
+                     nothing to flush",
+                ),
+            ));
+        };
+
+        // Checked here rather than left to the uploader so the answer says
+        // which of the two things went wrong. An instance with nowhere to put
+        // artifacts has not failed to flush them — it has never been told
+        // where they go, and that is what somebody needs to hear.
+        if ctx.artifact_target.borrow().is_none() {
+            return Err(HttpError::for_not_found(
+                None,
+                String::from(
+                    "this instance has not been told where its artifacts go",
+                ),
+            ));
+        }
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        flushes
+            .send(artifacts::Flush { reply })
+            .await
+            .map_err(|_| {
+                HttpError::for_internal_error(String::from(
+                    "the artifact uploader is gone",
+                ))
+            })?;
+
+        let flushed = answer.await.map_err(|_| {
+            HttpError::for_internal_error(String::from(
+                "the artifact uploader stopped before answering",
+            ))
+        })?;
+
+        if !flushed.settled {
+            slog::warn!(rqctx.log, "a flush did not settle";
+                "uploaded" => flushed.uploaded,
+            );
+        }
+
+        Ok(HttpResponseOk(
+            vw_api_types_versions::latest::ArtifactFlush {
+                uploaded: flushed.uploaded,
+                settled: flushed.settled,
+            },
+        ))
     }
 
     async fn put_artifact_target(
@@ -966,18 +1042,27 @@ async fn serve(args: ServerArgs) {
 
     // Only where builds happen. An artifact instance holds the store rather
     // than filling it, and helios does not produce images.
-    if kind == "vivado" {
+    let flushes = if kind == "vivado" {
+        // Depth of one: a flush is a barrier, and two callers waiting on the
+        // same directory to come to rest want the same answer. The second
+        // simply waits for the first to be taken.
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
         tokio::spawn(artifacts::synchronize(
             args.root.clone(),
             artifact_changes,
+            receiver,
             log.new(o!("task" => "artifacts")),
         ));
-    }
+        Some(sender)
+    } else {
+        None
+    };
 
     let context = Arc::new(Context {
         environment: environment.clone(),
         artifact_target,
         artifact_target_path: args.artifact_target.clone(),
+        flushes,
         object_store: store,
         root: args.root.clone(),
         store: Store::new(args.store.clone()),
@@ -991,8 +1076,25 @@ async fn serve(args: ServerArgs) {
         "netrc" => %netrc,
     );
 
+    // This API has endpoints that exist only from a given version onwards, so
+    // each request has to say which version it is written against — dropshot
+    // will not start a server that mixes versioned endpoints with no way to
+    // pick between them. No default for a missing header: the only client is
+    // `vw-svc`, which is built from this repository and sends one, and
+    // guessing on its behalf is how it would silently get a version it was not
+    // written for.
+    let versions = dropshot::VersionPolicy::Dynamic(Box::new(
+        dropshot::ClientSpecifiesVersionInHeader::new(
+            http::header::HeaderName::from_static(
+                vw_sync_api::API_VERSION_HEADER,
+            ),
+            vw_sync_api::latest_version(),
+        ),
+    ));
+
     let server =
         dropshot::ServerBuilder::new(api_description(), context, log.clone())
+            .version_policy(versions)
             .config(ConfigDropshot {
                 bind_address: SocketAddr::new(args.address, args.port),
                 // A manifest is one JSON document listing every file in the tree, and

@@ -36,8 +36,17 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (2, ARTIFACT_FLUSH),
     (1, INITIAL),
 ]);
+
+/// Header a client names the API version it is written against in.
+///
+/// Spelled the same as the user API's, and deliberately a separate constant:
+/// the two are different documents with different version histories, and a
+/// client that sent one's version to the other would be understood right up
+/// until the numbers diverged.
+pub const API_VERSION_HEADER: &str = "api-version";
 
 /// Which environment a request is for.
 ///
@@ -242,6 +251,33 @@ pub trait VwSyncApi {
         path_params: Path<EnvironmentPathParam>,
         body: TypedBody<latest::S3Credentials>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Send anything a build has left behind that has not gone yet, and
+    /// answer once there is nothing left to send.
+    ///
+    /// The uploader this drives is a poller: it notices a finished artifact a
+    /// second or two after the last byte is written, and deliberately waits to
+    /// see a file stop changing before sending it. That is right for the case
+    /// it was built for and wrong for the one where a build finishes and
+    /// something collects immediately — the collection lists the store before
+    /// the last artifact has reached it, and gets a set that looks complete.
+    ///
+    /// So this is a barrier rather than a command: it names nothing and knows
+    /// nothing about what a build produces, it just runs the same walk the
+    /// uploader already runs until a pass finds nothing left to do. A stage
+    /// added tomorrow is covered without anything here changing.
+    ///
+    /// Answers `404` when this instance has not been told where its artifacts
+    /// go, or when it is not the kind of instance that produces any.
+    #[endpoint {
+        method = POST,
+        path = "/environment/{environment}/artifact-flush",
+        versions = VERSION_ARTIFACT_FLUSH..,
+    }]
+    async fn flush_artifacts(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+    ) -> Result<HttpResponseOk<latest::ArtifactFlush>, HttpError>;
 
     /// Build the driver on this instance.
     ///

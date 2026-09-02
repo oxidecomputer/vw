@@ -213,6 +213,18 @@ pub enum CloudCommand {
         clear: bool,
         #[arg(
             long,
+            conflicts_with = "clear",
+            help = "Wait for the instance to finish uploading before \
+                    listing. A build's artifacts reach the store a second or \
+                    two after the build writes them, so a script that \
+                    collects the moment a build ends can otherwise get a \
+                    listing that is short and looks complete. Costs the \
+                    seconds the upload takes, which is why it is not the \
+                    default."
+        )]
+        flush: bool,
+        #[arg(
+            long,
             value_name = "DIR",
             help = "Directory to write downloads into [default: .]"
         )]
@@ -403,8 +415,12 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             get,
             all,
             clear,
+            flush,
             out,
-        } => artifacts(&session, &name, &get, all, clear, out.as_deref()).await,
+        } => {
+            artifacts(&session, &name, &get, all, clear, flush, out.as_deref())
+                .await
+        }
         CloudCommand::Keys { name, dir } => {
             fetch_keys(&session, &name, dir.as_deref()).await
         }
@@ -1227,10 +1243,15 @@ async fn artifacts(
     get: &[String],
     all: bool,
     clear: bool,
+    flush: bool,
     out: Option<&Utf8Path>,
 ) -> Result<(), CloudError> {
     if clear {
         return clear_artifacts(session, environment).await;
+    }
+
+    if flush {
+        flush_artifacts(session, environment).await;
     }
 
     let available =
@@ -1262,6 +1283,62 @@ async fn artifacts(
     }
 
     Ok(())
+}
+
+/// Wait for the environment to finish uploading what its builds produced.
+///
+/// Best-effort, and deliberately so. The artifacts already in the store are
+/// worth listing whether or not this works, and it can fail for reasons that
+/// have nothing to do with them — most often an instance that has been stopped
+/// or replaced since the build, which is an ordinary way to collect and not a
+/// failure. What it must not do is fail quietly: the whole point of asking is
+/// to find out whether the listing that follows is the complete one, so
+/// anything short of a settled flush is said out loud.
+///
+/// A caller that needs the failure to be fatal gets it from `--get`, which
+/// already refuses a pattern that matches nothing.
+async fn flush_artifacts(session: &Session, environment: &str) {
+    let flushed = match vw_api_client::retrying(|| {
+        session.client.flush_artifacts(environment)
+    })
+    .await
+    {
+        Ok(flushed) => flushed.into_inner(),
+        Err(e) => {
+            eprintln!(
+                "{} could not wait for uploads to finish: {}",
+                "warning:".yellow(),
+                session.error(e),
+            );
+            eprintln!(
+                "{}",
+                "the listing below may be missing artifacts that had not \
+                 been uploaded yet"
+                    .bright_black(),
+            );
+            return;
+        }
+    };
+
+    if !flushed.settled {
+        eprintln!(
+            "{} the instance did not finish uploading in time; the listing \
+             below may be short",
+            "warning:".yellow(),
+        );
+        return;
+    }
+
+    // Nothing to say when nothing moved: the ordinary case is a build whose
+    // artifacts were all uploaded before anyone asked, and reporting "0" every
+    // time would only teach people to stop reading it.
+    if flushed.uploaded > 0 {
+        println!(
+            "{} waited for {} artifact(s) to finish uploading",
+            "\u{2713}".bright_green(),
+            flushed.uploaded.to_string().cyan(),
+        );
+    }
 }
 
 /// Which artifacts the `--get` patterns name.

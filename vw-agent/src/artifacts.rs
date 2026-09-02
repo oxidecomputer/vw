@@ -69,6 +69,60 @@ const BUILD_OUTPUT: &str = "target";
 /// only reads a file that has actually changed.
 const INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a flush will wait for the build output to come to rest.
+///
+/// Generous, because the thing being waited for is a real upload — an image
+/// runs to hundreds of megabytes and the link to the store is whatever it is.
+/// Finite, because a caller blocked on this deserves an answer eventually, and
+/// "the store may still be missing something" is a far better answer than a
+/// connection that never comes back.
+///
+/// Checked between passes rather than during one, so a flush that runs out of
+/// time never abandons an upload half-sent.
+const FLUSH_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// A request to send everything that is ready, and somewhere to say what went.
+///
+/// Carries no description of what to send. The uploader already knows how to
+/// find artifacts, and a flush that named them would have to be edited every
+/// time a build learned to produce something new — which is the thing this is
+/// meant to save its callers from, not a cost to pass on to them.
+pub(crate) struct Flush {
+    pub(crate) reply: tokio::sync::oneshot::Sender<Flushed>,
+}
+
+/// What a flush managed.
+pub(crate) struct Flushed {
+    /// Artifacts that went during this flush.
+    pub(crate) uploaded: usize,
+    /// Whether the build output came to rest before the deadline.
+    pub(crate) settled: bool,
+}
+
+/// What one walk over the build output did.
+///
+/// Three counts rather than one, because "nothing was uploaded" on its own
+/// cannot tell the difference between a directory that is finished and one
+/// where every upload is failing — and a flush that mistook the second for the
+/// first would report success over a store that is missing things.
+#[derive(Debug, Default)]
+struct Pass {
+    /// Artifacts sent.
+    uploaded: usize,
+    /// Artifacts still being written, so not yet eligible to send.
+    unsettled: usize,
+    /// Artifacts that could not be read or could not be sent.
+    failed: usize,
+}
+
+impl Pass {
+    /// Whether the build output is at rest: nothing left to send, nothing
+    /// still moving, and nothing that tried and failed.
+    fn quiescent(&self) -> bool {
+        self.uploaded == 0 && self.unsettled == 0 && self.failed == 0
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ArtifactError {
     #[error("writing {0}")]
@@ -128,9 +182,17 @@ pub(crate) fn recall(
 /// Runs until the agent stops. Takes its target from `target`, which is
 /// updated whenever the service tells us where artifacts go — so an agent that
 /// started before anyone said simply uploads nothing until someone does.
+///
+/// Also services flush requests, which run the same walk without the waiting.
+/// They are handled here rather than by whoever asked because everything the
+/// walk remembers — what has been sent, and what each file looked like last
+/// time — lives in this task. A handler that scanned on its own would race
+/// this one for the same keys and keep a second, disagreeing account of what
+/// had already gone.
 pub(crate) async fn synchronize(
     root: Utf8PathBuf,
     mut target: tokio::sync::watch::Receiver<Option<S3Credentials>>,
+    mut flushes: tokio::sync::mpsc::Receiver<Flush>,
     log: Logger,
 ) {
     // What has already gone, by path, with the digest that went. Keyed by
@@ -143,6 +205,7 @@ pub(crate) async fn synchronize(
     let mut previously: HashMap<Utf8PathBuf, Stamp> = HashMap::new();
 
     loop {
+        let mut asked = None;
         tokio::select! {
             () = tokio::time::sleep(INTERVAL) => {}
             // A new target means the old record of what has been sent is
@@ -153,69 +216,181 @@ pub(crate) async fn synchronize(
                 }
                 uploaded.clear();
             }
+            request = flushes.recv() => {
+                let Some(request) = request else {
+                    return;
+                };
+                asked = Some(request);
+            }
         }
 
         let credentials = target.borrow().clone();
         let Some(credentials) = credentials else {
+            // Nothing can go anywhere. Anybody waiting on a flush is told so
+            // rather than left to sit until their own patience runs out.
+            if let Some(request) = asked {
+                let _ = request.reply.send(Flushed {
+                    uploaded: 0,
+                    settled: false,
+                });
+            }
             continue;
         };
 
-        let mut currently = HashMap::new();
-        for Found {
-            path: artifact,
-            key,
-        } in artifacts(&root)
-        {
-            // An image is written over seconds, and this looks every second.
-            // A file whose size or timestamp moved since the last pass is
-            // still being written, and uploading it now would put a truncated
-            // artifact in the bucket under the name of a finished one — which
-            // is worse than not having it yet, because it looks like success.
-            let Some(stamp) = stamp(&artifact) else {
-                continue;
-            };
-            let settled = previously.get(&artifact) == Some(&stamp);
-            currently.insert(artifact.clone(), stamp);
-            if !settled {
-                continue;
+        match asked {
+            Some(request) => {
+                let flushed = drain(
+                    &root,
+                    &credentials,
+                    &mut uploaded,
+                    &mut previously,
+                    &log,
+                )
+                .await;
+                info!(log, "flushed artifacts";
+                    "uploaded" => flushed.uploaded,
+                    "settled" => flushed.settled,
+                );
+                // A caller that gave up while we worked is not a problem: the
+                // artifacts went either way, which was the point.
+                let _ = request.reply.send(flushed);
             }
-
-            let digest = match digest_of(&artifact) {
-                Ok(digest) => digest,
-                Err(e) => {
-                    warn!(log, "cannot read an artifact";
-                        "path" => %artifact,
-                        "error" => %e,
-                    );
-                    continue;
-                }
-            };
-            if uploaded.get(&artifact) == Some(&digest) {
-                continue;
-            }
-
-            match upload(&credentials, &key, &artifact).await {
-                Ok(()) => {
-                    info!(log, "uploaded an artifact";
-                        "path" => %artifact,
-                        "bucket" => &credentials.bucket,
-                        "key" => &key,
-                    );
-                    uploaded.insert(artifact, digest);
-                }
-                Err(e) => {
-                    // Left out of `uploaded`, so the next pass tries again.
-                    // A store that is briefly unreachable should not cost an
-                    // artifact.
-                    warn!(log, "cannot upload an artifact";
-                        "path" => %artifact,
-                        "error" => %e,
-                    );
-                }
+            None => {
+                pass(&root, &credentials, &mut uploaded, &mut previously, &log)
+                    .await;
             }
         }
-        previously = currently;
     }
+}
+
+/// Run passes until the build output stops changing, or until the deadline.
+///
+/// The same walk and the same settle rule as an ordinary pass, just without
+/// the second of waiting in between being the only thing that advances it. A
+/// flush is the poller hurried along, not a way around the check that keeps a
+/// half-written file out of the bucket — forcing everything up on sight would
+/// turn a caller's missing artifact into a truncated one, which is the worse
+/// of the two because it looks like success.
+///
+/// Which is why this still takes a couple of seconds on a directory with
+/// nothing to do: proving that a file has stopped growing means watching it
+/// not grow.
+async fn drain(
+    root: &Utf8Path,
+    credentials: &S3Credentials,
+    uploaded: &mut HashMap<Utf8PathBuf, String>,
+    previously: &mut HashMap<Utf8PathBuf, Stamp>,
+    log: &Logger,
+) -> Flushed {
+    let deadline = tokio::time::Instant::now() + FLUSH_DEADLINE;
+    let mut sent = 0;
+
+    loop {
+        let outcome = pass(root, credentials, uploaded, previously, log).await;
+        sent += outcome.uploaded;
+
+        if outcome.quiescent() {
+            return Flushed {
+                uploaded: sent,
+                settled: true,
+            };
+        }
+
+        // After the pass rather than before, so running out of time never
+        // abandons an upload that is already on the wire.
+        if tokio::time::Instant::now() >= deadline {
+            warn!(log, "a flush ran out of time; the store may still be \
+                        missing something";
+                "uploaded" => sent,
+                "unsettled" => outcome.unsettled,
+                "failed" => outcome.failed,
+            );
+            return Flushed {
+                uploaded: sent,
+                settled: false,
+            };
+        }
+
+        tokio::time::sleep(INTERVAL).await;
+    }
+}
+
+/// One walk over the build output, sending whatever is ready to go.
+///
+/// Updates `previously` to what it saw, which is what makes the next call able
+/// to tell a finished file from one still being written.
+async fn pass(
+    root: &Utf8Path,
+    credentials: &S3Credentials,
+    uploaded: &mut HashMap<Utf8PathBuf, String>,
+    previously: &mut HashMap<Utf8PathBuf, Stamp>,
+    log: &Logger,
+) -> Pass {
+    let mut outcome = Pass::default();
+    let mut currently = HashMap::new();
+
+    for Found {
+        path: artifact,
+        key,
+    } in artifacts(root)
+    {
+        // An image is written over seconds, and this looks every second.
+        // A file whose size or timestamp moved since the last pass is
+        // still being written, and uploading it now would put a truncated
+        // artifact in the bucket under the name of a finished one — which
+        // is worse than not having it yet, because it looks like success.
+        let Some(stamp) = stamp(&artifact) else {
+            continue;
+        };
+        let settled = previously.get(&artifact) == Some(&stamp);
+        currently.insert(artifact.clone(), stamp);
+        if !settled {
+            outcome.unsettled += 1;
+            continue;
+        }
+
+        let digest = match digest_of(&artifact) {
+            Ok(digest) => digest,
+            Err(e) => {
+                warn!(log, "cannot read an artifact";
+                    "path" => %artifact,
+                    "error" => %e,
+                );
+                // Counted, because not knowing whether this needed to go is
+                // not the same as knowing it did not.
+                outcome.failed += 1;
+                continue;
+            }
+        };
+        if uploaded.get(&artifact) == Some(&digest) {
+            continue;
+        }
+
+        match upload(credentials, &key, &artifact).await {
+            Ok(()) => {
+                info!(log, "uploaded an artifact";
+                    "path" => %artifact,
+                    "bucket" => &credentials.bucket,
+                    "key" => &key,
+                );
+                uploaded.insert(artifact, digest);
+                outcome.uploaded += 1;
+            }
+            Err(e) => {
+                // Left out of `uploaded`, so the next pass tries again.
+                // A store that is briefly unreachable should not cost an
+                // artifact.
+                warn!(log, "cannot upload an artifact";
+                    "path" => %artifact,
+                    "error" => %e,
+                );
+                outcome.failed += 1;
+            }
+        }
+    }
+
+    *previously = currently;
+    outcome
 }
 
 /// What a file looks like from the outside, cheaply.
@@ -657,6 +832,80 @@ mod test {
 
         // Unchanged since the last pass, so it is done.
         assert_eq!(stamp(&path).expect("stamp"), grown);
+    }
+
+    /// Somewhere nothing is listening, so an upload fails immediately rather
+    /// than hanging the test on a connection that never resolves.
+    fn nowhere() -> S3Credentials {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        S3Credentials {
+            endpoint: format!("http://127.0.0.1:{port}"),
+            port,
+            ..credentials()
+        }
+    }
+
+    /// An empty directory is a finished one. This is what lets a flush return
+    /// promptly when a build's artifacts all went some time ago, which is the
+    /// ordinary case.
+    #[test]
+    fn a_pass_with_nothing_to_do_is_quiescent() {
+        assert!(Pass::default().quiescent());
+    }
+
+    /// A directory whose files have not been seen twice yet is not finished.
+    ///
+    /// This is exactly the state a flush starts from when it is called the
+    /// instant a build ends, and calling it quiescent would hand the caller a
+    /// tick over a store that has received nothing — the original bug, with a
+    /// flush in front of it.
+    #[tokio::test]
+    async fn a_pass_over_a_directory_not_seen_before_is_not_quiescent() {
+        let (_dir, root) = scratch();
+        build_output(&root, "reports/worst-paths.csv", "a report");
+        let log = slog::Logger::root(slog::Discard, slog::o!());
+
+        let mut uploaded = HashMap::new();
+        let mut previously = HashMap::new();
+        let outcome =
+            pass(&root, &nowhere(), &mut uploaded, &mut previously, &log).await;
+
+        assert_eq!(outcome.unsettled, 1, "{outcome:?}");
+        assert_eq!(outcome.uploaded, 0, "{outcome:?}");
+        assert!(!outcome.quiescent(), "{outcome:?}");
+    }
+
+    /// An artifact that settled but could not be sent leaves the directory
+    /// unfinished.
+    ///
+    /// Counting only uploads would make a store that is refusing every write
+    /// indistinguishable from one that already has everything, and a flush
+    /// would report success over the second while looking at the first.
+    #[tokio::test]
+    async fn a_pass_that_could_not_upload_is_not_quiescent() {
+        let (_dir, root) = scratch();
+        build_output(&root, "reports/worst-paths.csv", "a report");
+        let log = slog::Logger::root(slog::Discard, slog::o!());
+        let target = nowhere();
+
+        let mut uploaded = HashMap::new();
+        let mut previously = HashMap::new();
+
+        // The first pass only learns what the file looks like.
+        pass(&root, &target, &mut uploaded, &mut previously, &log).await;
+        // By the second it has not changed, so it is eligible — and the send
+        // fails, because there is nothing at the other end.
+        let outcome =
+            pass(&root, &target, &mut uploaded, &mut previously, &log).await;
+
+        assert_eq!(outcome.unsettled, 0, "{outcome:?}");
+        assert_eq!(outcome.uploaded, 0, "{outcome:?}");
+        assert_eq!(outcome.failed, 1, "{outcome:?}");
+        assert!(!outcome.quiescent(), "{outcome:?}");
     }
 
     #[test]
