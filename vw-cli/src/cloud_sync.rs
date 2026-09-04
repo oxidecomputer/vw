@@ -4,20 +4,27 @@
 
 //! Pushing a workspace to the instances that build it.
 //!
-//! A workspace is split across an environment's two instances: vivado builds
-//! the hardware, helios builds whatever drives it, and neither needs the
-//! other's sources. Where the line falls is not a question a workspace gets to
-//! answer — a vw workspace keeps its driver in `driver`, so that is what goes
-//! to helios and everything else goes to vivado.
+//! Every instance gets the whole workspace.
 //!
-//! Nothing to declare, nothing to keep in step with the layout, and no way to
-//! have a workspace whose configuration disagrees with where its files
-//! actually are.
+//! An environment's two halves do build different things — vivado builds the
+//! hardware, helios builds what drives it — and it is tempting to send each of
+//! them only what it builds from. That was how this worked, and the line
+//! turned out not to stay put: a build script that reads `vw.toml`, a register
+//! map the driver and the design both generate from, a header shared between a
+//! testbench and a kernel module. Every one of those is a file on the wrong
+//! side of the line, discovered as a build failure on an instance rather than
+//! as anything a developer did wrong.
 //!
-//! Each target is synchronized independently: its own manifest, its own
-//! content, its own commit. Nothing is shared between them, so there is no
-//! ordering to get right and a failure to reach one instance does not hold up
-//! the other.
+//! Sending all of it to both is what removes that failure mode rather than
+//! moving it, and it costs very little. The scan already leaves out build
+//! output and anything a `.gitignore` covers; content is addressed by digest,
+//! so a file the second instance already holds is named in a manifest and not
+//! sent; and a workspace's sources are megabytes, against the gigabytes of
+//! build output neither instance ever sends at all.
+//!
+//! Each instance is still synchronized on its own — its own plan, its own
+//! content, its own commit — so there is no ordering to get right and a
+//! failure to reach one does not hold up the other.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use colored::*;
@@ -33,96 +40,13 @@ use crate::cloud::CloudError;
 const UPLOAD_CONCURRENCY: usize = 16;
 use vw_api_types_versions::latest as types;
 
-/// A target's slice of the workspace, ready to be sent.
-pub struct Target {
-    pub kind: types::TargetKind,
-    /// The directory scanned for this target.
-    ///
-    /// A target with its own subtree is rooted there, so paths on the instance
-    /// are relative to it — `driver`'s `Cargo.toml` lands at `Cargo.toml`,
-    /// where cargo expects to find it, not at `driver/Cargo.toml`.
-    pub root: Utf8PathBuf,
-    /// Paths under the workspace root that belong to another target and must
-    /// not be sent with this one.
-    pub excluded: Vec<String>,
-}
-
-/// The directory a vw workspace keeps its driver in.
+/// The instances a workspace is synchronized to.
 ///
-/// Everything under it is built on helios and nothing else is, which is what
-/// makes the split something this can decide rather than something a workspace
-/// has to say.
-pub const DRIVER: &str = "driver";
-
-/// Work out how a workspace divides across an environment's instances.
-///
-/// A workspace with no driver gets no helios target, rather than one with an
-/// empty tree: an empty manifest is a valid instruction to delete everything,
-/// and sending one because there is no `driver` directory would be a poor way
-/// to find that out.
-pub fn targets(workspace: &Utf8Path) -> Vec<Target> {
-    // Vivado takes the workspace as a whole, less the driver.
-    let mut targets = vec![Target {
-        kind: types::TargetKind::Vivado,
-        root: workspace.to_owned(),
-        excluded: vec![DRIVER.to_owned()],
-    }];
-
-    let driver = workspace.join(DRIVER);
-    if driver.is_dir() {
-        targets.push(Target {
-            kind: types::TargetKind::Helios,
-            root: driver,
-            excluded: Vec::new(),
-        });
-    }
-
-    targets
-}
-
-/// Scan a target's tree, dropping anything claimed by another target.
-pub fn scan(
-    target: &Target,
-) -> Result<types::TreeManifest, vw_sync::ScanError> {
-    let manifest = vw_sync::scan(&target.root)?;
-
-    let entries = manifest
-        .entries
-        .into_iter()
-        .filter(|entry| {
-            !target.excluded.iter().any(|excluded| {
-                entry.path == *excluded
-                    || entry.path.starts_with(&format!("{excluded}/"))
-            })
-        })
-        .collect();
-
-    Ok(types::TreeManifest { entries })
-}
-
-impl Target {
-    /// Read one of this target's files, for delivery.
-    pub fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
-        std::fs::read(self.root.join(path))
-    }
-
-    /// Find the file in `manifest` with this digest.
-    ///
-    /// A plan asks for content by digest, and the sender has it by path, so
-    /// something has to bridge the two. Any path with the right digest will
-    /// do — that is the whole point of naming content by what it is.
-    pub fn path_for<'a>(
-        &self,
-        manifest: &'a types::TreeManifest,
-        digest: &types::Digest,
-    ) -> Option<&'a str> {
-        manifest
-            .entries
-            .iter()
-            .find(|entry| entry.digest == *digest)
-            .map(|entry| entry.path.as_str())
-    }
-}
+/// Both of them, whatever is in the workspace. There is nothing to derive and
+/// nothing to declare, so there is no way for a workspace's configuration to
+/// disagree with where its files actually are.
+pub const TARGETS: [types::TargetKind; 2] =
+    [types::TargetKind::Vivado, types::TargetKind::Helios];
 
 /// Push the workspace to an environment, once or continuously.
 pub async fn run(
@@ -134,14 +58,14 @@ pub async fn run(
     only: Option<types::TargetKind>,
 ) -> Result<(), CloudError> {
     let workspace = workspace_root()?;
-    let mut targets = targets(&workspace);
     // A command that only drives one instance should not fail because the
     // other one is down. `vw driver build` needs helios and nothing else; a
     // vivado instance rebooting is not its problem.
-    if let Some(only) = only {
-        targets.retain(|target| target.kind == only);
-    }
-    announce(&targets);
+    let targets: Vec<types::TargetKind> = TARGETS
+        .into_iter()
+        .filter(|kind| only.is_none_or(|only| only == *kind))
+        .collect();
+    announce(&workspace);
 
     // Only ever the first pass. Forcing is an answer to a doubt about what is
     // on the instance, and once the sync below has settled it there is nothing
@@ -151,7 +75,7 @@ pub async fn run(
         clear(session, environment, &targets).await?;
     }
 
-    sync_once(session, environment, &targets, true).await?;
+    sync_once(session, environment, &workspace, &targets, true).await?;
 
     if !watch {
         return Ok(());
@@ -175,7 +99,9 @@ pub async fn run(
         }
         while tokio::time::timeout(debounce, changes.recv()).await.is_ok() {}
 
-        if let Err(e) = sync_once(session, environment, &targets, false).await {
+        if let Err(e) =
+            sync_once(session, environment, &workspace, &targets, false).await
+        {
             // A failed sync is not a reason to stop watching. The next save
             // tries again, and an instance that is still coming up will be
             // there shortly.
@@ -184,21 +110,18 @@ pub async fn run(
     }
 }
 
-/// Say which instance is getting which directory.
+/// Say which workspace is being pushed.
 ///
-/// Worth the two lines because a target with nothing to do prints nothing, so
-/// a workspace with no driver and one whose helios instance is merely up to
-/// date look identical from the outside. Said once, before the first pass,
-/// because it describes the workspace rather than anything a sync does.
-fn announce(targets: &[Target]) {
-    for target in targets {
-        println!(
-            "{} {} {}",
-            "\u{2192}".bright_black(),
-            target.kind.to_string().cyan(),
-            target.root.as_str().bright_black(),
-        );
-    }
+/// Worth the line because a sync can be run from anywhere inside a workspace,
+/// and "which one did that just send" is not a question anyone should have to
+/// answer by remembering where they were standing. Which instances are getting
+/// it is left to the reports below, which name them either way.
+fn announce(workspace: &Utf8Path) {
+    println!(
+        "{} {}",
+        "\u{2192}".bright_black(),
+        workspace.as_str().bright_black(),
+    );
 }
 
 /// Throw away what every target's instance has.
@@ -211,11 +134,11 @@ fn announce(targets: &[Target]) {
 async fn clear(
     session: &crate::cloud::Session,
     environment: &str,
-    targets: &[Target],
+    targets: &[types::TargetKind],
 ) -> Result<(), CloudError> {
-    for target in targets {
+    for kind in targets {
         let result = vw_api_client::retrying(|| {
-            session.client.sync_clear(environment, &target.kind)
+            session.client.sync_clear(environment, kind)
         })
         .await
         .map_err(|e| session.error(e))?
@@ -224,7 +147,7 @@ async fn clear(
         println!(
             "{} {} cleared ({} removed)",
             "\u{2717}".bright_black(),
-            target.kind.to_string().cyan(),
+            kind.to_string().cyan(),
             result.deleted,
         );
     }
@@ -236,17 +159,20 @@ async fn clear(
 async fn sync_once(
     session: &crate::cloud::Session,
     environment: &str,
-    targets: &[Target],
+    workspace: &Utf8Path,
+    targets: &[types::TargetKind],
     announce: bool,
 ) -> Result<(), CloudError> {
-    for target in targets {
-        let manifest = scan(target)
-            .map_err(|e| CloudError::Scan(target.root.clone(), e))?;
+    // Scanned once for all of them. Every instance is being told about the
+    // same tree, and the scan is the expensive half of a pass — every source
+    // file read and hashed — so scanning per instance would double the cost of
+    // saying the same thing twice.
+    let manifest = vw_sync::scan(workspace)
+        .map_err(|e| CloudError::Scan(workspace.to_owned(), e))?;
 
+    for kind in targets {
         let plan = vw_api_client::retrying(|| {
-            session
-                .client
-                .sync_plan(environment, &target.kind, &manifest)
+            session.client.sync_plan(environment, kind, &manifest)
         })
         .await
         .map_err(|e| session.error(e))?
@@ -262,13 +188,11 @@ async fn sync_once(
         // arrive in any order and are safe to send at once. The commit that
         // follows is what imposes an order, and it happens after all of this.
         let uploads = plan.missing.iter().map(|digest| {
-            let path = target
-                .path_for(&manifest, digest)
+            let path = path_for(&manifest, digest)
                 .expect("the plan only asks for content the manifest names");
 
             async move {
-                let contents = target
-                    .read(path)
+                let contents = std::fs::read(workspace.join(path))
                     .map_err(|e| CloudError::ReadSource(path.to_owned(), e))?;
 
                 // Cloned per attempt because the body is consumed by the
@@ -279,7 +203,7 @@ async fn sync_once(
                 vw_api_client::retrying(|| {
                     session.client.sync_blob(
                         environment,
-                        &target.kind,
+                        kind,
                         digest.0.as_str(),
                         contents.clone(),
                     )
@@ -297,18 +221,32 @@ async fn sync_once(
             .await?;
 
         let result = vw_api_client::retrying(|| {
-            session
-                .client
-                .sync_commit(environment, &target.kind, &manifest)
+            session.client.sync_commit(environment, kind, &manifest)
         })
         .await
         .map_err(|e| session.error(e))?
         .into_inner();
 
-        report(target, &manifest, plan.missing.len(), &result, announce);
+        report(*kind, &manifest, plan.missing.len(), &result, announce);
     }
 
     Ok(())
+}
+
+/// Find the file in `manifest` with this digest.
+///
+/// A plan asks for content by digest, and the sender has it by path, so
+/// something has to bridge the two. Any path with the right digest will do —
+/// that is the whole point of naming content by what it is.
+fn path_for<'a>(
+    manifest: &'a types::TreeManifest,
+    digest: &types::Digest,
+) -> Option<&'a str> {
+    manifest
+        .entries
+        .iter()
+        .find(|entry| entry.digest == *digest)
+        .map(|entry| entry.path.as_str())
 }
 
 /// Say what a target's sync did.
@@ -322,7 +260,7 @@ async fn sync_once(
 /// actually get there" is not a question anyone should have to answer by
 /// reading the source.
 fn report(
-    target: &Target,
+    kind: types::TargetKind,
     manifest: &types::TreeManifest,
     uploaded: usize,
     result: &types::CommitResult,
@@ -334,7 +272,7 @@ fn report(
             println!(
                 "{} {} up to date ({} files)",
                 "\u{2713}".bright_green(),
-                target.kind.to_string().cyan(),
+                kind.to_string().cyan(),
                 manifest.entries.len(),
             );
         }
@@ -344,7 +282,7 @@ fn report(
     println!(
         "{} {} +{} ~{} -{} ({} sent, {} files)",
         "\u{2713}".bright_green(),
-        target.kind.to_string().cyan(),
+        kind.to_string().cyan(),
         result.created,
         result.updated,
         result.deleted,
@@ -414,12 +352,9 @@ pub async fn clean(
     session: &crate::cloud::Session,
     environment: &str,
 ) -> Result<(), CloudError> {
-    let workspace = workspace_root()?;
-    let targets = targets(&workspace);
-
-    for target in &targets {
+    for kind in TARGETS {
         let result = vw_api_client::retrying(|| {
-            session.client.clean_build_output(environment, &target.kind)
+            session.client.clean_build_output(environment, &kind)
         })
         .await
         .map_err(|e| session.error(e))?
@@ -429,14 +364,14 @@ pub async fn clean(
             println!(
                 "{} {} removed {}",
                 "\u{2713}".bright_green(),
-                target.kind.to_string().cyan(),
+                kind.to_string().cyan(),
                 human_bytes(result.bytes),
             );
         } else {
             println!(
                 "{} {} nothing to remove",
                 "\u{2713}".bright_green(),
-                target.kind.to_string().cyan(),
+                kind.to_string().cyan(),
             );
         }
     }
@@ -477,95 +412,98 @@ mod test {
         (dir, root)
     }
 
-    #[test]
-    fn a_workspace_with_no_driver_is_all_vivados() {
-        let (_dir, root) = workspace(&["hdl/top.vhd", "vw.toml"]);
-        let targets = targets(&root);
-
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].kind, types::TargetKind::Vivado);
-
-        let manifest = scan(&targets[0]).expect("scan");
-        let paths: Vec<&str> =
-            manifest.entries.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, ["hdl/top.vhd", "vw.toml"]);
+    fn paths(manifest: &types::TreeManifest) -> Vec<&str> {
+        manifest.entries.iter().map(|e| e.path.as_str()).collect()
     }
 
     #[test]
-    fn the_driver_goes_to_helios_and_nowhere_else() {
-        // The metroid shape: everything is vivado's except `driver`.
+    fn both_instances_are_synchronized() {
+        assert_eq!(
+            TARGETS,
+            [types::TargetKind::Vivado, types::TargetKind::Helios],
+        );
+    }
+
+    #[test]
+    fn the_whole_workspace_goes_to_both() {
+        // The thing that used to be split: `driver` went to helios and the
+        // rest to vivado. Both of them now get all of it, driver included,
+        // and at the paths it has in the workspace.
         let (_dir, root) = workspace(&[
             "hdl/top.vhd",
             "vw.toml",
             "driver/Cargo.toml",
             "driver/src/lib.rs",
         ]);
-        let targets = targets(&root);
 
-        assert_eq!(targets.len(), 2);
+        let manifest = vw_sync::scan(&root).expect("scan");
 
-        let vivado = scan(&targets[0]).expect("scan vivado");
-        let paths: Vec<&str> =
-            vivado.entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(
-            paths,
-            ["hdl/top.vhd", "vw.toml"],
-            "vivado should not be carrying the driver",
+            paths(&manifest),
+            [
+                "driver/Cargo.toml",
+                "driver/src/lib.rs",
+                "hdl/top.vhd",
+                "vw.toml",
+            ],
         );
-
-        let helios = scan(&targets[1]).expect("scan helios");
-        let paths: Vec<&str> =
-            helios.entries.iter().map(|e| e.path.as_str()).collect();
-        // Rooted at `driver`, so cargo finds its manifest where it expects to.
-        assert_eq!(paths, ["Cargo.toml", "src/lib.rs"]);
     }
 
     #[test]
-    fn a_name_that_merely_starts_with_driver_is_not_the_driver() {
-        // `driver` must not swallow `drivers-notes.md`, which shares its
-        // first six characters and nothing else.
-        let (_dir, root) =
-            workspace(&["driver/Cargo.toml", "drivers-notes.md"]);
-        let targets = targets(&root);
+    fn a_workspace_with_no_driver_still_syncs_to_both() {
+        // Plenty of workspaces are hardware only. Nothing about that is a
+        // reason to leave an instance out — it is a workspace with no driver,
+        // not a workspace with no helios half.
+        let (_dir, root) = workspace(&["hdl/top.vhd", "vw.toml"]);
 
-        let vivado = scan(&targets[0]).expect("scan");
-        let paths: Vec<&str> =
-            vivado.entries.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, ["drivers-notes.md"]);
+        let manifest = vw_sync::scan(&root).expect("scan");
+
+        assert_eq!(paths(&manifest), ["hdl/top.vhd", "vw.toml"]);
+        assert_eq!(TARGETS.len(), 2);
     }
 
     #[test]
-    fn a_workspace_without_a_driver_syncs_its_hardware_anyway() {
-        // Plenty of workspaces are hardware only. That should sync what there
-        // is rather than fail — and certainly not send helios an empty
-        // manifest, which would mean "delete everything".
-        let (_dir, root) = workspace(&["hdl/top.vhd"]);
-        let targets = targets(&root);
-
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].kind, types::TargetKind::Vivado);
-    }
-
-    #[test]
-    fn build_output_is_not_in_any_target() {
+    fn build_output_is_never_sent() {
         let (_dir, root) = workspace(&[
             "hdl/top.vhd",
             "target/synth/top.dcp",
             "driver/Cargo.toml",
             "driver/target/debug/thing",
         ]);
-        let targets = targets(&root);
 
-        for target in &targets {
-            let manifest = scan(target).expect("scan");
-            assert!(
-                !manifest
-                    .entries
-                    .iter()
-                    .any(|entry| entry.path.contains("target/")),
-                "{:?} is carrying build output",
-                target.kind,
+        let manifest = vw_sync::scan(&root).expect("scan");
+
+        assert!(
+            !manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path.contains("target/")),
+            "the manifest is carrying build output: {:?}",
+            paths(&manifest),
+        );
+    }
+
+    #[test]
+    fn content_is_found_by_digest() {
+        // What bridges a plan, which asks by digest, and a sender, which has
+        // files by path.
+        let (_dir, root) = workspace(&["hdl/top.vhd", "vw.toml"]);
+        let manifest = vw_sync::scan(&root).expect("scan");
+
+        for entry in &manifest.entries {
+            // Every file here has the same contents, so any of the paths is a
+            // correct answer — which is the property being relied on.
+            let found = path_for(&manifest, &entry.digest).expect("a path");
+            assert_eq!(
+                vw_sync::digest_bytes(
+                    &std::fs::read(root.join(found)).expect("read")
+                ),
+                entry.digest,
             );
         }
+
+        assert!(
+            path_for(&manifest, &types::Digest("nothing".to_owned())).is_none(),
+        );
     }
 }

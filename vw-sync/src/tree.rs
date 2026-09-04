@@ -328,25 +328,67 @@ pub struct Cleaned {
 /// Remove everything a build wrote under `root`.
 ///
 /// The counterpart to what synchronization refuses to touch: the same
-/// directory it will never send and never delete is the one this exists to
+/// directories it will never send and never delete are the ones this exists to
 /// delete, and both read the name from the same place.
+///
+/// Every one of them, not only the one at the top. A machine holds the whole
+/// workspace and builds part of it — vivado writes to `target` at the root,
+/// the driver's cargo writes to `driver/target` a level down — and which of
+/// those a given machine produces is not something the other end knows or
+/// should have to say. A directory named `target` anywhere in the tree is
+/// build output by the only rule vw has, which is exactly why the scan will
+/// not carry one; so all of them go.
 ///
 /// Source is left alone. A cleaned tree is one a build starts over in, not one
 /// that has to be pushed again.
 pub fn clean(root: &Utf8Path) -> Result<Cleaned, ApplyError> {
-    let output = root.join(crate::BUILD_OUTPUT);
-    if !output.is_dir() {
-        return Ok(Cleaned::default());
+    let mut outputs = Vec::new();
+    collect_build_output(root, &mut outputs);
+    outputs.sort();
+
+    let mut cleaned = Cleaned::default();
+    for output in outputs {
+        cleaned.existed = true;
+        cleaned.bytes += size_of(&output);
+        std::fs::remove_dir_all(&output)
+            .map_err(|e| ApplyError::Remove(output, e))?;
     }
 
-    let bytes = size_of(&output);
-    std::fs::remove_dir_all(&output)
-        .map_err(|e| ApplyError::Remove(output, e))?;
+    Ok(cleaned)
+}
 
-    Ok(Cleaned {
-        existed: true,
-        bytes,
-    })
+/// Find every build output directory under `root`.
+///
+/// The walk stops at each one rather than descending into it, and skips the
+/// other directory synchronization never touches. Those are the large ones in
+/// a tree, and descending into either would be the only slow thing here — for
+/// `target`, to enumerate files about to be removed with their parent anyway.
+///
+/// Symlinks are not followed. A link pointing at something elsewhere on the
+/// machine is not this tree's output, and removing what is on the far end of
+/// one would be a remarkable thing for `vw clean` to do.
+fn collect_build_output(root: &Utf8Path, into: &mut Vec<Utf8PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(path) = Utf8PathBuf::from_path_buf(entry.path()) else {
+            continue;
+        };
+
+        match path.file_name() {
+            Some(name) if name == crate::BUILD_OUTPUT => into.push(path),
+            // The rest of what synchronization never touches — `.git` — is
+            // not a build's, and is large enough that walking through it
+            // would be the slowest thing here.
+            Some(name) if crate::ALWAYS_IGNORED.contains(&name) => {}
+            _ => collect_build_output(&path, into),
+        }
+    }
 }
 
 /// How much a directory holds, following nothing.
