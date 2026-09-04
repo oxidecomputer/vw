@@ -2341,21 +2341,6 @@ mod tests {
         }
     }
 
-    /// A temp dir plus the *canonical* form of its path.
-    ///
-    /// Everything the analyzer resolves through the loader comes
-    /// back canonicalized, so a test that builds its expected URIs
-    /// from the raw `TempDir::path()` is comparing two spellings of
-    /// one file. That only shows up where the temp root crosses a
-    /// symlink — which is exactly what macOS does, with `$TMPDIR`
-    /// under `/var` → `/private/var`, and what Linux's `/tmp`
-    /// happens not to do. Build test paths from this root instead.
-    fn temp_root() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        (dir, root)
-    }
-
     #[tokio::test]
     async fn handles_htcl_extension() {
         let backend = HtclBackend::new();
