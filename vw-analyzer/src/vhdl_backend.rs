@@ -23,7 +23,8 @@
 
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
@@ -31,13 +32,14 @@ use tower_lsp::lsp_types::{
     ClientCapabilities, CompletionItem, Diagnostic,
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbol,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, Location,
-    LogMessageParams, MessageType, PartialResultParams, Position,
-    PublishDiagnosticsParams, ReferenceContext, ReferenceParams, RenameParams,
-    ShowMessageParams, SignatureHelp, SymbolInformation,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceEdit,
+    DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    InitializeParams, Location, LogMessageParams, MessageType,
+    PartialResultParams, Position, PublishDiagnosticsParams, ReferenceContext,
+    ReferenceParams, RenameParams, ShowMessageParams, SignatureHelp,
+    SymbolInformation, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceEdit,
 };
 use tower_lsp::Client;
 use tracing::warn;
@@ -49,6 +51,21 @@ use crate::backend::LanguageBackend;
 /// `tokio::sync::oneshot`.
 struct WorkspaceHandle {
     tx: std::sync::mpsc::Sender<Message>,
+    /// Workspace root (the dir holding `vw.toml`) — kept so the
+    /// config can be re-rendered when the file set shifts.
+    root: Utf8PathBuf,
+    /// Every file the *currently installed* config maps into a
+    /// library, normalized the same way `vhdl_lang` normalizes
+    /// source paths. A `.vhd` that isn't in here is invisible to
+    /// the wrapped server's library mapping — it gets analyzed as
+    /// a standalone `Source::inline` with no `work` visibility, so
+    /// `use work.<pkg>` fails to resolve.
+    project_files: StdMutex<HashSet<PathBuf>>,
+    /// Paths we already re-rendered for and *still* didn't find —
+    /// a scratch `.vhd` outside `hdl/`, or a buffer not yet written
+    /// to disk. Keeps every keystroke in such a file from walking
+    /// the workspace again. `did_save` re-checks regardless.
+    absent: StdMutex<HashSet<PathBuf>>,
     /// Held only for cleanup at drop; joining is best-effort.
     _thread: StdMutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -60,6 +77,93 @@ impl Drop for WorkspaceHandle {
             let _ = handle.join();
         }
     }
+}
+
+impl WorkspaceHandle {
+    /// Make sure `path` is part of the wrapped server's project
+    /// before its text arrives.
+    ///
+    /// The config is a *concrete file list* rendered from the
+    /// workspace's on-disk enumeration, so a `.vhd` created after
+    /// the worker spawned isn't in it. Re-render on first sight of
+    /// an unknown path and push the result down, which is what
+    /// puts a newly added `hdl/*.vhd` into `defaultlib` and lets
+    /// `use work.…` resolve.
+    ///
+    /// `force` bypasses the [`absent`](Self::absent) memo — used
+    /// from `did_save`, where the very event that matters is a
+    /// buffer becoming a file on disk (`file_names` only reports
+    /// files that exist).
+    fn ensure_in_project(&self, path: &Path, force: bool) {
+        let path = normalize(path);
+        if self.project_files.lock().unwrap().contains(&path) {
+            return;
+        }
+        if !force && !self.absent.lock().unwrap().insert(path.clone()) {
+            return;
+        }
+        let cfg = match vw_lib::render_vhdl_lang_config(&self.root, None) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "vhdl_backend: config re-render failed for {}: {e}",
+                    self.root
+                );
+                return;
+            }
+        };
+        let files = config_file_set(&cfg);
+        let found = files.contains(&path);
+        if found {
+            self.absent.lock().unwrap().remove(&path);
+        } else {
+            self.absent.lock().unwrap().insert(path);
+        }
+        // Installing a config rebuilds the whole design root, so
+        // only do it when the enumeration actually moved.
+        if self.install_files(files) {
+            let _ = self.tx.send(Message::UpdateConfig(cfg));
+        }
+    }
+
+    /// Replace the cached project-file set. Returns true when it
+    /// differed from what was already cached — i.e. when the
+    /// wrapped server needs the new config.
+    fn install_files(&self, files: HashSet<PathBuf>) -> bool {
+        let mut cached = self.project_files.lock().unwrap();
+        if *cached == files {
+            return false;
+        }
+        // Anything previously written off as absent gets another
+        // chance against the new enumeration.
+        self.absent.lock().unwrap().retain(|p| !files.contains(p));
+        *cached = files;
+        true
+    }
+}
+
+/// Every file the config maps into a library, normalized for
+/// comparison against a URI-derived path.
+fn config_file_set(cfg: &vhdl_lang::Config) -> HashSet<PathBuf> {
+    let mut messages = vhdl_lang::NullMessages;
+    cfg.iter_libraries()
+        .flat_map(|lib| lib.file_names(&mut messages))
+        .map(|p| normalize(&p))
+        .collect()
+}
+
+fn is_vhdl(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("vhd") | Some("vhdl")
+    )
+}
+
+/// Absolute-but-not-canonical, matching `vhdl_lang::FilePath`:
+/// symlinks are deliberately left unresolved there, so resolving
+/// them here would produce paths that never compare equal.
+fn normalize(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[allow(dead_code)]
@@ -155,6 +259,21 @@ impl VhdlBackend {
         map.insert(ws, handle.clone());
         Some(handle)
     }
+
+    /// Resolve `uri` to its workspace and make sure the file is in
+    /// that workspace's project before anything else touches it.
+    /// See [`WorkspaceHandle::ensure_in_project`] for why.
+    async fn workspace_for_file(
+        &self,
+        uri: &Url,
+        force_refresh: bool,
+    ) -> Option<Arc<WorkspaceHandle>> {
+        let handle = self.ensure_workspace(uri).await?;
+        if let Ok(path) = uri.to_file_path() {
+            handle.ensure_in_project(&path, force_refresh);
+        }
+        Some(handle)
+    }
 }
 
 fn spawn_workspace_worker(
@@ -165,9 +284,11 @@ fn spawn_workspace_worker(
     stdlib_libraries_path: Option<String>,
 ) -> Arc<WorkspaceHandle> {
     let (tx, rx) = std::sync::mpsc::channel::<Message>();
+    let project_files = config_file_set(&initial_config);
+    let worker_root = root.clone();
     let thread = std::thread::spawn(move || {
         workspace_thread(
-            root,
+            worker_root,
             client,
             runtime,
             initial_config,
@@ -177,6 +298,9 @@ fn spawn_workspace_worker(
     });
     Arc::new(WorkspaceHandle {
         tx,
+        root,
+        project_files: StdMutex::new(project_files),
+        absent: StdMutex::new(HashSet::new()),
         _thread: StdMutex::new(Some(thread)),
     })
 }
@@ -379,7 +503,10 @@ impl LanguageBackend for VhdlBackend {
     }
 
     async fn set_text(&self, uri: Url, text: String) {
-        let Some(ws) = self.ensure_workspace(&uri).await else {
+        // `force = false`: this runs on every keystroke, and the
+        // memo in `ensure_in_project` keeps all but the first sight
+        // of an unknown path free.
+        let Some(ws) = self.workspace_for_file(&uri, false).await else {
             return;
         };
         // vhdl_ls doesn't distinguish "first open" from
@@ -401,6 +528,14 @@ impl LanguageBackend for VhdlBackend {
         let _ = ws.tx.send(Message::DidOpen(params));
     }
 
+    async fn save(&self, uri: &Url) {
+        // A brand-new buffer only becomes a project file once it
+        // exists on disk — `LibraryConfig::file_names` skips paths
+        // that don't. Force past the absent-memo so the first write
+        // of `hdl/new.vhd` pulls it into `defaultlib`.
+        self.workspace_for_file(uri, true).await;
+    }
+
     async fn did_change_watched_files(
         &self,
         params: &DidChangeWatchedFilesParams,
@@ -419,6 +554,15 @@ impl LanguageBackend for VhdlBackend {
             let Ok(path) = change.uri.to_file_path() else {
                 continue;
             };
+            // A VHDL source only moves the config when it appears
+            // or disappears — its *contents* reach the server
+            // through `did_change`, and re-rendering on every save
+            // would rebuild the whole design root for nothing.
+            // Vivado writing a few thousand generated `.vhd`s
+            // under `target/` is the case that makes this matter.
+            if is_vhdl(&path) && change.typ == FileChangeType::CHANGED {
+                continue;
+            }
             if let Some(ws) = crate::workspace::find_workspace_dir(&path) {
                 affected.insert(ws);
             }
@@ -436,6 +580,11 @@ impl LanguageBackend for VhdlBackend {
             };
             match vw_lib::render_vhdl_lang_config(&ws, None) {
                 Ok(cfg) => {
+                    // Keep the membership cache in step with what
+                    // the server is about to be told, so a file
+                    // this event just added doesn't trigger a
+                    // second re-render when it's opened.
+                    handle.install_files(config_file_set(&cfg));
                     let _ = handle.tx.send(Message::UpdateConfig(cfg));
                 }
                 Err(e) => {
@@ -637,3 +786,139 @@ const _MSG_TYPES: &[MessageType] = &[
     MessageType::INFO,
     MessageType::LOG,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::Receiver;
+
+    const VW_TOML: &str = "[workspace]\nname=\"t\"\nversion=\"0.1.0\"\n\
+                           [dependencies]\n[test-dependencies]\n";
+
+    /// A workspace handle with no worker thread behind it —
+    /// `Message`s pile up in the returned receiver instead, which
+    /// is exactly what these tests want to inspect.
+    fn handle_for(ws: &Utf8PathBuf) -> (WorkspaceHandle, Receiver<Message>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cfg = vw_lib::render_vhdl_lang_config(ws, None).unwrap();
+        let handle = WorkspaceHandle {
+            tx,
+            root: ws.clone(),
+            project_files: StdMutex::new(config_file_set(&cfg)),
+            absent: StdMutex::new(HashSet::new()),
+            _thread: StdMutex::new(None),
+        };
+        (handle, rx)
+    }
+
+    fn workspace() -> (tempfile::TempDir, Utf8PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(ws.join("vw.toml"), VW_TOML).unwrap();
+        std::fs::create_dir_all(ws.join("hdl")).unwrap();
+        std::fs::write(ws.join("hdl/existing.vhd"), "").unwrap();
+        (tmp, ws)
+    }
+
+    fn took_update_config(rx: &Receiver<Message>) -> bool {
+        matches!(rx.try_recv(), Ok(Message::UpdateConfig(_)))
+    }
+
+    /// The bug: a `.vhd` created after the workspace's server
+    /// started isn't in its rendered config, so it lands outside
+    /// every library and `use work.<pkg>` can't resolve. Opening
+    /// it has to re-render first.
+    #[test]
+    fn new_file_pulls_in_a_fresh_config() {
+        let (_tmp, ws) = workspace();
+        let (handle, rx) = handle_for(&ws);
+
+        let added = ws.join("hdl/added.vhd");
+        std::fs::write(&added, "").unwrap();
+        handle.ensure_in_project(added.as_std_path(), false);
+
+        assert!(
+            took_update_config(&rx),
+            "opening a newly created source must push a re-rendered config"
+        );
+        assert!(handle
+            .project_files
+            .lock()
+            .unwrap()
+            .contains(&normalize(added.as_std_path())));
+    }
+
+    /// A file already in the config is the common case — every
+    /// keystroke goes through here, so it must not re-render.
+    #[test]
+    fn known_file_does_not_re_render() {
+        let (_tmp, ws) = workspace();
+        let (handle, rx) = handle_for(&ws);
+
+        handle.ensure_in_project(
+            ws.join("hdl/existing.vhd").as_std_path(),
+            false,
+        );
+
+        assert!(rx.try_recv().is_err(), "no config churn for a known file");
+    }
+
+    /// An unsaved buffer isn't on disk, so no re-render can find
+    /// it (`file_names` only reports files that exist). The memo
+    /// keeps the miss cheap; `did_save`'s forced re-check is what
+    /// picks the file up once it lands.
+    #[test]
+    fn absent_file_is_memoized_until_saved() {
+        let (_tmp, ws) = workspace();
+        let (handle, rx) = handle_for(&ws);
+        let pending = ws.join("hdl/pending.vhd");
+
+        handle.ensure_in_project(pending.as_std_path(), false);
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing on disk, nothing to install"
+        );
+
+        // File appears — but an unforced check is memoized away.
+        std::fs::write(&pending, "").unwrap();
+        handle.ensure_in_project(pending.as_std_path(), false);
+        assert!(
+            rx.try_recv().is_err(),
+            "unforced re-check must stay memoized"
+        );
+
+        // `did_save`'s forced path is the one that notices.
+        handle.ensure_in_project(pending.as_std_path(), true);
+        assert!(took_update_config(&rx), "save must re-check and install");
+        assert!(handle
+            .project_files
+            .lock()
+            .unwrap()
+            .contains(&normalize(pending.as_std_path())));
+    }
+
+    /// `did_change_watched_files` installs the new enumeration
+    /// directly; a file it just added must not trigger a second
+    /// re-render when the editor opens it.
+    #[test]
+    fn install_files_clears_the_absent_memo() {
+        let (_tmp, ws) = workspace();
+        let (handle, rx) = handle_for(&ws);
+        let late = ws.join("hdl/late.vhd");
+
+        handle.ensure_in_project(late.as_std_path(), false);
+        assert!(handle
+            .absent
+            .lock()
+            .unwrap()
+            .contains(&normalize(late.as_std_path())));
+
+        std::fs::write(&late, "").unwrap();
+        let cfg = vw_lib::render_vhdl_lang_config(&ws, None).unwrap();
+        assert!(handle.install_files(config_file_set(&cfg)));
+
+        handle.ensure_in_project(late.as_std_path(), false);
+        assert!(rx.try_recv().is_err(), "already installed — no re-render");
+        assert!(handle.absent.lock().unwrap().is_empty());
+    }
+}
