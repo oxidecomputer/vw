@@ -157,10 +157,10 @@ each instance. Long-running commands are relayed over websockets, so a
 synth/place/route run streams output as it happens and Ctrl-C interrupts it.
 
 Synchronization is content-addressed: a sync sends only file contents the
-instance does not already have. Driver code goes to the helios instance and
-everything else to the vivado instance. `target/` is never sent in either
-direction, which is what lets Vivado checkpoints on an instance survive from
-one command to the next.
+instance does not already have. Both instances get the whole workspace: the
+design and the driver are one project, and which files a build reads is not a
+line that stays put. `target/` is never sent in either direction, which is what
+lets Vivado checkpoints on an instance survive from one command to the next.
 
 Build output lands in the artifact instance's S3 store as it is produced.
 `vw cloud artifacts <env>` lists it and `--get <pattern>` downloads by glob

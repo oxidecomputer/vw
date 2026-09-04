@@ -606,8 +606,15 @@ impl VwSyncApi for Agent {
             args: query.arguments(),
         };
 
+        // This instance holds the whole workspace, the same as the other one
+        // does, and the driver is the part of it that is a cargo workspace.
+        // Everything about the build happens there: cargo runs there, and what
+        // it produces is named relative to the build output directory
+        // underneath it.
+        let driver = ctx.root.join(vw_remote::driver::DIRECTORY);
+
         info!(rqctx.log, "building the driver";
-            "root" => %ctx.root,
+            "root" => %driver,
             "release" => params.release,
             "args" => params.args.join(" "),
         );
@@ -623,7 +630,7 @@ impl VwSyncApi for Agent {
         // upload can happen the moment cargo is done rather than after the
         // developer's command has already returned.
         let target = ctx.artifact_target.borrow().clone();
-        let root = ctx.root.clone();
+        let root = driver.clone();
         let upload_log = rqctx.log.clone();
         let upload: vw_remote::driver::Uploader =
             Box::new(move |produced: Vec<camino::Utf8PathBuf>| {
@@ -654,7 +661,7 @@ impl VwSyncApi for Agent {
             });
 
         let result =
-            vw_remote::driver::serve(socket, &ctx.root, params, upload).await;
+            vw_remote::driver::serve(socket, &driver, params, upload).await;
 
         match &result {
             Ok(produced) => info!(rqctx.log, "driver build finished";

@@ -118,7 +118,7 @@ pub async fn build_locally(
     release: bool,
     args: &[String],
 ) -> Result<bool, CloudError> {
-    let driver = workspace.join(vw_cloud_driver_dir());
+    let driver = workspace.join(vw_remote::driver::DIRECTORY);
     if !driver.is_dir() {
         return Err(CloudError::NoDriver(driver));
     }
@@ -137,9 +137,4 @@ pub async fn build_locally(
         .map_err(|e| CloudError::Transport(format!("running cargo: {e}")))?;
 
     Ok(status.success())
-}
-
-/// The directory a vw workspace keeps its driver in.
-fn vw_cloud_driver_dir() -> &'static str {
-    crate::cloud_sync::DRIVER
 }

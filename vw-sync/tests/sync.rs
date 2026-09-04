@@ -577,6 +577,32 @@ fn cleaning_removes_the_build_output_and_nothing_else() {
 }
 
 #[test]
+fn cleaning_reaches_build_output_anywhere_in_the_tree() {
+    // The whole workspace goes to both instances, and each of them builds a
+    // different part of it: vivado writes to `target` at the root, the
+    // driver's cargo to `driver/target` a level down. Neither end says which
+    // of those this machine produced, so cleaning takes all of them.
+    let pair = Pair::new();
+    pair.write("hdl/top.vhd", "entity top is end;");
+    pair.write("driver/Cargo.toml", "[package]");
+    pair.write("driver/src/lib.rs", "");
+    pair.sync();
+
+    pair.write_receiver("target/synth/top.dcp", "checkpoint");
+    pair.write_receiver("driver/target/debug/driver", "a driver");
+    pair.write_receiver("driver/target/debug/build/x/out", "an intermediate");
+
+    let cleaned = clean(&pair.receiver).expect("clean");
+
+    assert!(cleaned.existed);
+    assert!(cleaned.bytes > 0, "it should have measured what it removed");
+    assert!(!pair.receiver.join("target").exists());
+    assert!(!pair.receiver.join("driver/target").exists());
+    // The driver itself is source, and source survives a clean.
+    assert_eq!(pair.receiver_contents("driver/Cargo.toml"), "[package]");
+}
+
+#[test]
 fn cleaning_a_tree_with_no_build_output_is_not_an_error() {
     let pair = Pair::new();
     pair.write("hdl/top.vhd", "entity top is end;");

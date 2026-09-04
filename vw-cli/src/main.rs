@@ -4515,12 +4515,11 @@ fn list_sources(
             paths.push(ws.join("vw.lock").into_std_path_buf());
         }
         SourceSet::Driver => {
-            // `driver/` is the driver — the same rule that decides what gets
-            // synchronized to the helios instance, and the reason there is
-            // nothing to configure. It is a cargo workspace of its own, so
-            // everything under it, including the manifests and the lockfile,
-            // is an input.
-            let root = ws.join(cloud_sync::DRIVER);
+            // `driver/` is the driver — the same rule the helios instance
+            // builds by, and the reason there is nothing to configure. It is a
+            // cargo workspace of its own, so everything under it, including
+            // the manifests and the lockfile, is an input.
+            let root = ws.join(vw_remote::driver::DIRECTORY);
             if root.exists() {
                 collect_files(root.as_std_path(), &mut paths);
             }

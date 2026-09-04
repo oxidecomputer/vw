@@ -25,6 +25,16 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+/// The directory a vw workspace keeps its driver in.
+///
+/// The whole workspace is synchronized to both of an environment's instances,
+/// so the helios instance holds a copy of all of it and this is what picks out
+/// the part that is a cargo workspace. Named here, beside the code that builds
+/// it, because everything else that needs the name — `vw driver build
+/// --local`, `vw sources driver`, the agent handing this module a root —
+/// needs it for exactly this reason.
+pub const DIRECTORY: &str = "driver";
+
 /// How the agent stores what a build produced.
 ///
 /// Passed in because storing is not this module's business — it knows what was
@@ -350,6 +360,22 @@ async fn build(
     events: tokio::sync::mpsc::UnboundedSender<DriverEvent>,
     upload: Uploader,
 ) -> Vec<Utf8PathBuf> {
+    // The whole workspace is on this instance and only part of it is the
+    // driver, so a workspace that has none reaches here as a directory that
+    // is not there. Said plainly, because what cargo would otherwise fail to
+    // spawn with is a bare "no such file or directory" naming a path on a
+    // machine the developer is not looking at.
+    if !root.is_dir() {
+        let _ = events.send(DriverEvent::Fatal {
+            message: format!(
+                "there is nothing to build: this workspace has no \
+                 `{DIRECTORY}` directory, which is where a vw workspace keeps \
+                 its driver"
+            ),
+        });
+        return Vec::new();
+    }
+
     // Said before anything is built, because the alternative is a compiler
     // error several minutes from now that names none of this.
     if let Some(contradiction) = contradiction(root) {
