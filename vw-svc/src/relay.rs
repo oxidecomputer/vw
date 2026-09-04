@@ -314,6 +314,28 @@ impl Agent {
         Ok(())
     }
 
+    /// Anodize the instance's workspace, joined to `client`.
+    pub(crate) async fn join_anodize(
+        &self,
+        client: dropshot::WebsocketConnection,
+        query: &vw_api_types_versions::latest::AnodizeQuery,
+    ) -> Result<(), RelayError> {
+        let upgraded = self
+            .client
+            .anodize(
+                &self.environment,
+                query.bench.as_deref(),
+                query.standard.as_deref(),
+            )
+            .await
+            .map_err(|e| self.failed(e))?
+            .into_inner();
+
+        join(client, upgraded).await;
+
+        Ok(())
+    }
+
     /// Run this environment's testbenches on the instance, joined to `client`.
     ///
     /// Relayed the same way a vivado session is, and for the same reason: what

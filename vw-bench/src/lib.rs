@@ -4,11 +4,11 @@
 
 //! Running a workspace's testbenches.
 //!
-//! One orchestrator, used from both sides. A developer running `vw bench` on
-//! their own machine and an agent running it on an instance discover the same
-//! benches, prepare the workspace the same way and fan out the same number at
-//! a time — because it is the same code, not because two copies were kept in
-//! step.
+//! One orchestrator, used from both sides. A developer running `vw bench run`
+//! on their own machine and an agent running it on an instance discover the
+//! same benches, prepare the workspace the same way and fan out the same
+//! number at a time — because it is the same code, not because two copies
+//! were kept in step.
 //!
 //! What differs between the two is only how a single bench is launched and
 //! where the progress goes, so those are the two things passed in. Everything
@@ -58,8 +58,14 @@ pub enum Event {
         name: String,
         passed: bool,
         seconds: f64,
-        /// Everything the bench wrote, kept for the ones that failed. A
-        /// passing bench's output is nobody's business.
+        /// Everything the bench wrote.
+        ///
+        /// Only shown for the ones that failed — a passing batch that printed
+        /// every bench's output would bury the result nobody can then find.
+        /// It is not thrown away though: the whole of it is written to
+        /// `target/bench/<name>/output.log` either way, because a `println!`
+        /// in a passing bench is somebody debugging, and having it vanish is
+        /// its own kind of failure.
         output: String,
     },
     /// Something worth saying that is not a result.
@@ -112,17 +118,22 @@ pub fn discover(
         .filter(|n| n.to_lowercase().ends_with("_tb"))
         .collect();
 
-    // Mixed-signal benches are a directory holding a `mist.toml`, not a VHDL
-    // entity, so the entity walk above cannot see them and the `_tb` suffix
-    // rule does not apply — the name is the directory's. Without this they are
-    // invisible to `--list` and to a bare `vw bench`, even though
-    // `run_testbench` knows how to run one by name.
+    // A bench that drives a design entity directly — mixed-signal, or Rust
+    // cosim with no VHDL harness — is a directory holding a `mist.toml` or a
+    // `cosim.toml`, not a VHDL entity. The entity walk above cannot see one
+    // and the `_tb` suffix rule does not apply: the name is the directory's.
+    // Without this they are invisible to `vw bench list` and to a bare
+    // `vw bench run`, even though `run_testbench` knows how to run one by
+    // name.
     let mixed_signal = vw_lib::sim::find_mist_configs(&bench_dir)
+        .map_err(|e| BenchError::Discover(bench_dir.clone(), e))?;
+    let direct = vw_lib::cosim::find_cosim_configs(&bench_dir)
         .map_err(|e| BenchError::Discover(bench_dir.clone(), e))?;
     names.extend(
         mixed_signal
             .into_iter()
             .map(|(name, _)| name)
+            .chain(direct.into_iter().map(|(name, _)| name))
             .filter(|name| !ignore.contains(name)),
     );
 
@@ -154,7 +165,31 @@ pub async fn prepare(
     // A missing generated `bench/<name>/Cargo.toml` — after a `git clean`,
     // say — stops cargo loading the bench workspace manifest at all, which
     // fails every bench's rust build rather than only the cosim ones.
-    vw_lib::ensure_bench_scaffolds(workspace).map_err(BenchError::Scaffold)
+    vw_lib::ensure_bench_scaffolds(workspace).map_err(BenchError::Scaffold)?;
+
+    // A cosim bench's handles are a function of the design, so a design that
+    // has moved since the last run leaves them describing something that is
+    // no longer there. Regenerated here rather than left to `vw cosim init`,
+    // so a bench cannot quietly drift from the entity it drives.
+    vw_lib::bench_init::cosim::ensure_all_generated(workspace, standard)
+        .map_err(BenchError::Scaffold)
+}
+
+/// Where a bench's output is kept, beside its waveform.
+pub fn log_path(workspace: &Utf8Path, name: &str) -> camino::Utf8PathBuf {
+    vw_lib::bench_output_dir(workspace, name).join("output.log")
+}
+
+fn write_log(
+    workspace: &Utf8Path,
+    name: &str,
+    output: &str,
+) -> std::io::Result<()> {
+    let path = log_path(workspace, name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, output)
 }
 
 /// Run `names`, at most `concurrency` at a time, reporting as it goes.
@@ -200,6 +235,16 @@ pub async fn run(
                 }
                 Err(e) => (false, format!("could not start the bench: {e}")),
             };
+
+            // Beside the waveform, which is the other thing you go looking
+            // for afterwards. Written for a pass as well as a failure: the
+            // run that prints something interesting and still passes is
+            // exactly the one whose output must not disappear.
+            if let Err(e) = write_log(&workspace, &name, &output) {
+                report(Event::Note {
+                    message: format!("could not write {name}'s output: {e}"),
+                });
+            }
 
             report(Event::Finished {
                 name,

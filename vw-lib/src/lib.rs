@@ -39,6 +39,8 @@ use serde::{Deserialize, Serialize};
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
 use vw_core::parse_entities;
 
+pub mod bench_init;
+pub mod cosim;
 pub mod parts;
 pub mod sim;
 
@@ -51,6 +53,24 @@ pub use vw_core::{
     VhdlLsConfig, VhdlLsLibrary, VhdlStandard, VwError,
 };
 pub use vw_core::{mapping, nvc_helpers, visitor};
+
+/// Start a `cargo` that resolves its own toolchain.
+///
+/// A bench workspace pins its toolchain — anodizer's output needs nightly —
+/// and rustup resolves that from the directory being built in. But cargo
+/// exports these to anything it spawns, and `RUSTUP_TOOLCHAIN` beats the
+/// directory: inherited, a bench builds with whatever toolchain launched
+/// `vw` instead of the one it asked for, and fails on a `#![feature]` that
+/// is perfectly legal where it is written. Nothing sets them outside a cargo
+/// invocation, so clearing them costs nothing and restores the pin when
+/// something does.
+pub fn cargo_command() -> std::process::Command {
+    let mut command = std::process::Command::new("cargo");
+    for leaked in ["RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "CARGO"] {
+        command.env_remove(leaked);
+    }
+    command
+}
 
 /// Workspace-relative directory for vw's own testbench simulation build (the
 /// nvc `work` + dependency libraries). Kept under `target/` so all generated
@@ -3339,6 +3359,90 @@ pub async fn ensure_anodized(
     vhdl_std: VhdlStandard,
     active_variant: Option<&str>,
 ) -> Result<()> {
+    anodize(workspace_dir, vhdl_std, active_variant, Freshness::IfStale)
+        .await
+        .map(|_| ())
+}
+
+/// Whether an anodization pass may decide it has nothing to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    /// Skip when the design sources have not changed since the last pass.
+    /// What every build path wants: the generated file is a pure function of
+    /// those sources, so regenerating an unchanged one only costs an nvc run
+    /// and a rebuild of everything downstream of it.
+    IfStale,
+    /// Regenerate regardless. What `vw cosim anodize` wants: a developer
+    /// working on the anodizer itself is asking to watch it run, and a pass
+    /// that reports "already current" answers a question nobody asked.
+    Always,
+}
+
+/// What an anodization pass found and did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnodizeReport {
+    /// Design sources considered.
+    pub sources: usize,
+    /// How many of them carry a `serialize_rust` attribute.
+    ///
+    /// Zero is a real answer and worth reporting rather than passing over in
+    /// silence: a developer who has just tagged a record and sees zero has
+    /// learnt that the file they edited is not in the design set.
+    pub tagged: usize,
+    /// Where the generated Rust went, when there was any to write.
+    pub generated: Option<Utf8PathBuf>,
+    /// How many lines it came to.
+    pub lines: usize,
+    /// Whether this pass ran the anodizer, or found the last one's output
+    /// still current.
+    pub regenerated: bool,
+}
+
+/// What an anodization pass would look at, without running one.
+///
+/// Returns the number of design sources and how many of them carry a
+/// `serialize_rust` attribute. Cheap — it is the same scan the generator gates
+/// itself on — and worth having separately so a caller can say what is about
+/// to happen *before* it happens. A pass that fails is exactly when knowing
+/// how much it was looking at matters most.
+pub fn anodize_scope(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<(usize, usize)> {
+    let config = render_vhdl_ls_config(workspace_dir, active_variant, false)?;
+    let files = config
+        .libraries
+        .get("defaultlib")
+        .map(|lib| lib.files.clone())
+        .unwrap_or_default();
+    let tagged = tagged_sources(&files);
+    Ok((files.len(), tagged))
+}
+
+/// How many of these sources ask for anything to be generated.
+fn tagged_sources(files: &[PathBuf]) -> usize {
+    files
+        .iter()
+        .filter(|f| {
+            fs::read_to_string(f)
+                .map(|c| c.contains("serialize_rust"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Generate anodizer Rust structs for the workspace's `serialize_rust`-tagged
+/// VHDL records, and say what happened.
+///
+/// [`ensure_anodized`] is this with [`Freshness::IfStale`] and the answer
+/// thrown away — which is what a build wants, since a build only cares that
+/// the file is there and current.
+pub async fn anodize(
+    workspace_dir: &Utf8Path,
+    vhdl_std: VhdlStandard,
+    active_variant: Option<&str>,
+    freshness: Freshness,
+) -> Result<AnodizeReport> {
     let config = render_vhdl_ls_config(workspace_dir, active_variant, false)?;
 
     // Tagged records live in the design sources, i.e. `defaultlib`.
@@ -3347,18 +3451,15 @@ pub async fn ensure_anodized(
         .get("defaultlib")
         .map(|lib| lib.files.clone())
         .unwrap_or_default();
-    if defaultlib_files.is_empty() {
-        return Ok(());
-    }
 
-    // Stage 1: cheap gate — is anything tagged for serialization at all?
-    let any_tagged = defaultlib_files.iter().any(|f| {
-        fs::read_to_string(f)
-            .map(|c| c.contains("serialize_rust"))
-            .unwrap_or(false)
-    });
-    if !any_tagged {
-        return Ok(());
+    let mut report = AnodizeReport {
+        sources: defaultlib_files.len(),
+        // Stage 1: cheap gate — is anything tagged for serialization at all?
+        tagged: tagged_sources(&defaultlib_files),
+        ..Default::default()
+    };
+    if report.tagged == 0 {
+        return Ok(report);
     }
 
     // Stage 2: regenerate only when the design sources changed.
@@ -3370,16 +3471,26 @@ pub async fn ensure_anodized(
     let stored = fs::read_to_string(&fingerprint_file)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());
-    if generated.exists() && stored == Some(fingerprint) {
-        return Ok(());
+    let current = generated.exists() && stored == Some(fingerprint);
+    if current && freshness == Freshness::IfStale {
+        report.generated = Some(generated);
+        return Ok(report);
     }
 
     let build_dir = workspace_dir.join(ANODIZER_BUILD_SUBDIR);
     fs::create_dir_all(&gen_dir)?;
     anodizer::anodize(&config, &build_dir, &gen_dir, vhdl_std).await?;
 
+    // Written even for a forced pass: the work was done, and leaving the
+    // fingerprint stale would make the next build redo it for nothing.
     fs::write(&fingerprint_file, fingerprint.to_string())?;
-    Ok(())
+
+    report.lines = fs::read_to_string(&generated)
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    report.generated = Some(generated);
+    report.regenerated = true;
+    Ok(report)
 }
 
 /// Run a testbench using NVC simulator.
@@ -3410,6 +3521,10 @@ fn dir_is_rust_crate(dir: &Path) -> bool {
 /// discovered) for their crate to need to exist. `write_file` is
 /// content-aware, so unchanged scaffolds don't touch the tree.
 pub fn ensure_bench_scaffolds(workspace_dir: &Utf8Path) -> Result<()> {
+    // A cosim crate's `build.rs` is generated too, and goes missing the same
+    // ways — see `bench_init::heal_cosim_scaffolds`.
+    bench_init::heal_cosim_scaffolds(workspace_dir)?;
+
     let bench_dir = workspace_dir.join("bench");
     let Ok(entries) = fs::read_dir(bench_dir.as_std_path()) else {
         return Ok(()); // no bench dir → nothing to scaffold
@@ -3462,8 +3577,28 @@ pub async fn run_testbench(
     scaffold: bool,
     build_dir: &str,
 ) -> Result<()> {
-    // Check for mixed-signal test (mist.toml in bench/<name>/)
     let bench_test_dir = workspace_dir.join("bench").join(&testbench_name);
+
+    // A cosim bench that drives a design entity directly: `cosim.toml` names
+    // the entity, nvc elaborates that entity as the top level, and the crate
+    // beside the config is the only thing driving it. No VHDL harness is
+    // involved, so none of the testbench-file machinery below applies.
+    let cosim_toml = bench_test_dir.join("cosim.toml");
+    if cosim_toml.exists() {
+        let config = cosim::read_config(cosim_toml.as_std_path())?;
+        return cosim::run(
+            workspace_dir,
+            &testbench_name,
+            &bench_test_dir,
+            &config,
+            vhdl_std,
+            build_dir,
+            runtime_flags,
+        )
+        .await;
+    }
+
+    // Check for mixed-signal test (mist.toml in bench/<name>/)
     let mist_toml = bench_test_dir.join("mist.toml");
     if mist_toml.exists() {
         let mist_content =
@@ -3477,11 +3612,11 @@ pub async fn run_testbench(
         if scaffold {
             return sim::scaffold(&bench_test_dir, &mist_config);
         }
-        // Auto-scaffold before simulating so `vw bench` works straight
+        // Auto-scaffold before simulating so `vw bench run` works straight
         // from a clean checkout (`git clean -fdx` wipes the generated
         // bridge crate — `Cargo.toml`, `build.rs`, generated sources —
         // that `run_analog_test`'s `build_bridge_library` needs) without
-        // a manual `vw bench --scaffold <name>` pre-step. `scaffold`
+        // a manual `vw bench run <name> --scaffold` pre-step. `scaffold`
         // regenerates only the boilerplate (the user-owned `src/lib.rs`
         // is left alone) and `write_file` is content-aware, so this is a
         // cheap no-op when nothing changed.
@@ -5481,7 +5616,7 @@ async fn build_rust_library(
     // Run cargo build in the testbench directory
     let testbench_dir_owned = testbench_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("cargo")
+        let output = cargo_command()
             .arg("build")
             .current_dir(&testbench_dir_owned)
             .output()

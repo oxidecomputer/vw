@@ -53,7 +53,7 @@ enum Commands {
     /// Run exactly one testbench into an isolated build directory.
     ///
     /// Hidden because it is not for people: the batch runner fans one of
-    /// these out per bench, the same way `vw bench` does on a developer's
+    /// these out per bench, the same way `vw bench run` does on a developer's
     /// machine. A child per bench is what makes each one's output separable
     /// and each one's build directory its own — `nvc` inherits stdio, so
     /// several in one process would interleave beyond recovery.
@@ -673,6 +673,52 @@ impl VwSyncApi for Agent {
         }
 
         result.map(|_| ()).map_err(Into::into)
+    }
+
+    async fn anodize(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+        query: dropshot::Query<vw_api_types_versions::latest::AnodizeQuery>,
+        websock: dropshot::WebsocketConnection,
+    ) -> dropshot::WebsocketChannelResult {
+        let ctx = rqctx.context();
+        ctx.check_environment(
+            &path_params.into_inner().environment,
+            &rqctx.log,
+        )?;
+
+        let query = query.into_inner();
+        let request = vw_remote::AnodizeRequest {
+            bench: query.bench.clone(),
+            standard: query
+                .standard
+                .clone()
+                .unwrap_or_else(|| "2019".to_owned()),
+        };
+
+        info!(rqctx.log, "anodizing";
+            "root" => %ctx.root,
+            "bench" => request.bench.as_deref().unwrap_or("-"),
+        );
+
+        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            websock.into_inner(),
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+
+        let result =
+            vw_remote::anodize::serve(socket, &ctx.root, request).await;
+
+        match &result {
+            Ok(()) => info!(rqctx.log, "anodization finished"),
+            Err(e) => slog::error!(rqctx.log, "anodization failed";
+                InlineErrorChain::new(e),
+            ),
+        }
+
+        result.map_err(Into::into)
     }
 
     async fn bench_session(

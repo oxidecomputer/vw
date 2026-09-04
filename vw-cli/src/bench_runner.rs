@@ -1,4 +1,4 @@
-//! `vw bench` on this machine, and the display both machines feed.
+//! `vw bench run` on this machine, and the display both machines feed.
 //!
 //! The orchestration — what to run, in what order, how many at once — lives in
 //! `vw-bench`, because an instance running the same benches has to make the
@@ -20,6 +20,28 @@ pub struct BenchResult {
     /// Combined stdout+stderr of the subprocess. Only failures are kept, so
     /// there is no passing bench's output to decide what to do with.
     output: String,
+}
+
+/// Say where the output went, once, after the results.
+///
+/// Every bench writes its whole output next to its waveform whether it passed
+/// or not. Without a line saying so, a `println!` that came out of a passing
+/// bench looks like it went nowhere — which is how it looked before there was
+/// anywhere for it to go.
+fn note_logs(ws: &Utf8Path, names: &[String]) {
+    let path = match names {
+        [] => return,
+        // The common case while working on one bench: give the real path,
+        // not a pattern to fill in.
+        [only] => vw_bench::log_path(ws, only),
+        _ => vw_lib::bench_output_dir(ws, "*").join("output.log"),
+    };
+    let shown = path.strip_prefix(ws).unwrap_or(&path);
+    println!(
+        "{} {}",
+        "output:".bright_black(),
+        shown.as_str().bright_black()
+    );
 }
 
 /// Run every matching testbench in parallel, here.
@@ -61,9 +83,10 @@ pub async fn run_benches(
         std::process::exit(1);
     }
 
-    // One `vw bench <name> --build-dir …` per bench. The child is this same
-    // binary: it already knows how to run exactly one bench into an isolated
-    // directory, which is what the internal `--build-dir` mode is for.
+    // One `vw bench run <name> --build-dir …` per bench. The child is this
+    // same binary: it already knows how to run exactly one bench into an
+    // isolated directory, which is what the internal `--build-dir` mode is
+    // for.
     let exe = std::env::current_exe()?;
     let standard = vhdl_std.to_string();
     let launch: vw_bench::Launch =
@@ -71,6 +94,7 @@ pub async fn run_benches(
             let mut command = tokio::process::Command::new(&exe);
             command.args([
                 "bench",
+                "run",
                 name,
                 "--build-dir",
                 build_dir,
@@ -81,6 +105,7 @@ pub async fn run_benches(
         });
 
     let overall = Instant::now();
+    let ran = names.clone();
     let panel = Arc::new(NextestPanel::new(names.len() as u64, "testbenches"));
     let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
 
@@ -105,6 +130,7 @@ pub async fn run_benches(
         }
     }
     print_result_line(panel.passed(), panel.failed(), overall.elapsed());
+    note_logs(&ws, &ran);
     if summary.failed > 0 {
         std::process::exit(1);
     }
@@ -196,6 +222,17 @@ fn print_bench_failure(f: &BenchResult) {
         let start = lines.len().saturating_sub(40);
         for l in &lines[start..] {
             println!("  {}", demangle_line(l));
+        }
+        if lines.len() > 40 {
+            println!(
+                "  {}",
+                format!(
+                    "... {} earlier lines in target/bench/{}/output.log",
+                    lines.len() - 40,
+                    f.name,
+                )
+                .bright_black(),
+            );
         }
     }
     println!("{}\n", bar.red());

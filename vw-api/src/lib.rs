@@ -19,6 +19,7 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (4, ANODIZE),
     (3, ARTIFACT_FLUSH),
     (2, IMAGE_RECYCLE),
     (1, INITIAL),
@@ -188,6 +189,25 @@ pub trait VwUserApi {
         rqctx: RequestContext<Self::Context>,
         path_params: Path<latest::EnvironmentPathParam>,
         query: Query<latest::DriverBuildQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
+
+    /// Run the anodizer on an environment's vivado instance.
+    ///
+    /// Relayed frame for frame. Anodization already happens on its own before
+    /// every bench run, cached and silent; this is the same generator with
+    /// the cache off and the answers reported, for working on the generator
+    /// itself. It runs there rather than here because it is an nvc pass over
+    /// the workspace's VHDL, and the workspace is there.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{name}/anodize",
+        versions = VERSION_ANODIZE..
+    }]
+    async fn anodize(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::EnvironmentPathParam>,
+        query: Query<latest::AnodizeQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
 

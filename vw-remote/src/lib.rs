@@ -17,12 +17,14 @@
 //! worker, carried over a websocket instead of a pipe. It streams because it
 //! always streamed.
 
+pub mod anodize;
 mod backend;
 pub mod bench;
 pub mod driver;
 pub mod protocol;
 mod session;
 
+pub use anodize::{AnodizeEvent, AnodizeRequest};
 pub use backend::{InterruptHandle, NoteSink, RemoteBackend};
 pub use bench::BenchEvent;
 pub use driver::{BuildParams, DriverEvent};
