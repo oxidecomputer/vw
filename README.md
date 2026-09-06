@@ -47,6 +47,25 @@ By default the vw client talks to the Redhawk vw build service at
 `https://rhbs.eng.oxide.computer:2727`. A different service can be selected by
 setting the environment variable `VW_SVC_URL`, or with `--url` on `vw cloud`.
 
+A beta service runs beside it on the same host, on ports 2828 and 2829, for
+trying a build of vw-svc and its agents before it becomes the one everybody
+uses. Export `VW_BETA` to point every cloud command at it:
+
+```sh
+export VW_BETA=1
+vw cloud list                     # the beta's environments, not production's
+```
+
+It is a variable rather than a flag because `vw run`, `vw check` and the rest
+have nowhere to put one — the same reason `VW_ENV` is a variable. Its
+environments are a separate set from production's, and its instances boot the
+beta's own images, so an environment created under `VW_BETA` is only reachable
+with `VW_BETA` set. `vw` says on stderr when it is in effect.
+
+`VW_SVC_URL` names a service outright and so wins over `VW_BETA`; if you have
+it exported, unset it before expecting `VW_BETA` to do anything. `vw` says that
+too, rather than quietly using the one you named.
+
 `vw --help` lists every command, and `vw <command> --help` its options.
 
 ## Workspace layout

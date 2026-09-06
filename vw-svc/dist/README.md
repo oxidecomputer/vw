@@ -81,7 +81,21 @@ rather than something a site chooses, so it sits in the unit next to
 service stops at startup naming the flag. Copying production's `VW_SVC_EXTRA`
 across verbatim is the way to trip this.
 
-Point a client at the beta with the same knobs that select any other service:
+Point a client at the beta with `VW_BETA`, which every cloud command reads:
+
+```sh
+export VW_BETA=1
+vw cloud list                     # the beta's environments, not production's
+```
+
+`vw` says on stderr when it is in effect, because the two look identical
+otherwise while reaching a different set of environments. `VW_SVC_URL` names a
+service outright and so wins over it — `vw` says that too rather than quietly
+using the named one, since a shell with `VW_SVC_URL` already exported would
+otherwise get nothing from `VW_BETA` and have no way of telling.
+
+`VW_BETA` assumes the default host and ports. A beta somewhere else is named
+the usual way:
 
 ```sh
 export VW_SVC_URL=https://vw.example.com:2828
