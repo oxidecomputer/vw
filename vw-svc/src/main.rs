@@ -70,6 +70,25 @@ struct ServerArgs {
     /// TLS private key file path
     #[arg(long, default_value = "key.pem")]
     key_file: Utf8PathBuf,
+    /// Run as the beta deployment.
+    ///
+    /// Two things follow, and between them they are what lets a beta service
+    /// run beside production against the same rack:
+    ///
+    /// Every Oxide object is named `vwsvcbeta-...` rather than `vwsvc-...`,
+    /// and only those are recognized as ours, so neither deployment can
+    /// reconcile the other's instances, disks or ssh keys out of existence --
+    /// including when the two share a silo user and so a single OXIDE_TOKEN,
+    /// whose key list no project scopes.
+    ///
+    /// Images come from --oxide-project alone, never the silo. Images are not
+    /// named for a deployment, so the project is the only thing that says
+    /// whose they are; and an image carries the vw-agent this service talks
+    /// to, which is the API a beta exists in order to change. --oxide-project
+    /// must therefore be the beta's own, holding the beta's images.
+    #[arg(long)]
+    beta: bool,
+
     /// Do not require a github token for API access
     #[arg(long)]
     no_auth: bool,
@@ -130,6 +149,18 @@ async fn main() {
 
 async fn serve(args: ServerArgs) {
     let log = logger();
+
+    // Before anything can name or parse an Oxide object. The prefix decides
+    // which deployment's instances, disks and ssh keys this process considers
+    // its own, and a beta that read it too late would be looking at
+    // production's.
+    oxide::init_deployment(args.beta)
+        .expect("the deployment has already been initialized");
+    info!(log, "starting";
+        "deployment" => if args.beta { "beta" } else { "production" },
+        "object_prefix" => oxide::instance_prefix(),
+    );
+
     db::init(&args.db_path).expect("unable to open environment database");
 
     if let Err(e) = oxide::init(
@@ -169,6 +200,16 @@ async fn serve(args: ServerArgs) {
             "no oxide backend configured; environments will be recorded but \
              never provisioned. Pass --oxide-api-endpoint and --oxide-token \
              to reconcile instances."
+        );
+    }
+
+    // Said once at startup because it is what makes "no image matching
+    // 'vw-vivado-*' is visible to this service" legible: the beta ignores the
+    // silo, so an image an operator can plainly see on the rack still is not
+    // one this service will boot unless it is in this project.
+    if args.beta && oxide::is_configured() {
+        info!(log, "the beta boots only images in its own project";
+            "project" => &args.oxide_project,
         );
     }
     //let addr: IpAddr = args.address.parse().expect("unable to parse address");

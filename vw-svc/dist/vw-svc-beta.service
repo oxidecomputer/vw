@@ -1,0 +1,92 @@
+# The vw service, beta.
+#
+# A second, complete vw-svc deployment that runs beside the production one on
+# the same host: its own binary, its own configuration, its own database, its
+# own ports. Nothing on this machine is shared, which is the point --
+# installing, starting or restarting the beta must not be able to disturb
+# production.
+#
+# Site-specific settings still come from an environment file, here
+# /etc/vw-svc-beta/vw-svc-beta.env. Three things are not among them, and are
+# fixed below because they are what makes this deployment the beta rather than
+# anything a site chooses:
+#
+#   --beta            names every Oxide object `vwsvcbeta-...` instead of
+#                     `vwsvc-...`, so the two deployments cannot see, and so
+#                     cannot reclaim, each other's instances, disks or silo
+#                     ssh keys. Without it this is a second production service
+#                     and the two would reconcile each other's environments
+#                     out of existence.
+#   the ports         2828 and 2829, where production answers on 2727 and
+#                     2728.
+#   --db-path         which follows from StateDirectory below.
+
+[Unit]
+Description=vw service (beta)
+Documentation=https://github.com/oxidecomputer/vw
+After=network-online.target
+Wants=network-online.target
+
+# Deliberately not Conflicts= or Requires= against vw-svc.service. The two are
+# independent services that happen to share a host: the beta should come up
+# whether or not production is running, and go down without taking it along.
+
+[Service]
+Type=exec
+
+# Root because of the certificate, for the same reason as production: certbot
+# keeps /etc/letsencrypt/live and archive at 0700 root and re-creates them on
+# every renewal. Both services read the same certificate and watch it
+# independently; nothing about that is exclusive.
+User=root
+
+# 0600, because it holds the rack token.
+EnvironmentFile=/etc/vw-svc-beta/vw-svc-beta.env
+
+# The variables are deliberately unquoted: systemd splits them into separate
+# arguments, which is the whole reason the configuration can live in a file
+# rather than in this unit. An unset one expands to nothing.
+#
+# Repeating any of the flags below in VW_SVC_EXTRA makes the service refuse to
+# start, naming the flag: clap rejects a second occurrence rather than letting
+# one silently win. Copying production's VW_SVC_EXTRA across is the way to
+# trip that.
+ExecStart=/usr/local/bin/vw-svc-beta serve \
+    --beta \
+    --db-path /var/lib/vw-svc-beta/vw-svc-beta.redb \
+    --user-api-port 2828 \
+    --admin-api-port 2829 \
+    $VW_SVC_TLS $VW_SVC_RACK $VW_SVC_ADMINS $VW_SVC_EXTRA
+
+# Creates /var/lib/vw-svc-beta on every start. Its own directory, not a file
+# beside production's database: the two services must never read each other's
+# record of which environments exist.
+StateDirectory=vw-svc-beta
+
+# Environments outlive any one run of this service, and the reconciler puts
+# them right when it comes back.
+Restart=always
+RestartSec=5
+
+# Hardening. Identical to production's: this reads a certificate, writes one
+# database, and talks to a rack and to agents; it has no business doing
+# anything else. ProtectSystem leaves /etc/letsencrypt readable, which is all
+# the certificate watch needs.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

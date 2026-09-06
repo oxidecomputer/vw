@@ -199,7 +199,7 @@ impl InstanceReconciler {
 /// Reject an environment name that would not survive the instance naming
 /// scheme.
 ///
-/// Instance names are `vwsvc-{user}-{env}-{kind}`, and they are taken back
+/// Instance names are `{prefix}-{user}-{env}-{kind}`, and they are taken back
 /// apart from the right so that a username may contain `-`. That only works if
 /// the environment name does not — otherwise the split lands in the wrong
 /// place and one environment can be mistaken for another. The remaining rules
@@ -386,8 +386,18 @@ impl UserInstance {
     ///
     /// One key per environment rather than per instance, so a user has a
     /// single key to fetch and use against all three.
+    ///
+    /// The prefix is the deployment's, not a constant: the silo key list is
+    /// the token's user's and is not scoped by project, so this name is the
+    /// only thing keeping a beta service beside production from reaping
+    /// production's keys.
     pub(crate) fn ssh_key_name(&self) -> String {
-        format!("{}-{}-{}", ox::INSTANCE_PREFIX, self.user, self.environment)
+        format!(
+            "{}-{}-{}",
+            ox::instance_prefix(),
+            self.user,
+            self.environment
+        )
     }
 
     /// The hostname the instance sees itself as.
@@ -410,7 +420,7 @@ impl UserInstance {
     pub(crate) fn oxide_instance_name(&self) -> String {
         format!(
             "{}-{}-{}-{}",
-            ox::INSTANCE_PREFIX,
+            ox::instance_prefix(),
             self.user,
             self.environment,
             self.kind

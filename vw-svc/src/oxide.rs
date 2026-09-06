@@ -51,12 +51,68 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 /// see [`InstanceKind::shape`].
 const BOOT_DISK_GIB: u64 = 600;
 
-/// Instances are named `vwsvc-{user}-{env}-{kind}`, and this prefix is the
-/// only thing that marks an Oxide instance as ours.
+/// Instances are named `vwsvc-{user}-{env}-{kind}`, their boot disks take the
+/// instance's name, and an environment's silo ssh key is `vwsvc-{user}-{env}`.
+/// This prefix is the only thing that marks any of them as ours.
 ///
 /// Anything without it is somebody else's and is never touched, which is what
 /// keeps a reconciler pass from deleting unrelated instances in the project.
-pub(crate) const INSTANCE_PREFIX: &str = "vwsvc";
+const PRODUCTION_PREFIX: &str = "vwsvc";
+
+/// The same, for a beta service running beside production.
+///
+/// Deliberately not `vwsvc-beta`. Ownership everywhere is decided by "the name
+/// starts with `{prefix}-`", so a beta prefix that were production's followed
+/// by a hyphen would make every beta object look like production's own:
+/// `vwsvc-beta-ferris-alpha` starts with `vwsvc-`. Run together it does not —
+/// the character after `vwsvc` is `b` — and the two name spaces come out
+/// disjoint in both directions.
+///
+/// That disjointness is what lets the two deployments share an Oxide silo user,
+/// and so a single `OXIDE_TOKEN`, without reaping each other's work. It has to
+/// hold for the ssh keys in particular: the silo key list is the token's user's
+/// and is not scoped by project, so separate projects do not cover it and
+/// nothing else can.
+const BETA_PREFIX: &str = "vwsvcbeta";
+
+/// Which deployment this process is, as the prefix it names objects with.
+///
+/// `None` until [`init_deployment`] runs.
+static PREFIX: OnceLock<&'static str> = OnceLock::new();
+
+/// Record which deployment this process is.
+///
+/// Called before anything can name or parse an Oxide object, which in practice
+/// means first thing in `serve`. A second call is refused rather than allowed
+/// to change the answer underneath objects already named by the first.
+pub(crate) fn init_deployment(beta: bool) -> Result<(), InitError> {
+    let prefix = if beta { BETA_PREFIX } else { PRODUCTION_PREFIX };
+    PREFIX
+        .set(prefix)
+        .map_err(|_| InitError::DeploymentAlreadyInitialized)
+}
+
+/// The prefix this deployment names and recognizes objects by.
+///
+/// Production's when [`init_deployment`] has not run, so that the pure
+/// name-handling functions below can be unit tested without a global to set
+/// up. `serve` initializes before anything reads this, so the fallback is not
+/// reachable in a running service — and it matters that it is not, since a
+/// beta that fell back to production's prefix would reap production's ssh keys,
+/// which is the one thing the split exists to prevent.
+pub(crate) fn instance_prefix() -> &'static str {
+    PREFIX.get().copied().unwrap_or(PRODUCTION_PREFIX)
+}
+
+/// Whether this is the beta deployment.
+///
+/// Asked about images, which carry no prefix of ours to go on: they are named
+/// for the kind they boot, by whoever built them, and the two deployments'
+/// images are told apart by which project they were published into rather than
+/// by their names. See [`Session::visible_images`].
+fn is_beta() -> bool {
+    instance_prefix() == BETA_PREFIX
+}
 
 /// How to reach the Oxide API, recorded at startup.
 ///
@@ -76,6 +132,8 @@ static OXIDE: OnceLock<Option<OxideConfig>> = OnceLock::new();
 pub(crate) enum InitError {
     #[error("the oxide configuration has already been initialized")]
     AlreadyInitialized,
+    #[error("the deployment has already been initialized")]
+    DeploymentAlreadyInitialized,
 }
 
 /// Error conditions for opening a session against the Oxide API.
@@ -401,7 +459,7 @@ impl Session {
             let name = key?.name.to_string();
             // Ours by the same prefix rule as everything else: this key list
             // belongs to a silo user that may well have keys of their own.
-            if name.starts_with(&format!("{INSTANCE_PREFIX}-"))
+            if name.starts_with(&format!("{}-", instance_prefix()))
                 && !wanted.contains(&name)
             {
                 names.push(name);
@@ -573,16 +631,36 @@ impl Session {
         Ok(plan)
     }
 
-    /// Every image the service can see, from both the project and the silo.
+    /// Every image this deployment may boot.
     ///
-    /// Project images shadow silo images of the same name, matching how the
-    /// control plane resolves them.
+    /// For production, the project's images and the silo's, with project
+    /// images shadowing silo images of the same name, matching how the control
+    /// plane resolves them.
+    ///
+    /// For the beta, its own project's images and nothing else. This is the
+    /// one thing that separates the two deployments' images, and it has to be
+    /// enforced rather than left to how a rack is arranged, because the agents
+    /// in those images are not interchangeable: an image carries the vw-agent
+    /// that vw-svc talks to, and a beta service is a beta precisely because
+    /// its side of that API is free to differ from production's. Booting the
+    /// wrong one does not fail at create time — it fails later, as an agent
+    /// that answers the wrong protocol.
+    ///
+    /// A silo image is visible from every project, so from the beta's side the
+    /// silo is exactly the set of images somebody else published. And since a
+    /// kind left unnamed resolves to the *newest* match, a production image
+    /// promoted to the silo would not merely be visible to a beta environment,
+    /// it would be what that environment booted. Skipping the silo list makes
+    /// the beta's own project the complete and only account of what the beta
+    /// can boot.
     async fn visible_images(&self) -> Result<Vec<types::Image>, ImageError> {
         let mut images = Vec::new();
 
-        let mut silo = self.client.image_list().limit(PAGE_SIZE).stream();
-        while let Some(image) = silo.next().await {
-            images.push(image?);
+        if !is_beta() {
+            let mut silo = self.client.image_list().limit(PAGE_SIZE).stream();
+            while let Some(image) = silo.next().await {
+                images.push(image?);
+            }
         }
 
         let mut project = self
@@ -749,9 +827,12 @@ impl Session {
 /// NOTE the Oxide Cloud Computer does not have tags, so we need to encode
 /// vw instance semantics in names. The format is
 ///
-///   vwsvc-{user name}-{env name}-{instance kind}
+///   {prefix}-{user name}-{env name}-{instance kind}
 ///
-/// where instance kind is currently one of vivado, helios or artifact.
+/// where instance kind is currently one of vivado, helios or artifact, and
+/// the prefix is this deployment's — see [`instance_prefix`]. An instance
+/// carrying the other deployment's prefix is somebody else's by exactly the
+/// same rule as one carrying no prefix of ours at all.
 ///
 /// This is the only thing standing between a reconciler pass and somebody
 /// else's instances: the project holds more than ours, and an instance that
@@ -900,7 +981,17 @@ fn reapable(
 /// [`crate::reconciler::validate_environment_name`] — so whatever sits between
 /// the prefix and those two is the user, hyphens and all.
 pub(crate) fn parse_instance_name(name: &str) -> Option<UserInstance> {
-    let rest = name.strip_prefix(INSTANCE_PREFIX)?.strip_prefix('-')?;
+    parse_named(instance_prefix(), name)
+}
+
+/// [`parse_instance_name`], against a prefix given explicitly.
+///
+/// Split out so that both deployments' rules can be exercised in one process:
+/// the prefix actually in force is a `OnceLock` that a test has no business
+/// setting, and the property worth testing is that neither prefix accepts the
+/// other's names.
+fn parse_named(prefix: &str, name: &str) -> Option<UserInstance> {
+    let rest = name.strip_prefix(prefix)?.strip_prefix('-')?;
 
     let (rest, kind) = rest.rsplit_once('-')?;
     let kind = kind.parse().ok()?;
@@ -1369,6 +1460,91 @@ mod test {
             .expect("a well formed name");
         assert_eq!(instance.user, "foo-bar");
         assert_eq!(instance.hostname(), "vivado-darmok");
+    }
+
+    /// Every name either deployment might put on the rack.
+    fn objects(prefix: &str) -> Vec<String> {
+        [
+            // Instances, and the boot disks that take their names.
+            "ferris-alpha-vivado",
+            "ferris-alpha-helios",
+            "ferris-alpha-artifact",
+            "foo-bar-darmok-vivado",
+            // Silo ssh keys, which carry no kind.
+            "ferris-alpha",
+            "foo-bar-darmok",
+        ]
+        .iter()
+        .map(|suffix| format!("{prefix}-{suffix}"))
+        .collect()
+    }
+
+    #[test]
+    fn neither_deployment_claims_the_others_instances() {
+        // Instances and disks are claimed by parsing, so this is the rule
+        // `ours` and `reapable` come down to. A name the wrong deployment
+        // parses is a name it will delete.
+        for (mine, theirs) in [
+            (PRODUCTION_PREFIX, BETA_PREFIX),
+            (BETA_PREFIX, PRODUCTION_PREFIX),
+        ] {
+            for name in objects(theirs) {
+                assert!(
+                    parse_named(mine, &name).is_none(),
+                    "{mine} claimed {name}",
+                );
+            }
+            for name in objects(mine) {
+                // Only the four-field names are instances; the two-field ssh
+                // key names are not meant to parse either way.
+                if name.ends_with("-vivado")
+                    || name.ends_with("-helios")
+                    || name.ends_with("-artifact")
+                {
+                    assert!(
+                        parse_named(mine, &name).is_some(),
+                        "{mine} disowned {name}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neither_deployment_reaps_the_others_ssh_keys() {
+        // `reap_ssh_keys` decides ownership with `starts_with("{prefix}-")`
+        // rather than by parsing, because a key name is
+        // `{prefix}-{user}-{env}` and the user may contain hyphens. Same
+        // disjointness, different rule, so it gets its own test -- and this is
+        // the one that matters most, since the silo key list is not scoped by
+        // project and is therefore shared whenever the two deployments share a
+        // token.
+        for (mine, theirs) in [
+            (PRODUCTION_PREFIX, BETA_PREFIX),
+            (BETA_PREFIX, PRODUCTION_PREFIX),
+        ] {
+            let owned = format!("{mine}-");
+            for name in objects(theirs) {
+                assert!(!name.starts_with(&owned), "{mine} would reap {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_beta_prefix_is_not_the_production_one_plus_a_word() {
+        // The whole disjointness argument rests on this: `vwsvc-beta-...`
+        // would start with `vwsvc-` and be production's to delete, so the two
+        // words are deliberately run together. If somebody ever reaches for
+        // the more readable spelling, this is what should stop them.
+        assert!(!BETA_PREFIX.starts_with(&format!("{PRODUCTION_PREFIX}-")));
+        assert!(BETA_PREFIX.starts_with(PRODUCTION_PREFIX));
+    }
+
+    #[test]
+    fn production_is_what_an_uninitialized_prefix_means() {
+        // The rest of this module's tests parse against the global, which no
+        // test sets. They are all asking about production, and this is why.
+        assert_eq!(instance_prefix(), PRODUCTION_PREFIX);
     }
 }
 
