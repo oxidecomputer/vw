@@ -27,25 +27,80 @@ Create an environment, then work in your workspace as normal:
 
 ```sh
 vw cloud create my-env --wait     # vivado, helios and artifact cloud instances
-export VW_ENV=my-env              # or pass --env to each command
 
 vw check                          # parse and analyze the design
 vw run                            # build the FPGA image
-vw bench                          # run testbenches
+vw bench run                      # run testbenches
 vw driver build --release         # build the kernel driver
 
-vw cloud artifacts my-env --all   # download build output
+vw cloud artifacts --all          # download build output
 vw cloud delete my-env            # release the instances
 ```
 
-`vw run`, `vw check`, `vw bench` and `vw driver build` synchronize the
+`vw cloud create` records the environment in `vw-cloud.toml`, so nothing after
+it has to name one. `$VW_ENV` and an explicit `--env` still win, in that order.
+
+`vw run`, `vw check`, `vw bench run` and `vw driver build` synchronize the
 workspace to the environment before they run, and stream output back as it
 happens. Pass `--local` to any of them to run on this machine instead, which
 needs the toolchains installed locally.
 
-By default the vw client talks to the Redhawk vw build service at
-`https://rhbs.eng.oxide.computer:2727`. A different service can be selected by
-setting the environment variable `VW_SVC_URL`, or with `--url` on `vw cloud`.
+### One environment, several workspaces
+
+An environment holds a source tree per workspace rather than one tree, so the
+three instances it costs are shared by everything you are working on. Which
+tree a command acts on is the workspace's name — `[workspace] name` from
+`vw.toml`, unless this checkout says otherwise.
+
+Two checkouts of the same project would otherwise resolve to the same name and
+overwrite each other on every sync, which is what `vw cloud set workspace` is
+for:
+
+```sh
+cd ~/src/redhawk-feature
+vw cloud set workspace redhawk-feat    # this checkout gets a tree of its own
+vw cloud workspaces --sizes            # what is on the environment, and how old
+vw cloud forget redhawk-old            # tree, build output and artifacts
+```
+
+That name is only the key — which directory the tree goes in and which bucket
+its artifacts land in. It is deliberately *not* `[workspace] name`, which is
+what a design's own imports resolve through (`src @redhawk/...`) and what
+`vw::project_name` reports: change that and the two checkouts you are comparing
+would differ in a way that has nothing to do with the change under test.
+
+Both settings live in `vw-cloud.toml` beside `vw.toml`, which `vw` adds to
+`.gitignore` — they describe a checkout, not the project, and committing one
+would send everybody on that branch to the same tree. Every sync prints which
+environment and workspace it is pushing to, and where each name came from.
+
+A `vw` older than workspaces still works against a current service: it names no
+workspace, so it gets a reserved one called `default`, entirely its own. That
+is why `vw cloud workspaces` may list a `default` nobody created — it is
+whatever has been synced by a client that has not been upgraded yet, and
+`vw cloud forget default` removes it like any other.
+
+By default the vw client talks to the vw build service at
+`https://vw-cloud.dev`.
+
+Other deployments are reached by naming them. A beta runs at
+`https://beta.vw-cloud.dev`, for trying a build of vw-svc and its agents before
+it becomes the one everybody uses:
+
+```sh
+export VW_SVC_URL=https://beta.vw-cloud.dev
+vw cloud list                     # the beta's environments, not production's
+```
+
+A URL is the whole of how a deployment is chosen — there is no flag naming one,
+and nothing in the client knows how many there are. It is an environment
+variable as well as `vw cloud --url` because `vw run`, `vw check` and the rest
+have nowhere to put a flag, the same reason `VW_ENV` is a variable.
+
+Each deployment's environments are a separate set, and its instances boot its
+own images, so an environment created against one is only reachable against
+that one. `vw cloud admin` speaks to a second listener on port 2053, which does
+not follow `--url`; `--admin-url` or `VW_SVC_ADMIN_URL` names it.
 
 `vw --help` lists every command, and `vw <command> --help` its options.
 
@@ -93,16 +148,58 @@ has already happened.
 
 ## Testbenches
 
-`vw bench` runs the workspace's testbenches with NVC, as many at once as there
-are cores.
+`vw bench run` runs the workspace's testbenches with NVC, as many at once as
+there are cores.
 
 ```sh
-vw bench                     # everything
-vw bench parser              # only names containing "parser"
-vw bench --list
+vw bench run                 # everything
+vw bench run parser          # only names containing "parser"
+vw bench list
 ```
 
-Testbenches are built on
+### Creating one
+
+There are three kinds of testbench, and one command each:
+
+```sh
+vw bench init fifo           # pure VHDL
+vw cosim init fifo           # Rust cosim
+vw mist init fifo            # mixed-signal (VHDL + Xyce)
+```
+
+Each writes a bench that runs, and passes, straight away — so the plumbing is
+known to work before the first check is written. Nothing else has to be
+registered anywhere: a Rust bench is added to the bench cargo workspace, and
+`vw bench run` finds all three kinds on its own. `vw bench remove`,
+`vw cosim remove` and `vw mist remove` take one back out again, workspace
+membership included.
+
+Point one at a design entity and its interface is read out of the workspace
+and wired up:
+
+```sh
+vw bench init fifo --dut flit_fifo
+vw cosim init fifo --dut flit_fifo --clock 250e6
+vw mist init fifo --entity flit_fifo --clock 26.5625e9
+```
+
+A pure VHDL bench comes out with a signal per port carrying that port's own
+type, the generic map and the port map filled in.
+
+A cosim bench comes out with a Rust handle per port. There is no VHDL harness:
+nvc elaborates the design entity itself and loads the driver beside it, so
+there is no second copy of the port list to keep in step. A record port
+becomes one handle per element, since that is how the simulator presents it,
+and everything the driver writes is sized from the signal rather than from the
+type it was declared with — so a subtype, or a width that comes from a
+generic, needs nothing said about it. Generics without defaults are surfaced
+in `cosim.toml`, which is where the entity is named and where elaboration gets
+its `-g` overrides.
+
+A mixed-signal bench comes out with a `mist.toml` mapping every output the
+bridge can read to an analog source, and a circuit with a DAC for each.
+
+Cosim testbenches are built on
 [rust-cosim](https://github.com/oxidecomputer/rust-cosim): the stimulus and
 checking are a Rust program driving the VHDL, rather than a VHDL harness.
 
@@ -110,6 +207,18 @@ Types cross the boundary rather than being maintained twice. A VHDL record
 carrying the `serialize_rust` attribute gets a matching Rust type generated by
 [anodizer](https://github.com/oxidecomputer/anodizer), so the testbench sees
 the same record the design does. It regenerates when the design sources change.
+
+That normally happens invisibly, which is no use when the generator itself is
+what you are working on. `vw cosim anodize <bench>` runs it on purpose — cache
+off, what it found reported — and then compiles that bench against the result,
+because a generator that succeeds and emits Rust which does not compile is the
+failure that otherwise surfaces much later:
+
+```sh
+vw cosim anodize                 # just run the generator
+vw cosim anodize fifo            # ...and build bench/fifo against it
+vw cosim anodize fifo --local    # on this machine
+```
 
 Mixed-mode digital/analog simulation runs against
 [Xyce](https://xyce.sandia.gov/). A bench directory containing a `mist.toml`
@@ -162,6 +271,11 @@ design and the driver are one project, and which files a build reads is not a
 line that stays put. `target/` is never sent in either direction, which is what
 lets Vivado checkpoints on an instance survive from one command to the next.
 
+Each instance keeps a tree, a content store and an artifact bucket per
+workspace, all keyed by the same name. Nothing declares which workspaces an
+environment has — one exists because somebody synchronized it — so
+`vw cloud workspaces` asks the instance rather than the service.
+
 Build output lands in the artifact instance's S3 store as it is produced.
 `vw cloud artifacts <env>` lists it and `--get <pattern>` downloads by glob
 (`'*.edif'`, `'reports/*place*'`), streamed through `vw-svc` so clients never
@@ -169,12 +283,22 @@ need to reach the artifact instance themselves.
 
 ```sh
 vw cloud list                       # your environments
-vw cloud get <env>                  # instance states and addresses
-vw cloud keys <env>                 # ssh key for the instances
-vw cloud sync <env> [--watch]       # push the workspace explicitly
-vw cloud artifacts <env> --get '*.pdi'
+vw cloud get                        # instance states and addresses
+vw cloud keys                       # ssh key for the instances
+vw cloud sync [--watch]             # push the workspace explicitly
+vw cloud artifacts --get '*.pdi'
+vw cloud workspaces [--sizes]       # what is on the environment
+vw cloud forget <workspace>         # remove one, with its artifacts
+vw cloud set workspace <name>       # this checkout's tree on the environment
+vw cloud set environment <name>     # the environment it builds in
 vw cloud admin list                 # every environment, for administrators
 ```
+
+Every command that takes an environment takes it as an optional argument,
+falling back to `$VW_ENV`, then to `vw-cloud.toml`, then to your only
+environment. `vw cloud create` and `vw cloud delete` are the exceptions: both
+name what they act on, because inferring it is meaningless for one and
+dangerous for the other.
 
 Running the service is documented in [`vw-svc/dist/`](vw-svc/dist).
 

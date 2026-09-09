@@ -1,5 +1,4 @@
 pub use crate::v1::Artifact;
-pub use crate::v1::ArtifactPathParam;
 pub use crate::v1::ArtifactsCleared;
 pub use crate::v1::BenchQuery;
 pub use crate::v1::CleanResult;
@@ -19,9 +18,7 @@ pub use crate::v1::OxideInstance;
 pub use crate::v1::S3Credentials;
 pub use crate::v1::SshKeyPair;
 pub use crate::v1::SyncPlan;
-pub use crate::v1::TargetBlobPathParam;
 pub use crate::v1::TargetKind;
-pub use crate::v1::TargetPathParam;
 pub use crate::v1::TreeManifest;
 pub use crate::v1::UserEnvironment;
 pub use crate::v1::UserEnvironmentPathParam;
@@ -33,3 +30,14 @@ pub use crate::v2::KeptImage;
 pub use crate::v2::RecycledImage;
 
 pub use crate::v3::ArtifactFlush;
+
+pub use crate::v4::AnodizeQuery;
+
+pub use crate::v5::ArtifactPathParam;
+pub use crate::v5::TargetBlobPathParam;
+pub use crate::v5::TargetPathParam;
+pub use crate::v5::Workspace;
+pub use crate::v5::WorkspaceForgotten;
+pub use crate::v5::WorkspaceListQuery;
+pub use crate::v5::WorkspacePathParam;
+pub use crate::v5::LEGACY_WORKSPACE;

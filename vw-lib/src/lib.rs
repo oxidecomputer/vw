@@ -39,6 +39,9 @@ use serde::{Deserialize, Serialize};
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
 use vw_core::parse_entities;
 
+pub mod bench_init;
+pub mod cosim;
+pub mod depcache;
 pub mod parts;
 pub mod sim;
 
@@ -51,6 +54,24 @@ pub use vw_core::{
     VhdlLsConfig, VhdlLsLibrary, VhdlStandard, VwError,
 };
 pub use vw_core::{mapping, nvc_helpers, visitor};
+
+/// Start a `cargo` that resolves its own toolchain.
+///
+/// A bench workspace pins its toolchain — anodizer's output needs nightly —
+/// and rustup resolves that from the directory being built in. But cargo
+/// exports these to anything it spawns, and `RUSTUP_TOOLCHAIN` beats the
+/// directory: inherited, a bench builds with whatever toolchain launched
+/// `vw` instead of the one it asked for, and fails on a `#![feature]` that
+/// is perfectly legal where it is written. Nothing sets them outside a cargo
+/// invocation, so clearing them costs nothing and restores the pin when
+/// something does.
+pub fn cargo_command() -> std::process::Command {
+    let mut command = std::process::Command::new("cargo");
+    for leaked in ["RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "CARGO"] {
+        command.env_remove(leaked);
+    }
+    command
+}
 
 /// Workspace-relative directory for vw's own testbench simulation build (the
 /// nvc `work` + dependency libraries). Kept under `target/` so all generated
@@ -1014,6 +1035,11 @@ pub fn init_workspace(
             message: format!("vw.toml already exists in {workspace_dir}"),
         });
     }
+    // Before anything is written, so a name the loader would refuse
+    // never becomes a workspace that cannot be opened again.
+    validate_workspace_name(&name).map_err(|detail| VwError::Config {
+        message: format!("`[workspace] name`: {detail}"),
+    })?;
 
     let target_parts = target_part
         .map(|part| {
@@ -1287,6 +1313,11 @@ async fn build_dependency_graph(
         dependencies: BTreeMap::new(),
     });
     let deps_dir = deps_directory()?;
+    // Reclaim what a killed process left behind. Here rather than in
+    // `deps_directory`, which every cache reader calls and none of
+    // them can orphan anything: this is the one place a download is
+    // about to happen, and once per resolution is enough.
+    depcache::sweep(&deps_dir);
     let mut graph: DiGraph<DepGraphNode, ()> = DiGraph::new();
     // First-seen (entry-wins) node per dep name; also the cycle guard.
     let mut node_by_name: HashMap<String, NodeIndex> = HashMap::new();
@@ -1304,8 +1335,18 @@ async fn build_dependency_graph(
     // Worklist of (parent node, workspace root, is_entry).
     let mut queue = vec![(entry_idx, entry_root, true)];
     while let Some((parent, ws, is_entry)) = queue.pop() {
-        let Ok(config) = load_workspace_config(&ws) else {
-            continue;
+        // The entry's own manifest is the caller's to fix, so a problem with
+        // it is reported rather than stepped over. A dependency's is not:
+        // skipping one there costs an unresolved import later, while failing
+        // would make somebody else's manifest able to stop this build
+        // outright.
+        let config = if is_entry {
+            load_workspace_config(&ws)?
+        } else {
+            let Ok(config) = load_workspace_config(&ws) else {
+                continue;
+            };
+            config
         };
         // The entry contributes its dev-deps too; transitive deps only
         // propagate their regular `[dependencies]`.
@@ -1356,21 +1397,22 @@ async fn build_dependency_graph(
                             })?,
                         };
                     let root = deps_dir.join(format!("{name}-{sha}"));
-                    // A dir left by a PARTIAL/failed prior download
-                    // (created but empty) must not count as cached.
-                    let was_cached = root.exists()
-                        && fs::read_dir(&root)
-                            .map(|mut d| d.next().is_some())
-                            .unwrap_or(false);
+                    // Only a published tree counts. A directory that
+                    // merely exists is either a download in flight or
+                    // one that was killed, and building against
+                    // either is how half a dependency gets linked.
+                    let was_cached = depcache::is_complete(&root);
                     if !was_cached {
-                        if root.exists() {
-                            let _ = fs::remove_dir_all(&root);
-                        }
+                        // Assembled somewhere private and moved into
+                        // place whole, so that a second process
+                        // fetching this same dependency neither sees
+                        // ours part-written nor writes over it.
+                        let staged = depcache::Staged::new(&deps_dir)?;
                         download_dependency(
                             repo,
                             &sha,
                             &dep.src,
-                            &root,
+                            staged.path(),
                             dep.recursive,
                             &dep.exclude,
                             *submodules,
@@ -1385,6 +1427,7 @@ async fn build_dependency_graph(
                             ),
                             }
                         })?;
+                        staged.publish(&root)?;
                     }
                     let root =
                         Utf8PathBuf::from_path_buf(root).map_err(|p| {
@@ -1502,13 +1545,20 @@ pub fn dependencies_present(workspace_dir: &Utf8Path) -> bool {
     else {
         return true;
     };
+    let Ok(deps_dir) = deps_directory() else {
+        return true;
+    };
     for (_name, path) in paths {
-        // Path deps resolve to real source trees (always present); git
-        // deps resolve into the cache and may be absent or empty.
-        let present = path.exists()
-            && fs::read_dir(&path)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
+        // Path deps resolve to real source trees, which are present by
+        // definition and carry no marker of their own. Git deps
+        // resolve into the cache, where only a published tree counts:
+        // a `vw clear`ed entry, or one a killed download left behind,
+        // is as absent as one that was never fetched at all.
+        let present = if path.starts_with(&deps_dir) {
+            depcache::is_complete(&path)
+        } else {
+            path.exists()
+        };
         if !present {
             return false;
         }
@@ -1658,6 +1708,16 @@ pub fn clear_cache(workspace_dir: &Utf8Path) -> Result<Vec<String>> {
                     if file_name_str.starts_with(&format!("{name}-")) {
                         let dep_path = entry.path();
                         if dep_path.is_dir() {
+                            // Retract it before removing it. The cache
+                            // is shared, so another workspace may be
+                            // about to read this tree; with the marker
+                            // gone nothing considers it usable, and
+                            // whoever wanted it fetches a copy of its
+                            // own rather than reading one that is
+                            // disappearing underneath them.
+                            let _ = fs::remove_file(
+                                dep_path.join(depcache::COMPLETE_MARKER),
+                            );
                             fs::remove_dir_all(&dep_path)
                                 .map_err(|e| VwError::FileSystem {
                                     message: format!("Failed to remove cached dependency at {dep_path:?}: {e}")
@@ -3339,6 +3399,90 @@ pub async fn ensure_anodized(
     vhdl_std: VhdlStandard,
     active_variant: Option<&str>,
 ) -> Result<()> {
+    anodize(workspace_dir, vhdl_std, active_variant, Freshness::IfStale)
+        .await
+        .map(|_| ())
+}
+
+/// Whether an anodization pass may decide it has nothing to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    /// Skip when the design sources have not changed since the last pass.
+    /// What every build path wants: the generated file is a pure function of
+    /// those sources, so regenerating an unchanged one only costs an nvc run
+    /// and a rebuild of everything downstream of it.
+    IfStale,
+    /// Regenerate regardless. What `vw cosim anodize` wants: a developer
+    /// working on the anodizer itself is asking to watch it run, and a pass
+    /// that reports "already current" answers a question nobody asked.
+    Always,
+}
+
+/// What an anodization pass found and did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnodizeReport {
+    /// Design sources considered.
+    pub sources: usize,
+    /// How many of them carry a `serialize_rust` attribute.
+    ///
+    /// Zero is a real answer and worth reporting rather than passing over in
+    /// silence: a developer who has just tagged a record and sees zero has
+    /// learnt that the file they edited is not in the design set.
+    pub tagged: usize,
+    /// Where the generated Rust went, when there was any to write.
+    pub generated: Option<Utf8PathBuf>,
+    /// How many lines it came to.
+    pub lines: usize,
+    /// Whether this pass ran the anodizer, or found the last one's output
+    /// still current.
+    pub regenerated: bool,
+}
+
+/// What an anodization pass would look at, without running one.
+///
+/// Returns the number of design sources and how many of them carry a
+/// `serialize_rust` attribute. Cheap — it is the same scan the generator gates
+/// itself on — and worth having separately so a caller can say what is about
+/// to happen *before* it happens. A pass that fails is exactly when knowing
+/// how much it was looking at matters most.
+pub fn anodize_scope(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<(usize, usize)> {
+    let config = render_vhdl_ls_config(workspace_dir, active_variant, false)?;
+    let files = config
+        .libraries
+        .get("defaultlib")
+        .map(|lib| lib.files.clone())
+        .unwrap_or_default();
+    let tagged = tagged_sources(&files);
+    Ok((files.len(), tagged))
+}
+
+/// How many of these sources ask for anything to be generated.
+fn tagged_sources(files: &[PathBuf]) -> usize {
+    files
+        .iter()
+        .filter(|f| {
+            fs::read_to_string(f)
+                .map(|c| c.contains("serialize_rust"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Generate anodizer Rust structs for the workspace's `serialize_rust`-tagged
+/// VHDL records, and say what happened.
+///
+/// [`ensure_anodized`] is this with [`Freshness::IfStale`] and the answer
+/// thrown away — which is what a build wants, since a build only cares that
+/// the file is there and current.
+pub async fn anodize(
+    workspace_dir: &Utf8Path,
+    vhdl_std: VhdlStandard,
+    active_variant: Option<&str>,
+    freshness: Freshness,
+) -> Result<AnodizeReport> {
     let config = render_vhdl_ls_config(workspace_dir, active_variant, false)?;
 
     // Tagged records live in the design sources, i.e. `defaultlib`.
@@ -3347,18 +3491,15 @@ pub async fn ensure_anodized(
         .get("defaultlib")
         .map(|lib| lib.files.clone())
         .unwrap_or_default();
-    if defaultlib_files.is_empty() {
-        return Ok(());
-    }
 
-    // Stage 1: cheap gate — is anything tagged for serialization at all?
-    let any_tagged = defaultlib_files.iter().any(|f| {
-        fs::read_to_string(f)
-            .map(|c| c.contains("serialize_rust"))
-            .unwrap_or(false)
-    });
-    if !any_tagged {
-        return Ok(());
+    let mut report = AnodizeReport {
+        sources: defaultlib_files.len(),
+        // Stage 1: cheap gate — is anything tagged for serialization at all?
+        tagged: tagged_sources(&defaultlib_files),
+        ..Default::default()
+    };
+    if report.tagged == 0 {
+        return Ok(report);
     }
 
     // Stage 2: regenerate only when the design sources changed.
@@ -3370,16 +3511,26 @@ pub async fn ensure_anodized(
     let stored = fs::read_to_string(&fingerprint_file)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());
-    if generated.exists() && stored == Some(fingerprint) {
-        return Ok(());
+    let current = generated.exists() && stored == Some(fingerprint);
+    if current && freshness == Freshness::IfStale {
+        report.generated = Some(generated);
+        return Ok(report);
     }
 
     let build_dir = workspace_dir.join(ANODIZER_BUILD_SUBDIR);
     fs::create_dir_all(&gen_dir)?;
     anodizer::anodize(&config, &build_dir, &gen_dir, vhdl_std).await?;
 
+    // Written even for a forced pass: the work was done, and leaving the
+    // fingerprint stale would make the next build redo it for nothing.
     fs::write(&fingerprint_file, fingerprint.to_string())?;
-    Ok(())
+
+    report.lines = fs::read_to_string(&generated)
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    report.generated = Some(generated);
+    report.regenerated = true;
+    Ok(report)
 }
 
 /// Run a testbench using NVC simulator.
@@ -3410,6 +3561,10 @@ fn dir_is_rust_crate(dir: &Path) -> bool {
 /// discovered) for their crate to need to exist. `write_file` is
 /// content-aware, so unchanged scaffolds don't touch the tree.
 pub fn ensure_bench_scaffolds(workspace_dir: &Utf8Path) -> Result<()> {
+    // A cosim crate's `build.rs` is generated too, and goes missing the same
+    // ways — see `bench_init::heal_cosim_scaffolds`.
+    bench_init::heal_cosim_scaffolds(workspace_dir)?;
+
     let bench_dir = workspace_dir.join("bench");
     let Ok(entries) = fs::read_dir(bench_dir.as_std_path()) else {
         return Ok(()); // no bench dir → nothing to scaffold
@@ -3462,8 +3617,28 @@ pub async fn run_testbench(
     scaffold: bool,
     build_dir: &str,
 ) -> Result<()> {
-    // Check for mixed-signal test (mist.toml in bench/<name>/)
     let bench_test_dir = workspace_dir.join("bench").join(&testbench_name);
+
+    // A cosim bench that drives a design entity directly: `cosim.toml` names
+    // the entity, nvc elaborates that entity as the top level, and the crate
+    // beside the config is the only thing driving it. No VHDL harness is
+    // involved, so none of the testbench-file machinery below applies.
+    let cosim_toml = bench_test_dir.join("cosim.toml");
+    if cosim_toml.exists() {
+        let config = cosim::read_config(cosim_toml.as_std_path())?;
+        return cosim::run(
+            workspace_dir,
+            &testbench_name,
+            &bench_test_dir,
+            &config,
+            vhdl_std,
+            build_dir,
+            runtime_flags,
+        )
+        .await;
+    }
+
+    // Check for mixed-signal test (mist.toml in bench/<name>/)
     let mist_toml = bench_test_dir.join("mist.toml");
     if mist_toml.exists() {
         let mist_content =
@@ -3477,11 +3652,11 @@ pub async fn run_testbench(
         if scaffold {
             return sim::scaffold(&bench_test_dir, &mist_config);
         }
-        // Auto-scaffold before simulating so `vw bench` works straight
+        // Auto-scaffold before simulating so `vw bench run` works straight
         // from a clean checkout (`git clean -fdx` wipes the generated
         // bridge crate — `Cargo.toml`, `build.rs`, generated sources —
         // that `run_analog_test`'s `build_bridge_library` needs) without
-        // a manual `vw bench --scaffold <name>` pre-step. `scaffold`
+        // a manual `vw bench run <name> --scaffold` pre-step. `scaffold`
         // regenerates only the boilerplate (the user-owned `src/lib.rs`
         // is left alone) and `write_file` is content-aware, so this is a
         // cheap no-op when nothing changed.
@@ -3822,12 +3997,15 @@ fn find_cached_vhdl_stdlib(deps_dir: &Path) -> Option<Utf8PathBuf> {
         if !entry.file_name().to_string_lossy().starts_with("rust_hdl-") {
             continue;
         }
+        // Published or nothing: a checkout still being copied here
+        // has a `vhdl_libraries` long before it has all of it, and
+        // handing that to vhdl_lang produces errors about the
+        // standard library that lead nowhere.
+        if !depcache::is_complete(&entry.path()) {
+            continue;
+        }
         let libs = entry.path().join("vhdl_libraries");
-        let present = libs.exists()
-            && fs::read_dir(&libs)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
-        if present {
+        if libs.is_dir() {
             if let Ok(u) = Utf8PathBuf::from_path_buf(libs) {
                 return Some(u);
             }
@@ -3845,6 +4023,7 @@ fn find_cached_vhdl_stdlib(deps_dir: &Path) -> Option<Utf8PathBuf> {
 /// `download_dependency` machinery as any other git dependency.
 pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
     let deps_dir = deps_directory()?;
+    depcache::sweep(&deps_dir);
     if let Some(libs) = find_cached_vhdl_stdlib(&deps_dir) {
         return Ok(libs);
     }
@@ -3856,20 +4035,13 @@ pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
     )
     .await?;
     let dep_path = deps_dir.join(format!("rust_hdl-{sha}"));
-    let libs = dep_path.join("vhdl_libraries");
-    let present = libs.exists()
-        && fs::read_dir(&libs)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-    if !present {
-        if dep_path.exists() {
-            let _ = fs::remove_dir_all(&dep_path);
-        }
+    if !depcache::is_complete(&dep_path) {
+        let staged = depcache::Staged::new(&deps_dir)?;
         download_dependency(
             VHDL_STDLIB_REPO,
             &sha,
             &[],
-            &dep_path,
+            staged.path(),
             false,
             &[],
             false,
@@ -3877,7 +4049,9 @@ pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
             Some("vhdl_libraries"),
         )
         .await?;
+        staged.publish(&dep_path)?;
     }
+    let libs = dep_path.join("vhdl_libraries");
     Utf8PathBuf::from_path_buf(libs).map_err(|p| VwError::FileSystem {
         message: format!("VHDL stdlib path is not UTF-8: {}", p.display()),
     })
@@ -4475,8 +4649,72 @@ pub fn load_workspace_config(
         })?;
 
     let config: WorkspaceConfig = toml::from_str(&config_content)?;
+    validate_workspace_name(&config.workspace.name).map_err(|detail| {
+        VwError::Config {
+            message: format!("`[workspace] name` in {config_path}: {detail}"),
+        }
+    })?;
     validate_variant_shape(&config.workspace)?;
     Ok(config)
+}
+
+/// The longest a workspace name may be on its own.
+///
+/// The name becomes the last component of an object store bucket
+/// called `{kind}-{environment}-{workspace}`, and S3 stops at 63
+/// characters. A fixed cap here cannot be the whole check — how much
+/// room is left over depends on an environment name this side has
+/// never heard of — so the assembled name is checked again where both
+/// halves are known. What this catches is the name that would not
+/// have fitted whatever it was paired with.
+const MAX_WORKSPACE_NAME: usize = 40;
+
+/// Reject a workspace name that cannot do what a workspace name is
+/// used for.
+///
+/// Checked when `vw.toml` is parsed, so a bad name stops every
+/// command rather than only the ones that reach a cloud environment.
+/// That is deliberate: the name is not decoration. It is the module a
+/// workspace's own imports resolve through (`src @foo/bar`), the
+/// answer `vw::project_name` hands a design, and — once one cloud
+/// environment holds several workspaces — a directory on a build
+/// instance and a bucket in an object store. Somewhere in that list
+/// is a rule every candidate name has to satisfy, and the moment to
+/// hear about a name that does not is `vw init`, not a first sync
+/// months later.
+///
+/// Fails with a `String` rather than a [`VwError`] because the same
+/// name is checked in four places that each know something this one
+/// does not — which file it came from, which request carried it — and
+/// a message naming `vw.toml` would be wrong in three of them.
+pub fn validate_workspace_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err(String::from("a workspace name cannot be empty"));
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(format!("'{name}' must start with a lowercase letter"));
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'))
+    {
+        return Err(format!(
+            "'{name}' cannot contain '{c}'; only lowercase letters, \
+             digits and '-' are allowed"
+        ));
+    }
+    // It is the tail of a bucket name, and a bucket name cannot end with
+    // one.
+    if name.ends_with('-') {
+        return Err(format!("'{name}' cannot end with '-'"));
+    }
+    if name.len() > MAX_WORKSPACE_NAME {
+        return Err(format!(
+            "'{name}' is {} characters; the limit is {MAX_WORKSPACE_NAME}",
+            name.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Post-deserialize validation for the `[[target-parts]]` /
@@ -5481,7 +5719,7 @@ async fn build_rust_library(
     // Run cargo build in the testbench directory
     let testbench_dir_owned = testbench_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("cargo")
+        let output = cargo_command()
             .arg("build")
             .current_dir(&testbench_dir_owned)
             .output()
@@ -5550,14 +5788,21 @@ mod locked_resolution_tests {
 
     /// A dependency already downloaded: what every CI worker's cache looks
     /// like once the first job in the pipeline has run.
+    ///
+    /// Published the way a real fetch publishes it rather than written
+    /// straight into place, so that what the cache checks look for
+    /// here is exactly what they look for in earnest — a tree that
+    /// merely exists is not one anybody is entitled to read.
     fn seed_cache(name: &str, sha: &str) {
-        let root = deps_cache().join(format!("{name}-{sha}"));
-        fs::create_dir_all(&root).unwrap();
+        let cache = deps_cache();
+        let staged = depcache::Staged::new(cache.as_std_path()).unwrap();
         fs::write(
-            root.join("vw.toml"),
+            staged.path().join("vw.toml"),
             format!("[workspace]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
         )
         .unwrap();
+        let root = cache.join(format!("{name}-{sha}"));
+        staged.publish(root.as_std_path()).unwrap();
     }
 
     /// A workspace whose only dependency is `name`, declared and locked as
@@ -8422,5 +8667,102 @@ mod download_tests {
             dest.join("meta_sync.vhd").exists(),
             "the pinned revision's sources are in the cache"
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_name_tests {
+    use super::*;
+
+    fn rejected(name: &str) -> String {
+        match validate_workspace_name(name) {
+            Err(message) => message,
+            Ok(()) => panic!("'{name}' was accepted"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_name_is_accepted() {
+        validate_workspace_name("redhawk").unwrap();
+    }
+
+    /// Hyphens are fine here, unlike in an environment name — that ban
+    /// exists because instance names are parsed by splitting on `-`,
+    /// and a workspace name never becomes part of one.
+    #[test]
+    fn a_hyphenated_name_is_accepted() {
+        validate_workspace_name("clk-wizard").unwrap();
+        validate_workspace_name("a1-b2-c3").unwrap();
+    }
+
+    #[test]
+    fn a_name_must_say_something() {
+        assert!(rejected("").contains("cannot be empty"));
+    }
+
+    /// A bucket name cannot end with a hyphen, and the workspace is
+    /// the tail of one.
+    #[test]
+    fn a_name_may_not_end_with_a_hyphen() {
+        assert!(rejected("redhawk-").contains("cannot end with '-'"));
+    }
+
+    #[test]
+    fn a_name_must_start_with_a_letter() {
+        assert!(rejected("2fast").contains("must start with"));
+        assert!(rejected("-leading").contains("must start with"));
+    }
+
+    #[test]
+    fn uppercase_and_underscores_are_out() {
+        assert!(rejected("Redhawk").contains("must start with"));
+        assert!(rejected("red_hawk").contains("cannot contain '_'"));
+        assert!(rejected("redHawk").contains("cannot contain 'H'"));
+    }
+
+    /// The one in `docs/snippets/vw.toml` until this landed, and the
+    /// reason a name has to be checked before it becomes a directory.
+    #[test]
+    fn a_name_that_is_a_path_component_is_out() {
+        assert!(rejected(".").contains("must start with"));
+        assert!(rejected("..").contains("must start with"));
+        assert!(rejected("a/b").contains("cannot contain '/'"));
+    }
+
+    #[test]
+    fn a_name_too_long_for_a_bucket_is_out() {
+        let long = "a".repeat(MAX_WORKSPACE_NAME + 1);
+        assert!(rejected(&long).contains("the limit is"));
+        validate_workspace_name(&"a".repeat(MAX_WORKSPACE_NAME)).unwrap();
+    }
+
+    /// The loader is where the invariant is actually held: a bad name
+    /// stops every command, not only the ones that reach the cloud.
+    #[test]
+    fn the_loader_refuses_a_bad_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = Utf8Path::from_path(dir.path()).unwrap();
+        fs::write(
+            dir.join("vw.toml"),
+            "[workspace]\nname = \"Red_Hawk\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let e = load_workspace_config(dir).unwrap_err();
+        assert!(e.to_string().contains("Red_Hawk"), "{e}");
+    }
+
+    /// And `vw init` refuses it first, so nobody ends up with a
+    /// workspace that cannot be opened again.
+    #[test]
+    fn init_refuses_a_name_the_loader_would_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = Utf8Path::from_path(dir.path()).unwrap();
+
+        let e =
+            init_workspace(dir, String::from("Red_Hawk"), None).unwrap_err();
+
+        assert!(e.to_string().contains("Red_Hawk"), "{e}");
+        assert!(!dir.join("vw.toml").exists(), "a vw.toml was left behind");
     }
 }

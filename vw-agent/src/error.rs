@@ -14,6 +14,8 @@ use dropshot::{ClientErrorStatusCode, HttpError};
 
 use vw_sync::{ApplyError, StoreError};
 
+use crate::workspace::WorkspaceError;
+
 pub(crate) fn apply_error(value: ApplyError) -> HttpError {
     let message = value.to_string();
     match value {
@@ -76,6 +78,24 @@ pub(crate) fn generated_error(
             HttpError::for_not_found(None, message)
         }
         crate::generated::GeneratedError::Read(..) => {
+            HttpError::for_internal_error(message)
+        }
+    }
+}
+
+/// A workspace that could not be opened, or could not be removed.
+///
+/// The name is the caller's and is checked before it becomes a path, so a
+/// refusal there is a `400` naming what is wrong with it. Everything else is
+/// this instance failing to make or unmake a directory, which the caller can
+/// do nothing about.
+pub(crate) fn workspace_error(value: WorkspaceError) -> HttpError {
+    let message = value.to_string();
+    match value {
+        WorkspaceError::BadName { .. } => {
+            HttpError::for_bad_request(None, message)
+        }
+        WorkspaceError::CreateDir(..) | WorkspaceError::Remove(..) => {
             HttpError::for_internal_error(message)
         }
     }

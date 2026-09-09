@@ -17,3 +17,6 @@ regex.workspace = true
 dirs.workspace = true
 petgraph.workspace = true
 vhdl_lang.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -43,6 +43,9 @@ impl TestServer {
             .args(["--admin-api-port", &admin_port.to_string()])
             .args(["--db-path", db_path.to_str().expect("utf8 database path")])
             .args(["--admin-users", ADMIN])
+            // Required, and with nothing sensible to default to: a service that
+            // guessed would name and reap Oxide objects as a deployment it is not.
+            .args(["--deployment", "test"])
             .arg("--no-auth")
             .stdout(Stdio::null())
             .stderr(Stdio::null())

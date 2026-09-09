@@ -10,6 +10,11 @@
 //! store has been rebuilt since — is put right without anyone having to do
 //! anything. And on each first sync, so an environment created after startup
 //! does not have to wait for the next one.
+//!
+//! A bucket per workspace, so the startup pass has to know which workspaces an
+//! environment has. It asks the instance rather than looking it up: a workspace
+//! is on an instance because somebody synchronized one there, and this service
+//! keeps no record that could be right about it.
 
 use slog::{error, info, Logger};
 use vw_api_types_versions::latest::TargetKind;
@@ -23,13 +28,14 @@ use crate::{db, relay, ServerArgs};
 pub(crate) async fn store_for(
     user: &str,
     name: &str,
+    workspace: &str,
     kind: TargetKind,
     args: &ServerArgs,
 ) -> Result<
     vw_api_types_versions::latest::S3Credentials,
     crate::artifacts::ArtifactError,
 > {
-    let artifact = relay::Agent::resolve_artifact(user, name, args)
+    let artifact = relay::Agent::resolve_artifact(user, name, workspace, args)
         .map_err(|_| crate::artifacts::ArtifactError::NoStore)?;
     let address = artifact_address(user, name, args)
         .ok_or(crate::artifacts::ArtifactError::NoStore)?;
@@ -41,6 +47,12 @@ pub(crate) async fn store_for(
 }
 
 /// The kinds of instance that build something worth keeping.
+///
+/// Helios is wired up before it has anything to put anywhere. A bucket costs
+/// nothing standing empty, and asking for it on the first sync means the day
+/// the driver build starts producing something there is nowhere for it to be
+/// missing — which the store used to guarantee by making every bucket at boot,
+/// and cannot now that they follow the workspaces.
 const KINDS: [TargetKind; 2] = [TargetKind::Vivado, TargetKind::Helios];
 
 /// Make sure one instance knows where its artifacts go.
@@ -52,21 +64,23 @@ const KINDS: [TargetKind; 2] = [TargetKind::Vivado, TargetKind::Helios];
 pub(crate) async fn ensure(
     user: &str,
     name: &str,
+    workspace: &str,
     kind: TargetKind,
     args: &ServerArgs,
     instance: &relay::Agent,
     log: &Logger,
 ) {
-    let artifact = match relay::Agent::resolve_artifact(user, name, args) {
-        Ok(artifact) => artifact,
-        Err(e) => {
-            info!(log, "no artifact instance to store artifacts on yet";
-                "environment" => name,
-                "detail" => %e,
-            );
-            return;
-        }
-    };
+    let artifact =
+        match relay::Agent::resolve_artifact(user, name, workspace, args) {
+            Ok(artifact) => artifact,
+            Err(e) => {
+                info!(log, "no artifact instance to store artifacts on yet";
+                    "environment" => name,
+                    "detail" => %e,
+                );
+                return;
+            }
+        };
 
     let Some(address) = artifact_address(user, name, args) else {
         return;
@@ -142,23 +156,76 @@ pub(crate) async fn ensure_all(args: &ServerArgs, log: &Logger) {
 
     for entry in environments {
         let (user, name) = (&entry.user, &entry.environment.name);
-        for kind in KINDS {
-            let instance = match relay::Agent::resolve(user, name, kind, args) {
-                Ok(instance) => instance,
-                Err(e) => {
-                    // Ordinary while an environment is still being built.
-                    info!(log, "instance not ready to be configured";
-                        "environment" => name,
-                        "kind" => %kind,
-                        "detail" => %e,
-                    );
-                    continue;
-                }
-            };
 
-            ensure(user, name, kind, args, &instance, log).await;
+        // Which workspaces an environment has is not something this service
+        // records, so the vivado instance is asked. Not measured: this wants
+        // names, and measuring means walking every build tree on the machine.
+        let workspaces = match workspaces_on(user, name, args, log).await {
+            Some(workspaces) => workspaces,
+            None => continue,
+        };
+
+        if workspaces.is_empty() {
+            continue;
+        }
+
+        for workspace in &workspaces {
+            for kind in KINDS {
+                let instance = match relay::Agent::resolve(
+                    user, name, workspace, kind, args,
+                ) {
+                    Ok(instance) => instance,
+                    Err(e) => {
+                        // Ordinary while an environment is still being built.
+                        info!(log, "instance not ready to be configured";
+                            "environment" => name,
+                            "kind" => %kind,
+                            "detail" => %e,
+                        );
+                        continue;
+                    }
+                };
+
+                ensure(user, name, workspace, kind, args, &instance, log).await;
+            }
         }
     }
+}
+
+/// The workspaces an environment is holding, as its vivado instance sees them.
+///
+/// `None` when the question could not be put — an instance still coming up, an
+/// agent that did not answer. That is not a failure worth reporting at
+/// startup: the environment gets wired on its next sync regardless, which is
+/// the path that catches everything this one is only trying to get ahead of.
+async fn workspaces_on(
+    user: &str,
+    name: &str,
+    args: &ServerArgs,
+    log: &Logger,
+) -> Option<Vec<String>> {
+    let instance =
+        relay::Agent::resolve_instance(user, name, TargetKind::Vivado, args)
+            .inspect_err(|e| {
+                info!(log, "instance not ready to be asked what it holds";
+                    "environment" => name,
+                    "detail" => %e,
+                );
+            })
+            .ok()?;
+
+    let held = instance
+        .workspaces(false)
+        .await
+        .inspect_err(|e| {
+            info!(log, "cannot ask an instance what workspaces it holds";
+                "environment" => name,
+                "detail" => %e,
+            );
+        })
+        .ok()?;
+
+    Some(held.into_iter().map(|workspace| workspace.name).collect())
 }
 
 /// The artifact instance's address on the rack's network.

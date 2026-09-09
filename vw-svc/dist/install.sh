@@ -11,6 +11,13 @@
 #   ./install.sh --binary /path/to/vw-svc
 #   ./install.sh --commit <sha>           # from that commit's buildomat build
 #   ./install.sh --restart                # and restart a running service
+#
+# One vw-svc per host. Which deployment it is -- `prod`, `beta`, anything else
+# -- is a setting in /etc/vw-svc/vw-svc.env rather than a mode of this script,
+# and everything else about a deployment is its Oxide project. Two of them on
+# one machine was a thing this script used to do, and it is not one any more:
+# a deployment's service has to sit inside the project it provisions into,
+# because it reaches agents over a VPC that does not span projects.
 
 set -euo pipefail
 
@@ -20,13 +27,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY=""
 COMMIT=""
 RESTART=false
+NAME=vw-svc
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--binary) BINARY="$2"; shift 2 ;;
 	--commit) COMMIT="$2"; shift 2 ;;
 	--restart) RESTART=true; shift ;;
-	-h | --help) sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+	# Printed from the comment block above rather than from a copy kept in
+	# step with it by hand, and stopped at the first blank line so that
+	# adding an option there is all there is to adding one here.
+	-h | --help) sed -n '2,/^$/{s/^# \?//;p;}' "${BASH_SOURCE[0]}"; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -57,51 +68,62 @@ fi
 # now rather than as a restart loop after the unit is in place.
 "$BINARY" serve --help >/dev/null
 
-echo "Installing /usr/local/bin/vw-svc"
-install -o root -g root -m 0755 "$BINARY" /usr/local/bin/vw-svc
+echo "Installing /usr/local/bin/$NAME"
+install -o root -g root -m 0755 "$BINARY" "/usr/local/bin/$NAME"
 
-install -d -o root -g root -m 0755 /etc/vw-svc
+install -d -o root -g root -m 0755 "/etc/$NAME"
 
 # Never overwritten. It holds the rack token and everything about how this
 # machine is configured, and an upgrade has no business resetting either.
 fresh=false
-if [ -e /etc/vw-svc/vw-svc.env ]; then
-	echo "Keeping /etc/vw-svc/vw-svc.env"
+if [ -e "/etc/$NAME/$NAME.env" ]; then
+	echo "Keeping /etc/$NAME/$NAME.env"
 else
-	echo "Installing /etc/vw-svc/vw-svc.env"
+	echo "Installing /etc/$NAME/$NAME.env"
 	install -o root -g root -m 0600 \
-		"$HERE/vw-svc.env.example" /etc/vw-svc/vw-svc.env
+		"$HERE/$NAME.env.example" "/etc/$NAME/$NAME.env"
 	fresh=true
 fi
 
-echo "Installing /etc/systemd/system/vw-svc.service"
+echo "Installing /etc/systemd/system/$NAME.service"
 install -o root -g root -m 0644 \
-	"$HERE/vw-svc.service" /etc/systemd/system/vw-svc.service
+	"$HERE/$NAME.service" "/etc/systemd/system/$NAME.service"
 
 systemctl daemon-reload
-systemctl enable vw-svc.service >/dev/null
+systemctl enable "$NAME.service" >/dev/null
 
 if $fresh; then
 	cat <<-EOF
 
-		vw-svc is installed and enabled, and has not been started.
+		$NAME is installed and enabled, and has not been started.
 
-		Edit /etc/vw-svc/vw-svc.env first. As shipped it names a
+		Edit /etc/$NAME/$NAME.env first. As shipped it names a
 		certificate that does not exist, and configures no rack -- so
 		starting on it would stop at the missing certificate, and
 		fixing only that would give you a service that records
-		environments and provisions nothing. Then:
+		environments and provisions nothing.
 
-		    systemctl start vw-svc
-		    journalctl -fu vw-svc
+		VW_SVC_DEPLOYMENT is the one to get right. It decides which
+		Oxide objects this service considers its own, so a name that
+		is another live deployment's makes this service reconcile that
+		deployment's environments out of existence -- silently, within
+		one pass. It should match the project it is pointed at.
+	EOF
+
+	cat <<-EOF
+
+		Then:
+
+		    systemctl start $NAME
+		    journalctl -fu $NAME
 	EOF
 	exit 0
 fi
 
-if systemctl is-active --quiet vw-svc.service; then
+if systemctl is-active --quiet "$NAME.service"; then
 	if $RESTART; then
-		echo "Restarting vw-svc"
-		systemctl restart vw-svc.service
+		echo "Restarting $NAME"
+		systemctl restart "$NAME.service"
 	else
 		# Deliberately not automatic. This service relays the connections
 		# builds run over, so a restart ends whatever synthesis runs, REPL
@@ -113,12 +135,12 @@ if systemctl is-active --quiet vw-svc.service; then
 			old one. Restarting ends any build, REPL session or download
 			currently being relayed, so it is left to you:
 
-			    systemctl restart vw-svc
+			    systemctl restart $NAME
 
 			Or re-run this with --restart.
 		EOF
 	fi
 else
 	echo
-	echo "vw-svc is installed and enabled. Start it with: systemctl start vw-svc"
+	echo "$NAME is installed and enabled. Start it with: systemctl start $NAME"
 fi

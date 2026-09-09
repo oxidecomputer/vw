@@ -57,9 +57,18 @@ struct ServerArgs {
     /// Server bind address
     #[arg(long, default_value_t = IpAddr::V6(Ipv6Addr::UNSPECIFIED))]
     address: IpAddr,
-    #[arg(long, default_value_t = 2727u16)]
+    /// Port the user API answers on.
+    ///
+    /// 443, so that the service is reached as `https://{host}` with no port to
+    /// quote. Binding it needs privilege the unit already has for the
+    /// certificate.
+    #[arg(long, default_value_t = 443u16)]
     user_api_port: u16,
-    #[arg(long, default_value_t = 2728u16)]
+    /// Port the administrative API answers on.
+    ///
+    /// A second listener rather than a path under the first, so that whoever
+    /// runs the service can decide separately who may reach it.
+    #[arg(long, default_value_t = 2053u16)]
     admin_api_port: u16,
     /// Enable TLS
     #[arg(long)]
@@ -70,6 +79,26 @@ struct ServerArgs {
     /// TLS private key file path
     #[arg(long, default_value = "key.pem")]
     key_file: Utf8PathBuf,
+    /// Which vw deployment this service is, for example `prod` or `beta`.
+    ///
+    /// Every Oxide object this service creates is named
+    /// `vwsvc-{deployment}-...`, and only those are recognized as its own, so
+    /// no deployment can reconcile another's instances, disks or ssh keys out
+    /// of existence. That holds even when two deployments share a silo user,
+    /// and so a single OXIDE_TOKEN, whose ssh key list no project scopes --
+    /// which is the case this name exists for, since a project separates
+    /// everything else on its own.
+    ///
+    /// Required, and with no default: a service that guessed would name and
+    /// reap objects as a deployment that is not the one it was meant to be.
+    /// The name may not contain a hyphen, and must not be shared with another
+    /// deployment in the same silo.
+    ///
+    /// Clients do not name it. They are pointed at a URL, and which deployment
+    /// answers there is not their business.
+    #[arg(long, value_name = "NAME")]
+    deployment: String,
+
     /// Do not require a github token for API access
     #[arg(long)]
     no_auth: bool,
@@ -130,6 +159,26 @@ async fn main() {
 
 async fn serve(args: ServerArgs) {
     let log = logger();
+
+    // Before anything can name or parse an Oxide object. The prefix decides
+    // which deployment's instances, disks and ssh keys this process considers
+    // its own, and a service that read it too late would be looking at
+    // another deployment's.
+    //
+    // A bad name is fatal here rather than something to fall back from: every
+    // fallback names objects as a deployment this service is not, and the
+    // reconciler acts on that within one pass.
+    if let Err(e) = oxide::init_deployment(&args.deployment) {
+        error!(log, "deployment configuration error";
+            slog_error_chain::InlineErrorChain::new(&e),
+        );
+        std::process::exit(1);
+    }
+    info!(log, "starting";
+        "deployment" => &args.deployment,
+        "object_prefix" => oxide::instance_prefix(),
+    );
+
     db::init(&args.db_path).expect("unable to open environment database");
 
     if let Err(e) = oxide::init(
@@ -169,6 +218,16 @@ async fn serve(args: ServerArgs) {
             "no oxide backend configured; environments will be recorded but \
              never provisioned. Pass --oxide-api-endpoint and --oxide-token \
              to reconcile instances."
+        );
+    }
+
+    // Said once at startup because it is what makes "no image matching
+    // 'vw-vivado-*' is visible to this service" legible: the silo is ignored,
+    // so an image an operator can plainly see on the rack still is not one
+    // this service will boot unless it is in this project.
+    if oxide::is_configured() {
+        info!(log, "booting only images in this deployment's project";
+            "project" => &args.oxide_project,
         );
     }
     //let addr: IpAddr = args.address.parse().expect("unable to parse address");

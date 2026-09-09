@@ -39,6 +39,7 @@ pub mod user {
             SyncPlan = vw_api_types_versions::latest::SyncPlan,
             TargetKind = vw_api_types_versions::latest::TargetKind,
             TreeManifest = vw_api_types_versions::latest::TreeManifest,
+            Workspace = vw_api_types_versions::latest::Workspace,
         },
     );
 }
@@ -65,6 +66,7 @@ pub mod agent {
             SyncPlan = vw_api_types_versions::latest::SyncPlan,
             TargetKind = vw_api_types_versions::latest::TargetKind,
             TreeManifest = vw_api_types_versions::latest::TreeManifest,
+            Workspace = vw_api_types_versions::latest::Workspace,
         },
     );
 }

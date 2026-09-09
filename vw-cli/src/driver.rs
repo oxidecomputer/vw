@@ -23,7 +23,7 @@ use crate::cloud::{CloudError, Session};
 /// wrong with vw.
 pub async fn build(
     session: &Session,
-    environment: &str,
+    target: &crate::cloud::Target,
     release: bool,
     args: &[String],
 ) -> Result<bool, CloudError> {
@@ -31,7 +31,8 @@ pub async fn build(
 
     let upgraded = vw_api_client::retrying(|| {
         session.client.driver_build(
-            environment,
+            &target.environment,
+            &target.workspace,
             joined.as_deref(),
             Some(release),
         )

@@ -65,12 +65,69 @@ const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A running garage, and the key that opens it.
 pub(crate) struct Store {
-    /// The key, and the bucket each kind of instance writes to.
+    /// The key. One for the whole store — see [`ensure_credentials`].
     pub(crate) credentials: S3Credentials,
-    /// The bucket for each kind, by the name the caller asks for.
-    pub(crate) buckets: std::collections::BTreeMap<String, String>,
+    /// The buckets made so far, keyed `{kind}/{workspace}`.
+    ///
+    /// Made as they are asked for rather than up front, because what
+    /// there is to make is not known up front: a workspace exists on an
+    /// environment because somebody synchronized one, and the answer
+    /// changes for as long as the environment does.
+    buckets: tokio::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    /// How to make another one.
+    admin: Admin,
+    /// Part of every bucket's name, so the objects say which environment
+    /// they belong to even though a store serves exactly one.
+    environment: String,
+    /// Where the key and the list of buckets are remembered.
+    path: Utf8PathBuf,
     /// Kept so garage is torn down with the agent rather than outliving it.
     _child: tokio::process::Child,
+}
+
+impl Store {
+    /// The bucket a workspace's `kind` artifacts belong in, created if
+    /// this is the first anybody has asked for it.
+    pub(crate) async fn bucket_for(
+        &self,
+        kind: &str,
+        workspace: &str,
+        log: &Logger,
+    ) -> Result<String, GarageError> {
+        let key = format!("{kind}/{workspace}");
+        let mut buckets = self.buckets.lock().await;
+        if let Some(bucket) = buckets.get(&key) {
+            return Ok(bucket.clone());
+        }
+
+        // A bucket per environment per kind, named for both. Even though an
+        // artifact instance serves one environment today, a name that says which
+        // one keeps the objects legible if a store is ever shared. The
+        // workspace joins them for the same reason it divides everything else:
+        // one store now holds several workspaces' output.
+        let bucket = format!("{kind}-{}-{workspace}", self.environment);
+        // Adopted if it is already there. That happens when this record was
+        // lost but the store's own state was not — a disk restored from a
+        // snapshot, a file removed by hand. Failing instead would leave an
+        // instance that cannot serve the artifacts sitting right there in a
+        // bucket, and creating a second bucket would orphan them. Neither is
+        // as good as picking up where we left off.
+        let id = self.admin.ensure_bucket(&bucket, log).await?;
+        self.admin
+            .allow(&id, &self.credentials.access_key_id)
+            .await?;
+
+        buckets.insert(key, bucket.clone());
+        remember(&self.path, &self.credentials, &buckets)?;
+
+        info!(log, "made a bucket for a workspace";
+            "bucket" => &bucket,
+            "workspace" => workspace,
+            "kind" => kind,
+        );
+
+        Ok(bucket)
+    }
 }
 
 /// Configure, start and bootstrap garage, returning the key for this
@@ -111,12 +168,17 @@ pub(crate) async fn start(
     admin.wait_until_ready(log).await?;
     ensure_layout(&config, &admin, settings, log).await?;
 
+    let path = settings.dir.join("credentials.json");
     let (credentials, buckets) =
-        ensure_credentials(environment, settings, &admin, log).await?;
+        ensure_credentials(environment, &path, settings.s3_port, &admin, log)
+            .await?;
 
     Ok(Store {
         credentials,
-        buckets,
+        buckets: tokio::sync::Mutex::new(buckets),
+        admin,
+        environment: environment.to_owned(),
+        path,
         _child: child,
     })
 }
@@ -223,38 +285,58 @@ async fn ensure_layout(
     Ok(())
 }
 
-/// The kinds of instance that produce artifacts, and so have a bucket.
-///
-/// Helios has one before it has anything to put in it. A bucket costs nothing
-/// standing empty, and creating it now means the day the driver build starts
-/// producing something there is nowhere for it to be missing.
-pub(crate) const KINDS: [&str; 2] = ["vivado", "helios"];
-
 /// What was minted, remembered so a reboot comes back to the same store.
 #[derive(Serialize, Deserialize)]
 struct Minted {
     credentials: S3Credentials,
+    /// Every bucket made so far, keyed `{kind}/{workspace}`.
     buckets: std::collections::BTreeMap<String, String>,
 }
 
-/// The key and buckets for this environment, created if this is the first boot.
+/// Write down the key and what it opens.
+///
+/// Rewritten whole every time a bucket is added, which is rare and cheap:
+/// there are a handful of workspaces on an environment and the file is a few
+/// hundred bytes.
+fn remember(
+    path: &Utf8Path,
+    credentials: &S3Credentials,
+    buckets: &std::collections::BTreeMap<String, String>,
+) -> Result<(), GarageError> {
+    let minted = Minted {
+        credentials: credentials.clone(),
+        buckets: buckets.clone(),
+    };
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&minted)
+            .map_err(|_| GarageError::Unexpected(path.to_string()))?,
+    )
+    .map_err(|e| GarageError::Write(path.to_owned(), e))?;
+    restrict(path)
+}
+
+/// The key for this store, and whatever buckets it has already been asked for.
 ///
 /// One key with access to every bucket rather than one key each: they are all
 /// reached from inside one VPC by instances of one environment, so a second
-/// key would be ceremony without a boundary behind it.
+/// key would be ceremony without a boundary behind it. That holds just as well
+/// now that the buckets are per workspace as it did when there were two — what
+/// separates one workspace's artifacts from another's is which bucket a build
+/// is told to write to, not what it is allowed to open.
 async fn ensure_credentials(
     environment: &str,
-    settings: &Settings,
+    path: &Utf8Path,
+    s3_port: u16,
     admin: &Admin,
     log: &Logger,
 ) -> Result<
     (S3Credentials, std::collections::BTreeMap<String, String>),
     GarageError,
 > {
-    let path = settings.dir.join("credentials.json");
     if path.is_file() {
-        let stored = std::fs::read_to_string(&path)
-            .map_err(|e| GarageError::Read(path.clone(), e))?;
+        let stored = std::fs::read_to_string(path)
+            .map_err(|e| GarageError::Read(path.to_owned(), e))?;
         let minted: Minted = serde_json::from_str(&stored)
             .map_err(|_| GarageError::Unexpected(path.to_string()))?;
         info!(log, "reusing the store credentials from a previous run";
@@ -265,29 +347,12 @@ async fn ensure_credentials(
 
     let key = admin.ensure_key(&format!("vw-{environment}"), log).await?;
 
-    // A bucket per environment per kind, named for both. Even though an
-    // artifact instance serves one environment today, a name that says which
-    // one keeps the objects legible if a store is ever shared.
-    let mut buckets = std::collections::BTreeMap::new();
-    for kind in KINDS {
-        let bucket = format!("{kind}-{environment}");
-        // Adopted if it is already there. That happens when this record was
-        // lost but the store's own state was not — a disk restored from a
-        // snapshot, a file removed by hand. Failing instead would leave an
-        // instance that cannot serve the artifacts sitting right there in a
-        // bucket, and creating a second bucket would orphan them. Neither is
-        // as good as picking up where we left off.
-        let bucket_id = admin.ensure_bucket(&bucket, log).await?;
-        admin.allow(&bucket_id, &key.access_key_id).await?;
-        buckets.insert(kind.to_owned(), bucket);
-    }
-
     let credentials = S3Credentials {
         // Left for the caller to fill in: this instance cannot see which of
         // its addresses another instance can reach it on. The port it can
         // see, because it chose it.
         endpoint: String::new(),
-        port: settings.s3_port,
+        port: s3_port,
         region: "garage".to_owned(),
         // Filled in per caller, which is the only thing that differs between
         // one instance's view of this store and another's.
@@ -296,21 +361,12 @@ async fn ensure_credentials(
         secret_access_key: key.secret_access_key,
     };
 
-    let minted = Minted {
-        credentials: credentials.clone(),
-        buckets: buckets.clone(),
-    };
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&minted)
-            .map_err(|_| GarageError::Unexpected(path.to_string()))?,
-    )
-    .map_err(|e| GarageError::Write(path.clone(), e))?;
-    restrict(&path)?;
+    // No buckets yet. Which ones this store will need is a question only a
+    // workspace being synchronized can answer, and none has been.
+    let buckets = std::collections::BTreeMap::new();
+    remember(path, &credentials, &buckets)?;
 
-    info!(log, "created the store for this environment";
-        "buckets" => format!("{:?}", buckets.values().collect::<Vec<_>>()),
-    );
+    info!(log, "created the store for this environment");
 
     Ok((credentials, buckets))
 }
@@ -638,12 +694,22 @@ mod test {
         assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
     }
 
+    /// A store starts with no buckets at all, which is the difference
+    /// this made: what a store needs follows the workspaces on the
+    /// environment, and at boot there are none.
     #[test]
-    fn every_kind_that_builds_gets_a_bucket() {
-        // Helios has one before it has anything to put in it, so the day the
-        // driver build produces something there is nowhere for it to be
-        // missing.
-        assert!(KINDS.contains(&"vivado"));
-        assert!(KINDS.contains(&"helios"));
+    fn a_fresh_store_has_no_buckets() {
+        let minted = Minted {
+            credentials: S3Credentials {
+                endpoint: String::new(),
+                port: 3900,
+                region: "garage".to_owned(),
+                bucket: String::new(),
+                access_key_id: "GK00000000000000000000000".to_owned(),
+                secret_access_key: "shhh".to_owned(),
+            },
+            buckets: std::collections::BTreeMap::new(),
+        };
+        assert!(minted.buckets.is_empty());
     }
 }
