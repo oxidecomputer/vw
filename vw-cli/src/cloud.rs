@@ -33,13 +33,11 @@ use vw_api_client::user::{types, Client};
 /// No port, because the user API answers on 443.
 const SERVICE_URL: &str = "https://vw-cloud.dev";
 
-/// Where the administrative API of [`SERVICE_URL`] lives.
+/// The port a vw service's administrative API answers on.
 ///
-/// A second listener on a second port rather than a path under the first, so
-/// that whoever runs the service can decide separately who may reach it. Which
-/// also means it does not follow from the user API's URL and has to be named
-/// separately when a caller points at another deployment.
-const ADMIN_URL: &str = "https://vw-cloud.dev:2053";
+/// A second listener rather than a path under the user API, so that whoever
+/// runs the service can decide separately who may reach it.
+const ADMIN_PORT: u16 = 2053;
 
 /// The service the commands without a `--url` of their own will talk to.
 ///
@@ -47,6 +45,36 @@ const ADMIN_URL: &str = "https://vw-cloud.dev:2053";
 /// is nowhere to pass.
 fn service_url_from_env() -> String {
     std::env::var("VW_SVC_URL").unwrap_or_else(|_| String::from(SERVICE_URL))
+}
+
+/// The administrative API of the service at `url`.
+///
+/// Derived from the user API's URL rather than named separately, because the
+/// two are one deployment and the cost of letting them come apart is paid by
+/// the administrative commands — the ones that delete other people's
+/// environments. A caller who points `--url` at the beta and gets an admin
+/// session on production has been handed the worst version of this tool.
+///
+/// It is only the port that differs. A deployment that puts its administrative
+/// API somewhere else entirely is still reachable, by saying so with
+/// `--admin-url` or `$VW_SVC_ADMIN_URL`.
+///
+/// A URL that will not parse is handed back untouched, so that the error the
+/// caller sees comes from the client trying to use it and names the URL, rather
+/// than from here.
+/// The trailing `/` is trimmed because the generated client builds every
+/// request as `{base}/v1/...`, so a base that ends in one asks for `//v1/...`.
+/// `Url` always serializes an empty path as `/`, and a caller who exported a
+/// URL with a trailing slash meant the same thing, so both are handled here
+/// rather than left to produce a 404 nobody would connect to this function.
+fn admin_url_for(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_owned();
+    };
+    if parsed.set_port(Some(ADMIN_PORT)).is_err() {
+        return url.to_owned();
+    }
+    parsed.to_string().trim_end_matches('/').to_owned()
 }
 
 /// How often `--wait` asks what an environment's instances are doing.
@@ -101,9 +129,9 @@ pub struct CloudArgs {
         global = true,
         env = "VW_SVC_ADMIN_URL",
         help = "Base URL of the vw service's administrative API, which is a \
-                separate listener on a separate port and so does not follow \
-                --url. Defaults to https://vw-cloud.dev:2053. Only used by \
-                `vw cloud admin`."
+                separate listener on a separate port. Defaults to --url with \
+                that port, so pointing --url at a deployment points these \
+                commands at it too. Only used by `vw cloud admin`."
     )]
     admin_url: Option<String>,
 
@@ -381,10 +409,13 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
     // The administrative commands speak to a different listener, and none of
     // them need the user API, so that session is the only one built.
     if let CloudCommand::Admin { command } = args.command {
-        let admin_url = args
-            .admin_url
-            .clone()
-            .unwrap_or_else(|| String::from(ADMIN_URL));
+        // Follows --url, so that pointing at a deployment points every command
+        // at it. These are the commands that delete other people's
+        // environments; an admin session left on the deployment the caller
+        // stopped talking to is the one mistake here worth engineering against.
+        let admin_url = args.admin_url.clone().unwrap_or_else(|| {
+            admin_url_for(args.url.as_deref().unwrap_or(SERVICE_URL))
+        });
         let session = AdminSession::new(&admin_url, args.insecure)?;
         return match command {
             AdminCommand::List => admin_list(&session).await,
@@ -1673,16 +1704,19 @@ mod test {
         use clap::Parser as _;
 
         let parsed = Wrapper::try_parse_from(argv).expect("should parse");
-        (
-            parsed
-                .cloud
-                .url
-                .unwrap_or_else(|| String::from(SERVICE_URL)),
-            parsed
-                .cloud
-                .admin_url
-                .unwrap_or_else(|| String::from(ADMIN_URL)),
-        )
+
+        // The same order `run` resolves them in: the service URL first, and
+        // the administrative one from it unless it was named outright.
+        let url = parsed
+            .cloud
+            .url
+            .clone()
+            .unwrap_or_else(|| String::from(SERVICE_URL));
+        let admin = parsed
+            .cloud
+            .admin_url
+            .unwrap_or_else(|| admin_url_for(&url));
+        (url, admin)
     }
 
     /// A URL is the whole of how a deployment is chosen.
@@ -1711,7 +1745,7 @@ mod test {
 
         // Saying nothing reaches the deployment nearly every invocation wants.
         // The user API carries no port because it answers on 443; the admin API
-        // is a separate listener and so does not follow from it.
+        // is the same host on its own port.
         let default = (
             String::from("https://vw-cloud.dev"),
             String::from("https://vw-cloud.dev:2053"),
@@ -1719,24 +1753,57 @@ mod test {
         assert_eq!(resolved(&["vw", "list"]), default);
         assert_eq!(service_url_from_env(), default.0);
 
-        // Another deployment is reached by naming it, on the flag...
+        // Another deployment is reached by naming it, on the flag -- and BOTH
+        // APIs go with it. This is the property worth having a test for: an
+        // admin session left behind on production while --url points at the
+        // beta is a `vw cloud admin delete` against the wrong deployment's
+        // environments, and it looks exactly like the right one.
         assert_eq!(
-            resolved(&["vw", "--url", "https://beta.vw-cloud.dev", "list"]).0,
-            "https://beta.vw-cloud.dev",
+            resolved(&["vw", "--url", "https://beta.vw-cloud.dev", "list"]),
+            (
+                String::from("https://beta.vw-cloud.dev"),
+                String::from("https://beta.vw-cloud.dev:2053"),
+            ),
         );
 
         // ...or in the environment, which is what the commands with no --url of
-        // their own -- `vw run`, `vw check` -- have to go on.
+        // their own -- `vw run`, `vw check` -- have to go on, and which follows
+        // the same rule.
         std::env::set_var("VW_SVC_URL", "https://beta.vw-cloud.dev");
-        assert_eq!(resolved(&["vw", "list"]).0, "https://beta.vw-cloud.dev");
+        assert_eq!(
+            resolved(&["vw", "list"]),
+            (
+                String::from("https://beta.vw-cloud.dev"),
+                String::from("https://beta.vw-cloud.dev:2053"),
+            ),
+        );
         assert_eq!(service_url_from_env(), "https://beta.vw-cloud.dev");
 
-        // And the flag still beats the variable, so a shell configured for one
-        // deployment can act on another without unsetting anything.
+        // A development service on some other port keeps its host and gets the
+        // admin port, rather than keeping the port it was given.
         assert_eq!(
-            resolved(&["vw", "--url", "https://elsewhere:1234", "list"]).0,
-            "https://elsewhere:1234",
+            resolved(&["vw", "--url", "https://elsewhere:1234", "list"]),
+            (
+                String::from("https://elsewhere:1234"),
+                String::from("https://elsewhere:2053"),
+            ),
         );
+
+        // A trailing slash survives nothing: the generated client appends
+        // `/v1/...` to whatever it is given.
+        assert_eq!(
+            resolved(&["vw", "--url", "https://beta.vw-cloud.dev/", "list"]).1,
+            "https://beta.vw-cloud.dev:2053",
+        );
+
+        // And a deployment that puts its administrative API somewhere else
+        // entirely says so, which is the only thing that separates the two.
+        std::env::set_var("VW_SVC_ADMIN_URL", "https://admin.example:9999");
+        assert_eq!(
+            resolved(&["vw", "--url", "https://beta.vw-cloud.dev", "list"]).1,
+            "https://admin.example:9999",
+        );
+        std::env::remove_var("VW_SVC_ADMIN_URL");
 
         for (name, value) in inherited {
             match value {

@@ -38,6 +38,7 @@ dirs.workspace = true
 tracing-subscriber.workspace = true
 petgraph.workspace = true
 futures.workspace = true
+url.workspace = true
 glob.workspace = true
 indicatif.workspace = true
 serde.workspace = true
