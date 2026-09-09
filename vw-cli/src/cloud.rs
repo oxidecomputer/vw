@@ -23,126 +23,30 @@ use indicatif::ProgressBar;
 use std::time::{Duration, Instant};
 use vw_api_client::user::{types, Client};
 
-/// The host the vw services run on.
+/// The vw service commands talk to when the caller does not name one.
 ///
-/// The one people actually use, rather than a development service on this
-/// machine — nearly every `vw` invocation wants the shared one, and pointing
-/// somewhere else is the unusual case that can afford `--url` or
-/// `VW_SVC_URL`.
-const SERVICE_HOST: &str = "rhbs.eng.oxide.computer";
-
-/// The two listeners a vw service answers on.
+/// A deployment is reached by its own name — there is one vw service per name,
+/// and which one this is is not the client's business beyond the URL. Other
+/// deployments (`beta.vw-cloud.dev`, or somebody else's entirely) are reached
+/// by pointing `--url` or `$VW_SVC_URL` at them; nothing here enumerates them.
 ///
-/// The administrative API is a second listener on a second port rather than a
-/// path under the first one, so that whoever runs the service can decide
-/// separately who may reach it. That is also why the two are carried together
-/// rather than one derived from the other: they are free to live in different
-/// places, and on a development service they usually do.
-struct ServicePorts {
-    user: u16,
-    admin: u16,
-}
+/// No port, because the user API answers on 443.
+const SERVICE_URL: &str = "https://vw-cloud.dev";
 
-/// The production service's ports.
-const PRODUCTION_PORTS: ServicePorts = ServicePorts {
-    user: 2727,
-    admin: 2728,
-};
-
-/// The beta service's ports.
+/// Where the administrative API of [`SERVICE_URL`] lives.
 ///
-/// A second vw-svc on the same host as production — same certificate, same
-/// name, different ports — so selecting it is a matter of ports alone. See
-/// `vw-svc/dist/README.md`.
-const BETA_PORTS: ServicePorts = ServicePorts {
-    user: 2828,
-    admin: 2829,
-};
-
-/// Whether `$VW_BETA` asks for the beta service.
-///
-/// Anything but an explicit denial counts, because of which way this fails. A
-/// developer who writes `VW_BETA=yes`, is told nothing, and gets production
-/// would go on to act on production believing it was the beta — deleting an
-/// environment there, or reading a build that is not the one they meant to
-/// test. The opposite mistake costs them a confusing empty environment list.
-/// So every spelling of yes works, and only the spellings of no are read as
-/// no.
-fn beta_selected() -> bool {
-    std::env::var("VW_BETA").is_ok_and(|value| {
-        !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "no" | "off"
-        )
-    })
-}
-
-/// The ports to use when the caller has not named a service.
-fn default_ports() -> ServicePorts {
-    if beta_selected() {
-        BETA_PORTS
-    } else {
-        PRODUCTION_PORTS
-    }
-}
-
-/// One of the services, by port.
-fn service_url(port: u16) -> String {
-    format!("https://{SERVICE_HOST}:{port}")
-}
-
-/// Where the service lives if the caller does not say otherwise.
-///
-/// Resolved after parsing rather than through clap's `default_value_t`, which
-/// stores the value it computes in a process-global and so would read
-/// `$VW_BETA` once for the life of the program. That is harmless in `vw`
-/// itself, which builds its command once, and wrong everywhere else.
-fn default_service_url() -> String {
-    service_url(default_ports().user)
-}
+/// A second listener on a second port rather than a path under the first, so
+/// that whoever runs the service can decide separately who may reach it. Which
+/// also means it does not follow from the user API's URL and has to be named
+/// separately when a caller points at another deployment.
+const ADMIN_URL: &str = "https://vw-cloud.dev:2053";
 
 /// The service the commands without a `--url` of their own will talk to.
 ///
 /// The same order `clap` applies to `vw cloud`'s `--url`, minus the flag there
-/// is nowhere to pass: `$VW_SVC_URL` names a service outright, and `$VW_BETA`
-/// only chooses between the two that are always there.
+/// is nowhere to pass.
 fn service_url_from_env() -> String {
-    std::env::var("VW_SVC_URL").unwrap_or_else(|_| default_service_url())
-}
-
-/// Where the administrative API lives if the caller does not say otherwise.
-fn default_admin_url() -> String {
-    service_url(default_ports().admin)
-}
-
-/// Say once, on stderr, what `$VW_BETA` did.
-///
-/// It changes which service every cloud command acts on while leaving the
-/// output identical, so a shell that still has it exported looks exactly like
-/// one that does not — while the environments, builds and artifacts it reaches
-/// are a different set.
-///
-/// The second branch is the one worth having. `$VW_SVC_URL` names a service
-/// outright and so wins, which means a developer who has it exported — a
-/// common enough thing — gets nothing at all from `$VW_BETA` and would have no
-/// way of telling.
-fn announce_beta(url: &str, beta: &str) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-
-    if !beta_selected() {
-        return;
-    }
-    ONCE.call_once(|| {
-        if url == beta {
-            eprintln!("{} using the beta service at {url}", "beta:".yellow());
-        } else {
-            eprintln!(
-                "{} $VW_BETA is set, but the service is named explicitly as \
-                 {url}; using that",
-                "warning:".yellow(),
-            );
-        }
-    });
+    std::env::var("VW_SVC_URL").unwrap_or_else(|_| String::from(SERVICE_URL))
 }
 
 /// How often `--wait` asks what an environment's instances are doing.
@@ -185,8 +89,10 @@ pub struct CloudArgs {
         long,
         global = true,
         env = "VW_SVC_URL",
-        help = "Base URL of the vw service. Defaults to the production \
-                service, or to the beta one when $VW_BETA is set."
+        help = "Base URL of the vw service. Defaults to \
+                https://vw-cloud.dev. Point it at another deployment -- \
+                https://beta.vw-cloud.dev, say -- to act on that one's \
+                environments instead."
     )]
     url: Option<String>,
 
@@ -195,8 +101,9 @@ pub struct CloudArgs {
         global = true,
         env = "VW_SVC_ADMIN_URL",
         help = "Base URL of the vw service's administrative API, which is a \
-                separate listener on a separate port. Follows $VW_BETA the \
-                same way --url does. Only used by `vw cloud admin`."
+                separate listener on a separate port and so does not follow \
+                --url. Defaults to https://vw-cloud.dev:2053. Only used by \
+                `vw cloud admin`."
     )]
     admin_url: Option<String>,
 
@@ -474,8 +381,10 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
     // The administrative commands speak to a different listener, and none of
     // them need the user API, so that session is the only one built.
     if let CloudCommand::Admin { command } = args.command {
-        let admin_url =
-            args.admin_url.clone().unwrap_or_else(default_admin_url);
+        let admin_url = args
+            .admin_url
+            .clone()
+            .unwrap_or_else(|| String::from(ADMIN_URL));
         let session = AdminSession::new(&admin_url, args.insecure)?;
         return match command {
             AdminCommand::List => admin_list(&session).await,
@@ -488,7 +397,10 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
         };
     }
 
-    let url = args.url.clone().unwrap_or_else(default_service_url);
+    let url = args
+        .url
+        .clone()
+        .unwrap_or_else(|| String::from(SERVICE_URL));
     let session = Session::new(&url, args.insecure)?;
 
     match args.command {
@@ -566,8 +478,6 @@ pub struct AdminSession {
 
 impl AdminSession {
     fn new(url: &str, insecure: bool) -> Result<AdminSession, CloudError> {
-        announce_beta(url, &service_url(BETA_PORTS.admin));
-
         let token = access_token()?;
         Ok(AdminSession {
             client: vw_api_client::admin_client(
@@ -778,8 +688,6 @@ fn admin_colored_state(state: &str) -> ColoredString {
 
 impl Session {
     fn new(url: &str, insecure: bool) -> Result<Session, CloudError> {
-        announce_beta(url, &service_url(BETA_PORTS.user));
-
         // A missing token is not fatal here. Services run with `--no-auth`
         // answer without one, so send what we have and let the service decide.
         let token = access_token()?;
@@ -1296,10 +1204,10 @@ impl Session {
     /// A session pointed at whatever service the environment names.
     ///
     /// For commands that are not `vw cloud` and so have no `--url` of their
-    /// own. Same variables, same defaults, so a developer configures the
-    /// service once and every command finds it — `$VW_BETA` included, which is
-    /// the point of its being a variable rather than a flag: `vw run`,
-    /// `vw check` and the rest have nowhere to put a flag.
+    /// own. Same variable, same default, so a developer points `$VW_SVC_URL` at
+    /// a deployment once and every command finds it — which is the point of its
+    /// being a variable rather than only a flag: `vw run`, `vw check` and the
+    /// rest have nowhere to put a flag.
     ///
     /// `insecure` comes from the command's own flag; `VW_SVC_INSECURE` says
     /// the same thing for a shell that talks to a development service all day
@@ -1766,22 +1674,32 @@ mod test {
 
         let parsed = Wrapper::try_parse_from(argv).expect("should parse");
         (
-            parsed.cloud.url.unwrap_or_else(default_service_url),
-            parsed.cloud.admin_url.unwrap_or_else(default_admin_url),
+            parsed
+                .cloud
+                .url
+                .unwrap_or_else(|| String::from(SERVICE_URL)),
+            parsed
+                .cloud
+                .admin_url
+                .unwrap_or_else(|| String::from(ADMIN_URL)),
         )
     }
 
-    /// `$VW_BETA` points every cloud command at the beta service.
+    /// A URL is the whole of how a deployment is chosen.
+    ///
+    /// There is no flag or variable naming a deployment, and no list of them
+    /// here: one vw service answers at one URL, and which deployment that is is
+    /// the service's business rather than the client's. So this is about the
+    /// only two things a caller can say — nothing, and a URL.
     ///
     /// One test rather than several because the variables are process-global:
     /// two tests setting them would race under the default parallel harness.
     /// Same reason the `$VW_ENV` test in `main.rs` is one test.
     #[test]
-    fn vw_beta_selects_the_beta_service() {
+    fn a_url_is_how_a_deployment_is_chosen() {
         // A developer's shell may well have $VW_SVC_URL and $VW_SVC_ADMIN_URL
-        // exported, and this process inherited whatever it has. They name a
-        // service outright and so beat $VW_BETA -- which the last part of this
-        // test is about, and which the rest of it must not be at the mercy of.
+        // exported, and this process inherited whatever it has. The first half
+        // of this test is about the defaults, so they must not be at its mercy.
         let inherited: Vec<(&str, Option<String>)> =
             ["VW_SVC_URL", "VW_SVC_ADMIN_URL"]
                 .iter()
@@ -1791,68 +1709,35 @@ mod test {
             std::env::remove_var(name);
         }
 
-        let production = (
-            String::from("https://rhbs.eng.oxide.computer:2727"),
-            String::from("https://rhbs.eng.oxide.computer:2728"),
+        // Saying nothing reaches the deployment nearly every invocation wants.
+        // The user API carries no port because it answers on 443; the admin API
+        // is a separate listener and so does not follow from it.
+        let default = (
+            String::from("https://vw-cloud.dev"),
+            String::from("https://vw-cloud.dev:2053"),
         );
-        let beta = (
-            String::from("https://rhbs.eng.oxide.computer:2828"),
-            String::from("https://rhbs.eng.oxide.computer:2829"),
+        assert_eq!(resolved(&["vw", "list"]), default);
+        assert_eq!(service_url_from_env(), default.0);
+
+        // Another deployment is reached by naming it, on the flag...
+        assert_eq!(
+            resolved(&["vw", "--url", "https://beta.vw-cloud.dev", "list"]).0,
+            "https://beta.vw-cloud.dev",
         );
 
-        // Unset is production, which is what nearly every invocation wants.
-        std::env::remove_var("VW_BETA");
-        assert_eq!(resolved(&["vw", "list"]), production);
-        assert_eq!(service_url_from_env(), production.0);
+        // ...or in the environment, which is what the commands with no --url of
+        // their own -- `vw run`, `vw check` -- have to go on.
+        std::env::set_var("VW_SVC_URL", "https://beta.vw-cloud.dev");
+        assert_eq!(resolved(&["vw", "list"]).0, "https://beta.vw-cloud.dev");
+        assert_eq!(service_url_from_env(), "https://beta.vw-cloud.dev");
 
-        // Every spelling of yes, because the cost of reading one of them as no
-        // is acting on production while believing it is the beta.
-        for yes in ["1", "true", "TRUE", "yes", "on", "beta", " 1 "] {
-            std::env::set_var("VW_BETA", yes);
-            assert_eq!(
-                resolved(&["vw", "list"]),
-                beta,
-                "VW_BETA={yes:?} should select the beta",
-            );
-            // And the commands with no --url of their own follow it, which is
-            // the reason it is a variable rather than a flag.
-            assert_eq!(
-                service_url_from_env(),
-                beta.0,
-                "VW_BETA={yes:?} should reach `vw run` and friends too",
-            );
-        }
-
-        // The spellings of no, including the empty assignment a shell leaves
-        // behind after `VW_BETA=`.
-        for no in ["", "0", "false", "FALSE", "no", "off", "  "] {
-            std::env::set_var("VW_BETA", no);
-            assert_eq!(
-                resolved(&["vw", "list"]),
-                production,
-                "VW_BETA={no:?} should not select the beta",
-            );
-            assert_eq!(service_url_from_env(), production.0);
-        }
-
-        // A service named outright still wins, or there would be no way to
-        // reach a third one without unsetting the variable. This is also why
-        // `announce_beta` reports the URL it ended up with rather than just
-        // saying "beta": a shell with $VW_SVC_URL already exported gets
-        // nothing from $VW_BETA, and has to be able to tell.
-        std::env::set_var("VW_BETA", "1");
+        // And the flag still beats the variable, so a shell configured for one
+        // deployment can act on another without unsetting anything.
         assert_eq!(
             resolved(&["vw", "--url", "https://elsewhere:1234", "list"]).0,
             "https://elsewhere:1234",
         );
-        std::env::set_var("VW_SVC_URL", "https://from-the-variable:9999");
-        assert_eq!(
-            resolved(&["vw", "list"]).0,
-            "https://from-the-variable:9999"
-        );
-        assert_eq!(service_url_from_env(), "https://from-the-variable:9999");
 
-        std::env::remove_var("VW_BETA");
         for (name, value) in inherited {
             match value {
                 Some(url) => std::env::set_var(name, url),

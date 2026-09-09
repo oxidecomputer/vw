@@ -6,8 +6,6 @@ Deployment files for vw-svc on a systemd host.
 | --- | --- |
 | [`vw-svc.service`](vw-svc.service) | `/etc/systemd/system/vw-svc.service` |
 | [`vw-svc.env.example`](vw-svc.env.example) | `/etc/vw-svc/vw-svc.env`, mode 0600, once |
-| [`vw-svc-beta.service`](vw-svc-beta.service) | `/etc/systemd/system/vw-svc-beta.service` |
-| [`vw-svc-beta.env.example`](vw-svc-beta.env.example) | `/etc/vw-svc-beta/vw-svc-beta.env`, mode 0600, once |
 | [`install.sh`](install.sh) | — |
 
 ## Install
@@ -34,161 +32,119 @@ file never is. A running service is **not** restarted unless you pass
 whatever synthesis, REPL session or artifact download is in flight, and when to
 do that is your call.
 
+On Oxide, the whole host is usually built from
+[`vw-cloud-images/deploy/vw-svc`](https://github.com/oxidecomputer/vw-cloud-images)
+rather than by hand, and that Terraform calls this script from cloud-init. What
+is here is what a machine ends up with either way.
+
 ## Configuration
 
-Everything site-specific is in `/etc/vw-svc/vw-svc.env`: which certificate to
-serve, which rack to provision on, who administers the service. The unit reads
-it and nothing else, so reinstalling never disturbs how a machine is set up.
+Everything site-specific is in `/etc/vw-svc/vw-svc.env`: which deployment this
+is, which certificate to serve, which project to provision in, who administers
+the service. The unit reads it and nothing else, so reinstalling never disturbs
+how a machine is set up.
 
 Each `VW_SVC_*` variable is split on whitespace into arguments, so values may
 not contain spaces or quoting. `OXIDE_TOKEN` is the exception — vw-svc reads
 that one from the environment by name.
 
-## The beta service
+## A deployment is a project
 
-`--beta` installs a second, complete vw-svc beside the production one on the
-same host, so a build of the service can be exercised against real work
-without production being the thing that is being tested.
+One vw deployment — `prod`, `beta`, or somebody else's — is one Oxide project,
+and everything belonging to it is inside: this service's own instance, the
+images environments boot, and the environment instances themselves.
 
-```sh
-sudo ./vw-svc/dist/install.sh --beta --commit <sha>
-```
+That is not a convention, it is a constraint. vw-svc reaches agents on their
+**private VPC addresses**, and a VPC does not span projects. A service outside
+the project it provisions into cannot talk to anything it creates.
 
-Nothing is shared. The beta gets its own binary, unit, configuration file,
-state directory and ports:
+So there is one vw-svc per host and one per project, and `--oxide-project` in
+`/etc/vw-svc/vw-svc.env` is what says which deployment this is more than
+anything else does.
 
-| | production | beta |
+### The deployment name
+
+`--deployment` is the one setting with no default, and the service refuses to
+start without it. Everything this service creates is named
+`vwsvc-{deployment}-…`, and only those names are recognized as its own:
+
+| | `prod` | `beta` |
 | --- | --- | --- |
-| binary | `/usr/local/bin/vw-svc` | `/usr/local/bin/vw-svc-beta` |
-| unit | `vw-svc.service` | `vw-svc-beta.service` |
-| configuration | `/etc/vw-svc/vw-svc.env` | `/etc/vw-svc-beta/vw-svc-beta.env` |
-| database | `/var/lib/vw-svc/` | `/var/lib/vw-svc-beta/` |
-| user API | 2727 | 2828 |
-| admin API | 2728 | 2829 |
-| objects on the rack | `vwsvc-*` | `vwsvcbeta-*` |
-| images | its project and the silo | its project only |
+| instance | `vwsvc-prod-ferris-alpha-vivado` | `vwsvc-beta-ferris-alpha-vivado` |
+| boot disk | `vwsvc-prod-ferris-alpha-vivado` | `vwsvc-beta-ferris-alpha-vivado` |
+| silo ssh key | `vwsvc-prod-ferris-alpha` | `vwsvc-beta-ferris-alpha` |
 
-Because the names differ all the way down, `install.sh --beta` and
-`install.sh` cannot reach each other's files: upgrading or restarting the beta
-leaves production running the binary it was running, and the reverse.
+If the project already separates instances and disks, why does the name matter?
+Because of the third row. **The silo ssh key list belongs to the token's user
+and is not scoped by project at all**, so two deployments on one `OXIDE_TOKEN`
+walk the same list. The reconciler reclaims every key of its own that no
+environment wants, and without the name in it, every one of the other
+deployment's keys looks exactly like that.
 
-The beta's ports are fixed in `vw-svc-beta.service` rather than left to its
-environment file. Which port a deployment answers on is what makes it the beta
-rather than something a site chooses, so it sits in the unit next to
-`--db-path`. The practical consequence is that `VW_SVC_EXTRA` in
-`/etc/vw-svc-beta/vw-svc-beta.env` must not name `--user-api-port`,
-`--admin-api-port` or `--db-path` — clap refuses a second occurrence, so the
-service stops at startup naming the flag. Copying production's `VW_SVC_EXTRA`
-across verbatim is the way to trip this.
+Two rules follow, and both are enforced at startup:
 
-Point a client at the beta with `VW_BETA`, which every cloud command reads:
+- **The name must be unique across the silo**, not merely across a project. Two
+  deployments called `prod` in different projects will reap each other's keys.
+- **The name may not contain a hyphen.** Ownership is "the name starts with
+  `vwsvc-{deployment}-`", so a deployment called `prod-west` would have every
+  one of its objects claimed — and then deleted — by one called `prod`. There
+  is a test in `oxide.rs` that exists to keep this true.
 
-```sh
-export VW_BETA=1
-vw cloud list                     # the beta's environments, not production's
-```
+By convention the name matches the project, which is already silo-unique:
+project `vw-prod` runs deployment `prod`.
 
-`vw` says on stderr when it is in effect, because the two look identical
-otherwise while reaching a different set of environments. `VW_SVC_URL` names a
-service outright and so wins over it — `vw` says that too rather than quietly
-using the named one, since a shell with `VW_SVC_URL` already exported would
-otherwise get nothing from `VW_BETA` and have no way of telling.
-
-`VW_BETA` assumes the default host and ports. A beta somewhere else is named
-the usual way:
-
-```sh
-export VW_SVC_URL=https://vw.example.com:2828
-export VW_SVC_ADMIN_URL=https://vw.example.com:2829
-```
-
-or `vw cloud --url https://vw.example.com:2828` for a single command.
-
-### How the two stay apart on the rack
-
-The reconciler decides what to keep by diffing the rack against its own
-database and reclaiming every object of its own that is left over. The beta's
-database does not contain production's environments, so without something
-separating them, production's instances, disks and keys are all orphans to the
-beta — and the beta's are orphans to production.
-
-What separates them is the names. `vw-svc-beta.service` passes `--beta`, and
-the service then creates and recognizes `vwsvcbeta-*` instead of `vwsvc-*`:
-
-| | production | beta |
-| --- | --- | --- |
-| instance | `vwsvc-ferris-alpha-vivado` | `vwsvcbeta-ferris-alpha-vivado` |
-| boot disk | `vwsvc-ferris-alpha-vivado` | `vwsvcbeta-ferris-alpha-vivado` |
-| silo ssh key | `vwsvc-ferris-alpha` | `vwsvcbeta-ferris-alpha` |
-
-Ownership everywhere is "the name starts with `{prefix}-`", so the two sets are
-disjoint in both directions and neither reaper can see the other's objects.
-That is why the prefix is `vwsvcbeta` and not the more readable `vwsvc-beta`,
-which *would* start with `vwsvc-` and so belong to production; there is a test
-in `oxide.rs` whose job is to stop anyone changing it back.
-
-**The beta may therefore share production's endpoint and `OXIDE_TOKEN`.**
-Sharing the token is in fact the case the naming exists for: the silo ssh key
-list belongs to the token's user and is not scoped by project at all, so no
-arrangement of projects would have kept two deployments off each other's keys.
-
-### The beta needs its own project, for the images
-
-Images are the one thing the naming does not separate, and the one thing that
-must be separated anyway.
+### Images come from the project, never the silo
 
 An image is named for the kind it boots — `vw-vivado-*`, `vw-helios-*`,
 `vw-artifact-*` — by whoever built it. Nothing in the name says which
 deployment it belongs to, so **the project is the only thing that does**. And
-the images are not interchangeable: each carries the vw-agent that vw-svc talks
-to, and a beta service exists precisely so that side of the API can differ from
-production's. Compatibility across the two is not guaranteed and is not meant
-to be.
+they are not interchangeable: each carries the vw-agent this service talks to,
+and a second deployment exists precisely so that side of the API can differ.
 
 The failure is quiet. A kind left unnamed resolves to the *newest* image
-matching its prefix, so an environment that can see the other deployment's
-images will simply boot one. Nothing fails at create time — the instance comes
-up, and the agent inside it answers a protocol the service on the other end
-does not speak.
+matching its prefix, so a deployment that could see another's images would
+simply boot one. Nothing fails at create time — the instance comes up, and the
+agent inside answers a protocol the service on the other end does not speak.
 
-So `--oxide-project` must name a project holding the beta's images, with all
-three kinds published into it. Two things then hold:
+So a silo image is by definition somebody else's, and is skipped. The project
+is the complete and only account of what a deployment can boot: an image
+visible in `oxide image list` but not in the project will not be picked, and
+naming it explicitly is refused. Image recycling is scoped the same way, so
+each deployment recycles only its own.
 
-- **The beta ignores silo images.** A silo image is visible from every project,
-  which from the beta's side makes it by definition somebody else's. Its
-  project is the complete and only account of what it can boot; an image
-  visible in `oxide image list` but not in that project will not be picked, and
-  naming it explicitly is refused. Production is unchanged and still sees both.
-- **Image recycling stays scoped.** It deletes only project images, so each
-  deployment recycles its own.
-
-The beta says which project it boots from on every start:
+Every start says which project that is:
 
 ```text
-the beta boots only images in its own project    project=redhawk-beta
+booting only images in this deployment's project    project=vw-prod
 ```
 
-which is what to check first if environment creation is failing with `no image
+which is the first thing to check if environment creation fails with `no image
 matching 'vw-vivado-*' is visible to this service`.
 
-Until the rack settings are uncommented the beta records environments and
-provisions nothing, which is what an unconfigured install should do and what it
-says in the log. That is a fine state to leave it in while it has nothing to
-do.
+Until the rack settings are uncommented, the service records environments and
+provisions nothing — which is what an unconfigured install should do, and what
+it says in the log.
 
-### Removing the beta
+## Ports
+
+| | port | |
+| --- | --- | --- |
+| user API | 443 | so the service is reached as `https://{host}`, with no port to quote |
+| admin API | 2053 | a separate listener, so who may reach it is decided separately |
+
+Both are defaults in the binary rather than settings in the unit. Binding 443
+needs privilege the service already has for the certificate.
+
+Clients pick a deployment by URL and nothing else:
 
 ```sh
-sudo systemctl disable --now vw-svc-beta
+vw cloud list                                   # https://vw-cloud.dev
+export VW_SVC_URL=https://beta.vw-cloud.dev     # or another deployment
+vw cloud --url https://vw.example.com list      # for one command
 ```
 
-Delete every environment the beta owns first, through its admin API — stopping
-the service stops the reconciler, and the instances and disks it created
-outlive it. They are the `vwsvcbeta-*` ones, so what to clear up by hand is
-unambiguous. Once the rack is clear,
-`/usr/local/bin/vw-svc-beta`, `/etc/systemd/system/vw-svc-beta.service`,
-`/etc/vw-svc-beta` and `/var/lib/vw-svc-beta` are all there is to remove, and
-none of them is production's.
+The admin API does not follow `--url`, since it is a separate listener on a
+separate port: `--admin-url` or `VW_SVC_ADMIN_URL` names it.
 
 ## Certificates
 
@@ -206,10 +162,9 @@ deploy hook to configure and nothing to restart. vw-svc notices the replaced
 certificate within a minute and serves it from the next handshake on;
 connections already established are untouched.
 
-The beta serves the same certificate: it is the same host under the same name,
-and only the port differs. Nothing about reading a certificate is exclusive —
-both services follow the live symlinks and both pick up a renewal on their own,
-neither needing a restart for one.
+Port 80 has to be reachable for `--standalone` to answer the challenge, which
+on Oxide means a firewall rule for it in the deployment's VPC. vw-svc itself
+does not use 80.
 
 The service runs as root for this reason: certbot keeps `/etc/letsencrypt/live`
 and `archive` at `0700 root` and re-creates them on each renewal, so any

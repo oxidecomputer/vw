@@ -12,19 +12,12 @@
 #   ./install.sh --commit <sha>           # from that commit's buildomat build
 #   ./install.sh --restart                # and restart a running service
 #
-# --beta installs a second deployment beside the production one instead of
-# touching it: its own binary, unit, configuration and database, answering on
-# 2828 and 2829 rather than 2727 and 2728. The two are installed, upgraded,
-# started and restarted entirely independently -- nothing a --beta run does
-# can disturb production, and nothing a production run does can disturb the
-# beta.
-#
-#   ./install.sh --beta                   # install or upgrade the beta
-#   ./install.sh --beta --commit <sha>
-#   ./install.sh --beta --restart
-#
-# It is the same binary either way; what differs is where it is installed and
-# what it is pointed at.
+# One vw-svc per host. Which deployment it is -- `prod`, `beta`, anything else
+# -- is a setting in /etc/vw-svc/vw-svc.env rather than a mode of this script,
+# and everything else about a deployment is its Oxide project. Two of them on
+# one machine was a thing this script used to do, and it is not one any more:
+# a deployment's service has to sit inside the project it provisions into,
+# because it reaches agents over a VPC that does not span projects.
 
 set -euo pipefail
 
@@ -34,14 +27,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY=""
 COMMIT=""
 RESTART=false
-BETA=false
+NAME=vw-svc
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--binary) BINARY="$2"; shift 2 ;;
 	--commit) COMMIT="$2"; shift 2 ;;
 	--restart) RESTART=true; shift ;;
-	--beta) BETA=true; shift ;;
 	# Printed from the comment block above rather than from a copy kept in
 	# step with it by hand, and stopped at the first blank line so that
 	# adding an option there is all there is to adding one here.
@@ -51,18 +43,6 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || { echo "install.sh must run as root" >&2; exit 1; }
-
-# Which deployment this run is about. Everything installed is named for it, so
-# the beta cannot overwrite production's binary, unit, configuration or
-# database by any path through this script -- there is no shared file to get
-# wrong.
-if $BETA; then
-	NAME=vw-svc-beta
-	OTHER=vw-svc
-else
-	NAME=vw-svc
-	OTHER=vw-svc-beta
-fi
 
 # Resolve what is being installed before touching anything, so a bad path or
 # an unreachable buildomat fails before the unit has been replaced.
@@ -122,32 +102,13 @@ if $fresh; then
 		starting on it would stop at the missing certificate, and
 		fixing only that would give you a service that records
 		environments and provisions nothing.
+
+		VW_SVC_DEPLOYMENT is the one to get right. It decides which
+		Oxide objects this service considers its own, so a name that
+		is another live deployment's makes this service reconcile that
+		deployment's environments out of existence -- silently, within
+		one pass. It should match the project it is pointed at.
 	EOF
-
-	# Said here as well as in the file because of what it prevents. Both
-	# halves are silent when they go wrong: a beta without --beta reconciles
-	# production's environments out of existence, and a beta sharing
-	# production's project boots production's agent and fails later as a
-	# protocol mismatch rather than as a bad configuration.
-	if $BETA && systemctl is-enabled --quiet "$OTHER.service" 2>/dev/null; then
-		cat <<-EOF
-
-			$OTHER is also installed on this machine.
-
-			The beta may share its rack endpoint and OXIDE_TOKEN: it
-			names its instances, disks and ssh keys vwsvcbeta-* rather
-			than vwsvc-*, so neither deployment can see the other's.
-			That comes from the --beta in vw-svc-beta.service -- do
-			not remove it, and do not run the beta from production's
-			unit.
-
-			It may NOT share --oxide-project. Images carry the agent
-			vw-svc talks to and are named for the kind they boot, not
-			for a deployment, so the project is the only thing that
-			says whose they are. Give the beta a project holding the
-			beta's images.
-		EOF
-	fi
 
 	cat <<-EOF
 

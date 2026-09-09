@@ -260,6 +260,54 @@ pub(crate) fn validate_user_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The longest name the Oxide control plane will accept.
+const MAX_OBJECT_NAME: usize = 63;
+
+/// Reject an environment whose objects would not fit an Oxide name.
+///
+/// Four things go into an instance name — the deployment prefix, the user, the
+/// environment and the kind — and only two of them are the caller's. A long
+/// Github username can leave very little room, and the deployment prefix takes
+/// its share before anyone gets to choose anything.
+///
+/// Checked here rather than left to the control plane because of when the
+/// control plane would say so. Every field is individually legal, so the
+/// environment is accepted, recorded, and only fails on the reconciler's next
+/// pass as a 400 against a name nobody asked for by hand. Said here it names
+/// the field to shorten while there is still something to shorten.
+///
+/// The longest name is the instance's, so the ssh key's — which is the same
+/// name without a kind — is covered by checking it.
+pub(crate) fn validate_object_names(
+    user: &str,
+    environment: &str,
+) -> Result<(), String> {
+    let longest = InstanceKind::ALL
+        .iter()
+        .map(|kind| {
+            format!(
+                "{}-{}-{}-{}",
+                ox::instance_prefix(),
+                user,
+                environment,
+                kind
+            )
+        })
+        .max_by_key(String::len)
+        .expect("there is at least one instance kind");
+
+    if longest.len() > MAX_OBJECT_NAME {
+        let over = longest.len() - MAX_OBJECT_NAME;
+        return Err(format!(
+            "environment '{environment}' would need the instance name \
+             '{longest}', which is {} characters where the rack allows \
+             {MAX_OBJECT_NAME}; a name {over} shorter would fit",
+            longest.len(),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether the db's record of an instance already matches the rack's.
 fn same_state(
     recorded: &Option<OxideInstance>,
@@ -840,7 +888,7 @@ mod test {
         for kind in InstanceKind::ALL {
             let original = instance("ferris", "alpha", kind, None);
             let name = original.oxide_instance_name();
-            assert_eq!(name, format!("vwsvc-ferris-alpha-{kind}"));
+            assert_eq!(name, format!("vwsvc-test-ferris-alpha-{kind}"));
 
             let parsed =
                 crate::oxide::parse_instance_name(&name).expect("parses back");
@@ -856,10 +904,10 @@ mod test {
         // pass would delete somebody else's work.
         for name in [
             "some-other-instance",
-            "vwsvc-ferris-alpha",
-            "vwsvc-ferris-alpha-vivado-extra",
-            "vwsvc-ferris-alpha-mystery",
-            "notvwsvc-ferris-alpha-vivado",
+            "vwsvc-test-ferris-alpha",
+            "vwsvc-test-ferris-alpha-vivado-extra",
+            "vwsvc-test-ferris-alpha-mystery",
+            "notvwsvc-test-ferris-alpha-vivado",
         ] {
             assert!(
                 crate::oxide::parse_instance_name(name).is_none(),
@@ -909,7 +957,7 @@ mod test {
         // reconciler would then recreate it on every pass.
         let original = instance("foo-bar", "alpha", InstanceKind::Vivado, None);
         let name = original.oxide_instance_name();
-        assert_eq!(name, "vwsvc-foo-bar-alpha-vivado");
+        assert_eq!(name, "vwsvc-test-foo-bar-alpha-vivado");
 
         let parsed =
             crate::oxide::parse_instance_name(&name).expect("parses back");

@@ -43,28 +43,27 @@ workspace to the environment before they run, and stream output back as it
 happens. Pass `--local` to any of them to run on this machine instead, which
 needs the toolchains installed locally.
 
-By default the vw client talks to the Redhawk vw build service at
-`https://rhbs.eng.oxide.computer:2727`. A different service can be selected by
-setting the environment variable `VW_SVC_URL`, or with `--url` on `vw cloud`.
+By default the vw client talks to the vw build service at
+`https://vw-cloud.dev`.
 
-A beta service runs beside it on the same host, on ports 2828 and 2829, for
-trying a build of vw-svc and its agents before it becomes the one everybody
-uses. Export `VW_BETA` to point every cloud command at it:
+Other deployments are reached by naming them. A beta runs at
+`https://beta.vw-cloud.dev`, for trying a build of vw-svc and its agents before
+it becomes the one everybody uses:
 
 ```sh
-export VW_BETA=1
+export VW_SVC_URL=https://beta.vw-cloud.dev
 vw cloud list                     # the beta's environments, not production's
 ```
 
-It is a variable rather than a flag because `vw run`, `vw check` and the rest
-have nowhere to put one — the same reason `VW_ENV` is a variable. Its
-environments are a separate set from production's, and its instances boot the
-beta's own images, so an environment created under `VW_BETA` is only reachable
-with `VW_BETA` set. `vw` says on stderr when it is in effect.
+A URL is the whole of how a deployment is chosen — there is no flag naming one,
+and nothing in the client knows how many there are. It is an environment
+variable as well as `vw cloud --url` because `vw run`, `vw check` and the rest
+have nowhere to put a flag, the same reason `VW_ENV` is a variable.
 
-`VW_SVC_URL` names a service outright and so wins over `VW_BETA`; if you have
-it exported, unset it before expecting `VW_BETA` to do anything. `vw` says that
-too, rather than quietly using the one you named.
+Each deployment's environments are a separate set, and its instances boot its
+own images, so an environment created against one is only reachable against
+that one. `vw cloud admin` speaks to a second listener on port 2053, which does
+not follow `--url`; `--admin-url` or `VW_SVC_ADMIN_URL` names it.
 
 `vw --help` lists every command, and `vw <command> --help` its options.
 

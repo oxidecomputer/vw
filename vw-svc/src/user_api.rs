@@ -1,7 +1,9 @@
 //! This module implements the user api trait `[vw_api::VwUserApi]`
 use crate::{
     auth, db, keys, oxide,
-    reconciler::{validate_environment_name, validate_user_name},
+    reconciler::{
+        validate_environment_name, validate_object_names, validate_user_name,
+    },
     relay,
 };
 use dropshot::{ApiDescription, BuildError, ConfigDropshot};
@@ -66,6 +68,14 @@ impl VwUserApi for UserApi {
         })?;
         validate_user_name(&caller.name).map_err(|e| {
             info!(log, "rejecting caller name"; "user" => &caller.name);
+            dropshot::HttpError::for_bad_request(None, e)
+        })?;
+        // Both are legal on their own and still too long together, which the
+        // rack would not say until the reconciler tried to create the instance.
+        validate_object_names(&caller.name, &name).map_err(|e| {
+            info!(log, "rejecting environment name as too long";
+                "user" => &caller.name, "name" => &name,
+            );
             dropshot::HttpError::for_bad_request(None, e)
         })?;
 
