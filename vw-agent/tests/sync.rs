@@ -24,6 +24,12 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_ATTEMPTS: usize = 5;
 const ENVIRONMENT: &str = "darmok";
 
+/// The workspace every test synchronizes into.
+///
+/// An instance holds a tree per workspace now, so `--root` names the
+/// directory those sit under and a tree is one level below it.
+const WORKSPACE: &str = "redhawk";
+
 /// Start an agent on `port`, with everything it needs under `base`.
 fn spawn_agent(
     base: &Utf8Path,
@@ -58,9 +64,7 @@ async fn listening(
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if client
-            .get(format!(
-                "{base_url}/environment/{ENVIRONMENT}/artifact-target"
-            ))
+            .get(format!("{base_url}/environment/{ENVIRONMENT}/workspaces"))
             .send()
             .await
             .is_ok()
@@ -116,7 +120,8 @@ impl Agent {
         let base = Utf8Path::from_path(dir.path())
             .expect("utf8 temp dir")
             .to_owned();
-        let root = base.join("tree");
+        let trees = base.join("tree");
+        let root = trees.join(WORKSPACE);
         let netrc = base.join("home/.netrc");
         let client = versioned_client();
 
@@ -126,7 +131,7 @@ impl Agent {
         // and there is nothing to do about it but pick another.
         for _ in 0..STARTUP_ATTEMPTS {
             let port = free_port();
-            let mut child = spawn_agent(&base, &root, &netrc, port);
+            let mut child = spawn_agent(&base, &trees, &netrc, port);
             let base_url = format!("http://127.0.0.1:{port}");
 
             if listening(&client, &base_url, &mut child).await {
@@ -154,7 +159,7 @@ impl Agent {
     ) -> reqwest::Result<reqwest::Response> {
         self.client
             .post(format!(
-                "{}/environment/{environment}/sync/plan",
+                "{}/environment/{environment}/workspace/{WORKSPACE}/sync/plan",
                 self.base_url
             ))
             .json(manifest)
@@ -178,7 +183,7 @@ impl Agent {
     ) -> reqwest::Response {
         self.client
             .put(format!(
-                "{}/environment/{ENVIRONMENT}/sync/blob/{digest}",
+                "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/sync/blob/{digest}",
                 self.base_url
             ))
             .body(contents.to_vec())
@@ -190,7 +195,7 @@ impl Agent {
     async fn commit_raw(&self, manifest: &TreeManifest) -> reqwest::Response {
         self.client
             .post(format!(
-                "{}/environment/{ENVIRONMENT}/sync/commit",
+                "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/sync/commit",
                 self.base_url
             ))
             .json(manifest)
@@ -201,7 +206,10 @@ impl Agent {
 
     async fn clear_raw(&self, environment: &str) -> reqwest::Response {
         self.client
-            .delete(format!("{}/environment/{environment}/sync", self.base_url))
+            .delete(format!(
+                "{}/environment/{environment}/workspace/{WORKSPACE}/sync",
+                self.base_url
+            ))
             .send()
             .await
             .expect("clear request")
@@ -232,7 +240,7 @@ impl Agent {
     async fn clean_raw(&self, environment: &str) -> reqwest::Response {
         self.client
             .delete(format!(
-                "{}/environment/{environment}/build-output",
+                "{}/environment/{environment}/workspace/{WORKSPACE}/build-output",
                 self.base_url
             ))
             .send()
@@ -456,7 +464,7 @@ async fn a_request_that_names_no_api_version_is_refused() {
 
     let response = reqwest::Client::new()
         .post(format!(
-            "{}/environment/{ENVIRONMENT}/sync/plan",
+            "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/sync/plan",
             agent.base_url
         ))
         .json(&TreeManifest::default())
@@ -480,7 +488,7 @@ async fn flushing_before_anyone_said_where_artifacts_go_is_refused() {
     let response = agent
         .client
         .post(format!(
-            "{}/environment/{ENVIRONMENT}/artifact-flush",
+            "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/artifact-flush",
             agent.base_url
         ))
         .send()

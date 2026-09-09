@@ -20,6 +20,7 @@ mod analyze;
 mod anodize;
 mod bench_runner;
 mod cloud;
+mod cloud_config;
 mod cloud_sync;
 mod driver;
 mod htcl_test;
@@ -1499,10 +1500,7 @@ async fn main() {
                 }
             };
             let site = match &cloud {
-                Some((session, environment)) => Site::Remote {
-                    session,
-                    environment,
-                },
+                Some((session, target)) => Site::Remote { session, target },
                 None => Site::Local,
             };
             if let Err(e) = run_htcl(
@@ -3626,18 +3624,18 @@ async fn anodize(
     }
 
     let session = cloud::Session::from_env(insecure)?;
-    let environment = cloud::pick_environment(&session, named).await?;
+    let target = cloud::resolve_target(&session, named).await?;
 
     // The instance anodizes what it was last given, so it has to have been
     // given it — the same contract every other cloud build works under.
     cloud::sync_for_build(
         &session,
-        &environment,
+        &target,
         Some(vw_api_types_versions::latest::TargetKind::Vivado),
     )
     .await?;
 
-    Ok(anodize::run(&session, &environment, bench, std).await?)
+    Ok(anodize::run(&session, &target, bench, std).await?)
 }
 
 /// The workspace `cwd` is in, or a message saying it is not in one.
@@ -3770,19 +3768,20 @@ fn confirm(question: &str) -> bool {
 async fn bench_site(
     named: Option<&str>,
     insecure: bool,
-) -> Result<Option<(cloud::Session, String)>, Box<dyn std::error::Error>> {
+) -> Result<Option<(cloud::Session, cloud::Target)>, Box<dyn std::error::Error>>
+{
     let session = cloud::Session::from_env(insecure)?;
 
-    let environment = cloud::pick_environment(&session, named).await?;
+    let target = cloud::resolve_target(&session, named).await?;
 
     cloud::sync_for_build(
         &session,
-        &environment,
+        &target,
         Some(vw_api_types_versions::latest::TargetKind::Vivado),
     )
     .await?;
 
-    Ok(Some((session, environment)))
+    Ok(Some((session, target)))
 }
 
 /// Open a vivado session on this workspace's cloud environment, for the REPL.
@@ -3799,20 +3798,20 @@ async fn remote_worker(
 ) -> Result<vw_repl::Worker, Box<dyn std::error::Error>> {
     let session = cloud::Session::from_env(insecure)?;
 
-    let environment = cloud::pick_environment(&session, named).await?;
+    let target = cloud::resolve_target(&session, named).await?;
 
     // The instance builds what it was last given, so give it this before the
     // first eval can ask for it.
     cloud::sync_for_build(
         &session,
-        &environment,
+        &target,
         Some(vw_api_types_versions::latest::TargetKind::Vivado),
     )
     .await?;
 
     let backend = cloud::open_vivado_session(
         &session,
-        &environment,
+        &target,
         vw_remote::SessionParams {
             part: part.clone(),
             variant: variant.clone(),
@@ -3850,16 +3849,16 @@ async fn driver_build(
 
     if !local {
         let session = cloud::Session::from_env(insecure)?;
-        let environment = cloud::pick_environment(&session, named).await?;
+        let target = cloud::resolve_target(&session, named).await?;
 
         // The instance builds what it was last given.
         cloud::sync_for_build(
             &session,
-            &environment,
+            &target,
             Some(vw_api_types_versions::latest::TargetKind::Helios),
         )
         .await?;
-        return Ok(driver::build(&session, &environment, release, args).await?);
+        return Ok(driver::build(&session, &target, release, args).await?);
     }
 
     Ok(driver::build_locally(&workspace, release, args).await?)
@@ -3881,8 +3880,8 @@ async fn clean(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !local {
         let session = cloud::Session::from_env(insecure)?;
-        let environment = cloud::pick_environment(&session, named).await?;
-        cloud::clean_build_output(&session, &environment).await?;
+        let target = cloud::resolve_target(&session, named).await?;
+        cloud::clean_build_output(&session, &target).await?;
         return Ok(());
     }
 
@@ -3920,20 +3919,21 @@ async fn clean(
 async fn cloud_site(
     named: Option<&str>,
     insecure: bool,
-) -> Result<Option<(cloud::Session, String)>, Box<dyn std::error::Error>> {
+) -> Result<Option<(cloud::Session, cloud::Target)>, Box<dyn std::error::Error>>
+{
     let session = cloud::Session::from_env(insecure)?;
 
-    let environment = cloud::pick_environment(&session, named).await?;
+    let target = cloud::resolve_target(&session, named).await?;
 
     // The instance builds what it was last given, so give it this.
     cloud::sync_for_build(
         &session,
-        &environment,
+        &target,
         Some(vw_api_types_versions::latest::TargetKind::Vivado),
     )
     .await?;
 
-    Ok(Some((session, environment)))
+    Ok(Some((session, target)))
 }
 
 /// Where the vivado driving this run is.
@@ -3945,7 +3945,7 @@ pub(crate) enum Site<'a> {
     Local,
     Remote {
         session: &'a cloud::Session,
-        environment: &'a str,
+        target: &'a cloud::Target,
     },
 }
 
@@ -4225,13 +4225,10 @@ async fn run_loaded_program(
                 .map_err(|e| format!("failed to start Vivado worker: {e}"))?,
             )
         }
-        Site::Remote {
-            session,
-            environment,
-        } => {
+        Site::Remote { session, target } => {
             let mut remote = cloud::open_vivado_session(
                 session,
-                environment,
+                target,
                 vw_remote::SessionParams {
                     part: part.map(str::to_owned),
                     variant: variant.map(str::to_owned),
@@ -4661,7 +4658,7 @@ fn diagnostics_need_ip_generation(diags: &[vw_lib::VhdlDiagnostic]) -> bool {
 /// entirely in-library: no temp file, no `vw run` sub-process.
 async fn ensure_ip_generated(
     ws: &camino::Utf8Path,
-    cloud: Option<&(cloud::Session, String)>,
+    cloud: Option<&(cloud::Session, cloud::Target)>,
     part: Option<&str>,
     variant: Option<&str>,
     log_level: vw_vivado::LogLevel,
@@ -4726,10 +4723,7 @@ async fn ensure_ip_generated(
     let program =
         vw_htcl::load_program_source(src, entry.as_std_path(), &resolver)?;
     let site = match cloud {
-        Some((session, environment)) => Site::Remote {
-            session,
-            environment,
-        },
+        Some((session, target)) => Site::Remote { session, target },
         None => Site::Local,
     };
     let run_result = run_loaded_program(
@@ -4748,8 +4742,8 @@ async fn ensure_ip_generated(
     // the same files at the same paths, which is the whole point — a language
     // server that opens a wrapper has to open a real file.
     match cloud {
-        Some((session, environment)) => {
-            match cloud::fetch_generated_ip(session, environment, ws).await {
+        Some((session, target)) => {
+            match cloud::fetch_generated_ip(session, target, ws).await {
                 Ok(0) => {}
                 Ok(n) => println!(
                     "{} fetched {n} generated IP file(s) for the VHDL check",

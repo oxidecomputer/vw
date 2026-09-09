@@ -1037,7 +1037,9 @@ pub fn init_workspace(
     }
     // Before anything is written, so a name the loader would refuse
     // never becomes a workspace that cannot be opened again.
-    validate_workspace_name(&name)?;
+    validate_workspace_name(&name).map_err(|detail| VwError::Config {
+        message: format!("`[workspace] name`: {detail}"),
+    })?;
 
     let target_parts = target_part
         .map(|part| {
@@ -1333,8 +1335,18 @@ async fn build_dependency_graph(
     // Worklist of (parent node, workspace root, is_entry).
     let mut queue = vec![(entry_idx, entry_root, true)];
     while let Some((parent, ws, is_entry)) = queue.pop() {
-        let Ok(config) = load_workspace_config(&ws) else {
-            continue;
+        // The entry's own manifest is the caller's to fix, so a problem with
+        // it is reported rather than stepped over. A dependency's is not:
+        // skipping one there costs an unresolved import later, while failing
+        // would make somebody else's manifest able to stop this build
+        // outright.
+        let config = if is_entry {
+            load_workspace_config(&ws)?
+        } else {
+            let Ok(config) = load_workspace_config(&ws) else {
+                continue;
+            };
+            config
         };
         // The entry contributes its dev-deps too; transitive deps only
         // propagate their regular `[dependencies]`.
@@ -4637,7 +4649,11 @@ pub fn load_workspace_config(
         })?;
 
     let config: WorkspaceConfig = toml::from_str(&config_content)?;
-    validate_workspace_name(&config.workspace.name)?;
+    validate_workspace_name(&config.workspace.name).map_err(|detail| {
+        VwError::Config {
+            message: format!("`[workspace] name` in {config_path}: {detail}"),
+        }
+    })?;
     validate_variant_shape(&config.workspace)?;
     Ok(config)
 }
@@ -4666,35 +4682,35 @@ const MAX_WORKSPACE_NAME: usize = 40;
 /// is a rule every candidate name has to satisfy, and the moment to
 /// hear about a name that does not is `vw init`, not a first sync
 /// months later.
-pub fn validate_workspace_name(name: &str) -> Result<()> {
-    let reject = |message: String| Err(VwError::Config { message });
-
+///
+/// Fails with a `String` rather than a [`VwError`] because the same
+/// name is checked in four places that each know something this one
+/// does not — which file it came from, which request carried it — and
+/// a message naming `vw.toml` would be wrong in three of them.
+pub fn validate_workspace_name(name: &str) -> std::result::Result<(), String> {
     if name.is_empty() {
-        return reject(String::from("`[workspace] name` cannot be empty"));
+        return Err(String::from("a workspace name cannot be empty"));
     }
     if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return reject(format!(
-            "`[workspace] name` '{name}' must start with a lowercase letter"
-        ));
+        return Err(format!("'{name}' must start with a lowercase letter"));
     }
     if let Some(c) = name
         .chars()
         .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'))
     {
-        return reject(format!(
-            "`[workspace] name` '{name}' cannot contain '{c}'; only              lowercase letters, digits and '-' are allowed"
+        return Err(format!(
+            "'{name}' cannot contain '{c}'; only lowercase letters, \
+             digits and '-' are allowed"
         ));
     }
-    // It is the tail of a bucket name, and a bucket name cannot end
-    // with one.
+    // It is the tail of a bucket name, and a bucket name cannot end with
+    // one.
     if name.ends_with('-') {
-        return reject(format!(
-            "`[workspace] name` '{name}' cannot end with '-'"
-        ));
+        return Err(format!("'{name}' cannot end with '-'"));
     }
     if name.len() > MAX_WORKSPACE_NAME {
-        return reject(format!(
-            "`[workspace] name` '{name}' is {} characters; the limit is              {MAX_WORKSPACE_NAME}",
+        return Err(format!(
+            "'{name}' is {} characters; the limit is {MAX_WORKSPACE_NAME}",
             name.len()
         ));
     }
@@ -8660,8 +8676,7 @@ mod workspace_name_tests {
 
     fn rejected(name: &str) -> String {
         match validate_workspace_name(name) {
-            Err(VwError::Config { message }) => message,
-            Err(other) => panic!("unexpected error for '{name}': {other}"),
+            Err(message) => message,
             Ok(()) => panic!("'{name}' was accepted"),
         }
     }

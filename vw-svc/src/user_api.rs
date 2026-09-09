@@ -149,7 +149,7 @@ impl VwUserApi for UserApi {
     async fn sync_plan(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::TargetPathParam,
+            vw_api_types_versions::latest::WorkspaceTargetPathParam,
         >,
         body: dropshot::TypedBody<vw_api_types_versions::latest::TreeManifest>,
     ) -> Result<
@@ -165,6 +165,7 @@ impl VwUserApi for UserApi {
         let agent = relay::Agent::resolve(
             &caller.name,
             &target.name,
+            &target.workspace,
             target.kind,
             &args,
         )
@@ -187,6 +188,7 @@ impl VwUserApi for UserApi {
         crate::wiring::ensure(
             &caller.name,
             &target.name,
+            &target.workspace,
             target.kind,
             &args,
             &agent,
@@ -196,7 +198,7 @@ impl VwUserApi for UserApi {
 
         let plan = agent
             .client
-            .sync_plan(&agent.environment, &manifest)
+            .sync_plan(&agent.environment, &agent.workspace, &manifest)
             .await
             .map_err(|e| agent.failed(e))
             .inspect_err(|e| log_relay_failure(&log, &target, e))?
@@ -208,7 +210,7 @@ impl VwUserApi for UserApi {
     async fn sync_blob(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::TargetBlobPathParam,
+            vw_api_types_versions::latest::WorkspaceBlobPathParam,
         >,
         body: dropshot::UntypedBody,
     ) -> Result<dropshot::HttpResponseUpdatedNoContent, dropshot::HttpError>
@@ -217,14 +219,16 @@ impl VwUserApi for UserApi {
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
         let params = path_params.into_inner();
-        let target = vw_api_types_versions::latest::TargetPathParam {
+        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
             name: params.name.clone(),
+            workspace: params.workspace.clone(),
             kind: params.kind,
         };
 
         let agent = relay::Agent::resolve(
             &caller.name,
             &params.name,
+            &params.workspace,
             params.kind,
             &args,
         )
@@ -234,6 +238,7 @@ impl VwUserApi for UserApi {
             .client
             .sync_blob(
                 &agent.environment,
+                &agent.workspace,
                 params.digest.0.as_str(),
                 body.as_bytes().to_vec(),
             )
@@ -247,7 +252,7 @@ impl VwUserApi for UserApi {
     async fn sync_commit(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::TargetPathParam,
+            vw_api_types_versions::latest::WorkspaceTargetPathParam,
         >,
         body: dropshot::TypedBody<vw_api_types_versions::latest::TreeManifest>,
     ) -> Result<
@@ -263,6 +268,7 @@ impl VwUserApi for UserApi {
         let agent = relay::Agent::resolve(
             &caller.name,
             &target.name,
+            &target.workspace,
             target.kind,
             &args,
         )
@@ -270,7 +276,7 @@ impl VwUserApi for UserApi {
 
         let result = agent
             .client
-            .sync_commit(&agent.environment, &manifest)
+            .sync_commit(&agent.environment, &agent.workspace, &manifest)
             .await
             .map_err(|e| agent.failed(e))
             .inspect_err(|e| log_relay_failure(&log, &target, e))?
@@ -291,7 +297,7 @@ impl VwUserApi for UserApi {
     async fn sync_clear(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::TargetPathParam,
+            vw_api_types_versions::latest::WorkspaceTargetPathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<vw_api_types_versions::latest::CommitResult>,
@@ -305,6 +311,7 @@ impl VwUserApi for UserApi {
         let agent = relay::Agent::resolve(
             &caller.name,
             &target.name,
+            &target.workspace,
             target.kind,
             &args,
         )
@@ -312,7 +319,7 @@ impl VwUserApi for UserApi {
 
         let result = agent
             .client
-            .sync_clear(&agent.environment)
+            .sync_clear(&agent.environment, &agent.workspace)
             .await
             .map_err(|e| agent.failed(e))
             .inspect_err(|e| log_relay_failure(&log, &target, e))?
@@ -330,7 +337,7 @@ impl VwUserApi for UserApi {
     async fn clean_build_output(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::TargetPathParam,
+            vw_api_types_versions::latest::WorkspaceTargetPathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<vw_api_types_versions::latest::CleanResult>,
@@ -344,6 +351,7 @@ impl VwUserApi for UserApi {
         let agent = relay::Agent::resolve(
             &caller.name,
             &target.name,
+            &target.workspace,
             target.kind,
             &args,
         )
@@ -351,7 +359,7 @@ impl VwUserApi for UserApi {
 
         let cleaned = agent
             .client
-            .clean_build_output(&agent.environment)
+            .clean_build_output(&agent.environment, &agent.workspace)
             .await
             .map_err(|e| agent.failed(e))
             .inspect_err(|e| log_relay_failure(&log, &target, e))?
@@ -369,7 +377,7 @@ impl VwUserApi for UserApi {
     async fn driver_build(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::EnvironmentPathParam,
+            vw_api_types_versions::latest::WorkspacePathParam,
         >,
         query: dropshot::Query<vw_api_types_versions::latest::DriverBuildQuery>,
         websock: dropshot::WebsocketConnection,
@@ -377,18 +385,22 @@ impl VwUserApi for UserApi {
         let log = rqctx.log.clone();
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
-        let name = path_params.into_inner().name;
+        let params = path_params.into_inner();
+        let name = params.name;
+        let workspace = params.workspace;
         let query = query.into_inner();
 
         // Helios, not vivado: the driver's target is native there and its
         // pinned toolchain is installed there.
-        let target = vw_api_types_versions::latest::TargetPathParam {
+        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
             name: name.clone(),
+            workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Helios,
         };
         let agent = relay::Agent::resolve(
             &caller.name,
             &name,
+            &workspace,
             vw_api_types_versions::latest::TargetKind::Helios,
             &args,
         )
@@ -422,7 +434,7 @@ impl VwUserApi for UserApi {
     async fn anodize(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::EnvironmentPathParam,
+            vw_api_types_versions::latest::WorkspacePathParam,
         >,
         query: dropshot::Query<vw_api_types_versions::latest::AnodizeQuery>,
         websock: dropshot::WebsocketConnection,
@@ -430,18 +442,22 @@ impl VwUserApi for UserApi {
         let log = rqctx.log.clone();
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
-        let name = path_params.into_inner().name;
+        let params = path_params.into_inner();
+        let name = params.name;
+        let workspace = params.workspace;
         let query = query.into_inner();
 
         // Vivado, not helios: anodization is an nvc pass over the design, and
         // the design is on the machine the benches run on.
-        let target = vw_api_types_versions::latest::TargetPathParam {
+        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
             name: name.clone(),
+            workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
         };
         let agent = relay::Agent::resolve(
             &caller.name,
             &name,
+            &workspace,
             vw_api_types_versions::latest::TargetKind::Vivado,
             &args,
         )
@@ -476,7 +492,7 @@ impl VwUserApi for UserApi {
     async fn bench_session(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::EnvironmentPathParam,
+            vw_api_types_versions::latest::WorkspacePathParam,
         >,
         query: dropshot::Query<vw_api_types_versions::latest::BenchQuery>,
         websock: dropshot::WebsocketConnection,
@@ -484,17 +500,21 @@ impl VwUserApi for UserApi {
         let log = rqctx.log.clone();
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
-        let name = path_params.into_inner().name;
+        let params = path_params.into_inner();
+        let name = params.name;
+        let workspace = params.workspace;
         let query = query.into_inner();
 
-        let target = vw_api_types_versions::latest::TargetPathParam {
+        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
             name: name.clone(),
+            workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
         };
 
         let agent = relay::Agent::resolve(
             &caller.name,
             &name,
+            &workspace,
             vw_api_types_versions::latest::TargetKind::Vivado,
             &args,
         )
@@ -528,7 +548,7 @@ impl VwUserApi for UserApi {
     async fn vivado_session(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::EnvironmentPathParam,
+            vw_api_types_versions::latest::WorkspacePathParam,
         >,
         query: dropshot::Query<
             vw_api_types_versions::latest::VivadoSessionQuery,
@@ -538,17 +558,21 @@ impl VwUserApi for UserApi {
         let log = rqctx.log.clone();
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
-        let name = path_params.into_inner().name;
+        let params = path_params.into_inner();
+        let name = params.name;
+        let workspace = params.workspace;
         let query = query.into_inner();
 
-        let target = vw_api_types_versions::latest::TargetPathParam {
+        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
             name: name.clone(),
+            workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
         };
 
         let agent = relay::Agent::resolve(
             &caller.name,
             &name,
+            &workspace,
             vw_api_types_versions::latest::TargetKind::Vivado,
             &args,
         )
@@ -583,7 +607,7 @@ impl VwUserApi for UserApi {
     async fn generated_manifest(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::EnvironmentPathParam,
+            vw_api_types_versions::latest::WorkspacePathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<vw_api_types_versions::latest::TreeManifest>,
@@ -592,15 +616,19 @@ impl VwUserApi for UserApi {
         let log = rqctx.log.clone();
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
-        let name = path_params.into_inner().name;
+        let params = path_params.into_inner();
+        let name = params.name;
+        let workspace = params.workspace;
 
-        let target = vw_api_types_versions::latest::TargetPathParam {
+        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
             name: name.clone(),
+            workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
         };
         let agent = relay::Agent::resolve(
             &caller.name,
             &name,
+            &workspace,
             vw_api_types_versions::latest::TargetKind::Vivado,
             &args,
         )
@@ -608,7 +636,7 @@ impl VwUserApi for UserApi {
 
         let manifest = agent
             .client
-            .generated_manifest(&agent.environment)
+            .generated_manifest(&agent.environment, &agent.workspace)
             .await
             .map_err(|e| agent.failed(e))
             .inspect_err(|e| log_relay_failure(&log, &target, e))?
@@ -625,7 +653,7 @@ impl VwUserApi for UserApi {
     async fn generated_file(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::EnvironmentPathParam,
+            vw_api_types_versions::latest::WorkspacePathParam,
         >,
         query: dropshot::Query<
             vw_api_types_versions::latest::GeneratedFileQuery,
@@ -637,16 +665,20 @@ impl VwUserApi for UserApi {
         let log = rqctx.log.clone();
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
-        let name = path_params.into_inner().name;
+        let params = path_params.into_inner();
+        let name = params.name;
+        let workspace = params.workspace;
         let wanted = query.into_inner().path;
 
-        let target = vw_api_types_versions::latest::TargetPathParam {
+        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
             name: name.clone(),
+            workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
         };
         let agent = relay::Agent::resolve(
             &caller.name,
             &name,
+            &workspace,
             vw_api_types_versions::latest::TargetKind::Vivado,
             &args,
         )
@@ -654,7 +686,7 @@ impl VwUserApi for UserApi {
 
         let contents = agent
             .client
-            .generated_file(&agent.environment, &wanted)
+            .generated_file(&agent.environment, &agent.workspace, &wanted)
             .await
             .map_err(|e| agent.failed(e))
             .inspect_err(|e| log_relay_failure(&log, &target, e))?
@@ -685,7 +717,7 @@ impl VwUserApi for UserApi {
     async fn flush_artifacts(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::EnvironmentPathParam,
+            vw_api_types_versions::latest::WorkspacePathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<vw_api_types_versions::latest::ArtifactFlush>,
@@ -694,18 +726,22 @@ impl VwUserApi for UserApi {
         let log = rqctx.log.clone();
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
-        let name = path_params.into_inner().name;
+        let params = path_params.into_inner();
+        let name = params.name;
+        let workspace = params.workspace;
 
         // The vivado instance is the only one that fills the store; helios
         // does not produce artifacts and the artifact instance holds them
         // rather than making them.
-        let target = vw_api_types_versions::latest::TargetPathParam {
+        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
             name: name.clone(),
+            workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
         };
         let agent = relay::Agent::resolve(
             &caller.name,
             &name,
+            &workspace,
             vw_api_types_versions::latest::TargetKind::Vivado,
             &args,
         )
@@ -713,7 +749,7 @@ impl VwUserApi for UserApi {
 
         let flushed = agent
             .client
-            .flush_artifacts(&agent.environment)
+            .flush_artifacts(&agent.environment, &agent.workspace)
             .await
             .map_err(|e| agent.failed(e))
             .inspect_err(|e| log_relay_failure(&log, &target, e))?
@@ -738,7 +774,7 @@ impl VwUserApi for UserApi {
     async fn get_artifacts(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::EnvironmentPathParam,
+            vw_api_types_versions::latest::WorkspacePathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<Vec<vw_api_types_versions::latest::Artifact>>,
@@ -747,7 +783,9 @@ impl VwUserApi for UserApi {
         let log = rqctx.log.clone();
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
-        let name = path_params.into_inner().name;
+        let params = path_params.into_inner();
+        let name = params.name;
+        let workspace = params.workspace;
 
         let mut found = Vec::new();
         // Every kind that has a bucket, so one listing answers "what did this
@@ -759,6 +797,7 @@ impl VwUserApi for UserApi {
             let credentials = match crate::wiring::store_for(
                 &caller.name,
                 &name,
+                &workspace,
                 kind,
                 &args,
             )
@@ -795,7 +834,7 @@ impl VwUserApi for UserApi {
     async fn clear_artifacts(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::EnvironmentPathParam,
+            vw_api_types_versions::latest::WorkspacePathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<
@@ -806,7 +845,9 @@ impl VwUserApi for UserApi {
         let log = rqctx.log.clone();
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
-        let name = path_params.into_inner().name;
+        let params = path_params.into_inner();
+        let name = params.name;
+        let workspace = params.workspace;
 
         let mut cleared =
             vw_api_types_versions::latest::ArtifactsCleared::default();
@@ -815,16 +856,21 @@ impl VwUserApi for UserApi {
             vw_api_types_versions::latest::TargetKind::Vivado,
             vw_api_types_versions::latest::TargetKind::Helios,
         ] {
-            let credentials =
-                crate::wiring::store_for(&caller.name, &name, kind, &args)
-                    .await
-                    .inspect_err(|e| {
-                        error!(log, "cannot reach the object store";
-                            "environment" => &name,
-                            "kind" => %kind,
-                            InlineErrorChain::new(e),
-                        );
-                    })?;
+            let credentials = crate::wiring::store_for(
+                &caller.name,
+                &name,
+                &workspace,
+                kind,
+                &args,
+            )
+            .await
+            .inspect_err(|e| {
+                error!(log, "cannot reach the object store";
+                    "environment" => &name,
+                    "kind" => %kind,
+                    InlineErrorChain::new(e),
+                );
+            })?;
 
             let (removed, bytes) = crate::artifacts::clear(&credentials)
                 .await
@@ -855,7 +901,7 @@ impl VwUserApi for UserApi {
     async fn get_artifact(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::ArtifactPathParam,
+            vw_api_types_versions::latest::WorkspaceArtifactPathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<dropshot::FreeformBody>,
@@ -869,6 +915,7 @@ impl VwUserApi for UserApi {
         let credentials = crate::wiring::store_for(
             &caller.name,
             &wanted.name,
+            &wanted.workspace,
             wanted.kind,
             &args,
         )
@@ -922,6 +969,160 @@ impl VwUserApi for UserApi {
             name: path_params.into_inner().name,
         };
         Ok(dropshot::HttpResponseOk(db::get_environment_keys(key)?))
+    }
+
+    async fn get_workspaces(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::EnvironmentPathParam,
+        >,
+        query: dropshot::Query<
+            vw_api_types_versions::latest::WorkspaceListQuery,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<Vec<vw_api_types_versions::latest::Workspace>>,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let name = path_params.into_inner().name;
+        let measure = query.into_inner().measure;
+
+        // The vivado instance, because every sync reaches it and because it is
+        // the one holding the build output whose size somebody asking this is
+        // usually trying to account for.
+        let instance = relay::Agent::resolve_instance(
+            &caller.name,
+            &name,
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            &args,
+        )
+        .inspect_err(|e| {
+            info!(log, "cannot reach the instance holding the workspaces";
+                "environment" => &name,
+                "user" => &caller.name,
+                InlineErrorChain::new(e),
+            );
+        })?;
+
+        let held = instance.workspaces(measure).await.inspect_err(|e| {
+            error!(log, "cannot list the workspaces on an instance";
+                "environment" => &name,
+                "user" => &caller.name,
+                InlineErrorChain::new(e),
+            );
+        })?;
+
+        Ok(dropshot::HttpResponseOk(held))
+    }
+
+    async fn forget_workspace(
+        rqctx: dropshot::RequestContext<Self::Context>,
+        path_params: dropshot::Path<
+            vw_api_types_versions::latest::WorkspacePathParam,
+        >,
+    ) -> Result<
+        dropshot::HttpResponseOk<
+            vw_api_types_versions::latest::WorkspaceForgotten,
+        >,
+        dropshot::HttpError,
+    > {
+        let log = rqctx.log.clone();
+        let args = rqctx.context().server_args.clone();
+        let caller = auth::authorize_caller(rqctx).await?;
+        let params = path_params.into_inner();
+        let (name, workspace) = (params.name, params.workspace);
+
+        let mut forgotten =
+            vw_api_types_versions::latest::WorkspaceForgotten::default();
+
+        // The trees first. An instance that cannot be reached is reported
+        // rather than skipped: half a workspace removed, silently, is the one
+        // outcome nobody could act on.
+        for kind in [
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            vw_api_types_versions::latest::TargetKind::Helios,
+        ] {
+            let instance = relay::Agent::resolve(
+                &caller.name,
+                &name,
+                &workspace,
+                kind,
+                &args,
+            )
+            .inspect_err(|e| {
+                error!(log, "cannot reach an instance to forget a workspace";
+                    "environment" => &name,
+                    "workspace" => &workspace,
+                    "kind" => %kind,
+                    InlineErrorChain::new(e),
+                );
+            })?;
+
+            let cleaned =
+                instance.forget_workspace().await.inspect_err(|e| {
+                    error!(log, "cannot forget a workspace on an instance";
+                        "environment" => &name,
+                        "workspace" => &workspace,
+                        "kind" => %kind,
+                        InlineErrorChain::new(e),
+                    );
+                })?;
+
+            if cleaned.existed {
+                forgotten.trees.push(kind);
+            }
+        }
+
+        // Then the artifacts. The bucket itself is left standing: an empty one
+        // costs the store nothing, and leaving it means a workspace of the
+        // same name coming back finds its own bucket rather than a new one.
+        for kind in [
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            vw_api_types_versions::latest::TargetKind::Helios,
+        ] {
+            let credentials = crate::wiring::store_for(
+                &caller.name,
+                &name,
+                &workspace,
+                kind,
+                &args,
+            )
+            .await
+            .inspect_err(|e| {
+                error!(log, "cannot reach the object store";
+                    "environment" => &name,
+                    "workspace" => &workspace,
+                    "kind" => %kind,
+                    InlineErrorChain::new(e),
+                );
+            })?;
+
+            let (removed, bytes) = crate::artifacts::clear(&credentials)
+                .await
+                .inspect_err(|e| {
+                    error!(log, "cannot clear a workspace's artifacts";
+                        "environment" => &name,
+                        "workspace" => &workspace,
+                        "kind" => %kind,
+                        InlineErrorChain::new(e),
+                    );
+                })?;
+
+            forgotten.artifacts += removed;
+            forgotten.bytes += bytes;
+        }
+
+        info!(log, "workspace forgotten";
+            "environment" => &name,
+            "workspace" => &workspace,
+            "user" => &caller.name,
+            "trees" => forgotten.trees.len(),
+            "artifacts" => forgotten.artifacts,
+        );
+
+        Ok(dropshot::HttpResponseOk(forgotten))
     }
 
     async fn get_environment(
@@ -1037,11 +1238,12 @@ pub fn api_description() -> ApiDescription<Arc<Context>> {
 /// from the response alone, which only says the sync did not happen.
 fn log_relay_failure(
     log: &slog::Logger,
-    target: &vw_api_types_versions::latest::TargetPathParam,
+    target: &vw_api_types_versions::latest::WorkspaceTargetPathParam,
     error: &relay::RelayError,
 ) {
     slog::warn!(log, "cannot relay a source sync";
         "environment" => &target.name,
+        "workspace" => &target.workspace,
         "target" => %target.kind,
         InlineErrorChain::new(error),
     );

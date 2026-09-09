@@ -52,15 +52,18 @@ pub enum AnodizeError {
 /// anodization that failed is not a vw failure, it is the answer.
 pub async fn run(
     session: &Session,
-    environment: &str,
+    target: &crate::cloud::Target,
     bench: Option<&str>,
     standard: vw_lib::VhdlStandard,
 ) -> Result<bool, AnodizeError> {
     let standard = standard.to_string();
     let upgraded = vw_api_client::retrying(|| {
-        session
-            .client
-            .anodize(environment, bench, Some(standard.as_str()))
+        session.client.anodize(
+            &target.environment,
+            &target.workspace,
+            bench,
+            Some(standard.as_str()),
+        )
     })
     .await
     .map_err(|e| session.error(e))?

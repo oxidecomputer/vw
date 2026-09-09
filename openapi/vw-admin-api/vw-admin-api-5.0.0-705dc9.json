@@ -3,7 +3,7 @@
   "info": {
     "title": "VW admin API",
     "description": "Manage every user's vw build environments. Restricted to the operators named in the service's --admin-users argument.",
-    "version": "3.0.0"
+    "version": "5.0.0"
   },
   "paths": {
     "/environment/{user}/{name}": {

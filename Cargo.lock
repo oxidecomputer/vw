@@ -5778,6 +5778,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
+ "toml 0.8.23",
  "tracing-subscriber",
  "url",
  "vw-analyzer",

@@ -4,11 +4,12 @@
 
 //! Receives source on a vw build instance.
 //!
-//! One agent serves one environment on one instance. It takes delivery of
-//! content from `vw-svc` over the rack's internal network and keeps a
-//! directory matching whatever the developer's machine last said it should
-//! look like — so vivado, nvc and cargo find ordinary files where they expect
-//! them, with no knowledge that any of this happened.
+//! One agent serves one environment on one instance, and as many workspaces on
+//! it as have been synchronized. It takes delivery of content from `vw-svc`
+//! over the rack's internal network and keeps a directory per workspace
+//! matching whatever the developer's machine last said it should look like —
+//! so vivado, nvc and cargo find ordinary files where they expect them, with
+//! no knowledge that any of this happened.
 //!
 //! It is deliberately incurious. It does not know which developer it is
 //! working for, whether they are allowed to be, or what is going to be built:
@@ -29,14 +30,16 @@ use std::{
 use vw_api_types_versions::latest::{
     CommitResult, Credentials, SyncPlan, TreeManifest,
 };
-use vw_sync::Store;
-use vw_sync_api::{BlobPathParam, EnvironmentPathParam, VwSyncApi};
+use vw_sync_api::{
+    EnvironmentPathParam, VwSyncApi, WorkspaceBlobPathParam, WorkspacePathParam,
+};
 
 mod artifacts;
 mod error;
 mod garage;
 mod generated;
 mod netrc;
+mod workspace;
 
 #[derive(Parser)]
 #[command(name = "vw-agent")]
@@ -96,18 +99,24 @@ struct ServerArgs {
     #[arg(long)]
     kind: Option<String>,
 
-    /// Directory the source tree is kept in.
+    /// Directory the source trees are kept under.
     ///
-    /// Fixed at startup and never derived from a request, so nothing a caller
-    /// sends can place a file outside it.
+    /// One tree per workspace, a level below this. The base is fixed at
+    /// startup, and the only thing a request contributes is the workspace
+    /// name — which is checked against the same rules `vw.toml` is held to
+    /// before it becomes a path component, so nothing a caller sends can
+    /// place a file outside here.
     #[arg(long)]
     root: Utf8PathBuf,
 
-    /// Directory delivered content waits in before being put in place.
+    /// Directory the content stores are kept under, one per workspace.
+    ///
+    /// Beside the trees rather than shared between them, so that clearing one
+    /// workspace's sync cannot discard content another is mid-delivery on.
     #[arg(long, default_value = "/var/lib/vw-agent/store")]
     store: Utf8PathBuf,
 
-    /// Where to remember the object store artifacts are uploaded to.
+    /// Where to remember which object store each workspace's artifacts go to.
     ///
     /// Kept so an instance that reboots between builds still knows where its
     /// output goes without being told again.
@@ -167,34 +176,20 @@ struct BenchOneArgs {
 
 pub struct Context {
     environment: String,
-    /// Where finished artifacts are uploaded, once anyone has said.
-    artifact_target: tokio::sync::watch::Sender<
-        Option<vw_api_types_versions::latest::S3Credentials>,
-    >,
-    /// Where that answer is kept across restarts.
+    /// Where each workspace's artifact target is kept across restarts.
     artifact_target_path: Utf8PathBuf,
-    /// How to ask the uploader to send everything it has and say when it is
-    /// done.
-    ///
-    /// `None` on an instance that does not build anything, which has no
-    /// uploader to ask.
-    flushes: Option<tokio::sync::mpsc::Sender<artifacts::Flush>>,
     /// The object store this instance runs, if it is the one that runs it.
     ///
-    /// Held so garage lives as long as the agent does, and so the key can be
-    /// handed to whoever asks for it. Distinct from `store` below, which is
-    /// where delivered source waits — this one is where finished artifacts go.
+    /// Held so garage lives as long as the agent does, and so a bucket can be
+    /// made and its key handed out when a workspace first needs one.
     object_store: Option<garage::Store>,
-    root: Utf8PathBuf,
-    store: Store,
     /// Where the credentials for fetching dependencies are kept.
-    netrc: Utf8PathBuf,
-    /// Held while a tree is being made to match a manifest.
     ///
-    /// Two machines synchronizing the same environment is not a conflict worth
-    /// reporting — the later one wins — but it is worth making sure the loser
-    /// does not leave half of its tree interleaved with half of the winner's.
-    materializing: tokio::sync::Mutex<()>,
+    /// One file for the instance, not one per workspace: an environment has a
+    /// single owner, and every build on this machine fetches as them.
+    netrc: Utf8PathBuf,
+    /// The trees this instance is holding, one per workspace.
+    workspaces: workspace::Registry,
 }
 
 pub struct Agent {}
@@ -204,25 +199,25 @@ impl VwSyncApi for Agent {
 
     async fn sync_plan(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
         body: dropshot::TypedBody<TreeManifest>,
     ) -> Result<HttpResponseOk<SyncPlan>, HttpError> {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
         let manifest = body.into_inner();
-        let plan = vw_sync::missing(&ctx.root, &ctx.store, &manifest)
+        let plan = vw_sync::missing(&ws.root, &ws.store, &manifest)
             .inspect_err(|e| {
-                slog::error!(rqctx.log, "cannot work out what is missing";
+                slog::error!(log, "cannot work out what is missing";
                     InlineErrorChain::new(e),
                 );
             })
             .map_err(error::apply_error)?;
 
-        info!(rqctx.log, "planned a sync";
+        info!(log, "planned a sync";
             "wanted" => manifest.entries.len(),
             "missing" => plan.missing.len(),
         );
@@ -232,17 +227,19 @@ impl VwSyncApi for Agent {
 
     async fn sync_blob(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<BlobPathParam>,
+        path_params: dropshot::Path<WorkspaceBlobPathParam>,
         body: dropshot::UntypedBody,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let ctx = rqctx.context();
         let params = path_params.into_inner();
-        ctx.check_environment(&params.environment, &rqctx.log)?;
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
-        ctx.store
+        ws.store
             .put(&params.digest, body.as_bytes())
             .inspect_err(|e| {
-                slog::error!(rqctx.log, "rejected delivered content";
+                slog::error!(log, "rejected delivered content";
                     "digest" => %params.digest,
                     InlineErrorChain::new(e),
                 );
@@ -254,27 +251,32 @@ impl VwSyncApi for Agent {
 
     async fn sync_commit(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
         body: dropshot::TypedBody<TreeManifest>,
     ) -> Result<HttpResponseOk<CommitResult>, HttpError> {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
         let manifest = body.into_inner();
 
-        let _guard = ctx.materializing.lock().await;
-        let result = vw_sync::apply(&ctx.root, &ctx.store, &manifest)
+        let _guard = ws.materializing.lock().await;
+        let result = vw_sync::apply(&ws.root, &ws.store, &manifest)
             .inspect_err(|e| {
-                slog::error!(rqctx.log, "cannot make the tree match";
-                    "root" => %ctx.root,
+                slog::error!(log, "cannot make the tree match";
+                    "root" => %ws.root,
                     InlineErrorChain::new(e),
                 );
             })
             .map_err(error::apply_error)?;
 
-        info!(rqctx.log, "tree synchronized";
+        // Only on the way out of a commit that worked. A listing reports this
+        // so somebody can see which of several workspaces they have stopped
+        // pushing to, and a failed sync is not a push.
+        ws.mark_synced();
+
+        info!(log, "tree synchronized";
             "created" => result.created,
             "updated" => result.updated,
             "deleted" => result.deleted,
@@ -286,28 +288,28 @@ impl VwSyncApi for Agent {
 
     async fn sync_clear(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
     ) -> Result<HttpResponseOk<CommitResult>, HttpError> {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
         // The same lock a commit takes: this is a commit, of an empty
         // manifest, and it would be no better to interleave with one than two
         // commits would be with each other.
-        let _guard = ctx.materializing.lock().await;
-        let result = vw_sync::clear(&ctx.root, &ctx.store)
+        let _guard = ws.materializing.lock().await;
+        let result = vw_sync::clear(&ws.root, &ws.store)
             .inspect_err(|e| {
-                slog::error!(rqctx.log, "cannot clear the tree";
-                    "root" => %ctx.root,
+                slog::error!(log, "cannot clear the tree";
+                    "root" => %ws.root,
                     InlineErrorChain::new(e),
                 );
             })
             .map_err(error::apply_error)?;
 
-        info!(rqctx.log, "tree cleared";
+        info!(log, "tree cleared";
             "deleted" => result.deleted,
         );
 
@@ -316,21 +318,21 @@ impl VwSyncApi for Agent {
 
     async fn generated_manifest(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
     ) -> Result<HttpResponseOk<TreeManifest>, HttpError> {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
         // Finish vivado's work before reporting it: the stubs do not exist
         // until the templates are spliced, and on a remote run this is the
         // only place that happens.
-        let written = generated::prepare(&ctx.root);
-        let manifest = generated::manifest(&ctx.root);
+        let written = generated::prepare(&ws.root);
+        let manifest = generated::manifest(&ws.root);
 
-        info!(rqctx.log, "reporting generated ip";
+        info!(log, "reporting generated ip";
             "stubs_written" => written,
             "files" => manifest.entries.len(),
         );
@@ -340,21 +342,21 @@ impl VwSyncApi for Agent {
 
     async fn generated_file(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
         query: dropshot::Query<
             vw_api_types_versions::latest::GeneratedFileQuery,
         >,
     ) -> Result<HttpResponseOk<dropshot::FreeformBody>, HttpError> {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
         let wanted = query.into_inner().path;
 
-        let contents = generated::read(&ctx.root, &wanted)
+        let contents = generated::read(&ws.root, &wanted)
             .inspect_err(|e| {
-                slog::warn!(rqctx.log, "refusing a generated file";
+                slog::warn!(log, "refusing a generated file";
                     "path" => &wanted,
                     InlineErrorChain::new(e),
                 );
@@ -368,20 +370,20 @@ impl VwSyncApi for Agent {
 
     async fn get_artifact_target(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
     ) -> Result<
         HttpResponseOk<vw_api_types_versions::latest::S3Credentials>,
         HttpError,
     > {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
-        let current = ctx.artifact_target.borrow().clone();
+        let current = ws.artifact_target.borrow().clone();
         let Some(current) = current else {
-            slog::debug!(rqctx.log, "no artifact target has been set");
+            slog::debug!(log, "no artifact target has been set");
             return Err(HttpError::for_not_found(
                 None,
                 String::from(
@@ -396,22 +398,22 @@ impl VwSyncApi for Agent {
 
     async fn flush_artifacts(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
     ) -> Result<
         HttpResponseOk<vw_api_types_versions::latest::ArtifactFlush>,
         HttpError,
     > {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
         // Only an instance that builds has an uploader running. Asking one
         // that does not is a mistake worth naming rather than a request to
         // answer with a cheerful nothing, which would read as "flushed" to
         // whoever is about to collect.
-        let Some(flushes) = ctx.flushes.as_ref() else {
+        let Some(flushes) = ws.flushes.as_ref() else {
             return Err(HttpError::for_not_found(
                 None,
                 String::from(
@@ -425,7 +427,7 @@ impl VwSyncApi for Agent {
         // which of the two things went wrong. An instance with nowhere to put
         // artifacts has not failed to flush them — it has never been told
         // where they go, and that is what somebody needs to hear.
-        if ctx.artifact_target.borrow().is_none() {
+        if ws.artifact_target.borrow().is_none() {
             return Err(HttpError::for_not_found(
                 None,
                 String::from(
@@ -451,7 +453,7 @@ impl VwSyncApi for Agent {
         })?;
 
         if !flushed.settled {
-            slog::warn!(rqctx.log, "a flush did not settle";
+            slog::warn!(log, "a flush did not settle";
                 "uploaded" => flushed.uploaded,
             );
         }
@@ -466,53 +468,58 @@ impl VwSyncApi for Agent {
 
     async fn put_artifact_target(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
         body: dropshot::TypedBody<vw_api_types_versions::latest::S3Credentials>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
         let credentials = body.into_inner();
 
-        artifacts::remember(&ctx.artifact_target_path, &credentials)
-            .inspect_err(|e| {
-                slog::error!(rqctx.log, "cannot remember the artifact target";
-                    "path" => %ctx.artifact_target_path,
-                    InlineErrorChain::new(e),
-                );
-            })
-            .map_err(|e| HttpError::for_internal_error(e.to_string()))?;
+        artifacts::remember(
+            &ctx.artifact_target_path,
+            &params.workspace,
+            &credentials,
+        )
+        .inspect_err(|e| {
+            slog::error!(log, "cannot remember the artifact target";
+                "path" => %ctx.artifact_target_path,
+                InlineErrorChain::new(e),
+            );
+        })
+        .map_err(|e| HttpError::for_internal_error(e.to_string()))?;
 
-        info!(rqctx.log, "artifacts now go to a store";
+        info!(log, "artifacts now go to a store";
             "bucket" => &credentials.bucket,
             "endpoint" => &credentials.endpoint,
         );
 
         // Waking the uploader, which will send anything already built.
-        let _ = ctx.artifact_target.send(Some(credentials));
+        let _ = ws.artifact_target.send(Some(credentials));
 
         Ok(HttpResponseUpdatedNoContent())
     }
 
     async fn get_object_store(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
         query: dropshot::Query<vw_api_types_versions::latest::ObjectStoreQuery>,
     ) -> Result<
         HttpResponseOk<vw_api_types_versions::latest::S3Credentials>,
         HttpError,
     > {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
+        let _ = &ws;
         let Some(store) = ctx.object_store.as_ref() else {
             slog::warn!(
-                rqctx.log,
+                log,
                 "asked for an object store this instance \
                                     does not run"
             );
@@ -531,53 +538,58 @@ impl VwSyncApi for Agent {
             .unwrap_or(vw_api_types_versions::latest::TargetKind::Vivado)
             .to_string();
 
-        let Some(bucket) = store.buckets.get(&kind) else {
-            slog::warn!(rqctx.log, "asked for a bucket that does not exist";
-                "kind" => &kind,
-            );
-            return Err(HttpError::for_not_found(
-                None,
-                format!("this store has no bucket for '{kind}'"),
-            ));
-        };
+        // Made now if this is the first anybody has asked. Which buckets a
+        // store needs is not knowable when it starts: they follow the
+        // workspaces, and a workspace exists because somebody synchronized
+        // one.
+        let bucket = store
+            .bucket_for(&kind, &params.workspace, &log)
+            .await
+            .map_err(|e| {
+                slog::error!(log, "cannot make a bucket for a workspace";
+                    "kind" => &kind,
+                    InlineErrorChain::new(&e),
+                );
+                HttpError::for_internal_error(e.to_string())
+            })?;
 
-        info!(rqctx.log, "handing out the object store key";
-            "bucket" => bucket,
+        info!(log, "handing out the object store key";
+            "bucket" => &bucket,
         );
 
         let mut credentials = store.credentials.clone();
-        credentials.bucket = bucket.clone();
+        credentials.bucket = bucket;
 
         Ok(HttpResponseOk(credentials))
     }
 
     async fn clean_build_output(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
     ) -> Result<
         HttpResponseOk<vw_api_types_versions::latest::CleanResult>,
         HttpError,
     > {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
         // The same lock a commit takes. Removing the build output while a
         // tree is being written would not corrupt either — they are disjoint
         // — but a build starting in between would see half a world.
-        let _guard = ctx.materializing.lock().await;
-        let cleaned = vw_sync::clean(&ctx.root)
+        let _guard = ws.materializing.lock().await;
+        let cleaned = vw_sync::clean(&ws.root)
             .inspect_err(|e| {
-                slog::error!(rqctx.log, "cannot remove the build output";
-                    "root" => %ctx.root,
+                slog::error!(log, "cannot remove the build output";
+                    "root" => %ws.root,
                     InlineErrorChain::new(e),
                 );
             })
             .map_err(error::apply_error)?;
 
-        info!(rqctx.log, "build output removed";
+        info!(log, "build output removed";
             "existed" => cleaned.existed,
             "bytes" => cleaned.bytes,
         );
@@ -590,15 +602,15 @@ impl VwSyncApi for Agent {
 
     async fn driver_build(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
         query: dropshot::Query<vw_api_types_versions::latest::DriverBuildQuery>,
         websock: dropshot::WebsocketConnection,
     ) -> dropshot::WebsocketChannelResult {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
         let query = query.into_inner();
         let params = vw_remote::BuildParams {
@@ -611,9 +623,9 @@ impl VwSyncApi for Agent {
         // Everything about the build happens there: cargo runs there, and what
         // it produces is named relative to the build output directory
         // underneath it.
-        let driver = ctx.root.join(vw_remote::driver::DIRECTORY);
+        let driver = ws.root.join(vw_remote::driver::DIRECTORY);
 
-        info!(rqctx.log, "building the driver";
+        info!(log, "building the driver";
             "root" => %driver,
             "release" => params.release,
             "args" => params.args.join(" "),
@@ -629,9 +641,9 @@ impl VwSyncApi for Agent {
         // Where the artifacts go is settled before the build starts, so the
         // upload can happen the moment cargo is done rather than after the
         // developer's command has already returned.
-        let target = ctx.artifact_target.borrow().clone();
+        let target = ws.artifact_target.borrow().clone();
         let root = driver.clone();
-        let upload_log = rqctx.log.clone();
+        let upload_log = log.clone();
         let upload: vw_remote::driver::Uploader =
             Box::new(move |produced: Vec<camino::Utf8PathBuf>| {
                 let target = target.clone();
@@ -664,10 +676,10 @@ impl VwSyncApi for Agent {
             vw_remote::driver::serve(socket, &driver, params, upload).await;
 
         match &result {
-            Ok(produced) => info!(rqctx.log, "driver build finished";
+            Ok(produced) => info!(log, "driver build finished";
                 "artifacts" => produced.len(),
             ),
-            Err(e) => slog::error!(rqctx.log, "driver build failed";
+            Err(e) => slog::error!(log, "driver build failed";
                 InlineErrorChain::new(e),
             ),
         }
@@ -677,15 +689,15 @@ impl VwSyncApi for Agent {
 
     async fn anodize(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
         query: dropshot::Query<vw_api_types_versions::latest::AnodizeQuery>,
         websock: dropshot::WebsocketConnection,
     ) -> dropshot::WebsocketChannelResult {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
         let query = query.into_inner();
         let request = vw_remote::AnodizeRequest {
@@ -696,8 +708,8 @@ impl VwSyncApi for Agent {
                 .unwrap_or_else(|| "2019".to_owned()),
         };
 
-        info!(rqctx.log, "anodizing";
-            "root" => %ctx.root,
+        info!(log, "anodizing";
+            "root" => %ws.root,
             "bench" => request.bench.as_deref().unwrap_or("-"),
         );
 
@@ -708,12 +720,11 @@ impl VwSyncApi for Agent {
         )
         .await;
 
-        let result =
-            vw_remote::anodize::serve(socket, &ctx.root, request).await;
+        let result = vw_remote::anodize::serve(socket, &ws.root, request).await;
 
         match &result {
-            Ok(()) => info!(rqctx.log, "anodization finished"),
-            Err(e) => slog::error!(rqctx.log, "anodization failed";
+            Ok(()) => info!(log, "anodization finished"),
+            Err(e) => slog::error!(log, "anodization failed";
                 InlineErrorChain::new(e),
             ),
         }
@@ -723,15 +734,15 @@ impl VwSyncApi for Agent {
 
     async fn bench_session(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
         query: dropshot::Query<vw_api_types_versions::latest::BenchQuery>,
         websock: dropshot::WebsocketConnection,
     ) -> dropshot::WebsocketChannelResult {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
         let query = query.into_inner();
         // The instance decides how many run at once when the client does not
@@ -753,8 +764,8 @@ impl VwSyncApi for Agent {
             ignore: query.ignored(),
         };
 
-        info!(rqctx.log, "running testbenches";
-            "root" => %ctx.root,
+        info!(log, "running testbenches";
+            "root" => %ws.root,
             "filter" => query.filter.as_deref().unwrap_or("-"),
             "concurrency" => concurrency,
         );
@@ -763,7 +774,7 @@ impl VwSyncApi for Agent {
         // knows how to run exactly one bench into its own directory, which is
         // what the hidden `bench-one` mode is for.
         let exe = std::env::current_exe()?;
-        let root = ctx.root.clone();
+        let root = ws.root.clone();
         let standard = request.standard.clone();
         let launch: vw_bench::Launch =
             std::sync::Arc::new(move |name: &str, build_dir: &str| {
@@ -790,11 +801,11 @@ impl VwSyncApi for Agent {
         .await;
 
         let result =
-            vw_remote::bench::serve(socket, &ctx.root, request, launch).await;
+            vw_remote::bench::serve(socket, &ws.root, request, launch).await;
 
         match &result {
-            Ok(()) => info!(rqctx.log, "testbenches finished"),
-            Err(e) => slog::error!(rqctx.log, "testbench run failed";
+            Ok(()) => info!(log, "testbenches finished"),
+            Err(e) => slog::error!(log, "testbench run failed";
                 InlineErrorChain::new(e),
             ),
         }
@@ -804,17 +815,17 @@ impl VwSyncApi for Agent {
 
     async fn vivado_session(
         rqctx: RequestContext<Self::Context>,
-        path_params: dropshot::Path<EnvironmentPathParam>,
+        path_params: dropshot::Path<WorkspacePathParam>,
         query: dropshot::Query<
             vw_api_types_versions::latest::VivadoSessionQuery,
         >,
         websock: dropshot::WebsocketConnection,
     ) -> dropshot::WebsocketChannelResult {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let params = path_params.into_inner();
+        let (ws, log) = ctx
+            .workspace(&params.environment, &params.workspace, &rqctx.log)
+            .await?;
 
         let query = query.into_inner();
         let params = vw_remote::SessionParams {
@@ -824,8 +835,8 @@ impl VwSyncApi for Agent {
             verbose: query.verbose,
         };
 
-        info!(rqctx.log, "starting a vivado session";
-            "root" => %ctx.root,
+        info!(log, "starting a vivado session";
+            "root" => %ws.root,
             "part" => query.part.as_deref().unwrap_or("-"),
             "variant" => query.variant.as_deref().unwrap_or("-"),
         );
@@ -837,11 +848,11 @@ impl VwSyncApi for Agent {
         )
         .await;
 
-        let result = vw_remote::serve(socket, &ctx.root, params).await;
+        let result = vw_remote::serve(socket, &ws.root, params).await;
 
         match &result {
-            Ok(()) => info!(rqctx.log, "vivado session finished"),
-            Err(e) => slog::error!(rqctx.log, "vivado session failed";
+            Ok(()) => info!(log, "vivado session finished"),
+            Err(e) => slog::error!(log, "vivado session failed";
                 InlineErrorChain::new(e),
             ),
         }
@@ -855,15 +866,13 @@ impl VwSyncApi for Agent {
         body: dropshot::TypedBody<Credentials>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let ctx = rqctx.context();
-        ctx.check_environment(
-            &path_params.into_inner().environment,
-            &rqctx.log,
-        )?;
+        let log = &rqctx.log;
+        ctx.check_environment(&path_params.into_inner().environment, log)?;
         let credentials = body.into_inner();
 
         netrc::write(&ctx.netrc, &credentials)
             .inspect_err(|e| {
-                slog::error!(rqctx.log, "cannot write the credentials file";
+                slog::error!(log, "cannot write the credentials file";
                     "path" => %ctx.netrc,
                     InlineErrorChain::new(e),
                 );
@@ -871,16 +880,103 @@ impl VwSyncApi for Agent {
             .map_err(error::netrc_error)?;
 
         // The login and the path, never the token.
-        info!(rqctx.log, "credentials in place";
+        info!(log, "credentials in place";
             "user" => &credentials.user,
             "path" => %ctx.netrc,
         );
 
         Ok(HttpResponseUpdatedNoContent())
     }
+
+    async fn get_workspaces(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<EnvironmentPathParam>,
+        query: dropshot::Query<
+            vw_api_types_versions::latest::WorkspaceListQuery,
+        >,
+    ) -> Result<
+        HttpResponseOk<Vec<vw_api_types_versions::latest::Workspace>>,
+        HttpError,
+    > {
+        let ctx = rqctx.context();
+        let log = &rqctx.log;
+        ctx.check_environment(&path_params.into_inner().environment, log)?;
+
+        let measure = query.into_inner().measure;
+        let held = ctx.workspaces.list(measure);
+
+        info!(log, "reporting the workspaces held";
+            "workspaces" => held.len(),
+            "measured" => measure,
+        );
+
+        Ok(HttpResponseOk(held))
+    }
+
+    async fn forget_workspace(
+        rqctx: RequestContext<Self::Context>,
+        path_params: dropshot::Path<WorkspacePathParam>,
+    ) -> Result<
+        HttpResponseOk<vw_api_types_versions::latest::CleanResult>,
+        HttpError,
+    > {
+        let ctx = rqctx.context();
+        let params = path_params.into_inner();
+        ctx.check_environment(&params.environment, &rqctx.log)?;
+        let log = rqctx.log.new(o!("workspace" => params.workspace.clone()));
+
+        // Deliberately not through `Context::workspace`, which makes a
+        // workspace that is not there. Asking to forget one is the single
+        // request where that would be exactly wrong.
+        let cleaned = ctx
+            .workspaces
+            .forget(&params.workspace)
+            .await
+            .inspect_err(|e| {
+                slog::error!(log, "cannot forget a workspace";
+                    InlineErrorChain::new(e),
+                );
+            })
+            .map_err(error::workspace_error)?;
+
+        Ok(HttpResponseOk(cleaned))
+    }
 }
 
 impl Context {
+    /// The workspace a request is about, after settling that the request
+    /// belongs here at all.
+    ///
+    /// Both halves in one call because they are one question — which tree —
+    /// and because getting the second without the first would serve a request
+    /// meant for another environment out of a directory named the same way.
+    ///
+    /// Hands back a logger naming the workspace along with it. An instance
+    /// holds several now, and a line saying a sync finished is worth much less
+    /// without saying whose.
+    async fn workspace(
+        &self,
+        environment: &str,
+        workspace: &str,
+        log: &Logger,
+    ) -> Result<(std::sync::Arc<workspace::Workspace>, Logger), HttpError> {
+        self.check_environment(environment, log)?;
+
+        let log = log.new(o!("workspace" => workspace.to_owned()));
+        let held = self
+            .workspaces
+            .open(workspace)
+            .await
+            .inspect_err(|e| {
+                slog::warn!(log, "cannot open a workspace";
+                    InlineErrorChain::new(e),
+                );
+            })
+            .map_err(error::workspace_error)?;
+
+        Ok((held, log))
+    }
+
     /// Refuse a request meant for a different environment.
     fn check_environment(
         &self,
@@ -1021,9 +1117,11 @@ async fn serve(args: ServerArgs) {
         info!(log, "took this instance's identity from its hostname");
     }
 
-    // Both are made now rather than on the first request, so a directory that
-    // cannot be created is a startup failure naming it rather than a confusing
-    // error in the middle of somebody's first sync.
+    // The two directories everything else is made under. Created now rather
+    // than on the first request, so one that cannot be created is a startup
+    // failure naming it rather than a confusing error in the middle of
+    // somebody's first sync. What goes inside them is per workspace and waits
+    // until there is a workspace.
     for directory in [&args.root, &args.store] {
         if let Err(e) = std::fs::create_dir_all(directory) {
             slog::error!(log, "cannot create a directory the agent needs";
@@ -1076,66 +1174,42 @@ async fn serve(args: ServerArgs) {
         None
     };
 
-    // Where artifacts go, recovered from the last time anyone said. An agent
-    // that has never been told simply uploads nothing.
-    let remembered = artifacts::recall(&args.artifact_target)
-        .inspect_err(|e| {
-            slog::warn!(log, "cannot read the remembered artifact target";
-                InlineErrorChain::new(e),
-            );
-        })
-        .unwrap_or(None);
-    if let Some(target) = &remembered {
-        info!(log, "artifacts go to a store this instance was told about";
-            "bucket" => &target.bucket,
-        );
-    }
-    let (artifact_target, artifact_changes) =
-        tokio::sync::watch::channel(remembered);
+    // One tree, one content store and one uploader per workspace, each made
+    // when that workspace is first synchronized. Only where builds happen: an
+    // artifact instance holds the store rather than filling it, and helios
+    // does not produce images.
+    let workspaces = workspace::Registry::new(
+        args.root.clone(),
+        args.store.clone(),
+        args.artifact_target.clone(),
+        kind == "vivado",
+        log.clone(),
+    );
 
-    // Only where builds happen. An artifact instance holds the store rather
-    // than filling it, and helios does not produce images.
-    let flushes = if kind == "vivado" {
-        // Depth of one: a flush is a barrier, and two callers waiting on the
-        // same directory to come to rest want the same answer. The second
-        // simply waits for the first to be taken.
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(artifacts::synchronize(
-            args.root.clone(),
-            artifact_changes,
-            receiver,
-            log.new(o!("task" => "artifacts")),
-        ));
-        Some(sender)
-    } else {
-        None
-    };
+    // Whatever is already here comes back now rather than when somebody next
+    // touches it. An instance that rebooted between a build finishing and its
+    // artifacts going up has an upload waiting, and nothing else would start
+    // the uploader that finishes it.
+    workspaces.restore().await;
 
     let context = Arc::new(Context {
         environment: environment.clone(),
-        artifact_target,
         artifact_target_path: args.artifact_target.clone(),
-        flushes,
         object_store: store,
-        root: args.root.clone(),
-        store: Store::new(args.store.clone()),
         netrc: netrc.clone(),
-        materializing: tokio::sync::Mutex::new(()),
+        workspaces,
     });
 
     info!(log, "serving source synchronization";
-        "root" => %args.root,
-        "store" => %args.store,
+        "trees" => %args.root,
+        "stores" => %args.store,
         "netrc" => %netrc,
     );
 
-    // This API has endpoints that exist only from a given version onwards, so
-    // each request has to say which version it is written against — dropshot
-    // will not start a server that mixes versioned endpoints with no way to
-    // pick between them. No default for a missing header: the only client is
-    // `vw-svc`, which is built from this repository and sends one, and
-    // guessing on its behalf is how it would silently get a version it was not
-    // written for.
+    // Each request says which version of this API it is written against. No
+    // default for a missing header: the only client is `vw-svc`, which is
+    // built from this repository and sends one, and guessing on its behalf is
+    // how it would silently get a version it was not written for.
     let versions = dropshot::VersionPolicy::Dynamic(Box::new(
         dropshot::ClientSpecifiesVersionInHeader::new(
             http::header::HeaderName::from_static(

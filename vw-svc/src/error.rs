@@ -91,6 +91,10 @@ impl From<relay::RelayError> for dropshot::HttpError {
         let message = value.to_string();
         match value {
             // The caller named something that is not theirs or not there.
+            // The caller's own name, refused before it was sent anywhere.
+            relay::RelayError::BadWorkspace { .. } => {
+                dropshot::HttpError::for_bad_request(None, message)
+            }
             relay::RelayError::NoSuchEnvironment => {
                 dropshot::HttpError::for_not_found(None, message)
             }

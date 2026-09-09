@@ -36,10 +36,21 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
-    (3, ANODIZE),
-    (2, ARTIFACT_FLUSH),
-    (1, INITIAL),
+    (4, WORKSPACES),
 ]);
+
+// Every endpoint below exists from this version, so none of them carries a
+// range of its own, and every version before it has been dropped from the
+// supported set rather than retired endpoint by endpoint.
+//
+// Which is a real break, stated plainly: workspaces move the tree a request
+// acts on out of the environment and into a path segment, so there is no
+// spelling of the old routes that means anything now. Keeping them serving
+// would mean choosing a workspace on the caller's behalf, and the number of
+// clients that would help is zero — `vw-svc` and the agents ship together in
+// one image, and `vw` is built from this repository. The count keeps going up
+// even so, because a version number nobody may send is still a version number
+// somebody once did.
 
 /// Header a client names the API version it is written against in.
 ///
@@ -52,18 +63,33 @@ pub const API_VERSION_HEADER: &str = "api-version";
 /// Which environment a request is for.
 ///
 /// An agent serves exactly one, and checks this against the one it was
-/// started with. The name never becomes part of a filesystem path — the tree
-/// and content store are fixed at startup — so a request for the wrong
-/// environment is answered rather than acted on.
+/// started with, so a request for another environment is answered rather than
+/// acted on. Left over for the handful of calls that are about the instance
+/// rather than about anything on it — the credentials a build fetches with
+/// are one `.netrc` per machine, not one per tree.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct EnvironmentPathParam {
     pub environment: String,
 }
 
-/// Which piece of content is being delivered.
+/// Which environment, and which of its workspaces.
+///
+/// An instance holds a tree per workspace, so unlike the environment this
+/// **does** become part of a filesystem path — which is why the agent
+/// validates it on arrival rather than trusting that whoever sent it already
+/// did. `vw-svc` checks it too; a name reaching a path is worth refusing
+/// twice.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct BlobPathParam {
+pub struct WorkspacePathParam {
     pub environment: String,
+    pub workspace: String,
+}
+
+/// Which piece of content is being delivered, and to which tree.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceBlobPathParam {
+    pub environment: String,
+    pub workspace: String,
     /// The digest of the content in the body, which is verified on arrival
     /// rather than taken at face value.
     pub digest: latest::Digest,
@@ -81,11 +107,11 @@ pub trait VwSyncApi {
     /// costs nothing over the wire.
     #[endpoint {
         method = POST,
-        path = "/environment/{environment}/sync/plan",
+        path = "/environment/{environment}/workspace/{workspace}/sync/plan",
     }]
     async fn sync_plan(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
         body: TypedBody<latest::TreeManifest>,
     ) -> Result<HttpResponseOk<latest::SyncPlan>, HttpError>;
 
@@ -96,11 +122,11 @@ pub trait VwSyncApi {
     /// under a name it does not have would be worse than not storing it.
     #[endpoint {
         method = PUT,
-        path = "/environment/{environment}/sync/blob/{digest}",
+        path = "/environment/{environment}/workspace/{workspace}/sync/blob/{digest}",
     }]
     async fn sync_blob(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<BlobPathParam>,
+        path_params: Path<WorkspaceBlobPathParam>,
         body: UntypedBody,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
@@ -110,11 +136,11 @@ pub trait VwSyncApi {
     /// removes as needed. Anything a build produced is invisible to it.
     #[endpoint {
         method = POST,
-        path = "/environment/{environment}/sync/commit",
+        path = "/environment/{environment}/workspace/{workspace}/sync/commit",
     }]
     async fn sync_commit(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
         body: TypedBody<latest::TreeManifest>,
     ) -> Result<HttpResponseOk<latest::CommitResult>, HttpError>;
 
@@ -133,11 +159,11 @@ pub trait VwSyncApi {
     /// of what was removed is the `deleted` field.
     #[endpoint {
         method = DELETE,
-        path = "/environment/{environment}/sync",
+        path = "/environment/{environment}/workspace/{workspace}/sync",
     }]
     async fn sync_clear(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
     ) -> Result<HttpResponseOk<latest::CommitResult>, HttpError>;
 
     /// Put the credentials a build needs to fetch its dependencies in place.
@@ -168,11 +194,11 @@ pub trait VwSyncApi {
     /// over without anything having to be pushed again.
     #[endpoint {
         method = DELETE,
-        path = "/environment/{environment}/build-output",
+        path = "/environment/{environment}/workspace/{workspace}/build-output",
     }]
     async fn clean_build_output(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
     ) -> Result<HttpResponseOk<latest::CleanResult>, HttpError>;
 
     /// Where this instance currently believes its artifacts should go.
@@ -183,11 +209,11 @@ pub trait VwSyncApi {
     /// credentials at every instance on every restart.
     #[endpoint {
         method = GET,
-        path = "/environment/{environment}/artifact-target",
+        path = "/environment/{environment}/workspace/{workspace}/artifact-target",
     }]
     async fn get_artifact_target(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
     ) -> Result<HttpResponseOk<latest::S3Credentials>, HttpError>;
 
     /// The VHDL vivado generated for this environment's IP.
@@ -203,21 +229,21 @@ pub trait VwSyncApi {
     /// each file exactly where its own tools will look for it.
     #[endpoint {
         method = POST,
-        path = "/environment/{environment}/generated",
+        path = "/environment/{environment}/workspace/{workspace}/generated",
     }]
     async fn generated_manifest(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
     ) -> Result<HttpResponseOk<latest::TreeManifest>, HttpError>;
 
     /// One generated file's contents.
     #[endpoint {
         method = GET,
-        path = "/environment/{environment}/generated/file",
+        path = "/environment/{environment}/workspace/{workspace}/generated/file",
     }]
     async fn generated_file(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
         query: Query<latest::GeneratedFileQuery>,
     ) -> Result<HttpResponseOk<FreeformBody>, HttpError>;
 
@@ -229,11 +255,11 @@ pub trait VwSyncApi {
     /// to upload.
     #[endpoint {
         method = GET,
-        path = "/environment/{environment}/object-store",
+        path = "/environment/{environment}/workspace/{workspace}/object-store",
     }]
     async fn get_object_store(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
         query: Query<latest::ObjectStoreQuery>,
     ) -> Result<HttpResponseOk<latest::S3Credentials>, HttpError>;
 
@@ -245,11 +271,11 @@ pub trait VwSyncApi {
     /// does not lose the answer.
     #[endpoint {
         method = PUT,
-        path = "/environment/{environment}/artifact-target",
+        path = "/environment/{environment}/workspace/{workspace}/artifact-target",
     }]
     async fn put_artifact_target(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
         body: TypedBody<latest::S3Credentials>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
@@ -272,12 +298,11 @@ pub trait VwSyncApi {
     /// go, or when it is not the kind of instance that produces any.
     #[endpoint {
         method = POST,
-        path = "/environment/{environment}/artifact-flush",
-        versions = VERSION_ARTIFACT_FLUSH..,
+        path = "/environment/{environment}/workspace/{workspace}/artifact-flush",
     }]
     async fn flush_artifacts(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
     ) -> Result<HttpResponseOk<latest::ArtifactFlush>, HttpError>;
 
     /// Build the driver on this instance.
@@ -292,11 +317,11 @@ pub trait VwSyncApi {
     /// wrong compiler.
     #[channel {
         protocol = WEBSOCKETS,
-        path = "/environment/{environment}/driver/build",
+        path = "/environment/{environment}/workspace/{workspace}/driver/build",
     }]
     async fn driver_build(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
         query: Query<latest::DriverBuildQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
@@ -308,12 +333,11 @@ pub trait VwSyncApi {
     /// as it happens.
     #[channel {
         protocol = WEBSOCKETS,
-        path = "/environment/{environment}/anodize",
-        versions = VERSION_ANODIZE..
+        path = "/environment/{environment}/workspace/{workspace}/anodize",
     }]
     async fn anodize(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
         query: Query<latest::AnodizeQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
@@ -325,11 +349,11 @@ pub trait VwSyncApi {
     /// should see each result land rather than a verdict at the end.
     #[channel {
         protocol = WEBSOCKETS,
-        path = "/environment/{environment}/bench/session",
+        path = "/environment/{environment}/workspace/{workspace}/bench/session",
     }]
     async fn bench_session(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
         query: Query<latest::BenchQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
@@ -350,12 +374,47 @@ pub trait VwSyncApi {
     /// already relies on for speed.
     #[channel {
         protocol = WEBSOCKETS,
-        path = "/environment/{environment}/vivado/session",
+        path = "/environment/{environment}/workspace/{workspace}/vivado/session",
     }]
     async fn vivado_session(
         rqctx: RequestContext<Self::Context>,
-        path_params: Path<EnvironmentPathParam>,
+        path_params: Path<WorkspacePathParam>,
         query: Query<latest::VivadoSessionQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
+
+    /// The workspaces this instance is holding.
+    ///
+    /// Read off the filesystem rather than from a record, because the
+    /// filesystem is the record: a workspace exists here because somebody
+    /// synchronized one, and nothing else creates or removes them. A second
+    /// account kept somewhere else could only ever disagree with this one.
+    #[endpoint {
+        method = GET,
+        path = "/environment/{environment}/workspaces",
+    }]
+    async fn get_workspaces(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<EnvironmentPathParam>,
+        query: Query<latest::WorkspaceListQuery>,
+    ) -> Result<HttpResponseOk<Vec<latest::Workspace>>, HttpError>;
+
+    /// Remove a workspace from this instance entirely.
+    ///
+    /// Its tree, the content delivered towards it, and everything a build
+    /// wrote under it. Not the same as [`Self::sync_clear`], which leaves an
+    /// empty slot behind ready to be filled again — this exists because
+    /// renaming a workspace, or abandoning a branch it was standing for,
+    /// otherwise leaves a tree nothing will ever come back for.
+    ///
+    /// Answers the same way for a workspace that was not there, since the
+    /// caller wanted it gone and it is.
+    #[endpoint {
+        method = DELETE,
+        path = "/environment/{environment}/workspace/{workspace}",
+    }]
+    async fn forget_workspace(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<WorkspacePathParam>,
+    ) -> Result<HttpResponseOk<latest::CleanResult>, HttpError>;
 }

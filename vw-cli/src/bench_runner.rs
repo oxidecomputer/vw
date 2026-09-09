@@ -297,7 +297,7 @@ fn demangle_symbol(sym: &str) -> String {
 /// decided how it looks never moved.
 pub async fn run_benches_remotely(
     session: &crate::cloud::Session,
-    environment: &str,
+    target: &crate::cloud::Target,
     filter: Option<&str>,
     concurrency: Option<usize>,
     vhdl_std: vw_lib::VhdlStandard,
@@ -311,7 +311,8 @@ pub async fn run_benches_remotely(
     let vhdl = vhdl_std.to_string();
     let upgraded = vw_api_client::retrying(|| {
         session.client.bench_session(
-            environment,
+            &target.environment,
+            &target.workspace,
             concurrency.map(|n| n as u32),
             filter,
             ignored.as_deref(),

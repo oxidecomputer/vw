@@ -27,21 +27,52 @@ Create an environment, then work in your workspace as normal:
 
 ```sh
 vw cloud create my-env --wait     # vivado, helios and artifact cloud instances
-export VW_ENV=my-env              # or pass --env to each command
 
 vw check                          # parse and analyze the design
 vw run                            # build the FPGA image
 vw bench run                      # run testbenches
 vw driver build --release         # build the kernel driver
 
-vw cloud artifacts my-env --all   # download build output
+vw cloud artifacts --all          # download build output
 vw cloud delete my-env            # release the instances
 ```
+
+`vw cloud create` records the environment in `vw-cloud.toml`, so nothing after
+it has to name one. `$VW_ENV` and an explicit `--env` still win, in that order.
 
 `vw run`, `vw check`, `vw bench run` and `vw driver build` synchronize the
 workspace to the environment before they run, and stream output back as it
 happens. Pass `--local` to any of them to run on this machine instead, which
 needs the toolchains installed locally.
+
+### One environment, several workspaces
+
+An environment holds a source tree per workspace rather than one tree, so the
+three instances it costs are shared by everything you are working on. Which
+tree a command acts on is the workspace's name — `[workspace] name` from
+`vw.toml`, unless this checkout says otherwise.
+
+Two checkouts of the same project would otherwise resolve to the same name and
+overwrite each other on every sync, which is what `vw cloud set workspace` is
+for:
+
+```sh
+cd ~/src/redhawk-feature
+vw cloud set workspace redhawk-feat    # this checkout gets a tree of its own
+vw cloud workspaces --sizes            # what is on the environment, and how old
+vw cloud forget redhawk-old            # tree, build output and artifacts
+```
+
+That name is only the key — which directory the tree goes in and which bucket
+its artifacts land in. It is deliberately *not* `[workspace] name`, which is
+what a design's own imports resolve through (`src @redhawk/...`) and what
+`vw::project_name` reports: change that and the two checkouts you are comparing
+would differ in a way that has nothing to do with the change under test.
+
+Both settings live in `vw-cloud.toml` beside `vw.toml`, which `vw` adds to
+`.gitignore` — they describe a checkout, not the project, and committing one
+would send everybody on that branch to the same tree. Every sync prints which
+environment and workspace it is pushing to, and where each name came from.
 
 By default the vw client talks to the vw build service at
 `https://vw-cloud.dev`.
@@ -234,6 +265,11 @@ design and the driver are one project, and which files a build reads is not a
 line that stays put. `target/` is never sent in either direction, which is what
 lets Vivado checkpoints on an instance survive from one command to the next.
 
+Each instance keeps a tree, a content store and an artifact bucket per
+workspace, all keyed by the same name. Nothing declares which workspaces an
+environment has — one exists because somebody synchronized it — so
+`vw cloud workspaces` asks the instance rather than the service.
+
 Build output lands in the artifact instance's S3 store as it is produced.
 `vw cloud artifacts <env>` lists it and `--get <pattern>` downloads by glob
 (`'*.edif'`, `'reports/*place*'`), streamed through `vw-svc` so clients never
@@ -241,12 +277,22 @@ need to reach the artifact instance themselves.
 
 ```sh
 vw cloud list                       # your environments
-vw cloud get <env>                  # instance states and addresses
-vw cloud keys <env>                 # ssh key for the instances
-vw cloud sync <env> [--watch]       # push the workspace explicitly
-vw cloud artifacts <env> --get '*.pdi'
+vw cloud get                        # instance states and addresses
+vw cloud keys                       # ssh key for the instances
+vw cloud sync [--watch]             # push the workspace explicitly
+vw cloud artifacts --get '*.pdi'
+vw cloud workspaces [--sizes]       # what is on the environment
+vw cloud forget <workspace>         # remove one, with its artifacts
+vw cloud set workspace <name>       # this checkout's tree on the environment
+vw cloud set environment <name>     # the environment it builds in
 vw cloud admin list                 # every environment, for administrators
 ```
+
+Every command that takes an environment takes it as an optional argument,
+falling back to `$VW_ENV`, then to `vw-cloud.toml`, then to your only
+environment. `vw cloud create` and `vw cloud delete` are the exceptions: both
+name what they act on, because inferring it is meaningless for one and
+dangerous for the other.
 
 Running the service is documented in [`vw-svc/dist/`](vw-svc/dist).
 

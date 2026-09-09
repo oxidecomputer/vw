@@ -35,3 +35,11 @@ pub use crate::v2::RecycledImage;
 pub use crate::v3::ArtifactFlush;
 
 pub use crate::v4::AnodizeQuery;
+
+pub use crate::v5::Workspace;
+pub use crate::v5::WorkspaceArtifactPathParam;
+pub use crate::v5::WorkspaceBlobPathParam;
+pub use crate::v5::WorkspaceForgotten;
+pub use crate::v5::WorkspaceListQuery;
+pub use crate::v5::WorkspacePathParam;
+pub use crate::v5::WorkspaceTargetPathParam;

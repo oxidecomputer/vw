@@ -133,12 +133,19 @@ pub(crate) enum ArtifactError {
     Corrupt,
 }
 
-/// Remember where artifacts go, so a restart does not have to be told again.
+/// Remember where one workspace's artifacts go, so a restart does not have to
+/// be told again.
 ///
 /// The instance can reboot between one build and the next, and whoever told it
 /// where to put things may not think to say so a second time.
+///
+/// One file holding every workspace's answer rather than a file each. They are
+/// written one at a time and read all at once — at startup, to bring back what
+/// this instance already knew — and a directory of small files would make the
+/// second of those a walk in order to save nothing on the first.
 pub(crate) fn remember(
     path: &Utf8Path,
+    workspace: &str,
     credentials: &S3Credentials,
 ) -> Result<(), ArtifactError> {
     if let Some(parent) = path.parent() {
@@ -146,12 +153,18 @@ pub(crate) fn remember(
             .map_err(|e| ArtifactError::Write(parent.to_owned(), e))?;
     }
 
-    let encoded = serde_json::to_string_pretty(credentials)
+    // Read, amend, write. Two workspaces being told where their artifacts go
+    // at the same moment is possible, and the loser of a blind write would
+    // take the winner's entry out with it.
+    let mut targets = recall(path)?;
+    targets.insert(workspace.to_owned(), credentials.clone());
+
+    let encoded = serde_json::to_string_pretty(&targets)
         .map_err(|_| ArtifactError::Corrupt)?;
     std::fs::write(path, encoded)
         .map_err(|e| ArtifactError::Write(path.to_owned(), e))?;
 
-    // It holds a secret key.
+    // It holds secret keys.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -162,19 +175,33 @@ pub(crate) fn remember(
     Ok(())
 }
 
-/// What was remembered, if anything.
+/// Where each workspace's artifacts were last said to go.
 pub(crate) fn recall(
     path: &Utf8Path,
-) -> Result<Option<S3Credentials>, ArtifactError> {
+) -> Result<HashMap<String, S3Credentials>, ArtifactError> {
     if !path.is_file() {
-        return Ok(None);
+        return Ok(HashMap::new());
     }
 
     let stored = std::fs::read_to_string(path)
         .map_err(|e| ArtifactError::Read(path.to_owned(), e))?;
-    serde_json::from_str(&stored)
-        .map(Some)
-        .map_err(|_| ArtifactError::Corrupt)
+    serde_json::from_str(&stored).map_err(|_| ArtifactError::Corrupt)
+}
+
+/// Stop remembering a workspace's target, because the workspace is going.
+pub(crate) fn forget(
+    path: &Utf8Path,
+    workspace: &str,
+) -> Result<(), ArtifactError> {
+    let mut targets = recall(path)?;
+    if targets.remove(workspace).is_none() {
+        return Ok(());
+    }
+
+    let encoded = serde_json::to_string_pretty(&targets)
+        .map_err(|_| ArtifactError::Corrupt)?;
+    std::fs::write(path, encoded)
+        .map_err(|e| ArtifactError::Write(path.to_owned(), e))
 }
 
 /// Watch `root`'s image directory and upload whatever appears in it.
@@ -785,11 +812,46 @@ mod test {
         let (_dir, root) = scratch();
         let path = root.join("artifact-target.json");
 
-        remember(&path, &credentials()).expect("remember");
-        let recalled = recall(&path).expect("recall").expect("something");
+        remember(&path, "redhawk", &credentials()).expect("remember");
+        let recalled = recall(&path).expect("recall");
+        let target = recalled.get("redhawk").expect("something");
 
-        assert_eq!(recalled.bucket, "vivado-darmok");
-        assert_eq!(recalled.access_key_id, "GK00000000000000000000000");
+        assert_eq!(target.bucket, "vivado-darmok");
+        assert_eq!(target.access_key_id, "GK00000000000000000000000");
+    }
+
+    /// One instance holds several workspaces, each writing to its own
+    /// bucket, so remembering where one goes cannot be allowed to lose
+    /// where another does.
+    #[test]
+    fn one_workspace_target_does_not_displace_another() {
+        let (_dir, root) = scratch();
+        let path = root.join("artifact-target.json");
+
+        remember(&path, "redhawk", &credentials()).expect("remember");
+        let mut other = credentials();
+        other.bucket = "vivado-darmok-scratch".to_owned();
+        remember(&path, "scratch", &other).expect("remember");
+
+        let recalled = recall(&path).expect("recall");
+        assert_eq!(recalled.len(), 2);
+        assert_eq!(recalled["redhawk"].bucket, "vivado-darmok");
+        assert_eq!(recalled["scratch"].bucket, "vivado-darmok-scratch");
+    }
+
+    /// And forgetting one leaves the rest where they were.
+    #[test]
+    fn forgetting_one_target_keeps_the_others() {
+        let (_dir, root) = scratch();
+        let path = root.join("artifact-target.json");
+
+        remember(&path, "redhawk", &credentials()).expect("remember");
+        remember(&path, "scratch", &credentials()).expect("remember");
+        forget(&path, "scratch").expect("forget");
+
+        let recalled = recall(&path).expect("recall");
+        assert_eq!(recalled.len(), 1);
+        assert!(recalled.contains_key("redhawk"));
     }
 
     #[test]
@@ -797,7 +859,7 @@ mod test {
         let (_dir, root) = scratch();
         assert!(recall(&root.join("nothing.json"))
             .expect("recall")
-            .is_none());
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -807,7 +869,7 @@ mod test {
         let (_dir, root) = scratch();
         let path = root.join("artifact-target.json");
 
-        remember(&path, &credentials()).expect("remember");
+        remember(&path, "redhawk", &credentials()).expect("remember");
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);

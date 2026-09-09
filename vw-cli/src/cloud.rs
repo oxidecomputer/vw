@@ -194,8 +194,10 @@ pub enum CloudCommand {
     },
     #[command(about = "Show a remote build environment")]
     Get {
-        #[arg(help = "Environment name")]
-        name: String,
+        #[arg(help = "Environment name. Defaults to $VW_ENV, then to what \
+                    `vw cloud set environment` recorded for this checkout, \
+                    then to your only environment.")]
+        name: Option<String>,
     },
     #[command(about = "Delete a remote build environment")]
     Delete {
@@ -204,8 +206,11 @@ pub enum CloudCommand {
     },
     #[command(about = "Push the workspace to an environment's instances")]
     Sync {
-        #[arg(help = "Environment name")]
-        name: String,
+        #[arg(help = "Environment name. Defaults to $VW_ENV, then to what \
+                    `vw cloud set environment` recorded for this checkout, \
+                    then to your only environment.")]
+        name: Option<String>,
+
         #[arg(
             long,
             help = "Discard the instance's source tree first, so every file \
@@ -224,8 +229,11 @@ pub enum CloudCommand {
     },
     #[command(about = "List or download an environment's build artifacts")]
     Artifacts {
-        #[arg(help = "Environment name")]
-        name: String,
+        #[arg(help = "Environment name. Defaults to $VW_ENV, then to what \
+                    `vw cloud set environment` recorded for this checkout, \
+                    then to your only environment.")]
+        name: Option<String>,
+
         #[arg(
             long,
             value_name = "PATTERN",
@@ -269,6 +277,61 @@ pub enum CloudCommand {
         out: Option<Utf8PathBuf>,
     },
     #[command(
+        about = "List the workspaces synchronized to an environment",
+        long_about = "List the workspaces synchronized to an environment.\n\n\
+                      One environment holds a tree per workspace, keyed by \
+                      what `vw cloud set workspace` recorded for a checkout \
+                      or, failing that, by `[workspace] name` in its \
+                      vw.toml. Shows when each was last pushed to, so you \
+                      can tell which ones you are finished with."
+    )]
+    Workspaces {
+        #[arg(help = "Environment name. Defaults to $VW_ENV, then to what \
+                    `vw cloud set environment` recorded for this checkout, \
+                    then to your only environment.")]
+        name: Option<String>,
+        #[arg(
+            long,
+            help = "Measure what each workspace occupies. Takes a moment: it \
+                    means walking every file a build has written."
+        )]
+        sizes: bool,
+    },
+    #[command(
+        about = "Remove a workspace from an environment",
+        long_about = "Remove a workspace from an environment.\n\n\
+                      Its source tree on both instances, everything a build \
+                      wrote under it, and its artifacts. For a workspace that \
+                      was renamed, or stood for a branch you are done with — \
+                      nothing else ever removes one.\n\n\
+                      The artifacts cannot be recovered. The source can: it \
+                      came from a machine like this one and a sync puts it \
+                      back."
+    )]
+    Forget {
+        #[arg(help = "Workspace to remove")]
+        workspace: String,
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Environment to remove it from. Defaults the same way \
+                    every other command's does."
+        )]
+        env: Option<String>,
+    },
+    #[command(
+        about = "Record what this checkout does in the cloud",
+        long_about = "Record what this checkout does in the cloud.\n\n\
+                      Written to vw-cloud.toml beside vw.toml, and added to \
+                      .gitignore — these are facts about your checkout, not \
+                      about the project, and committing them would send \
+                      everyone who checks out this branch to the same place."
+    )]
+    Set {
+        #[command(subcommand)]
+        command: SetCommand,
+    },
+    #[command(
         about = "Administer the service — every environment, whoever owns it"
     )]
     Admin {
@@ -279,8 +342,11 @@ pub enum CloudCommand {
         about = "Download the ssh key that opens an environment's instances"
     )]
     Keys {
-        #[arg(help = "Environment name")]
-        name: String,
+        #[arg(help = "Environment name. Defaults to $VW_ENV, then to what \
+                    `vw cloud set environment` recorded for this checkout, \
+                    then to your only environment.")]
+        name: Option<String>,
+
         #[arg(
             long,
             value_name = "DIR",
@@ -288,6 +354,45 @@ pub enum CloudCommand {
                     already there. [default: ~/.ssh]"
         )]
         dir: Option<Utf8PathBuf>,
+    },
+}
+
+/// What this checkout can be told about the cloud.
+///
+/// A separate file from `vw.toml` because both of these are properties of a
+/// checkout rather than of the project. The workspace especially: two
+/// checkouts of one repository — `main` and a feature branch, say — want two
+/// trees on one environment, and the only way for them to disagree about which
+/// slot is theirs is for the answer to live somewhere git is not carrying
+/// between them.
+#[derive(Subcommand)]
+pub enum SetCommand {
+    #[command(
+        about = "The slot on the environment this checkout pushes to",
+        long_about = "The slot on the environment this checkout pushes to.\n\n\
+                      Defaults to `[workspace] name` from vw.toml, which is \
+                      right until a second checkout of the same project needs \
+                      a tree of its own.\n\n\
+                      This is only the key: which directory the tree goes in, \
+                      and which bucket its artifacts land in. It does not \
+                      change `[workspace] name`, which is what the design's \
+                      own imports resolve through — so both checkouts still \
+                      build exactly what they would have built."
+    )]
+    Workspace {
+        #[arg(
+            help = "Name for this checkout's slot. Lowercase letters, digits \
+                    and '-'. Omit to go back to using vw.toml's name."
+        )]
+        name: Option<String>,
+    },
+    #[command(about = "The environment this checkout builds in")]
+    Environment {
+        #[arg(
+            help = "Environment name. Omit to stop pinning one and go back to \
+                    $VW_ENV or your only environment."
+        )]
+        name: Option<String>,
     },
 }
 
@@ -335,11 +440,21 @@ pub enum CloudError {
     )]
     NoEnvironments,
     #[error(
-        "you have several cloud environments ({}); say which with --env, or \
+        "you have several cloud environments ({}); say which with --env, set \
+         one for this checkout with `vw cloud set environment <name>`, or \
          pass --local to build on this machine",
         .0.join(", ")
     )]
     AmbiguousEnvironment(Vec<String>),
+    #[error(
+        "the workspace name '{0}' in {} cannot be used: {1}",
+        crate::cloud_config::FILE
+    )]
+    BadWorkspaceName(String, String),
+    #[error("reading this checkout's cloud settings")]
+    CloudConfig(#[from] crate::cloud_config::ConfigError),
+    #[error("reading the workspace configuration")]
+    WorkspaceConfig(#[source] vw_lib::VwError),
     #[error("nothing matches '{0}'; run `vw cloud artifacts <env>` to see what there is")]
     NoSuchArtifact(String),
     #[error("'{0}' is not a valid pattern: {1}")]
@@ -457,7 +572,11 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             )
             .await
         }
-        CloudCommand::Get { name } => get(&session, &name).await,
+        CloudCommand::Get { name } => {
+            let environment =
+                environment_only(&session, name.as_deref()).await?;
+            get(&session, &environment).await
+        }
         CloudCommand::Delete { name } => delete(&session, &name).await,
         CloudCommand::Artifacts {
             name,
@@ -467,11 +586,22 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             flush,
             out,
         } => {
-            artifacts(&session, &name, &get, all, clear, flush, out.as_deref())
-                .await
+            let target = resolve_target(&session, name.as_deref()).await?;
+            artifacts(
+                &session,
+                &target,
+                &get,
+                all,
+                clear,
+                flush,
+                out.as_deref(),
+            )
+            .await
         }
         CloudCommand::Keys { name, dir } => {
-            fetch_keys(&session, &name, dir.as_deref()).await
+            let environment =
+                environment_only(&session, name.as_deref()).await?;
+            fetch_keys(&session, &environment, dir.as_deref()).await
         }
         CloudCommand::Sync {
             name,
@@ -479,11 +609,12 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             watch,
             debounce,
         } => {
+            let target = resolve_target(&session, name.as_deref()).await?;
             crate::cloud_sync::run(
                 // `vw cloud sync` is the command that means "everything", so
                 // it is the one place with no filter.
                 &session,
-                &name,
+                &target,
                 force,
                 watch,
                 std::time::Duration::from_millis(debounce),
@@ -491,9 +622,228 @@ pub async fn run(args: CloudArgs) -> Result<(), CloudError> {
             )
             .await
         }
+        CloudCommand::Workspaces { name, sizes } => {
+            let environment =
+                environment_only(&session, name.as_deref()).await?;
+            workspaces(&session, &environment, sizes).await
+        }
+        CloudCommand::Forget { workspace, env } => {
+            let environment =
+                environment_only(&session, env.as_deref()).await?;
+            forget(&session, &environment, &workspace).await
+        }
+        CloudCommand::Set { command } => set(&session, command).await,
         // Handled before the user session is built.
         CloudCommand::Admin { .. } => unreachable!(),
     }
+}
+
+/// Which environment a command acts on, for the ones that do not act on a
+/// tree.
+///
+/// `vw cloud get`, `keys`, `workspaces` and `forget` are about the environment
+/// itself, and three of the four can reasonably be run from outside a
+/// workspace altogether. So this resolves the environment the same way
+/// [`resolve_target`] does and simply never asks about a slot — a missing
+/// `vw.toml` is not an obstacle to asking what an environment is doing.
+async fn environment_only(
+    session: &Session,
+    named: Option<&str>,
+) -> Result<String, CloudError> {
+    if let Some(name) = named {
+        return Ok(name.to_owned());
+    }
+    if let Ok(name) = std::env::var("VW_ENV") {
+        if !name.is_empty() {
+            return Ok(name);
+        }
+    }
+    if let Ok(dir) = crate::cloud_sync::workspace_root() {
+        if let Some(name) = crate::cloud_config::load(&dir)?.environment {
+            return Ok(name);
+        }
+    }
+
+    let environments =
+        vw_api_client::retrying(|| session.client.get_environments())
+            .await
+            .map_err(|e| session.error(e))?
+            .into_inner()
+            .items;
+
+    match environments.len() {
+        0 => Err(CloudError::NoEnvironments),
+        1 => Ok(environments[0].name.clone()),
+        _ => Err(CloudError::AmbiguousEnvironment(
+            environments.iter().map(|e| e.name.clone()).collect(),
+        )),
+    }
+}
+
+/// List the workspaces an environment is holding.
+async fn workspaces(
+    session: &Session,
+    environment: &str,
+    sizes: bool,
+) -> Result<(), CloudError> {
+    let held = vw_api_client::retrying(|| {
+        session.client.get_workspaces(environment, Some(sizes))
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
+
+    if held.is_empty() {
+        println!(
+            "{} nothing has been synchronized to {environment} yet",
+            "\u{2713}".bright_green(),
+        );
+        return Ok(());
+    }
+
+    // Which slot this checkout occupies, so the listing can point at it. A
+    // command run from outside a workspace simply has nothing to point at.
+    let mine = crate::cloud_sync::workspace_root()
+        .ok()
+        .and_then(|dir| workspace_slot(&dir).ok())
+        .map(|(name, _)| name);
+
+    for workspace in &held {
+        let here = if Some(&workspace.name) == mine.as_ref() {
+            " (this checkout)".bright_black().to_string()
+        } else {
+            String::new()
+        };
+        let size = if sizes {
+            format!("  {}", human_bytes(workspace.bytes).bright_black())
+        } else {
+            String::new()
+        };
+        println!(
+            "{}  {}{}{}",
+            workspace.name.cyan(),
+            since(workspace.last_synced).bright_black(),
+            size,
+            here,
+        );
+    }
+
+    Ok(())
+}
+
+/// How long ago a workspace was last pushed to, in words.
+///
+/// Rounded hard and deliberately: this answers "am I still using this", and
+/// nobody deciding that needs minutes.
+fn since(last_synced: Option<u64>) -> String {
+    let Some(at) = last_synced else {
+        return String::from("never synced");
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let ago = now.saturating_sub(at);
+
+    match ago {
+        0..=3599 => String::from("synced within the hour"),
+        3600..=86399 => format!("synced {}h ago", ago / 3600),
+        _ => format!("synced {}d ago", ago / 86400),
+    }
+}
+
+/// Remove a workspace from an environment.
+async fn forget(
+    session: &Session,
+    environment: &str,
+    workspace: &str,
+) -> Result<(), CloudError> {
+    let forgotten = vw_api_client::retrying(|| {
+        session.client.forget_workspace(environment, workspace)
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
+
+    if forgotten.trees.is_empty() && forgotten.artifacts == 0 {
+        println!(
+            "{} '{workspace}' was not on {environment}",
+            "\u{2713}".bright_green(),
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} forgot {} ({} {}, {} artifacts, {})",
+        "\u{2713}".bright_green(),
+        workspace.cyan(),
+        forgotten.trees.len(),
+        if forgotten.trees.len() == 1 {
+            "tree"
+        } else {
+            "trees"
+        },
+        forgotten.artifacts,
+        human_bytes(forgotten.bytes),
+    );
+
+    Ok(())
+}
+
+/// Record what this checkout does in the cloud.
+async fn set(session: &Session, command: SetCommand) -> Result<(), CloudError> {
+    let dir = crate::cloud_sync::workspace_root()?;
+    let mut settings = crate::cloud_config::load(&dir)?;
+
+    match command {
+        SetCommand::Workspace { name } => {
+            if let Some(name) = &name {
+                vw_lib::validate_workspace_name(name).map_err(|e| {
+                    CloudError::BadWorkspaceName(name.clone(), e)
+                })?;
+            }
+            settings.workspace = name;
+        }
+        SetCommand::Environment { name } => {
+            // Checked against the service, and only warned about. Pinning an
+            // environment before creating it is a reasonable thing to do, and
+            // so is doing this on a train — but a typo found now beats one
+            // found as a confusing failure on the next sync.
+            if let Some(name) = &name {
+                match vw_api_client::retrying(|| {
+                    session.client.get_environment(name)
+                })
+                .await
+                {
+                    Ok(_) => {}
+                    Err(e) => println!(
+                        "{} could not confirm '{name}' exists: {}",
+                        "warning:".yellow(),
+                        session.error(e),
+                    ),
+                }
+            }
+            settings.environment = name;
+        }
+    }
+
+    crate::cloud_config::save(&dir, &settings)?;
+
+    let (workspace, workspace_from) = workspace_slot(&dir)?;
+    println!(
+        "{} {} {}",
+        "\u{2713}".bright_green(),
+        crate::cloud_config::path(&dir).as_str().bright_black(),
+        format!(
+            "environment {} · workspace {} ({})",
+            settings.environment.as_deref().unwrap_or("unset"),
+            workspace,
+            workspace_from.describe(),
+        )
+        .bright_black(),
+    );
+
+    Ok(())
 }
 
 /// A connection to the service's administrative API.
@@ -805,6 +1155,27 @@ async fn create(
         "✓".bright_green(),
         name.cyan()
     );
+
+    // Almost certainly what this checkout wants, and it saves the follow-up
+    // command. Only when there is a workspace here to record it in, and only
+    // when nothing has been recorded already — somebody creating a second
+    // environment from a checkout already pinned to one did not mean to
+    // repoint it.
+    if let Ok(dir) = crate::cloud_sync::workspace_root() {
+        let mut settings = crate::cloud_config::load(&dir)?;
+        if settings.environment.is_none() {
+            settings.environment = Some(name.to_owned());
+            crate::cloud_config::save(&dir, &settings)?;
+            println!(
+                "  {}",
+                format!(
+                    "recorded in {} — this checkout builds here now",
+                    crate::cloud_config::FILE
+                )
+                .bright_black(),
+            );
+        }
+    }
 
     // The environment exists either way, so a key that cannot be saved is a
     // warning and a recovery instruction rather than a failure. Reporting an
@@ -1171,12 +1542,13 @@ fn access_token() -> Result<Option<String>, CloudError> {
 /// the one before it.
 pub async fn open_vivado_session(
     session: &Session,
-    environment: &str,
+    target: &Target,
     params: vw_remote::SessionParams,
 ) -> Result<vw_remote::RemoteBackend<reqwest::Upgraded>, CloudError> {
     let upgraded = vw_api_client::retrying(|| {
         session.client.vivado_session(
-            environment,
+            &target.environment,
+            &target.workspace,
             Some(params.info_with_stack),
             params.part.as_deref(),
             params.variant.as_deref(),
@@ -1202,17 +1574,126 @@ pub async fn open_vivado_session(
     Ok(vw_remote::RemoteBackend::new(socket))
 }
 
-/// Which environment a bare `vw run` should use.
+/// How a name was arrived at, for the line that says which one is being used.
 ///
-/// Named explicitly, or inferred when there is no ambiguity to resolve. Two
-/// environments and no `--env` is a question only the developer can answer,
-/// and guessing at it would run a build somewhere they did not intend.
-pub async fn pick_environment(
+/// Worth reporting. An environment holding several workspaces means two
+/// checkouts can land in one slot and overwrite each other, and the only thing
+/// standing between a developer and that is being told which slot they are
+/// pushing to and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chose {
+    /// Said explicitly: an argument, or `$VW_ENV`.
+    Named,
+    /// `vw-cloud.toml`, in this checkout.
+    File,
+    /// `[workspace] name`, from `vw.toml`.
+    Manifest,
+    /// The only environment there is.
+    Inferred,
+}
+
+impl Chose {
+    fn describe(&self) -> &'static str {
+        match self {
+            Chose::Named => "named",
+            Chose::File => crate::cloud_config::FILE,
+            Chose::Manifest => "vw.toml",
+            Chose::Inferred => "the only one",
+        }
+    }
+}
+
+/// Which environment a command acts on, and which slot on it.
+///
+/// One value rather than two arguments, because they travel together through
+/// every call from here down and a signature taking two strings of the same
+/// type is a signature somebody eventually passes backwards.
+pub struct Target {
+    pub environment: String,
+    pub workspace: String,
+    environment_from: Chose,
+    workspace_from: Chose,
+}
+
+impl Target {
+    /// Say which environment and slot this is, and how each was decided.
+    ///
+    /// Printed by anything that pushes. "Why did my feature branch overwrite
+    /// main" has no visible cause otherwise.
+    pub fn announce(&self) {
+        println!(
+            "{} {} {} {} {}",
+            "\u{2192}".bright_black(),
+            self.environment.cyan(),
+            format!("({})", self.environment_from.describe()).bright_black(),
+            self.workspace.cyan(),
+            format!("({})", self.workspace_from.describe()).bright_black(),
+        );
+    }
+}
+
+/// The slot this checkout occupies, and what said so.
+///
+/// `vw-cloud.toml` first, so a second checkout of one project can take a slot
+/// of its own; `vw.toml` otherwise, which is what a single checkout wants and
+/// never has to think about.
+///
+/// Deliberately not the same value as `[workspace] name` when the two differ.
+/// That name is what the workspace's own imports resolve through and what
+/// `vw::project_name` reports, and moving it would change what gets built
+/// rather than only where it is kept.
+pub fn workspace_slot(
+    workspace_dir: &Utf8Path,
+) -> Result<(String, Chose), CloudError> {
+    let settings = crate::cloud_config::load(workspace_dir)?;
+    if let Some(name) = settings.workspace {
+        vw_lib::validate_workspace_name(&name)
+            .map_err(|e| CloudError::BadWorkspaceName(name.clone(), e))?;
+        return Ok((name, Chose::File));
+    }
+
+    let config = vw_lib::load_workspace_config(workspace_dir)
+        .map_err(CloudError::WorkspaceConfig)?;
+    Ok((config.workspace.name, Chose::Manifest))
+}
+
+/// Which environment and slot a command should act on.
+///
+/// The environment is settled in order: what was said, then what this checkout
+/// records, then the only one there is. Two environments, nothing said and
+/// nothing recorded is a question only the developer can answer, and guessing
+/// would build somewhere they did not intend.
+pub async fn resolve_target(
     session: &Session,
     named: Option<&str>,
-) -> Result<String, CloudError> {
-    if let Some(name) = named {
-        return Ok(name.to_owned());
+) -> Result<Target, CloudError> {
+    let workspace_dir = crate::cloud_sync::workspace_root()?;
+    let (workspace, workspace_from) = workspace_slot(&workspace_dir)?;
+    let settings = crate::cloud_config::load(&workspace_dir)?;
+
+    // `$VW_ENV` arrives already folded into `named` for the commands clap
+    // reads it for, and is read here for `vw cloud`, which has nowhere to put
+    // a flag. Either way somebody said it, which is what `Named` records.
+    let said = named
+        .map(str::to_owned)
+        .or_else(|| std::env::var("VW_ENV").ok().filter(|v| !v.is_empty()));
+
+    if let Some(environment) = said {
+        return Ok(Target {
+            environment,
+            workspace,
+            environment_from: Chose::Named,
+            workspace_from,
+        });
+    }
+
+    if let Some(environment) = settings.environment {
+        return Ok(Target {
+            environment,
+            workspace,
+            environment_from: Chose::File,
+            workspace_from,
+        });
     }
 
     let environments =
@@ -1224,7 +1705,12 @@ pub async fn pick_environment(
 
     match environments.len() {
         0 => Err(CloudError::NoEnvironments),
-        1 => Ok(environments[0].name.clone()),
+        1 => Ok(Target {
+            environment: environments[0].name.clone(),
+            workspace,
+            environment_from: Chose::Inferred,
+            workspace_from,
+        }),
         _ => Err(CloudError::AmbiguousEnvironment(
             environments.iter().map(|e| e.name.clone()).collect(),
         )),
@@ -1255,9 +1741,9 @@ impl Session {
 /// Remove the build output on an environment's instances.
 pub async fn clean_build_output(
     session: &Session,
-    environment: &str,
+    target: &Target,
 ) -> Result<(), CloudError> {
-    crate::cloud_sync::clean(session, environment).await
+    crate::cloud_sync::clean(session, target).await
 }
 
 /// Push the workspace to an environment before building in it.
@@ -1266,12 +1752,12 @@ pub async fn clean_build_output(
 /// code the developer is looking at.
 pub async fn sync_for_build(
     session: &Session,
-    environment: &str,
+    target: &Target,
     only: Option<vw_api_types_versions::latest::TargetKind>,
 ) -> Result<(), CloudError> {
     crate::cloud_sync::run(
         session,
-        environment,
+        target,
         false,
         false,
         std::time::Duration::from_millis(0),
@@ -1289,7 +1775,7 @@ pub async fn sync_for_build(
 /// people want it.
 async fn artifacts(
     session: &Session,
-    environment: &str,
+    target: &Target,
     get: &[String],
     all: bool,
     clear: bool,
@@ -1297,18 +1783,21 @@ async fn artifacts(
     out: Option<&Utf8Path>,
 ) -> Result<(), CloudError> {
     if clear {
-        return clear_artifacts(session, environment).await;
+        return clear_artifacts(session, target).await;
     }
 
     if flush {
-        flush_artifacts(session, environment).await;
+        flush_artifacts(session, target).await;
     }
 
-    let available =
-        vw_api_client::retrying(|| session.client.get_artifacts(environment))
-            .await
-            .map_err(|e| session.error(e))?
-            .into_inner();
+    let available = vw_api_client::retrying(|| {
+        session
+            .client
+            .get_artifacts(&target.environment, &target.workspace)
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
 
     let wanted: Vec<&vw_api_types_versions::latest::Artifact> = if all {
         available.iter().collect()
@@ -1329,7 +1818,7 @@ async fn artifacts(
         .map_err(|e| CloudError::KeyDir(directory.to_owned(), e))?;
 
     for artifact in wanted {
-        download(session, environment, artifact, directory).await?;
+        download(session, target, artifact, directory).await?;
     }
 
     Ok(())
@@ -1347,9 +1836,11 @@ async fn artifacts(
 ///
 /// A caller that needs the failure to be fatal gets it from `--get`, which
 /// already refuses a pattern that matches nothing.
-async fn flush_artifacts(session: &Session, environment: &str) {
+async fn flush_artifacts(session: &Session, target: &Target) {
     let flushed = match vw_api_client::retrying(|| {
-        session.client.flush_artifacts(environment)
+        session
+            .client
+            .flush_artifacts(&target.environment, &target.workspace)
     })
     .await
     {
@@ -1452,13 +1943,16 @@ fn select<'a>(
 /// went, since that is the only record left of it.
 async fn clear_artifacts(
     session: &Session,
-    environment: &str,
+    target: &Target,
 ) -> Result<(), CloudError> {
-    let cleared =
-        vw_api_client::retrying(|| session.client.clear_artifacts(environment))
-            .await
-            .map_err(|e| session.error(e))?
-            .into_inner();
+    let cleared = vw_api_client::retrying(|| {
+        session
+            .client
+            .clear_artifacts(&target.environment, &target.workspace)
+    })
+    .await
+    .map_err(|e| session.error(e))?
+    .into_inner();
 
     if cleared.removed == 0 {
         println!("{}", "nothing stored to clear".bright_black());
@@ -1536,16 +2030,19 @@ fn source_order(kind: vw_api_types_versions::latest::TargetKind) -> u8 {
 /// Fetch one artifact into `directory`.
 async fn download(
     session: &Session,
-    environment: &str,
+    target: &Target,
     artifact: &vw_api_types_versions::latest::Artifact,
     directory: &Utf8Path,
 ) -> Result<(), CloudError> {
     use futures::StreamExt;
 
     let response = vw_api_client::retrying(|| {
-        session
-            .client
-            .get_artifact(environment, &artifact.kind, &artifact.name)
+        session.client.get_artifact(
+            &target.environment,
+            &target.workspace,
+            &artifact.kind,
+            &artifact.name,
+        )
     })
     .await
     .map_err(|e| session.error(e))?;
@@ -1634,11 +2131,13 @@ fn human_bytes(bytes: u64) -> String {
 /// one round trip, which matters because this runs before every check.
 pub async fn fetch_generated_ip(
     session: &Session,
-    environment: &str,
+    target: &Target,
     workspace: &Utf8Path,
 ) -> Result<usize, CloudError> {
     let manifest = vw_api_client::retrying(|| {
-        session.client.generated_manifest(environment)
+        session
+            .client
+            .generated_manifest(&target.environment, &target.workspace)
     })
     .await
     .map_err(|e| session.error(e))?
@@ -1657,7 +2156,11 @@ pub async fn fetch_generated_ip(
         }
 
         let contents = vw_api_client::retrying(|| {
-            session.client.generated_file(environment, &entry.path)
+            session.client.generated_file(
+                &target.environment,
+                &target.workspace,
+                &entry.path,
+            )
         })
         .await
         .map_err(|e| session.error(e))?
