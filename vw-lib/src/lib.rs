@@ -41,6 +41,7 @@ use vw_core::parse_entities;
 
 pub mod bench_init;
 pub mod cosim;
+pub mod depcache;
 pub mod parts;
 pub mod sim;
 
@@ -1307,6 +1308,11 @@ async fn build_dependency_graph(
         dependencies: BTreeMap::new(),
     });
     let deps_dir = deps_directory()?;
+    // Reclaim what a killed process left behind. Here rather than in
+    // `deps_directory`, which every cache reader calls and none of
+    // them can orphan anything: this is the one place a download is
+    // about to happen, and once per resolution is enough.
+    depcache::sweep(&deps_dir);
     let mut graph: DiGraph<DepGraphNode, ()> = DiGraph::new();
     // First-seen (entry-wins) node per dep name; also the cycle guard.
     let mut node_by_name: HashMap<String, NodeIndex> = HashMap::new();
@@ -1376,21 +1382,22 @@ async fn build_dependency_graph(
                             })?,
                         };
                     let root = deps_dir.join(format!("{name}-{sha}"));
-                    // A dir left by a PARTIAL/failed prior download
-                    // (created but empty) must not count as cached.
-                    let was_cached = root.exists()
-                        && fs::read_dir(&root)
-                            .map(|mut d| d.next().is_some())
-                            .unwrap_or(false);
+                    // Only a published tree counts. A directory that
+                    // merely exists is either a download in flight or
+                    // one that was killed, and building against
+                    // either is how half a dependency gets linked.
+                    let was_cached = depcache::is_complete(&root);
                     if !was_cached {
-                        if root.exists() {
-                            let _ = fs::remove_dir_all(&root);
-                        }
+                        // Assembled somewhere private and moved into
+                        // place whole, so that a second process
+                        // fetching this same dependency neither sees
+                        // ours part-written nor writes over it.
+                        let staged = depcache::Staged::new(&deps_dir)?;
                         download_dependency(
                             repo,
                             &sha,
                             &dep.src,
-                            &root,
+                            staged.path(),
                             dep.recursive,
                             &dep.exclude,
                             *submodules,
@@ -1405,6 +1412,7 @@ async fn build_dependency_graph(
                             ),
                             }
                         })?;
+                        staged.publish(&root)?;
                     }
                     let root =
                         Utf8PathBuf::from_path_buf(root).map_err(|p| {
@@ -1522,13 +1530,20 @@ pub fn dependencies_present(workspace_dir: &Utf8Path) -> bool {
     else {
         return true;
     };
+    let Ok(deps_dir) = deps_directory() else {
+        return true;
+    };
     for (_name, path) in paths {
-        // Path deps resolve to real source trees (always present); git
-        // deps resolve into the cache and may be absent or empty.
-        let present = path.exists()
-            && fs::read_dir(&path)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
+        // Path deps resolve to real source trees, which are present by
+        // definition and carry no marker of their own. Git deps
+        // resolve into the cache, where only a published tree counts:
+        // a `vw clear`ed entry, or one a killed download left behind,
+        // is as absent as one that was never fetched at all.
+        let present = if path.starts_with(&deps_dir) {
+            depcache::is_complete(&path)
+        } else {
+            path.exists()
+        };
         if !present {
             return false;
         }
@@ -1678,6 +1693,16 @@ pub fn clear_cache(workspace_dir: &Utf8Path) -> Result<Vec<String>> {
                     if file_name_str.starts_with(&format!("{name}-")) {
                         let dep_path = entry.path();
                         if dep_path.is_dir() {
+                            // Retract it before removing it. The cache
+                            // is shared, so another workspace may be
+                            // about to read this tree; with the marker
+                            // gone nothing considers it usable, and
+                            // whoever wanted it fetches a copy of its
+                            // own rather than reading one that is
+                            // disappearing underneath them.
+                            let _ = fs::remove_file(
+                                dep_path.join(depcache::COMPLETE_MARKER),
+                            );
                             fs::remove_dir_all(&dep_path)
                                 .map_err(|e| VwError::FileSystem {
                                     message: format!("Failed to remove cached dependency at {dep_path:?}: {e}")
@@ -3957,12 +3982,15 @@ fn find_cached_vhdl_stdlib(deps_dir: &Path) -> Option<Utf8PathBuf> {
         if !entry.file_name().to_string_lossy().starts_with("rust_hdl-") {
             continue;
         }
+        // Published or nothing: a checkout still being copied here
+        // has a `vhdl_libraries` long before it has all of it, and
+        // handing that to vhdl_lang produces errors about the
+        // standard library that lead nowhere.
+        if !depcache::is_complete(&entry.path()) {
+            continue;
+        }
         let libs = entry.path().join("vhdl_libraries");
-        let present = libs.exists()
-            && fs::read_dir(&libs)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
-        if present {
+        if libs.is_dir() {
             if let Ok(u) = Utf8PathBuf::from_path_buf(libs) {
                 return Some(u);
             }
@@ -3980,6 +4008,7 @@ fn find_cached_vhdl_stdlib(deps_dir: &Path) -> Option<Utf8PathBuf> {
 /// `download_dependency` machinery as any other git dependency.
 pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
     let deps_dir = deps_directory()?;
+    depcache::sweep(&deps_dir);
     if let Some(libs) = find_cached_vhdl_stdlib(&deps_dir) {
         return Ok(libs);
     }
@@ -3991,20 +4020,13 @@ pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
     )
     .await?;
     let dep_path = deps_dir.join(format!("rust_hdl-{sha}"));
-    let libs = dep_path.join("vhdl_libraries");
-    let present = libs.exists()
-        && fs::read_dir(&libs)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-    if !present {
-        if dep_path.exists() {
-            let _ = fs::remove_dir_all(&dep_path);
-        }
+    if !depcache::is_complete(&dep_path) {
+        let staged = depcache::Staged::new(&deps_dir)?;
         download_dependency(
             VHDL_STDLIB_REPO,
             &sha,
             &[],
-            &dep_path,
+            staged.path(),
             false,
             &[],
             false,
@@ -4012,7 +4034,9 @@ pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
             Some("vhdl_libraries"),
         )
         .await?;
+        staged.publish(&dep_path)?;
     }
+    let libs = dep_path.join("vhdl_libraries");
     Utf8PathBuf::from_path_buf(libs).map_err(|p| VwError::FileSystem {
         message: format!("VHDL stdlib path is not UTF-8: {}", p.display()),
     })
@@ -5685,14 +5709,21 @@ mod locked_resolution_tests {
 
     /// A dependency already downloaded: what every CI worker's cache looks
     /// like once the first job in the pipeline has run.
+    ///
+    /// Published the way a real fetch publishes it rather than written
+    /// straight into place, so that what the cache checks look for
+    /// here is exactly what they look for in earnest — a tree that
+    /// merely exists is not one anybody is entitled to read.
     fn seed_cache(name: &str, sha: &str) {
-        let root = deps_cache().join(format!("{name}-{sha}"));
-        fs::create_dir_all(&root).unwrap();
+        let cache = deps_cache();
+        let staged = depcache::Staged::new(cache.as_std_path()).unwrap();
         fs::write(
-            root.join("vw.toml"),
+            staged.path().join("vw.toml"),
             format!("[workspace]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
         )
         .unwrap();
+        let root = cache.join(format!("{name}-{sha}"));
+        staged.publish(root.as_std_path()).unwrap();
     }
 
     /// A workspace whose only dependency is `name`, declared and locked as
