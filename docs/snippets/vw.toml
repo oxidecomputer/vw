@@ -1,5 +1,5 @@
 [workspace]
-name = "."
+name = "my-design"
 version = "0.1.0"
 variants = []
 top = "top"

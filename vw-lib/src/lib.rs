@@ -1035,6 +1035,9 @@ pub fn init_workspace(
             message: format!("vw.toml already exists in {workspace_dir}"),
         });
     }
+    // Before anything is written, so a name the loader would refuse
+    // never becomes a workspace that cannot be opened again.
+    validate_workspace_name(&name)?;
 
     let target_parts = target_part
         .map(|part| {
@@ -4634,8 +4637,68 @@ pub fn load_workspace_config(
         })?;
 
     let config: WorkspaceConfig = toml::from_str(&config_content)?;
+    validate_workspace_name(&config.workspace.name)?;
     validate_variant_shape(&config.workspace)?;
     Ok(config)
+}
+
+/// The longest a workspace name may be on its own.
+///
+/// The name becomes the last component of an object store bucket
+/// called `{kind}-{environment}-{workspace}`, and S3 stops at 63
+/// characters. A fixed cap here cannot be the whole check — how much
+/// room is left over depends on an environment name this side has
+/// never heard of — so the assembled name is checked again where both
+/// halves are known. What this catches is the name that would not
+/// have fitted whatever it was paired with.
+const MAX_WORKSPACE_NAME: usize = 40;
+
+/// Reject a workspace name that cannot do what a workspace name is
+/// used for.
+///
+/// Checked when `vw.toml` is parsed, so a bad name stops every
+/// command rather than only the ones that reach a cloud environment.
+/// That is deliberate: the name is not decoration. It is the module a
+/// workspace's own imports resolve through (`src @foo/bar`), the
+/// answer `vw::project_name` hands a design, and — once one cloud
+/// environment holds several workspaces — a directory on a build
+/// instance and a bucket in an object store. Somewhere in that list
+/// is a rule every candidate name has to satisfy, and the moment to
+/// hear about a name that does not is `vw init`, not a first sync
+/// months later.
+pub fn validate_workspace_name(name: &str) -> Result<()> {
+    let reject = |message: String| Err(VwError::Config { message });
+
+    if name.is_empty() {
+        return reject(String::from("`[workspace] name` cannot be empty"));
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return reject(format!(
+            "`[workspace] name` '{name}' must start with a lowercase letter"
+        ));
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'))
+    {
+        return reject(format!(
+            "`[workspace] name` '{name}' cannot contain '{c}'; only              lowercase letters, digits and '-' are allowed"
+        ));
+    }
+    // It is the tail of a bucket name, and a bucket name cannot end
+    // with one.
+    if name.ends_with('-') {
+        return reject(format!(
+            "`[workspace] name` '{name}' cannot end with '-'"
+        ));
+    }
+    if name.len() > MAX_WORKSPACE_NAME {
+        return reject(format!(
+            "`[workspace] name` '{name}' is {} characters; the limit is              {MAX_WORKSPACE_NAME}",
+            name.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Post-deserialize validation for the `[[target-parts]]` /
@@ -8588,5 +8651,103 @@ mod download_tests {
             dest.join("meta_sync.vhd").exists(),
             "the pinned revision's sources are in the cache"
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_name_tests {
+    use super::*;
+
+    fn rejected(name: &str) -> String {
+        match validate_workspace_name(name) {
+            Err(VwError::Config { message }) => message,
+            Err(other) => panic!("unexpected error for '{name}': {other}"),
+            Ok(()) => panic!("'{name}' was accepted"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_name_is_accepted() {
+        validate_workspace_name("redhawk").unwrap();
+    }
+
+    /// Hyphens are fine here, unlike in an environment name — that ban
+    /// exists because instance names are parsed by splitting on `-`,
+    /// and a workspace name never becomes part of one.
+    #[test]
+    fn a_hyphenated_name_is_accepted() {
+        validate_workspace_name("clk-wizard").unwrap();
+        validate_workspace_name("a1-b2-c3").unwrap();
+    }
+
+    #[test]
+    fn a_name_must_say_something() {
+        assert!(rejected("").contains("cannot be empty"));
+    }
+
+    /// A bucket name cannot end with a hyphen, and the workspace is
+    /// the tail of one.
+    #[test]
+    fn a_name_may_not_end_with_a_hyphen() {
+        assert!(rejected("redhawk-").contains("cannot end with '-'"));
+    }
+
+    #[test]
+    fn a_name_must_start_with_a_letter() {
+        assert!(rejected("2fast").contains("must start with"));
+        assert!(rejected("-leading").contains("must start with"));
+    }
+
+    #[test]
+    fn uppercase_and_underscores_are_out() {
+        assert!(rejected("Redhawk").contains("must start with"));
+        assert!(rejected("red_hawk").contains("cannot contain '_'"));
+        assert!(rejected("redHawk").contains("cannot contain 'H'"));
+    }
+
+    /// The one in `docs/snippets/vw.toml` until this landed, and the
+    /// reason a name has to be checked before it becomes a directory.
+    #[test]
+    fn a_name_that_is_a_path_component_is_out() {
+        assert!(rejected(".").contains("must start with"));
+        assert!(rejected("..").contains("must start with"));
+        assert!(rejected("a/b").contains("cannot contain '/'"));
+    }
+
+    #[test]
+    fn a_name_too_long_for_a_bucket_is_out() {
+        let long = "a".repeat(MAX_WORKSPACE_NAME + 1);
+        assert!(rejected(&long).contains("the limit is"));
+        validate_workspace_name(&"a".repeat(MAX_WORKSPACE_NAME)).unwrap();
+    }
+
+    /// The loader is where the invariant is actually held: a bad name
+    /// stops every command, not only the ones that reach the cloud.
+    #[test]
+    fn the_loader_refuses_a_bad_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = Utf8Path::from_path(dir.path()).unwrap();
+        fs::write(
+            dir.join("vw.toml"),
+            "[workspace]\nname = \"Red_Hawk\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let e = load_workspace_config(dir).unwrap_err();
+        assert!(e.to_string().contains("Red_Hawk"), "{e}");
+    }
+
+    /// And `vw init` refuses it first, so nobody ends up with a
+    /// workspace that cannot be opened again.
+    #[test]
+    fn init_refuses_a_name_the_loader_would_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = Utf8Path::from_path(dir.path()).unwrap();
+
+        let e =
+            init_workspace(dir, String::from("Red_Hawk"), None).unwrap_err();
+
+        assert!(e.to_string().contains("Red_Hawk"), "{e}");
+        assert!(!dir.join("vw.toml").exists(), "a vw.toml was left behind");
     }
 }
