@@ -74,6 +74,12 @@ Both settings live in `vw-cloud.toml` beside `vw.toml`, which `vw` adds to
 would send everybody on that branch to the same tree. Every sync prints which
 environment and workspace it is pushing to, and where each name came from.
 
+A `vw` older than workspaces still works against a current service: it names no
+workspace, so it gets a reserved one called `default`, entirely its own. That
+is why `vw cloud workspaces` may list a `default` nobody created — it is
+whatever has been synced by a client that has not been upgraded yet, and
+`vw cloud forget default` removes it like any other.
+
 By default the vw client talks to the vw build service at
 `https://vw-cloud.dev`.
 

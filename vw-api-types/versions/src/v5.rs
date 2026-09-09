@@ -24,9 +24,29 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::v1;
 use crate::v1::{Digest, TargetKind};
 
+/// The workspace a request that predates this version is taken to mean.
+///
+/// Every endpoint before `WORKSPACES` named an environment and nothing
+/// else, because an environment was one tree. Those endpoints still
+/// answer, and they need a tree to answer about — so they get this one,
+/// reserved and named for what it is.
+///
+/// A client too old to name a workspace is one that syncs into this slot
+/// and then builds out of it, so it sees exactly what it saw before:
+/// one environment, one tree, entirely its own. What it will not see is
+/// a tree some newer client pushed, which is the point — guessing at
+/// which of several that client meant is the one thing worse than not
+/// guessing.
+pub const LEGACY_WORKSPACE: &str = "default";
+
 /// Which environment, and which workspace on it.
+///
+/// Supersedes nothing: the endpoints that take this used to take an
+/// [`EnvironmentPathParam`](crate::v1::EnvironmentPathParam), which is
+/// still what creating, reading and deleting an environment takes.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspacePathParam {
     /// The name of the environment.
@@ -35,33 +55,93 @@ pub struct WorkspacePathParam {
     pub workspace: String,
 }
 
-/// Which workspace, and which half of the environment it is on.
+impl WorkspacePathParam {
+    /// What an endpoint from before this version means by its
+    /// environment.
+    pub fn from_v1(
+        old: v1::EnvironmentPathParam,
+        workspace: &str,
+    ) -> WorkspacePathParam {
+        WorkspacePathParam {
+            name: old.name,
+            workspace: workspace.to_owned(),
+        }
+    }
+}
+
+/// Which environment and half a synchronization request is for, and
+/// which workspace on it.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct WorkspaceTargetPathParam {
+pub struct TargetPathParam {
+    /// The name of the environment.
     pub name: String,
+    /// The workspace within it.
     pub workspace: String,
-    /// Which half of the environment.
+    /// Which half of it.
     pub kind: TargetKind,
 }
 
-/// Which piece of content is being delivered, and to which tree.
+impl TargetPathParam {
+    pub fn from_v1(
+        old: v1::TargetPathParam,
+        workspace: &str,
+    ) -> TargetPathParam {
+        TargetPathParam {
+            name: old.name,
+            workspace: workspace.to_owned(),
+            kind: old.kind,
+        }
+    }
+}
+
+/// Which piece of content is being delivered, and where.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct WorkspaceBlobPathParam {
+pub struct TargetBlobPathParam {
     pub name: String,
+    /// The workspace within it.
     pub workspace: String,
     pub kind: TargetKind,
     /// The digest of the content in the body, verified on arrival.
     pub digest: Digest,
 }
 
-/// Which artifact is being fetched, and whose.
+impl TargetBlobPathParam {
+    pub fn from_v1(
+        old: v1::TargetBlobPathParam,
+        workspace: &str,
+    ) -> TargetBlobPathParam {
+        TargetBlobPathParam {
+            name: old.name,
+            workspace: workspace.to_owned(),
+            kind: old.kind,
+            digest: old.digest,
+        }
+    }
+}
+
+/// Which artifact is being fetched.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct WorkspaceArtifactPathParam {
+pub struct ArtifactPathParam {
     pub name: String,
+    /// The workspace within it.
     pub workspace: String,
     pub kind: TargetKind,
     /// The artifact's file name.
     pub artifact: String,
+}
+
+impl ArtifactPathParam {
+    pub fn from_v1(
+        old: v1::ArtifactPathParam,
+        workspace: &str,
+    ) -> ArtifactPathParam {
+        ArtifactPathParam {
+            name: old.name,
+            workspace: workspace.to_owned(),
+            kind: old.kind,
+            artifact: old.artifact,
+        }
+    }
 }
 
 /// One workspace an environment is holding.

@@ -3,7 +3,7 @@
   "info": {
     "title": "VW user API",
     "description": "Manage your own vw build environments. Callers are identified by a Github access token.",
-    "version": "5.0.0"
+    "version": "1.0.0"
   },
   "paths": {
     "/environment/{name}": {
@@ -111,190 +111,7 @@
         }
       }
     },
-    "/environment/{name}/keys": {
-      "get": {
-        "summary": "Fetch the ssh keypair that opens an environment's instances.",
-        "description": "The private key is only ever handed to the environment's owner. One pair for the environment however many workspaces are on it: the instances are what a key opens, and those are not divided up.",
-        "operationId": "get_environment_keys",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "description": "The name of this environment to create.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SshKeyPair"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/environment/{name}/workspace/{workspace}": {
-      "delete": {
-        "summary": "Remove a workspace from an environment entirely.",
-        "description": "Its tree on both instances that take source, everything a build wrote under it, and its artifacts. Distinct from clearing a sync, which leaves the slot behind ready to be filled again: this is for a workspace that was renamed, or stood for a branch that is finished, and would otherwise sit there forever because nothing else ever removes one.\n\nIrreversible on the artifact side — the store keeps no versions — and costs nothing on the source side, since the tree came from a developer's machine and can be pushed again.",
-        "operationId": "forget_workspace",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WorkspaceForgotten"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/environment/{name}/workspace/{workspace}/anodize": {
-      "get": {
-        "summary": "Run the anodizer on an environment's vivado instance.",
-        "description": "Relayed frame for frame. Anodization already happens on its own before every bench run, cached and silent; this is the same generator with the cache off and the answers reported, for working on the generator itself. It runs there rather than here because it is an nvc pass over the workspace's VHDL, and the workspace is there.",
-        "operationId": "anodize",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "bench",
-            "description": "A bench crate to compile against what was generated.\n\nAbsent runs the generator and stops there. Anodizer failing is easy to see; anodizer succeeding and emitting Rust that does not compile is not, and compiling something against it is what turns that into an answer.",
-            "schema": {
-              "nullable": true,
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "standard",
-            "description": "The VHDL standard, as `nvc` spells it. Absent lets the instance use its own default.",
-            "schema": {
-              "nullable": true,
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "101": {
-            "description": "Negotiating protocol upgrade from HTTP/1.1 to WebSocket"
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "x-dropshot-websocket": {}
-      }
-    },
-    "/environment/{name}/workspace/{workspace}/artifact-flush": {
-      "post": {
-        "summary": "Wait for this environment's finished artifacts to reach its store.",
-        "description": "The instance uploads what a build produces on a timer, noticing a finished artifact a second or two after the last byte is written. That gap is invisible to a person, who takes minutes to think about collecting, and is exactly the wrong size for a script, which collects in under a second and gets a listing that is short by however many artifacts were still on their way. Nothing about the result says so.\n\nSo this exists to be called before [`Self::get_artifacts`], by the callers that would otherwise lose the race. It is not called on the caller's behalf, because it costs the seconds the uploader takes to come to rest and most listings are somebody looking rather than a build collecting.\n\nNames nothing: the instance runs the walk it already runs until a pass finds nothing left to do, so a build stage added later is covered without this changing.",
-        "operationId": "flush_artifacts",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ArtifactFlush"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/environment/{name}/workspace/{workspace}/artifacts": {
+    "/environment/{name}/artifacts": {
       "get": {
         "summary": "List the artifacts an environment's builds have produced.",
         "description": "Read from the environment's own object store, which lives on its artifact instance.",
@@ -303,16 +120,7 @@
           {
             "in": "path",
             "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
+            "description": "The name of this environment to create.",
             "required": true,
             "schema": {
               "type": "string"
@@ -350,16 +158,7 @@
           {
             "in": "path",
             "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
+            "description": "The name of this environment to create.",
             "required": true,
             "schema": {
               "type": "string"
@@ -386,7 +185,7 @@
         }
       }
     },
-    "/environment/{name}/workspace/{workspace}/artifacts/{kind}/{artifact}": {
+    "/environment/{name}/artifacts/{kind}/{artifact}": {
       "get": {
         "summary": "Download one artifact.",
         "description": "Streamed through this service rather than handed out as a link to the store. The store sits on the rack's internal network, and its instance's external address is often only reachable over a VPN — needing one to collect a build's output would make this useless from anywhere else. The body is passed through as it arrives, so an image of any size costs this service no more memory than a small one.",
@@ -416,14 +215,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
           }
         ],
         "responses": {
@@ -444,7 +235,7 @@
         }
       }
     },
-    "/environment/{name}/workspace/{workspace}/bench/session": {
+    "/environment/{name}/bench/session": {
       "get": {
         "summary": "Run an environment's testbenches on its vivado instance.",
         "description": "Relayed frame for frame. What comes back is the same stream of events a local run produces, so the display on a developer's terminal is driven by exactly what would have driven it here.",
@@ -453,16 +244,7 @@
           {
             "in": "path",
             "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
+            "description": "The name of this environment to create.",
             "required": true,
             "schema": {
               "type": "string"
@@ -521,7 +303,7 @@
         "x-dropshot-websocket": {}
       }
     },
-    "/environment/{name}/workspace/{workspace}/driver/build": {
+    "/environment/{name}/driver/build": {
       "get": {
         "summary": "Build the driver on an environment's helios instance.",
         "description": "Relayed frame for frame. The driver's target is native there and its pinned toolchain is installed there, which is the whole reason the build does not happen on a developer's machine.",
@@ -530,16 +312,7 @@
           {
             "in": "path",
             "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
+            "description": "The name of this environment to create.",
             "required": true,
             "schema": {
               "type": "string"
@@ -577,7 +350,7 @@
         "x-dropshot-websocket": {}
       }
     },
-    "/environment/{name}/workspace/{workspace}/generated": {
+    "/environment/{name}/generated": {
       "post": {
         "summary": "The VHDL vivado generated for this environment's IP.",
         "description": "A developer's static analysis needs these to resolve the design, and they only exist where vivado ran. Relayed from the vivado instance.",
@@ -586,16 +359,7 @@
           {
             "in": "path",
             "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
+            "description": "The name of this environment to create.",
             "required": true,
             "schema": {
               "type": "string"
@@ -622,7 +386,7 @@
         }
       }
     },
-    "/environment/{name}/workspace/{workspace}/generated/file": {
+    "/environment/{name}/generated/file": {
       "get": {
         "summary": "One generated file's contents.",
         "operationId": "generated_file",
@@ -630,16 +394,7 @@
           {
             "in": "path",
             "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
+            "description": "The name of this environment to create.",
             "required": true,
             "schema": {
               "type": "string"
@@ -672,7 +427,43 @@
         }
       }
     },
-    "/environment/{name}/workspace/{workspace}/target/{kind}/build-output": {
+    "/environment/{name}/keys": {
+      "get": {
+        "summary": "Fetch the ssh keypair that opens an environment's instances.",
+        "description": "The private key is only ever handed to the environment's owner.",
+        "operationId": "get_environment_keys",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "description": "The name of this environment to create.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SshKeyPair"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{name}/target/{kind}/build-output": {
       "delete": {
         "summary": "Remove everything a build wrote on one of an environment's instances.",
         "description": "`target/` is the one directory synchronization will never touch, in either direction, so it outlives every push and has to be removed on purpose. Source on the instance is left alone.",
@@ -681,7 +472,7 @@
           {
             "in": "path",
             "name": "kind",
-            "description": "Which half of the environment.",
+            "description": "Which half of it.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/TargetKind"
@@ -690,14 +481,7 @@
           {
             "in": "path",
             "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
+            "description": "The name of the environment.",
             "required": true,
             "schema": {
               "type": "string"
@@ -724,7 +508,7 @@
         }
       }
     },
-    "/environment/{name}/workspace/{workspace}/target/{kind}/sync": {
+    "/environment/{name}/target/{kind}/sync": {
       "delete": {
         "summary": "Discard an environment's source tree, so the next sync sends all of it.",
         "description": "An ordinary sync does not need this: the instance is told the whole desired state and replaces whatever differs from it. This is for when what the instance says it has is itself in question — with the tree and the delivered content both gone there is nothing left to be wrong about, and the sync that follows sends every file.\n\nBuild output on the instance is not touched.",
@@ -733,7 +517,7 @@
           {
             "in": "path",
             "name": "kind",
-            "description": "Which half of the environment.",
+            "description": "Which half of it.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/TargetKind"
@@ -742,14 +526,7 @@
           {
             "in": "path",
             "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
+            "description": "The name of the environment.",
             "required": true,
             "schema": {
               "type": "string"
@@ -776,7 +553,7 @@
         }
       }
     },
-    "/environment/{name}/workspace/{workspace}/target/{kind}/sync/blob/{digest}": {
+    "/environment/{name}/target/{kind}/sync/blob/{digest}": {
       "put": {
         "summary": "Deliver one piece of source content.",
         "operationId": "sync_blob",
@@ -801,14 +578,6 @@
           {
             "in": "path",
             "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
             "required": true,
             "schema": {
               "type": "string"
@@ -839,7 +608,7 @@
         }
       }
     },
-    "/environment/{name}/workspace/{workspace}/target/{kind}/sync/commit": {
+    "/environment/{name}/target/{kind}/sync/commit": {
       "post": {
         "summary": "Make the instance's source tree match the manifest.",
         "operationId": "sync_commit",
@@ -847,7 +616,7 @@
           {
             "in": "path",
             "name": "kind",
-            "description": "Which half of the environment.",
+            "description": "Which half of it.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/TargetKind"
@@ -856,14 +625,7 @@
           {
             "in": "path",
             "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
+            "description": "The name of the environment.",
             "required": true,
             "schema": {
               "type": "string"
@@ -900,7 +662,7 @@
         }
       }
     },
-    "/environment/{name}/workspace/{workspace}/target/{kind}/sync/plan": {
+    "/environment/{name}/target/{kind}/sync/plan": {
       "post": {
         "summary": "Report what source content an environment's instance still needs.",
         "operationId": "sync_plan",
@@ -908,7 +670,7 @@
           {
             "in": "path",
             "name": "kind",
-            "description": "Which half of the environment.",
+            "description": "Which half of it.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/TargetKind"
@@ -917,14 +679,7 @@
           {
             "in": "path",
             "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
+            "description": "The name of the environment.",
             "required": true,
             "schema": {
               "type": "string"
@@ -961,7 +716,7 @@
         }
       }
     },
-    "/environment/{name}/workspace/{workspace}/vivado/session": {
+    "/environment/{name}/vivado/session": {
       "get": {
         "summary": "Drive a vivado worker on an environment's vivado instance.",
         "description": "Relayed frame for frame to the instance, which spawns the worker when this opens and tears it down when it closes. A build is a conversation that runs for a long time and produces output throughout, so it is a websocket rather than a request and a reply — the developer sees each message as vivado emits it, exactly as they would running it locally.\n\nThe source being built is whatever the last synchronization put on the instance. Nothing is shipped over this socket.",
@@ -970,16 +725,7 @@
           {
             "in": "path",
             "name": "name",
-            "description": "The name of the environment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "workspace",
-            "description": "The workspace within it.",
+            "description": "The name of this environment to create.",
             "required": true,
             "schema": {
               "type": "string"
@@ -1032,54 +778,6 @@
           }
         },
         "x-dropshot-websocket": {}
-      }
-    },
-    "/environment/{name}/workspaces": {
-      "get": {
-        "summary": "List the workspaces synchronized to an environment.",
-        "description": "Read from the vivado instance, which every sync reaches. What comes back is what is taking up room and when each was last pushed to, which together are how somebody works out which slots they are finished with.",
-        "operationId": "get_workspaces",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "description": "The name of this environment to create.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "measure",
-            "description": "Measure what each workspace occupies.\n\nOff by default. The names and their sync times come from a `readdir` and a `stat`; the size comes from walking every file a build has ever written, which on a vivado instance is a great many of them. Somebody deciding what to forget wants the number and can wait for it. The service checking at startup which workspaces exist does not.",
-            "schema": {
-              "type": "boolean"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Array_of_Workspace",
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Workspace"
-                  }
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
       }
     },
     "/environments": {
@@ -1141,26 +839,6 @@
           "kind",
           "name",
           "size"
-        ]
-      },
-      "ArtifactFlush": {
-        "description": "What a flush sent, and whether it got to the end of the job.\n\n`settled` is the half that matters. A flush that ran out of time has still uploaded whatever it managed, and a listing taken afterwards will look entirely normal — just short. Saying so is the only thing standing between a caller and the silent partial collection this call exists to prevent.",
-        "type": "object",
-        "properties": {
-          "settled": {
-            "description": "Whether the build output came to rest.\n\nTrue when a whole pass found nothing left to send, nothing still being written, and nothing that failed to go. False when the deadline arrived first, which means the store may still be missing something.",
-            "type": "boolean"
-          },
-          "uploaded": {
-            "description": "Artifacts that went during this flush.\n\nZero is the ordinary answer: it means everything a build produced had already been uploaded by the time anybody asked.",
-            "type": "integer",
-            "format": "uint",
-            "minimum": 0
-          }
-        },
-        "required": [
-          "settled",
-          "uploaded"
         ]
       },
       "ArtifactsCleared": {
@@ -1585,63 +1263,6 @@
         },
         "required": [
           "entries"
-        ]
-      },
-      "Workspace": {
-        "description": "One workspace an environment is holding.",
-        "type": "object",
-        "properties": {
-          "bytes": {
-            "description": "What the workspace occupies on the instance, source and build output together.\n\nZero when it was not measured — see [`WorkspaceListQuery::measure`], which is off by default because working this out means walking a build tree that runs to gigabytes.",
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0
-          },
-          "last_synced": {
-            "nullable": true,
-            "description": "When its tree was last made to match a manifest, in seconds since the Unix epoch.\n\nA number rather than a formatted time because what a reader wants is how long ago, and an age is worked out from an instant rather than parsed back out of a rendering of one.\n\nAbsent when the instance cannot say — a tree cleared since it was last committed to, or one put there by something other than a sync. The point of reporting it at all is that staleness is what tells a developer which of several slots they are finished with, and a name on its own never does.",
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0
-          },
-          "name": {
-            "description": "What it is called: the key it was synchronized under.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "bytes",
-          "name"
-        ]
-      },
-      "WorkspaceForgotten": {
-        "description": "What forgetting a workspace came to.\n\nReported rather than silent because the three pieces go separately — a tree on each instance that takes source, and a bucket per kind on the one that holds artifacts — and \"it is gone\" is a claim about all of them.",
-        "type": "object",
-        "properties": {
-          "artifacts": {
-            "description": "Artifacts deleted from the environment's store.",
-            "type": "integer",
-            "format": "uint",
-            "minimum": 0
-          },
-          "bytes": {
-            "description": "What those artifacts were taking up.",
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0
-          },
-          "trees": {
-            "description": "Instances whose copy of the tree was removed.",
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/TargetKind"
-            }
-          }
-        },
-        "required": [
-          "artifacts",
-          "bytes",
-          "trees"
         ]
       }
     },

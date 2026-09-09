@@ -1,0 +1,826 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "VW agent API",
+    "description": "Receive source on a build instance. Reachable only from vw-svc over the rack's internal network.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/environment/{environment}/artifact-target": {
+      "get": {
+        "summary": "Where this instance currently believes its artifacts should go.",
+        "description": "Answers `404` when it has never been told. Lets the service notice an instance that needs configuring — one created before there was a store, or whose store has since been rebuilt with a new key — without pushing credentials at every instance on every restart.",
+        "operationId": "get_artifact_target",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3Credentials"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "summary": "Tell this instance where to put the artifacts it builds.",
+        "description": "Sent by `vw-svc`, which got it from the instance that runs the store — this one cannot ask directly, since it has no way to know which of its neighbours holds it. Remembered on disk, so a reboot between two builds does not lose the answer.",
+        "operationId": "put_artifact_target",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/S3Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/bench/session": {
+      "get": {
+        "summary": "Run this workspace's testbenches on this instance.",
+        "description": "A websocket for the same reason a vivado session is one: a batch takes minutes and finishes one bench at a time, and a developer watching it should see each result land rather than a verdict at the end.",
+        "operationId": "bench_session",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "concurrency",
+            "description": "How many benches run at once. Absent lets the instance decide from its own processor count, which is the number that matters — it is the machine doing the work.",
+            "schema": {
+              "nullable": true,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "filter",
+            "description": "Substring match against a testbench's entity name. Absent runs all.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ignore",
+            "description": "Directory names to skip while looking for benches, comma separated.\n\nOne string rather than a repeated parameter because a query parameter has to be scalar, and because that is already how `--ignore` is written on the command line.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "standard",
+            "description": "The VHDL standard, as `nvc` spells it.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Negotiating protocol upgrade from HTTP/1.1 to WebSocket"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
+    },
+    "/environment/{environment}/build-output": {
+      "delete": {
+        "summary": "Remove everything a build wrote on this instance.",
+        "description": "The opposite of what synchronization does: `target/` is the one thing a sync will never send and never delete, which is exactly why removing it needs saying explicitly. Source is untouched, so the next build starts over without anything having to be pushed again.",
+        "operationId": "clean_build_output",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleanResult"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/credentials": {
+      "put": {
+        "summary": "Put the credentials a build needs to fetch its dependencies in place.",
+        "description": "Written as a `.netrc`, which is what git, cargo and the rest already know how to read, so nothing on the instance needs teaching about where its credentials come from.\n\nThese belong to whoever is synchronizing, and `vw-svc` sends them with every sync rather than once: an instance rebuilt underneath us comes back with no credentials at all, and the alternative is builds that fail to fetch until something notices.",
+        "operationId": "put_credentials",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/driver/build": {
+      "get": {
+        "summary": "Build the driver on this instance.",
+        "description": "A websocket because a build takes minutes and produces output the whole time, and because a developer who interrupts one should not leave cargo running on a machine nobody is watching.\n\nCargo is spawned rather than linked: the driver pins its toolchain in `rust-toolchain.toml`, which the rustup shim honours and a linked cargo would not, so linking it would quietly build a kernel module with the wrong compiler.",
+        "operationId": "driver_build",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "args",
+            "description": "Anything else to put on cargo's command line, separated by spaces.\n\nOne string because a query parameter has to be scalar. Split on whitespace at the far end, so a value containing a space cannot be expressed — no flag the driver build needs has one, and the alternative is reimplementing half a shell's quoting rules.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "release",
+            "description": "Build with optimizations.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Negotiating protocol upgrade from HTTP/1.1 to WebSocket"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
+    },
+    "/environment/{environment}/generated": {
+      "post": {
+        "summary": "The VHDL vivado generated for this environment's IP.",
+        "description": "A `POST` because it finishes the job first: vivado writes an instantiation template per standalone IP, and turning those into black-box entities is a mechanical step that happens in Rust after the vivado pass. On a local run that happens on the developer's machine; on a remote one there is nobody there to do it, so it happens here, where the templates are.\n\nAnswers with paths relative to the workspace, so the far end can put each file exactly where its own tools will look for it.",
+        "operationId": "generated_manifest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TreeManifest"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/generated/file": {
+      "get": {
+        "summary": "One generated file's contents.",
+        "operationId": "generated_file",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/object-store": {
+      "get": {
+        "summary": "The key that opens this instance's object store.",
+        "description": "Answered only by the instance that runs the store. The admin credential that minted this key never leaves that machine — this is the one thing it hands out, and `vw-svc` passes it to the instance that has artifacts to upload.",
+        "operationId": "get_object_store",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "description": "The instance kind whose bucket is wanted. Absent means vivado, which is the one that produces images today.",
+            "schema": {
+              "$ref": "#/components/schemas/TargetKind"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3Credentials"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/sync": {
+      "delete": {
+        "summary": "Discard the source tree and everything delivered towards it.",
+        "description": "The instance is left as though it had never been synchronized: no source, and no record of what content it holds. Build output is untouched, as it is for a commit.\n\nThis is not part of an ordinary sync, which needs no help — a commit replaces whatever differs from the manifest. It is what a sender uses when it does not believe the instance's account of what it has, so that the sync that follows sends everything rather than asking first.\n\nAnswers with the result of committing an empty manifest, so the count of what was removed is the `deleted` field.",
+        "operationId": "sync_clear",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitResult"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/sync/blob/{digest}": {
+      "put": {
+        "summary": "Deliver one piece of content.",
+        "description": "Rejected if the body does not hash to the digest in the path: the digest is how every later lookup finds this content, so storing it under a name it does not have would be worse than not storing it.",
+        "operationId": "sync_blob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "digest",
+            "description": "The digest of the content in the body, which is verified on arrival rather than taken at face value.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/sync/commit": {
+      "post": {
+        "summary": "Make the instance's tree match the manifest.",
+        "description": "The manifest is the complete desired state, so this adds, replaces and removes as needed. Anything a build produced is invisible to it.",
+        "operationId": "sync_commit",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TreeManifest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitResult"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/sync/plan": {
+      "post": {
+        "summary": "Report what content is missing before a tree can be made to match.",
+        "description": "Content already held anywhere in the instance's tree is not asked for, whatever path it currently sits under, so a rename or a directory move costs nothing over the wire.",
+        "operationId": "sync_plan",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TreeManifest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncPlan"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/environment/{environment}/vivado/session": {
+      "get": {
+        "summary": "Drive a vivado worker on this instance.",
+        "description": "A websocket rather than a request and a reply because a build is not one of those. It is a conversation that runs for minutes, produces output the whole time, and has to show that output as it happens — waiting for a synthesis run to finish before saying anything would make the remote flow useless for the thing people actually do with it.\n\nWhat crosses the socket is the protocol `vw-eda` already uses to talk to a local worker: commands in, output chunks and results back. The worker is spawned when the socket opens and torn down when it closes, so no state survives between runs — the same guarantee running vivado locally gives, and what the checkpoint machinery in the htcl library already relies on for speed.",
+        "operationId": "vivado_session",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "environment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "info_with_stack",
+            "description": "Attach the Tcl call stack to INFO messages, not only to warnings and errors.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "part",
+            "description": "`--part`, for a workspace that declares parts at the top level.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "variant",
+            "description": "`--variant`, for a workspace that declares variants.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "verbose",
+            "description": "Forward vivado's unclassified chatter rather than discarding it.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Negotiating protocol upgrade from HTTP/1.1 to WebSocket"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CleanResult": {
+        "description": "What removing an instance's build output came to.",
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "description": "How much space it was taking, measured before it went.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "existed": {
+            "description": "Whether there was any build output to remove.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "bytes",
+          "existed"
+        ]
+      },
+      "CommitResult": {
+        "description": "What applying a manifest did.",
+        "type": "object",
+        "properties": {
+          "created": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "deleted": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "unchanged": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "updated": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "created",
+          "deleted",
+          "unchanged",
+          "updated"
+        ]
+      },
+      "Credentials": {
+        "description": "What a build needs in order to fetch its dependencies.\n\nSources are synchronized from a developer's machine, but the things a build pulls from Github are not: they are fetched by the instance itself, which therefore needs credentials for them. These are the caller's own — the same token that authorized the request that carries them — so an instance can reach exactly what its owner can reach and nothing more.\n\nNothing keeps a copy. `vw-svc` reads these off the request it is already authorizing and passes them straight through.",
+        "type": "object",
+        "properties": {
+          "token": {
+            "description": "A Github access token.",
+            "type": "string"
+          },
+          "user": {
+            "description": "The Github login the token belongs to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "user"
+        ]
+      },
+      "Error": {
+        "description": "Error information from a response.",
+        "type": "object",
+        "properties": {
+          "error_code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "request_id"
+        ]
+      },
+      "FileEntry": {
+        "description": "One file in a synchronized tree.",
+        "type": "object",
+        "properties": {
+          "digest": {
+            "description": "The digest of its contents.",
+            "type": "string"
+          },
+          "executable": {
+            "description": "Whether the execute bit is set. The only mode bit that survives the trip, because it is the only one a build cares about.",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Where the file goes, relative to the tree root, `/`-separated.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "digest",
+          "executable",
+          "path"
+        ]
+      },
+      "S3Credentials": {
+        "description": "How to reach an environment's object store, and the key that opens it.\n\nGenerated on the artifact instance and handed out from there, so the admin credential that minted it never leaves the machine that holds the store.",
+        "type": "object",
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "bucket": {
+            "description": "The bucket this environment's artifacts go in.",
+            "type": "string"
+          },
+          "endpoint": {
+            "description": "The base URL of the S3 API, e.g. `http://172.30.0.7:3900`.\n\nComposed from [`port`](Self::port) and an address by whoever knows which address the instance is reachable on. Each side supplies what it knows: the instance cannot tell which of its addresses another machine can use, and nobody else should be guessing which port it chose.",
+            "type": "string"
+          },
+          "port": {
+            "description": "The port the store serves S3 on, as the instance running it configured it.",
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0
+          },
+          "region": {
+            "description": "The region the store answers to. Garage's own default is `garage`, and signing fails against the wrong one.",
+            "type": "string"
+          },
+          "secret_access_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_key_id",
+          "bucket",
+          "endpoint",
+          "port",
+          "region",
+          "secret_access_key"
+        ]
+      },
+      "SyncPlan": {
+        "description": "What the receiver still needs before a manifest can be applied.",
+        "type": "object",
+        "properties": {
+          "missing": {
+            "description": "Digests the receiver holds nowhere — neither in its content store nor anywhere in the tree it already has.\n\nContent already present under a different path is not listed: a rename or a move costs nothing, because the receiver copies it locally.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "missing"
+        ]
+      },
+      "TreeManifest": {
+        "description": "The complete desired state of a target's source tree.\n\nComplete, not a changeset: a path absent from this is a path that should not exist, which is the only way deletions and renames can be expressed.",
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileEntry"
+            }
+          }
+        },
+        "required": [
+          "entries"
+        ]
+      },
+      "TargetKind": {
+        "description": "Which half of an environment a request is about.\n\nOnly the two that take source. The artifact instance holds build output and is reached as an object store, so there is nothing to synchronize to it.",
+        "type": "string",
+        "enum": [
+          "vivado",
+          "helios"
+        ]
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

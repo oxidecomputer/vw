@@ -535,3 +535,58 @@ async fn a_request_that_names_no_api_version_is_refused() {
 
     assert_eq!(unversioned.status(), StatusCode::BAD_REQUEST);
 }
+
+/// A `vw` from before workspaces existed still reaches the service.
+///
+/// The check is the status: `503` means the request was routed, authorized and
+/// relayed, and fell over only because this test's environment has no
+/// instances behind it. A route that had been taken away would answer `404`
+/// with nothing about an instance in it, which is what a developer who had not
+/// upgraded would have got.
+#[tokio::test]
+async fn a_client_from_before_workspaces_is_still_served() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let server = TestServer::start(&scratch.path().join("db")).await;
+
+    assert_eq!(
+        server.create("darmok", "jalad").await.status(),
+        reqwest::StatusCode::CREATED,
+    );
+
+    let old = server
+        .request(
+            reqwest::Method::POST,
+            "darmok",
+            // The pre-workspace shape: an environment and a half, no tree.
+            "/environment/jalad/target/vivado/sync/plan",
+        )
+        .header("api-version", "1.0.0")
+        .json(&serde_json::json!({ "entries": [] }))
+        .send()
+        .await
+        .expect("plan request");
+
+    // `503` is the whole assertion. Dropshot keeps the detail ("the vivado
+    // instance for this environment does not exist yet") to the log, so the
+    // status is what distinguishes the two outcomes — and it is enough: a
+    // route that had been taken away answers `404`, and one whose version is
+    // no longer served answers `400`.
+    assert_eq!(old.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// And a version the service no longer offers is refused outright, which is
+/// what the retired routes exist to prevent a working client from meeting.
+#[tokio::test]
+async fn a_version_the_service_does_not_have_is_refused() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let server = TestServer::start(&scratch.path().join("db")).await;
+
+    let ahead = server
+        .request(reqwest::Method::GET, "darmok", "/environments")
+        .header("api-version", "99.0.0")
+        .send()
+        .await
+        .expect("list request");
+
+    assert_eq!(ahead.status(), reqwest::StatusCode::BAD_REQUEST);
+}

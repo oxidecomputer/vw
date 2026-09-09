@@ -88,11 +88,6 @@ pub(crate) struct Store {
 impl Store {
     /// The bucket a workspace's `kind` artifacts belong in, created if
     /// this is the first anybody has asked for it.
-    ///
-    /// Idempotent in both directions: an entry already known is handed
-    /// straight back, and one that is not is adopted if the store turns
-    /// out to have it anyway — which is what happens when this record
-    /// was lost and the store's own state was not.
     pub(crate) async fn bucket_for(
         &self,
         kind: &str,
@@ -105,7 +100,18 @@ impl Store {
             return Ok(bucket.clone());
         }
 
+        // A bucket per environment per kind, named for both. Even though an
+        // artifact instance serves one environment today, a name that says which
+        // one keeps the objects legible if a store is ever shared. The
+        // workspace joins them for the same reason it divides everything else:
+        // one store now holds several workspaces' output.
         let bucket = format!("{kind}-{}-{workspace}", self.environment);
+        // Adopted if it is already there. That happens when this record was
+        // lost but the store's own state was not — a disk restored from a
+        // snapshot, a file removed by hand. Failing instead would leave an
+        // instance that cannot serve the artifacts sitting right there in a
+        // bucket, and creating a second bucket would orphan them. Neither is
+        // as good as picking up where we left off.
         let id = self.admin.ensure_bucket(&bucket, log).await?;
         self.admin
             .allow(&id, &self.credentials.access_key_id)

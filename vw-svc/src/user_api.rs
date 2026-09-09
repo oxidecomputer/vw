@@ -149,7 +149,7 @@ impl VwUserApi for UserApi {
     async fn sync_plan(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::WorkspaceTargetPathParam,
+            vw_api_types_versions::latest::TargetPathParam,
         >,
         body: dropshot::TypedBody<vw_api_types_versions::latest::TreeManifest>,
     ) -> Result<
@@ -210,7 +210,7 @@ impl VwUserApi for UserApi {
     async fn sync_blob(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::WorkspaceBlobPathParam,
+            vw_api_types_versions::latest::TargetBlobPathParam,
         >,
         body: dropshot::UntypedBody,
     ) -> Result<dropshot::HttpResponseUpdatedNoContent, dropshot::HttpError>
@@ -219,7 +219,7 @@ impl VwUserApi for UserApi {
         let args = rqctx.context().server_args.clone();
         let caller = auth::authorize_caller(rqctx).await?;
         let params = path_params.into_inner();
-        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
+        let target = vw_api_types_versions::latest::TargetPathParam {
             name: params.name.clone(),
             workspace: params.workspace.clone(),
             kind: params.kind,
@@ -252,7 +252,7 @@ impl VwUserApi for UserApi {
     async fn sync_commit(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::WorkspaceTargetPathParam,
+            vw_api_types_versions::latest::TargetPathParam,
         >,
         body: dropshot::TypedBody<vw_api_types_versions::latest::TreeManifest>,
     ) -> Result<
@@ -297,7 +297,7 @@ impl VwUserApi for UserApi {
     async fn sync_clear(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::WorkspaceTargetPathParam,
+            vw_api_types_versions::latest::TargetPathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<vw_api_types_versions::latest::CommitResult>,
@@ -337,7 +337,7 @@ impl VwUserApi for UserApi {
     async fn clean_build_output(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::WorkspaceTargetPathParam,
+            vw_api_types_versions::latest::TargetPathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<vw_api_types_versions::latest::CleanResult>,
@@ -392,7 +392,7 @@ impl VwUserApi for UserApi {
 
         // Helios, not vivado: the driver's target is native there and its
         // pinned toolchain is installed there.
-        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
+        let target = vw_api_types_versions::latest::TargetPathParam {
             name: name.clone(),
             workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Helios,
@@ -449,7 +449,7 @@ impl VwUserApi for UserApi {
 
         // Vivado, not helios: anodization is an nvc pass over the design, and
         // the design is on the machine the benches run on.
-        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
+        let target = vw_api_types_versions::latest::TargetPathParam {
             name: name.clone(),
             workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
@@ -505,7 +505,7 @@ impl VwUserApi for UserApi {
         let workspace = params.workspace;
         let query = query.into_inner();
 
-        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
+        let target = vw_api_types_versions::latest::TargetPathParam {
             name: name.clone(),
             workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
@@ -563,7 +563,7 @@ impl VwUserApi for UserApi {
         let workspace = params.workspace;
         let query = query.into_inner();
 
-        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
+        let target = vw_api_types_versions::latest::TargetPathParam {
             name: name.clone(),
             workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
@@ -620,7 +620,7 @@ impl VwUserApi for UserApi {
         let name = params.name;
         let workspace = params.workspace;
 
-        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
+        let target = vw_api_types_versions::latest::TargetPathParam {
             name: name.clone(),
             workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
@@ -670,7 +670,7 @@ impl VwUserApi for UserApi {
         let workspace = params.workspace;
         let wanted = query.into_inner().path;
 
-        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
+        let target = vw_api_types_versions::latest::TargetPathParam {
             name: name.clone(),
             workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
@@ -733,7 +733,7 @@ impl VwUserApi for UserApi {
         // The vivado instance is the only one that fills the store; helios
         // does not produce artifacts and the artifact instance holds them
         // rather than making them.
-        let target = vw_api_types_versions::latest::WorkspaceTargetPathParam {
+        let target = vw_api_types_versions::latest::TargetPathParam {
             name: name.clone(),
             workspace: workspace.clone(),
             kind: vw_api_types_versions::latest::TargetKind::Vivado,
@@ -901,7 +901,7 @@ impl VwUserApi for UserApi {
     async fn get_artifact(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
-            vw_api_types_versions::latest::WorkspaceArtifactPathParam,
+            vw_api_types_versions::latest::ArtifactPathParam,
         >,
     ) -> Result<
         dropshot::HttpResponseOk<dropshot::FreeformBody>,
@@ -1238,7 +1238,7 @@ pub fn api_description() -> ApiDescription<Arc<Context>> {
 /// from the response alone, which only says the sync did not happen.
 fn log_relay_failure(
     log: &slog::Logger,
-    target: &vw_api_types_versions::latest::WorkspaceTargetPathParam,
+    target: &vw_api_types_versions::latest::TargetPathParam,
     error: &relay::RelayError,
 ) {
     slog::warn!(log, "cannot relay a source sync";

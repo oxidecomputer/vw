@@ -47,6 +47,12 @@ pub(crate) async fn store_for(
 }
 
 /// The kinds of instance that build something worth keeping.
+///
+/// Helios is wired up before it has anything to put anywhere. A bucket costs
+/// nothing standing empty, and asking for it on the first sync means the day
+/// the driver build starts producing something there is nowhere for it to be
+/// missing — which the store used to guarantee by making every bucket at boot,
+/// and cannot now that they follow the workspaces.
 const KINDS: [TargetKind; 2] = [TargetKind::Vivado, TargetKind::Helios];
 
 /// Make sure one instance knows where its artifacts go.
