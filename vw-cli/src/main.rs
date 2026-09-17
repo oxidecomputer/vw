@@ -1293,6 +1293,7 @@ async fn main() {
                 let outcome = match &cloud {
                     Some((session, environment)) => {
                         bench_runner::run_benches_remotely(
+                            &cwd,
                             session,
                             environment,
                             testbench.as_deref(),

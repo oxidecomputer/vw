@@ -180,7 +180,13 @@ pub fn log_path(workspace: &Utf8Path, name: &str) -> camino::Utf8PathBuf {
     vw_lib::bench_output_dir(workspace, name).join("output.log")
 }
 
-fn write_log(
+/// Keep a bench's whole output beside its waveform.
+///
+/// Public because a remote run has to do this on the developer's machine:
+/// the instance writes it under the instance's `target/`, which is not a
+/// place the developer can open. Same path, same bytes, one definition of
+/// both.
+pub fn write_log(
     workspace: &Utf8Path,
     name: &str,
     output: &str,

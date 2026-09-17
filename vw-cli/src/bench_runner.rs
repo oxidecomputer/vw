@@ -24,10 +24,10 @@ pub struct BenchResult {
 
 /// Say where the output went, once, after the results.
 ///
-/// Every bench writes its whole output next to its waveform whether it passed
-/// or not. Without a line saying so, a `println!` that came out of a passing
-/// bench looks like it went nowhere — which is how it looked before there was
-/// anywhere for it to go.
+/// Every bench's whole output lands under this machine's `target/` whether it
+/// passed or not, and whichever machine it ran on. Without a line saying so, a
+/// `println!` that came out of a passing bench looks like it went nowhere —
+/// which is how it looked before there was anywhere for it to go.
 fn note_logs(ws: &Utf8Path, names: &[String]) {
     let path = match names {
         [] => return,
@@ -194,8 +194,14 @@ fn report_nothing_found(ws: &Utf8Path, filter: Option<&str>) {
 }
 
 /// Failure block for one bench, in the same visual frame `vw test` uses:
-/// the key diagnostic lines surfaced up front, then a (demangled) tail of
-/// the captured output for context.
+/// the key diagnostic lines surfaced up front, then the whole of the
+/// (demangled) captured output.
+///
+/// **Why nothing is elided.** A bench that fails is a bench somebody is
+/// about to read every line of, and the line that explains it is as often
+/// the first as the last. The saving from cutting it short is a few
+/// kilobytes; the cost is a second command to run, against a log file that —
+/// on a cloud run — is on a machine the developer is not sitting at.
 fn print_bench_failure(f: &BenchResult) {
     let bar = "─".repeat(64);
     println!("{}", bar.red());
@@ -203,8 +209,9 @@ fn print_bench_failure(f: &BenchResult) {
 
     let lines: Vec<&str> = f.output.trim_end().lines().collect();
 
-    // The real reason (`** Fatal: …`, `panicked at …`, `error: …`) often
-    // sits far above the tail — pull those lines out and show them first.
+    // The real reason (`** Fatal: …`, `panicked at …`, `error: …`) can sit
+    // anywhere in a long dump — pull those lines out and show them first, so
+    // the full output below is context rather than a search.
     let key: Vec<&str> = lines
         .iter()
         .copied()
@@ -218,21 +225,9 @@ fn print_bench_failure(f: &BenchResult) {
     }
 
     if !lines.is_empty() {
-        println!("\n{}", "OUTPUT (tail):".bright_black().bold());
-        let start = lines.len().saturating_sub(40);
-        for l in &lines[start..] {
+        println!("\n{}", "OUTPUT:".bright_black().bold());
+        for l in &lines {
             println!("  {}", demangle_line(l));
-        }
-        if lines.len() > 40 {
-            println!(
-                "  {}",
-                format!(
-                    "... {} earlier lines in target/bench/{}/output.log",
-                    lines.len() - 40,
-                    f.name,
-                )
-                .bright_black(),
-            );
         }
     }
     println!("{}\n", bar.red());
@@ -294,8 +289,11 @@ fn demangle_symbol(sym: &str) -> String {
 ///
 /// The display is the local one, driven by the same events — a bench finishing
 /// looks the same whichever machine it finished on, because the thing that
-/// decided how it looks never moved.
+/// decided how it looks never moved. The logs follow: each bench's output is
+/// written under this machine's `target/bench/` as it arrives, so the path
+/// this run names is one the developer can open.
 pub async fn run_benches_remotely(
+    cwd: &Utf8Path,
     session: &crate::cloud::Session,
     target: &crate::cloud::Target,
     filter: Option<&str>,
@@ -304,6 +302,12 @@ pub async fn run_benches_remotely(
     ignore: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use futures::StreamExt;
+
+    // Resolved before the socket opens: there is nothing to do with a batch
+    // whose output has nowhere to land. `resolve_target` already found the
+    // same `vw.toml`, so this cannot fail by the time it runs.
+    let ws = vw_lib::find_workspace_dir(cwd.as_std_path())
+        .ok_or("not in a vw workspace (no vw.toml in the parent chain)")?;
 
     let ignored = (!ignore.is_empty()).then(|| ignore.join(","));
     // Bound here rather than in the call: the closure runs once per attempt,
@@ -338,6 +342,7 @@ pub async fn run_benches_remotely(
     // see the tree to count.
     let mut panel: Option<Arc<NextestPanel>> = None;
     let mut summary = vw_bench::Summary::default();
+    let mut ran: Vec<String> = Vec::new();
 
     while let Some(message) = socket.next().await {
         let text = match message? {
@@ -348,15 +353,36 @@ pub async fn run_benches_remotely(
 
         match serde_json::from_str::<vw_remote::BenchEvent>(&text)? {
             vw_remote::BenchEvent::Progress { event } => {
-                if let vw_bench::Event::Discovered { names } = &event {
-                    if names.is_empty() {
-                        eprintln!("no testbenches matched");
-                        return Ok(());
+                match &event {
+                    vw_bench::Event::Discovered { names } => {
+                        if names.is_empty() {
+                            eprintln!("no testbenches matched");
+                            return Ok(());
+                        }
+                        ran = names.clone();
+                        panel = Some(Arc::new(NextestPanel::new(
+                            names.len() as u64,
+                            "testbenches",
+                        )));
                     }
-                    panel = Some(Arc::new(NextestPanel::new(
-                        names.len() as u64,
-                        "testbenches",
-                    )));
+                    // The instance wrote this under its own `target/` on its
+                    // way past. That copy is on the instance, so keep one
+                    // here as well — same path, relative to this workspace.
+                    vw_bench::Event::Finished { name, output, .. } => {
+                        if let Err(e) = vw_bench::write_log(&ws, name, output) {
+                            let line = format!(
+                                "{} could not write {name}'s output: {e}",
+                                "info:".cyan(),
+                            );
+                            // Above the live panel, not through it: a bare
+                            // `eprintln!` here tears the rows being drawn.
+                            match panel.as_ref() {
+                                Some(panel) => panel.println(line),
+                                None => eprintln!("{line}"),
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 if let Some(panel) = panel.as_ref() {
                     drive_panel(panel, &rows, &failures, event);
@@ -389,6 +415,7 @@ pub async fn run_benches_remotely(
         }
     }
     print_result_line(panel.passed(), panel.failed(), overall.elapsed());
+    note_logs(&ws, &ran);
     if summary.failed > 0 {
         std::process::exit(1);
     }
