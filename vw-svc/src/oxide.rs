@@ -58,6 +58,27 @@ const BOOT_DISK_GIB: u64 = 600;
 /// prefix of another's — see [`validate_deployment_name`].
 const OBJECT_MARKER: &str = "vwsvc";
 
+/// What marks a silo ssh key as some vw service's.
+///
+/// Deliberately not [`OBJECT_MARKER`], and the reason is the one asymmetry in
+/// this whole scheme. Instances and disks live in a project, and a project is a
+/// boundary: a vw service cannot see, let alone reap, another project's. The
+/// silo ssh key list is scoped by nothing — it belongs to the token's user —
+/// so it is the single place where one service can reach another's work, and
+/// the only defence available is the name.
+///
+/// A name is not enough on its own, because it has to be recognized by the
+/// *other* service's rule, which may be older than any rule written here. A
+/// vw-svc predating deployment names claims every key beginning `vwsvc-` that
+/// its own database does not want — which is every name a named deployment
+/// produces. It re-reads that list every pass, so a key is gone within seconds
+/// of being registered and an instance booting in that window comes up with no
+/// way in. Nothing in this binary can change the old one's rule.
+///
+/// So keys are named outside the namespace that rule watches. `vwkey-` is not
+/// `vwsvc-`, and a service looking for the latter cannot see these at all.
+const KEY_MARKER: &str = "vwkey";
+
 /// The deployment the name-handling functions assume when nothing has
 /// initialized the global.
 ///
@@ -67,10 +88,11 @@ const TEST_DEPLOYMENT: &str = "test";
 
 /// The prefix a deployment names and recognizes its objects by.
 ///
-/// Instances are `vwsvc-{deployment}-{user}-{env}-{kind}`, their boot disks
-/// take the instance's name, and an environment's silo ssh key is
-/// `vwsvc-{deployment}-{user}-{env}`. This prefix is the only thing that marks
-/// any of them as this deployment's.
+/// Instances are `vwsvc-{deployment}-{user}-{env}-{kind}` and their boot disks
+/// take the instance's name. This prefix is the only thing that marks either as
+/// this deployment's. Silo ssh keys are named apart, by
+/// [`deployment_key_prefix`], for a reason that is worth reading before
+/// changing anything here.
 ///
 /// Anything without it belongs to somebody else — another deployment, or no vw
 /// service at all — and is never touched, which is what keeps a reconciler pass
@@ -85,10 +107,23 @@ fn deployment_prefix(deployment: &str) -> String {
     format!("{OBJECT_MARKER}-{deployment}")
 }
 
+/// The prefix a deployment names and recognizes its silo ssh keys by.
+///
+/// Keys are `vwkey-{deployment}-{user}-{env}`. Same shape as everything else
+/// and the same disjointness argument — a deployment name cannot contain a
+/// hyphen, so no deployment's key names begin with another's prefix — but
+/// under a marker of their own. See [`KEY_MARKER`].
+fn deployment_key_prefix(deployment: &str) -> String {
+    format!("{KEY_MARKER}-{deployment}")
+}
+
 /// Which deployment this process is, as the prefix it names objects with.
 ///
 /// Unset until [`init_deployment`] runs.
 static PREFIX: OnceLock<String> = OnceLock::new();
+
+/// The same, for the silo ssh keys it registers.
+static KEY_PREFIX: OnceLock<String> = OnceLock::new();
 
 /// Record which deployment this process is.
 ///
@@ -100,6 +135,9 @@ pub(crate) fn init_deployment(deployment: &str) -> Result<(), InitError> {
         .map_err(InitError::InvalidDeployment)?;
     PREFIX
         .set(deployment_prefix(deployment))
+        .map_err(|_| InitError::DeploymentAlreadyInitialized)?;
+    KEY_PREFIX
+        .set(deployment_key_prefix(deployment))
         .map_err(|_| InitError::DeploymentAlreadyInitialized)
 }
 
@@ -153,6 +191,13 @@ pub(crate) fn validate_deployment_name(name: &str) -> Result<(), String> {
 pub(crate) fn instance_prefix() -> &'static str {
     PREFIX
         .get_or_init(|| deployment_prefix(TEST_DEPLOYMENT))
+        .as_str()
+}
+
+/// The prefix this deployment names and recognizes its silo ssh keys by.
+pub(crate) fn ssh_key_prefix() -> &'static str {
+    KEY_PREFIX
+        .get_or_init(|| deployment_key_prefix(TEST_DEPLOYMENT))
         .as_str()
 }
 
@@ -508,9 +553,10 @@ impl Session {
             .stream();
         while let Some(key) = keys.next().await {
             let name = key?.name.to_string();
-            // Ours by the same prefix rule as everything else: this key list
-            // belongs to a silo user that may well have keys of their own.
-            if name.starts_with(&format!("{}-", instance_prefix()))
+            // Ours by the same prefix rule as everything else, on the key
+            // marker: this list belongs to a silo user who may well have keys
+            // of their own, and to any number of other vw services.
+            if name.starts_with(&format!("{}-", ssh_key_prefix()))
                 && !wanted.contains(&name)
             {
                 names.push(name);
@@ -1512,7 +1558,7 @@ mod test {
     /// `prod-west`.
     const DEPLOYMENTS: [&str; 4] = ["prod", "beta", "acme2", "prodwest"];
 
-    /// Every name a deployment might put on the rack.
+    /// Every name a deployment might put in its project.
     fn objects(deployment: &str) -> Vec<String> {
         let prefix = deployment_prefix(deployment);
         [
@@ -1521,13 +1567,20 @@ mod test {
             "ferris-alpha-helios",
             "ferris-alpha-artifact",
             "foo-bar-darmok-vivado",
-            // Silo ssh keys, which carry no kind.
-            "ferris-alpha",
-            "foo-bar-darmok",
         ]
         .iter()
         .map(|suffix| format!("{prefix}-{suffix}"))
         .collect()
+    }
+
+    /// And every silo ssh key it might register, which carry no kind and sit
+    /// under a marker of their own.
+    fn ssh_keys(deployment: &str) -> Vec<String> {
+        let prefix = deployment_key_prefix(deployment);
+        ["ferris-alpha", "foo-bar-darmok"]
+            .iter()
+            .map(|suffix| format!("{prefix}-{suffix}"))
+            .collect()
     }
 
     #[test]
@@ -1582,9 +1635,9 @@ mod test {
         // the one that matters most, since the silo key list is not scoped by
         // project and is therefore shared by every deployment on one token.
         for mine in DEPLOYMENTS {
-            let owned = format!("{}-", deployment_prefix(mine));
+            let owned = format!("{}-", deployment_key_prefix(mine));
             for theirs in DEPLOYMENTS.iter().filter(|d| **d != mine) {
-                for name in objects(theirs) {
+                for name in ssh_keys(theirs) {
                     assert!(
                         !name.starts_with(&owned),
                         "{mine} would reap {name}",
@@ -1594,26 +1647,47 @@ mod test {
         }
     }
 
-    /// The one case the hyphen rule cannot cover, recorded because it has
-    /// already cost a developer three unreachable instances.
+    /// The case the hyphen rule cannot cover, and the reason ssh keys are
+    /// named apart from everything else.
     ///
-    /// Before deployments had names, a service's prefix was the bare marker
-    /// and it reaped every silo key starting `vwsvc-`. Every modern name
-    /// starts that way, so such a service claims all of them — and the silo
-    /// key list is not scoped by project, so sharing one token is enough for
-    /// it to reach them. Nothing in this code can stop it: the rule is in the
-    /// old binary. A vw-svc from before deployment names must not be left
-    /// running against a token a current one uses.
+    /// Before deployments had names a service's prefix was the bare marker,
+    /// and it reaps every silo key starting `vwsvc-` that its own database
+    /// does not want. Nothing here can change that rule: it is compiled into a
+    /// binary still running in front of a production build service that cannot
+    /// be touched. What this code can do is name its keys where that rule is
+    /// not looking.
+    ///
+    /// This cost a developer three unreachable instances twice over, so it is
+    /// asserted for every deployment name rather than argued about.
     #[test]
-    fn a_service_predating_deployment_names_claims_every_key() {
+    fn a_service_predating_deployment_names_cannot_see_our_keys() {
         let legacy = format!("{OBJECT_MARKER}-");
         for deployment in DEPLOYMENTS {
-            let name =
-                format!("{}-ferris-alpha", deployment_prefix(deployment));
-            assert!(
-                name.starts_with(&legacy),
-                "a legacy service would spare {name}, which it will not",
-            );
+            for name in ssh_keys(deployment) {
+                assert!(
+                    !name.starts_with(&legacy),
+                    "{name} is a key a pre-naming service would delete",
+                );
+            }
+        }
+    }
+
+    /// The two markers cannot be confused for one another by a rule that only
+    /// ever sees a string, in either direction.
+    #[test]
+    fn the_two_markers_do_not_overlap() {
+        for deployment in DEPLOYMENTS {
+            let keys = format!("{}-", deployment_key_prefix(deployment));
+            let rest = format!("{}-", deployment_prefix(deployment));
+            for name in objects(deployment) {
+                assert!(!name.starts_with(&keys), "{name} reads as a key");
+            }
+            for name in ssh_keys(deployment) {
+                assert!(
+                    !name.starts_with(&rest),
+                    "{name} reads as an instance",
+                );
+            }
         }
     }
 

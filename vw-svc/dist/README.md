@@ -72,7 +72,7 @@ start without it. Everything this service creates is named
 | --- | --- | --- |
 | instance | `vwsvc-prod-ferris-alpha-vivado` | `vwsvc-beta-ferris-alpha-vivado` |
 | boot disk | `vwsvc-prod-ferris-alpha-vivado` | `vwsvc-beta-ferris-alpha-vivado` |
-| silo ssh key | `vwsvc-prod-ferris-alpha` | `vwsvc-beta-ferris-alpha` |
+| silo ssh key | `vwkey-prod-ferris-alpha` | `vwkey-beta-ferris-alpha` |
 
 If the project already separates instances and disks, why does the name matter?
 Because of the third row. **The silo ssh key list belongs to the token's user
@@ -80,6 +80,30 @@ and is not scoped by project at all**, so two deployments on one `OXIDE_TOKEN`
 walk the same list. The reconciler reclaims every key of its own that no
 environment wants, and without the name in it, every one of the other
 deployment's keys looks exactly like that.
+
+### Why the keys carry a different marker
+
+`vwkey-`, not `vwsvc-`, and that is the whole of what keeps a key alive.
+
+A name only protects a key if every service walking that list agrees about what
+the name means — and one of them may be older than any agreement written here.
+A vw-svc from before deployments had names reaps every key beginning `vwsvc-`
+that its own database does not want, which is every name a named deployment
+produces. Nothing a current service does can change that rule; it is compiled
+into the other binary.
+
+It is not hypothetical. A `beta` deployment sharing a token with one such
+service had its keys deleted within seconds of registering them, every pass,
+for days: an environment's instances came up with no authorized key, ssh was
+refused, and recreating the environment only lost the race again, because an
+instance reads its keys once while booting and the delete landed inside that
+window. The service's own log showed the key being registered every thirty
+seconds and never staying.
+
+So keys are named outside the namespace that rule watches. Instances and disks
+keep `vwsvc-`, because a project is a real boundary and nothing outside the
+project can reach them. The key list has no boundary, so the name is the only
+one it gets.
 
 Two rules follow, and both are enforced at startup:
 
@@ -93,20 +117,12 @@ Two rules follow, and both are enforced at startup:
 By convention the name matches the project, which is already silo-unique:
 project `vw-prod` runs deployment `prod`.
 
-- **No vw-svc from before deployment names may share the token.** Such a
-  service's prefix is the bare `vwsvc`, and it reaps every silo key beginning
-  `vwsvc-` that its own database does not want — which is every name a named
-  deployment produces. Nothing in a current service can prevent this; the rule
-  lives in the old binary. The symptom is instances that come up with no
-  authorized key and an ssh that is refused, sometimes with
-  `not found: ssh-key` failing the create outright. Shut the old service down
-  before starting a named one on the same `OXIDE_TOKEN`.
-
-A current service re-registers every environment's key on each reconciler pass
-rather than only when creating instances, so a key removed by anything is back
-within a tick. That limits the damage but does not undo it: an instance reads
-its keys once, at boot, so one already running stays unreachable and has to be
-recreated.
+A current service also re-registers every environment's key on each reconciler
+pass rather than only when creating instances, so a key removed by anything at
+all is back within a tick. Between that and the separate marker, a key that
+goes missing is both unlikely and self-correcting — but neither undoes the loss
+for an instance that has already booted. That one reads its keys once and stays
+unreachable until it is recreated.
 
 ### Images come from the project, never the silo
 

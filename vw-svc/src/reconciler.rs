@@ -458,7 +458,7 @@ impl UserInstance {
     pub(crate) fn ssh_key_name(&self) -> String {
         format!(
             "{}-{}-{}",
-            ox::instance_prefix(),
+            ox::ssh_key_prefix(),
             self.user,
             self.environment
         )
