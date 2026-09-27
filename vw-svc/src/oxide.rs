@@ -402,6 +402,13 @@ impl Session {
     /// register it — the one that got there first won, and the other two
     /// failed on a name that now existed, taking their instance creates down
     /// with them.
+    ///
+    /// Run over every environment on every pass rather than only the ones
+    /// being created, because the silo key list is shared by every deployment
+    /// on one token and so is not ours alone to rely on. A key somebody else
+    /// deleted is put back here; without that the loss is permanent, since an
+    /// instance reads its keys once at boot. The cost when nothing is wrong is
+    /// one listing and no writes.
     pub(crate) async fn ensure_ssh_keys(
         &self,
         instances: &InstanceMap,
@@ -1584,6 +1591,29 @@ mod test {
                     );
                 }
             }
+        }
+    }
+
+    /// The one case the hyphen rule cannot cover, recorded because it has
+    /// already cost a developer three unreachable instances.
+    ///
+    /// Before deployments had names, a service's prefix was the bare marker
+    /// and it reaped every silo key starting `vwsvc-`. Every modern name
+    /// starts that way, so such a service claims all of them — and the silo
+    /// key list is not scoped by project, so sharing one token is enough for
+    /// it to reach them. Nothing in this code can stop it: the rule is in the
+    /// old binary. A vw-svc from before deployment names must not be left
+    /// running against a token a current one uses.
+    #[test]
+    fn a_service_predating_deployment_names_claims_every_key() {
+        let legacy = format!("{OBJECT_MARKER}-");
+        for deployment in DEPLOYMENTS {
+            let name =
+                format!("{}-ferris-alpha", deployment_prefix(deployment));
+            assert!(
+                name.starts_with(&legacy),
+                "a legacy service would spare {name}, which it will not",
+            );
         }
     }
 

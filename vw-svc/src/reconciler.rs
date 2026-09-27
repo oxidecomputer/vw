@@ -71,6 +71,22 @@ impl InstanceReconciler {
         let current = session.get_instances().await?;
         let plan = self.plan(&target, &current, log);
 
+        // Every environment's key, on every pass, rather than only the ones
+        // whose instances are about to be made. The silo key list is not
+        // scoped by project, so it is shared mutable state that something
+        // else can damage -- and something did: a vw-svc predating deployment
+        // names claims every key beginning `vwsvc-`, which since deployment
+        // names arrived is every deployment's. Registering only at create
+        // time made that permanent, because an instance reads its keys once
+        // at boot and the environment never asks again. Doing it here means a
+        // key that goes missing is back within a tick, and the create that
+        // follows finds it.
+        //
+        // Before anything concurrent, for the reason it was before the
+        // creates when it lived there: an environment's three instances share
+        // one key, and racing to register it is how two of them fail.
+        session.ensure_ssh_keys(&target, log).await?;
+
         // Before acting, not after: the writes describe state read at the top
         // of this pass, and `execute` can spend a long time waiting on the
         // control plane. Deferring them would leave the environment looking
@@ -554,11 +570,6 @@ impl PassAction {
         // different functions cannot share a `Vec` without being boxed.
         // `FuturesUnordered` of boxed futures lets them all run together and
         // report back as they finish.
-        // Before anything concurrent: an environment's instances share one
-        // ssh key, and racing to register it is how two of the three end up
-        // failing.
-        session.ensure_ssh_keys(&self.to_create, log).await?;
-
         let mut tasks = FuturesUnordered::new();
         for inst in self.to_create.iter() {
             tasks.push(boxed(labeled(

@@ -93,6 +93,21 @@ Two rules follow, and both are enforced at startup:
 By convention the name matches the project, which is already silo-unique:
 project `vw-prod` runs deployment `prod`.
 
+- **No vw-svc from before deployment names may share the token.** Such a
+  service's prefix is the bare `vwsvc`, and it reaps every silo key beginning
+  `vwsvc-` that its own database does not want — which is every name a named
+  deployment produces. Nothing in a current service can prevent this; the rule
+  lives in the old binary. The symptom is instances that come up with no
+  authorized key and an ssh that is refused, sometimes with
+  `not found: ssh-key` failing the create outright. Shut the old service down
+  before starting a named one on the same `OXIDE_TOKEN`.
+
+A current service re-registers every environment's key on each reconciler pass
+rather than only when creating instances, so a key removed by anything is back
+within a tick. That limits the damage but does not undo it: an instance reads
+its keys once, at boot, so one already running stays unreachable and has to be
+recreated.
+
 ### Images come from the project, never the silo
 
 An image is named for the kind it boots — `vw-vivado-*`, `vw-helios-*`,
