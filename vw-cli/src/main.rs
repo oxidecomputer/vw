@@ -1767,6 +1767,12 @@ async fn main() {
             // batch alongside the htcl check. Skipped entirely for a
             // pure-htcl workspace (nothing rendered into a VHDL library).
             if let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) {
+                // Build output is per variant now (`vw_lib::build_dir`);
+                // carry a flat pre-variant `target/` over before
+                // anything below looks for it there.
+                for note in vw_lib::migrate_flat_build_output(&ws).notes() {
+                    println!("{} {note}", "note:".bright_yellow());
+                }
                 // `exclusive` entries that don't do what they look
                 // like they do. Nothing downstream would notice: a
                 // pattern that matches nothing just filters nothing.
@@ -1850,7 +1856,8 @@ async fn main() {
                             .and_then(|cfg| {
                                 vw_lib::project_needs_wipe(
                                     &ws,
-                                    vw_lib::vw_project_dir(&ws).as_std_path(),
+                                    vw_lib::vw_project_dir(&ws, vhdl_variant)
+                                        .as_std_path(),
                                     &cfg.workspace.name,
                                     vhdl_variant,
                                 )
@@ -2014,41 +2021,48 @@ async fn main() {
                 if cloud.is_none() {
                     if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
                         let name = &cfg.workspace.name;
-                        let project_dir = vw_lib::vw_project_dir(&ws);
-                        // Against the variant the loop above ended
-                        // on — the one `target/ip/` now holds.
-                        let last_variant =
-                            check_variants.last().cloned().flatten();
-                        match vw_lib::project_needs_wipe(
-                            &ws,
-                            project_dir.as_std_path(),
-                            name,
-                            last_variant.as_deref(),
-                        ) {
-                            Ok(true) if project_dir.exists() => {
-                                had_errors = true;
-                                eprintln!(
-                                    "{} IP wrappers under `target/ip/` are \
+                        // Each variant checked above has its own project
+                        // (see `vw_lib::build_dir`).
+                        for check_variant in &check_variants {
+                            let check_variant = check_variant.as_deref();
+                            let project_dir =
+                                vw_lib::vw_project_dir(&ws, check_variant);
+                            let ip_dir = vw_lib::build_dir(&ws, check_variant)
+                                .join("ip");
+                            let ip_dir = ip_dir
+                                .strip_prefix(&ws)
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|_| ip_dir.to_string());
+                            match vw_lib::project_needs_wipe(
+                                &ws,
+                                project_dir.as_std_path(),
+                                name,
+                                check_variant,
+                            ) {
+                                Ok(true) if project_dir.exists() => {
+                                    had_errors = true;
+                                    eprintln!(
+                                        "{} IP wrappers under `{ip_dir}/` are \
                                  stale — the `ip/**.htcl` config has \
-                                 changed since the last generation, or \
-                                 it was generated for another variant. \
-                                 Run `vw check --ip-generate` to \
-                                 regenerate just the wrappers in-process \
-                                 (no synthesis) and re-check.",
-                                    "error:".bright_red(),
-                                );
-                            }
-                            // Wipe-needed but the project doesn't exist
-                            // yet is the "fresh workspace" case, which
-                            // the VHDL block above already handles by
-                            // calling `ensure_ip_generated` when it sees
-                            // the missing-library diagnostics.
-                            Ok(_) => {}
-                            Err(e) => eprintln!(
+                                 changed since the last generation. Run \
+                                 `vw check --ip-generate` to regenerate \
+                                 just the wrappers in-process (no \
+                                 synthesis) and re-check.",
+                                        "error:".bright_red(),
+                                    );
+                                }
+                                // Wipe-needed but the project doesn't exist
+                                // yet is the "fresh workspace" case, which
+                                // the VHDL block above already handles by
+                                // calling `ensure_ip_generated` when it sees
+                                // the missing-library diagnostics.
+                                Ok(_) => {}
+                                Err(e) => eprintln!(
                                 "{} could not compare IP source fingerprint: \
                              {e}",
                                 "warning:".yellow(),
                             ),
+                            }
                         }
                     }
                 }
@@ -2568,7 +2582,9 @@ fn resolve_checkpoint_path(
                  `{ws}/vw.toml`",
             )
         })?;
-    let path = ws.join("target").join(stage).join(format!("{top}.dcp"));
+    let path = vw_lib::build_dir(&ws, active_variant.as_deref())
+        .join(stage)
+        .join(format!("{top}.dcp"));
     if !path.exists() {
         return Err(format!(
             "checkpoint not found: {path}\n\

@@ -23,8 +23,9 @@ use vw_api_types_versions::latest::S3Credentials;
 
 /// Where a build leaves things worth keeping, and what to keep from each.
 ///
-/// Directories under the workspace's `target`, paired with the extension that
-/// matters there. Everything else a build writes — checkpoints, logs, journal
+/// Directories under each build directory (`target`, or `target/<variant>`
+/// in a workspace with variants — see `vw_lib::build_dir`), paired with the
+/// extension that matters there. Everything else a build writes — checkpoints, logs, journal
 /// files, the vivado project — is either enormous, only meaningful on the
 /// machine that made it, or both.
 ///
@@ -457,9 +458,22 @@ struct Found {
 /// stage directory is neither small nor meaningful anywhere else.
 fn artifacts(root: &Utf8Path) -> Vec<Found> {
     let mut found = Vec::new();
+    let output = root.join(BUILD_OUTPUT);
 
-    for (directory, extension) in GATHERED {
-        let source = root.join(BUILD_OUTPUT).join(directory);
+    // Every variant's build, keyed by its path under `target` — so each
+    // variant's image and reports are their own objects (`vpk120/image/…`)
+    // rather than overwriting another variant's of the same name.
+    let gathered = vw_lib::build_dirs(root).into_iter().flat_map(|build| {
+        GATHERED.iter().map(move |(directory, extension)| {
+            (build.join(directory), *extension)
+        })
+    });
+    for (source, extension) in gathered {
+        let Some(prefix) =
+            source.strip_prefix(&output).ok().map(Utf8Path::to_owned)
+        else {
+            continue;
+        };
         let Ok(entries) = std::fs::read_dir(&source) else {
             // A build that has not reached this stage yet, which is the
             // ordinary case for most of them most of the time.
@@ -476,7 +490,7 @@ fn artifacts(root: &Utf8Path) -> Vec<Found> {
                 continue;
             };
             found.push(Found {
-                key: format!("{directory}/{name}"),
+                key: format!("{prefix}/{name}"),
                 path,
             });
         }
@@ -675,6 +689,62 @@ mod test {
     /// A mixed-signal bench writes a directory of its own, one level below
     /// everything else. The flat walk that finds images and netlists cannot
     /// see into it, so this is the thing that would silently ship nothing.
+    /// A workspace with two variants, which build into `target/<variant>`.
+    fn two_variants(root: &Utf8Path) {
+        std::fs::write(
+            root.join("vw.toml"),
+            "[workspace]\nname = \"twin\"\nversion = \"0.1.0\"\n\n\
+             [[workspace.variants]]\nname = \"alpha\"\npart = \"p\"\n\
+             default = true\n\n\
+             [[workspace.variants]]\nname = \"beta\"\npart = \"p\"\n",
+        )
+        .expect("vw.toml");
+    }
+
+    #[test]
+    fn each_variants_build_is_its_own_set_of_objects() {
+        // The same report name out of both variants: two objects, named
+        // for the variant that built each.
+        let (_dir, root) = scratch();
+        two_variants(&root);
+        build_output(&root, "alpha/image/alpha.pdi", "image");
+        build_output(&root, "alpha/reports/worst-paths.csv", "a");
+        build_output(&root, "beta/reports/worst-paths.csv", "b");
+        build_output(&root, "beta/route/top_beta-netlist.edif", "netlist");
+        // Not build output, and not a variant's: still gathered as before.
+        build_output(&root, "bench/tx-eq/eye.png", "a plot");
+
+        let keys: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(
+            keys,
+            [
+                "alpha/image/alpha.pdi",
+                "alpha/reports/worst-paths.csv",
+                "bench/tx-eq/eye.png",
+                "beta/reports/worst-paths.csv",
+                "beta/route/top_beta-netlist.edif",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_workspace_without_variants_keeps_its_names() {
+        let (_dir, root) = scratch();
+        std::fs::write(
+            root.join("vw.toml"),
+            "[workspace]\nname = \"flat\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("vw.toml");
+        build_output(&root, "image/flat.pdi", "image");
+
+        let keys: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(keys, ["image/flat.pdi"]);
+    }
+
     #[test]
     fn a_mixed_signal_benchs_results_are_gathered() {
         let (_dir, root) = scratch();

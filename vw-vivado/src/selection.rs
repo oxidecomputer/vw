@@ -130,6 +130,7 @@ fn persist_dir(
                     },
                 ));
             }
+            notes.extend(prep.migrated.notes());
             if let Some(wiped) = &prep.wiped_project {
                 notes.push(format!(
                     "wiped stale Vivado project at {wiped} (source \
@@ -141,8 +142,9 @@ fn persist_dir(
         Err(e) => {
             notes.push(format!(
                 "failed to prepare on-disk Vivado project dir under \
-                 {ws}/target/vw-project ({e}); falling back to in-memory \
+                 {} ({e}); falling back to in-memory \
                  project (state won't persist across sessions)",
+                vw_lib::vw_project_dir(ws, variant),
             ));
             None
         }

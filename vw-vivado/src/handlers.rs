@@ -290,7 +290,11 @@ async fn dispatch(
             workspace_root,
             extract_variant(&args).or_else(|| active_variant.map(String::from)),
         ),
-        "vhdl_ip_sources" => vhdl_ip_sources(workspace_root),
+        "vhdl_ip_sources" => vhdl_ip_sources(
+            workspace_root,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
+        "target_dir" => target_dir(workspace_root, active_variant),
         "design_constraints" => design_constraints(
             workspace_root,
             extract_variant(&args).or_else(|| active_variant.map(String::from)),
@@ -761,7 +765,7 @@ fn mark_project_configured(
     let name = obj.get("name").and_then(Value::as_str).ok_or_else(|| {
         "mark_project_configured: missing string `name` field".to_string()
     })?;
-    let project_dir = vw_lib::vw_project_dir(&ws);
+    let project_dir = vw_lib::vw_project_dir(&ws, active_variant);
     vw_lib::write_project_manifest(
         &ws,
         project_dir.as_std_path(),
@@ -1235,17 +1239,35 @@ fn top_value(
     )
 }
 
-/// `vhdl_ip_sources` — return every generated IP wrapper under
-/// `<workspace>/target/ip/**/*.vhd` as a JSON array of
-/// absolute-path strings. Empty array when nothing has been
+/// `vhdl_ip_sources` — return every generated IP wrapper under the
+/// variant's `<build>/ip/**/*.vhd` (see `vw_lib::build_dir`) as a
+/// JSON array of absolute-path strings. Variant resolution matches
+/// [`vhdl_design_sources`]. Empty array when nothing has been
 /// wrapped yet.
 fn vhdl_ip_sources(
     workspace_root: Option<&std::path::Path>,
+    variant: Option<String>,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
-    let paths = vw_lib::vhdl_ip_sources(&ws)
+    let variant = variant.or_else(|| workspace_default_variant_name(&ws));
+    let paths = vw_lib::vhdl_ip_sources(&ws, variant.as_deref())
         .map_err(|e| format!("enumerating VHDL IP sources: {e}"))?;
     Ok(paths_to_json_array(paths))
+}
+
+/// `target_dir` — the absolute directory this session's build writes
+/// its outputs to (`vw_lib::build_dir`): `<ws>/target/<variant>` in a
+/// variant-mode workspace, `<ws>/target` otherwise. vw.htcl builds
+/// every IP, checkpoint, report and image path from this rather than
+/// from `workspace_root`, so the layout lives in one place.
+fn target_dir(
+    workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    Ok(Value::String(
+        vw_lib::build_dir(&ws, active_variant).into_string(),
+    ))
 }
 
 /// `design_constraints` — return every constraint file under
@@ -1458,4 +1480,86 @@ fn render_unified_diff(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod variant_build_dir_tests {
+    use super::*;
+
+    /// Call an RPC method the way the shim does, with `active_variant`
+    /// being what the session was started with.
+    async fn call(
+        ws: &std::path::Path,
+        variant: Option<&str>,
+        method: &str,
+        args: Value,
+    ) -> Value {
+        let preloaded: SharedPreload = Arc::new(RwLock::new(HashMap::new()));
+        let cw: SharedCriticalWarningCount = Arc::default();
+        dispatch(method, args, Some(ws), variant, &preloaded, &cw, None)
+            .await
+            .unwrap()
+    }
+
+    fn two_variant_ws() -> (tempfile::TempDir, camino::Utf8PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"twin\"\nversion = \"0.1.0\"\n\n\
+             [[workspace.variants]]\nname = \"alpha\"\npart = \"p\"\n\
+             default = true\n\n\
+             [[workspace.variants]]\nname = \"beta\"\npart = \"p\"\n",
+        )
+        .unwrap();
+        for v in ["alpha", "beta"] {
+            let wrapper = ws.join(format!("target/{v}/ip/txr0/wrapper.vhd"));
+            std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+            std::fs::write(wrapper, "").unwrap();
+        }
+        (tmp, ws)
+    }
+
+    /// vw.htcl builds every IP, checkpoint, report and image path from
+    /// this answer.
+    #[tokio::test]
+    async fn target_dir_is_the_sessions_variants_build_dir() {
+        let (_tmp, ws) = two_variant_ws();
+        let dir = |v| call(ws.as_std_path(), v, "target_dir", Value::Null);
+        assert_eq!(dir(Some("beta")).await, ws.join("target/beta").as_str());
+        assert_eq!(dir(None).await, ws.join("target/alpha").as_str());
+    }
+
+    #[tokio::test]
+    async fn ip_sources_are_the_sessions_variants() {
+        let (_tmp, ws) = two_variant_ws();
+        let beta = call(
+            ws.as_std_path(),
+            Some("beta"),
+            "vhdl_ip_sources",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            beta,
+            serde_json::json!([ws
+                .join("target/beta/ip/txr0/wrapper.vhd")
+                .as_str()])
+        );
+        // An explicit `variant` argument wins, as for `vhdl_design_sources`.
+        let alpha = call(
+            ws.as_std_path(),
+            Some("beta"),
+            "vhdl_ip_sources",
+            serde_json::json!({ "variant": "alpha" }),
+        )
+        .await;
+        assert_eq!(
+            alpha,
+            serde_json::json!([ws
+                .join("target/alpha/ip/txr0/wrapper.vhd")
+                .as_str()])
+        );
+    }
 }

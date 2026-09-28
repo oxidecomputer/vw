@@ -4304,6 +4304,9 @@ fn prepare_repl_persist_dir(
                     },
                 );
             }
+            for note in prep.migrated.notes() {
+                tracing::info!("{note}");
+            }
             if let Some(wiped) = &prep.wiped_project {
                 tracing::info!(
                     "wiped stale Vivado project at {wiped} \
@@ -4315,8 +4318,9 @@ fn prepare_repl_persist_dir(
         Err(e) => {
             tracing::warn!(
                 "failed to prepare on-disk Vivado project dir under \
-                 {ws}/target/vw-project ({e}); falling back to in-memory \
-                 project (state won't persist across sessions)"
+                 {} ({e}); falling back to in-memory \
+                 project (state won't persist across sessions)",
+                vw_lib::vw_project_dir(ws, variant),
             );
             None
         }
