@@ -202,6 +202,29 @@ pub(crate) fn populate_procs(
     }
 }
 
+/// Index of the first pattern/body word of a `switch` command:
+/// past the options (`-matchvar` / `-indexvar` take a value, `--`
+/// ends them) and the STRING being matched.
+pub(crate) fn switch_arms_index(cmd: &crate::ast::Command) -> usize {
+    let n = cmd.words.len();
+    let mut i = 1;
+    while let Some(t) = cmd.words.get(i).and_then(|w| w.as_text()) {
+        // The last word left is STRING even if it starts with `-`.
+        if !t.starts_with('-') || i + 1 >= n {
+            break;
+        }
+        i += if matches!(t, "-matchvar" | "-indexvar") {
+            2
+        } else {
+            1
+        };
+        if t == "--" {
+            break;
+        }
+    }
+    i + 1
+}
+
 /// Body-arg positions per builtin. Word-index 0 is the head, so
 /// `foreach var list body` puts the body at word 3. `dict for
 /// {kv} dict body` is the two-word head form.
@@ -221,18 +244,56 @@ fn populate_control_flow_bodies(
     // a script. Multiple positions handle `for INIT COND STEP
     // BODY` and `if COND BODY [elseif COND BODY]* [else BODY]`.
     let body_positions: Vec<usize> = match head {
-        "foreach" => vec![cmd.words.len().saturating_sub(1)],
+        "foreach" | "lmap" => vec![cmd.words.len().saturating_sub(1)],
         "while" => vec![2],
         "for" => vec![1, 3, 4], // init, step, body — cond is an expr
-        "catch" => vec![1],
+        "catch" | "time" => vec![1],
         "dict"
             // `dict for {kv} DICT BODY` — head is the two-word
-            // sub-command form. Only recognize the `for` variant
-            // for body descent; other `dict` sub-commands have no
-            // script args.
-            if cmd.words.get(1).and_then(|w| w.as_text()) == Some("for") => {
+            // sub-command form. `map` / `update` / `with` also take
+            // the script as their last arg; other `dict`
+            // sub-commands have no script args.
+            if matches!(
+                cmd.words.get(1).and_then(|w| w.as_text()),
+                Some("for" | "map" | "update" | "with")
+            ) =>
+            {
                 vec![cmd.words.len().saturating_sub(1)]
             }
+        "switch" => {
+            // Inline-arm form, `switch ?OPTS? STRING PAT BODY …`:
+            // every second word after STRING is a body (`-` falls
+            // through). The single-braced-list form has no body
+            // words of its own.
+            let arms = switch_arms_index(cmd);
+            if arms + 1 >= cmd.words.len() {
+                return;
+            }
+            (arms + 1..cmd.words.len())
+                .step_by(2)
+                .filter(|&j| cmd.words[j].as_text() != Some("-"))
+                .collect()
+        }
+        "try" => {
+            // `try BODY (on CODE VARS BODY | trap PAT VARS BODY)*
+            // ?finally BODY?`.
+            let mut out = vec![1];
+            let mut i = 2usize;
+            while i < cmd.words.len() {
+                match cmd.words[i].as_text() {
+                    Some("on" | "trap") => {
+                        out.push(i + 3);
+                        i += 4;
+                    }
+                    Some("finally") => {
+                        out.push(i + 1);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            out
+        }
         "if" => {
             // `if COND BODY [elseif COND BODY]* [else BODY]`.
             // Scan word-by-word: after `if`/`elseif` we skip the

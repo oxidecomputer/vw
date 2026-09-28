@@ -2120,7 +2120,7 @@ fn write_dict_assembly(
 /// `set_property -dict` expects (via [`Properties::to_dotted_flat`]),
 /// then apply against the cell handle. Two-mode `-bd` branch:
 /// `bd=1` → target `$cell` directly (a bd_cell path); `bd=0` →
-/// resolve via `[get_ips $name]` because `create_ip` returns an
+/// resolve via `[vivado_cmd::get_ips -patterns $name]` because `create_ip` returns an
 /// XCI file path, not an IP handle.
 fn emit_config_finalize(out: &mut String, ip_name: &str) {
     let config_ty = config_name(ip_name);
@@ -2133,7 +2133,7 @@ fn emit_config_finalize(out: &mut String, ip_name: &str) {
     // - `-bd true`: `$handle` IS the `/…` bd_cell path,
     //   `set_property -objects` takes it directly.
     // - `-bd false`: `$handle` is a bare module name; the IP
-    //   object is fetched via `[get_ips $handle]`.
+    //   object is fetched via `[vivado_cmd::get_ips -patterns $handle]`.
     // Both branches are semantically identical up to the target
     // resolution, matching the pre-collapse behavior.
     writeln!(out, "if {{[llength $_dict] > 0}} {{").unwrap();
@@ -2146,7 +2146,7 @@ fn emit_config_finalize(out: &mut String, ip_name: &str) {
     writeln!(out, "  }} else {{").unwrap();
     writeln!(
         out,
-        "    vivado_cmd::set_property -dict $_dict -objects [get_ips $handle]"
+        "    vivado_cmd::set_property -dict $_dict -objects [vivado_cmd::get_ips -patterns $handle]"
     )
     .unwrap();
     writeln!(out, "  }}").unwrap();
@@ -3530,12 +3530,12 @@ mod tests {
         );
         // Both bd branches: `-bd true` targets `$handle` (the
         // bd_cell path directly); `-bd false` fetches the IP
-        // object via `[get_ips $handle]`.
+        // object via `[vivado_cmd::get_ips -patterns $handle]`.
         assert!(
             create_range.contains("set_property -dict $_dict -objects $handle")
         );
         assert!(create_range
-            .contains("set_property -dict $_dict -objects [get_ips $handle]"));
+            .contains("set_property -dict $_dict -objects [vivado_cmd::get_ips -patterns $handle]"));
     }
 
     // ------------------------------------------------------------------

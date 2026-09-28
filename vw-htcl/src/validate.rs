@@ -197,7 +197,7 @@ pub fn validate_with_all_extras_and_vars<'doc>(
     // index once per sig — even for sigs never touched — is cheap
     // (linear in total-args-in-workspace) and turns per-call-site
     // work from O(K × N_args) into O(K).
-    let sig_env = SigEnv::build(&table);
+    let sig_env = SigEnv::build(&table, &enum_table);
     validate_stmts(
         &document.stmts,
         source,
@@ -1526,10 +1526,19 @@ pub(crate) struct SigEnv<'a> {
     /// per-call alloc dominated `validate_stmts` (~100s on the
     /// metroid workspace). Precomputed here once.
     pub bare_names: Vec<String>,
+    /// Procs the compiler emits for every `enum` declaration
+    /// (`<Enum>::<Variant>` constructors plus `tag` / `payload` /
+    /// `repr` / `from` / `to` / `to_raw` / `from_raw`). They ship
+    /// via `repr::emit_enum_prelude` at session start, not through
+    /// `src`, so they have no entry in the signature table.
+    pub enum_procs: std::collections::HashSet<String>,
 }
 
 impl<'a> SigEnv<'a> {
-    fn build(table: &'a HashMap<String, &'a ProcSignature>) -> Self {
+    fn build(
+        table: &'a HashMap<String, &'a ProcSignature>,
+        enum_table: &HashMap<String, &EnumDecl>,
+    ) -> Self {
         let arg_indexes: HashMap<String, HashMap<String, &ProcArg>> = table
             .iter()
             .map(|(name, sig)| {
@@ -1554,11 +1563,27 @@ impl<'a> SigEnv<'a> {
                     .unwrap_or_else(|| (*k).to_string())
             })
             .collect();
+        // Keyed by the enum's bare name: `emit_enum_prelude` wraps
+        // the procs in `namespace eval <bare name>` regardless of
+        // where the enum was declared.
+        let mut enum_procs = std::collections::HashSet::new();
+        for ed in enum_table.values() {
+            let Some(name) = ed.name.as_deref() else {
+                continue;
+            };
+            let fixed =
+                ["tag", "payload", "repr", "from", "to", "to_raw", "from_raw"];
+            let variants = ed.variants.iter().map(|v| v.name.as_str());
+            for leaf in fixed.into_iter().chain(variants) {
+                enum_procs.insert(format!("{name}::{leaf}"));
+            }
+        }
         Self {
             arg_indexes,
             suffix_index,
             qualified_names,
             bare_names,
+            enum_procs,
         }
     }
 }
@@ -1676,7 +1701,127 @@ fn validate_stmts(
                 }
             }
         }
+        // Control-flow script bodies (`if`/`foreach`/`try`/…) —
+        // parsed onto `Word::body` by
+        // `parser::populate_control_flow_bodies`. They run in the
+        // enclosing frame, so the var table is shared.
+        for word in &cmd.words {
+            if let Some(body) = &word.body {
+                validate_stmts(
+                    body,
+                    source,
+                    table,
+                    env,
+                    proc_table,
+                    newtype_names,
+                    var_table,
+                    diags,
+                );
+            }
+        }
+        // Braced words that hold calls but aren't scripts, so the
+        // parser leaves them opaque: expressions and `switch` arm
+        // lists. Reparse just enough to reach the calls.
+        for (word, pos) in non_script_call_words(cmd) {
+            let Some(stmts) = crate::unused::reparse_braced_body(word, source)
+            else {
+                continue;
+            };
+            let stmts = match pos {
+                // Only an expression's `[ … ]` substitutions are
+                // calls — `while {1}` must not read as a call to `1`.
+                NonScript::Expr => expr_cmd_substs(stmts),
+                NonScript::SwitchArms => switch_arm_bodies(stmts, source),
+            };
+            validate_stmts(
+                &stmts,
+                source,
+                table,
+                env,
+                proc_table,
+                newtype_names,
+                var_table,
+                diags,
+            );
+        }
     }
+}
+
+/// A braced argument that contains calls without being a script.
+#[derive(Clone, Copy)]
+enum NonScript {
+    /// An `expr` expression (`if`/`while`/`for` conditions too).
+    Expr,
+    /// A `switch` pattern/body list, as one braced word.
+    SwitchArms,
+}
+
+/// The braced expression and `switch` arm-list arguments of a
+/// control-flow command. Argument positions follow the Tcl core
+/// grammars; script bodies are handled via `Word::body` instead.
+fn non_script_call_words(cmd: &Command) -> Vec<(&Word, NonScript)> {
+    let w = &cmd.words;
+    let n = w.len();
+    let text = |i: usize| w.get(i).and_then(Word::as_text);
+    let at = |i: usize, pos: NonScript| w.get(i).map(|word| (word, pos));
+    if !matches!(cmd.kind, CommandKind::Generic) {
+        return Vec::new();
+    }
+    match text(0) {
+        // if COND BODY (elseif COND BODY)* ?else BODY?
+        Some("if") => (1..n)
+            .filter(|&i| i == 1 || text(i - 1) == Some("elseif"))
+            .filter_map(|i| at(i, NonScript::Expr))
+            .collect(),
+        Some("while") => at(1, NonScript::Expr).into_iter().collect(),
+        Some("for") => at(2, NonScript::Expr).into_iter().collect(),
+        Some("expr") => (1..n).filter_map(|i| at(i, NonScript::Expr)).collect(),
+        // switch ?OPTS? STRING {PAT BODY …}. The inline-arm form's
+        // bodies are plain words the parser already populates.
+        Some("switch") => {
+            let arms = crate::parser::switch_arms_index(cmd);
+            if arms + 1 == n {
+                at(arms, NonScript::SwitchArms).into_iter().collect()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The `[ … ]` substitutions in an expression that was reparsed as
+/// a script, as a flat statement list.
+fn expr_cmd_substs(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        let Stmt::Command(cmd) = stmt else { continue };
+        for word in cmd.words {
+            for part in word.parts {
+                if let WordPart::CmdSubst { body, .. } = part {
+                    out.extend(body);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The body scripts of a braced `switch` arm list that was reparsed
+/// as a script. The list's words, read across line breaks, alternate
+/// pattern / body; a `-` body falls through to the next arm.
+fn switch_arm_bodies(stmts: Vec<Stmt>, source: &str) -> Vec<Stmt> {
+    let words = stmts.into_iter().flat_map(|stmt| match stmt {
+        Stmt::Command(cmd) => cmd.words,
+        _ => Vec::new(),
+    });
+    words
+        .skip(1)
+        .step_by(2)
+        .filter(|w| w.as_text() != Some("-"))
+        .filter_map(|w| crate::unused::reparse_braced_body(&w, source))
+        .flatten()
+        .collect()
 }
 
 /// Build a name → signature map from every proc declaration in
@@ -2625,10 +2770,11 @@ fn render_type_inline(ty: &crate::ast::TypeExpr) -> String {
 /// by `lappend`). Calls to anything in this list pass the
 /// unknown-call check unconditionally.
 ///
-/// Keep this small but pragmatic: a missed builtin produces a
-/// pestering error on calls that work fine; an over-included name
-/// hides a real "you forgot to src @x" mistake. The set below is
-/// the standard Tcl core surface most htcl bodies actually use.
+/// Every other unresolved call is an error, so a Tcl core command
+/// missing here produces a false `undefined proc` — add it. Tool
+/// commands (Vivado's `get_ips`, the shim's `::vw::rpc_call`) do
+/// NOT belong here: they're called through `extern::` or an htcl
+/// wrapper.
 fn is_known_tcl_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -2736,6 +2882,26 @@ fn is_known_tcl_builtin(name: &str) -> bool {
             | "global"
             | "rename"
             | "interp"
+            // Remaining Tcl core commands.
+            | "exit"
+            | "vwait"
+            | "update"
+            | "encoding"
+            | "seek"
+            | "tell"
+            | "eof"
+            | "fblocked"
+            | "fcopy"
+            | "load"
+            | "tailcall"
+            | "yield"
+            | "coroutine"
+            | "zlib"
+            | "lpop"
+            | "lremove"
+            | "lseq"
+            | "ledit"
+            | "parray"
     )
 }
 
@@ -2764,6 +2930,53 @@ fn qualify(prefix: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{prefix}::{name}")
+    }
+}
+
+/// The " — did you mean `x`?" suffix for an undefined-proc error,
+/// or empty when nothing is close.
+///
+/// An exact namespaced homonym (`get_bd_addr_spaces` when
+/// `vivado_cmd::get_bd_addr_spaces` exists) is the strongest signal
+/// — a missed namespace prefix — so it wins outright. Otherwise a
+/// Levenshtein-close proc name, matched against BOTH qualified names
+/// (`ip::generate_dcmac`) and their bare suffixes (`generate_dcmac`):
+/// inside `namespace eval ip { ... }`, a call to `generate_dcmacc` is
+/// distance 1 from the bare `generate_dcmac` but distance 5 from the
+/// qualified name (past the length-scaled threshold). A bare hit is
+/// mapped back to its qualified name for the hint.
+fn undefined_proc_hint(
+    call_name: &str,
+    table: &HashMap<String, &ProcSignature>,
+    env: &SigEnv,
+) -> String {
+    let shortest_qualified = |bare: &str| {
+        env.suffix_index
+            .get(bare)
+            .and_then(|qs| qs.iter().min_by_key(|s| s.len()))
+            .map(|s| s.to_string())
+    };
+    if !call_name.contains("::") {
+        if let Some(qualified) = shortest_qualified(call_name) {
+            return format!(" — did you mean `{qualified}`?");
+        }
+    }
+    let suggestion = suggest_name(
+        call_name,
+        env.qualified_names.iter().copied(),
+    )
+    .or_else(|| {
+        suggest_name(call_name, env.bare_names.iter().map(String::as_str))
+    });
+    match suggestion {
+        Some(s) if s.contains("::") => format!(" — did you mean `{s}`?"),
+        Some(s) => {
+            let name = shortest_qualified(&s)
+                .or_else(|| table.get(s.as_str()).map(|_| s.clone()))
+                .unwrap_or(s);
+            format!(" — did you mean `{name}`?")
+        }
+        None => String::new(),
     }
 }
 
@@ -2802,130 +3015,46 @@ fn validate_command(
     if crate::lower::is_extern_call(call_name) {
         return;
     }
+    // `{*}$cmd …` — the parser splits the expand prefix into its own
+    // braced `*` word. The callee is whatever `$cmd` holds at
+    // runtime, as dynamic as a `$cmd` head, which isn't checked.
+    if call_name == "*" && cmd.words[0].form == crate::ast::WordForm::Braced {
+        return;
+    }
     let Some(sig) = table.get(call_name) else {
-        // Unknown call. Two paths fire an error:
-        //
-        // 1. The call uses `-flag` keyword arguments. Almost
-        //    always the user meant an htcl wrapper that isn't
-        //    loaded — shipping it raw to the EDA backend either
-        //    errors cryptically or misinterprets the args.
-        //
-        // 2. The unqualified name has a matching namespaced
-        //    proc in scope (e.g., `get_bd_addr_spaces` when
-        //    `vivado_cmd::get_bd_addr_spaces` exists). That's a
-        //    missed namespace prefix on the same wrapper the
-        //    user is calling elsewhere with the qualified name.
-        //    Catching this even for positional-only calls is
-        //    what makes the analyzer's behavior consistent —
-        //    otherwise `assign_bd_address` errors (has `-flag`
-        //    args) but `[get_bd_addr_spaces X]` inside its arg
-        //    silently passes, which reads as an analyzer gap.
-        //
-        // A positional-only call to a bare Tcl builtin (`llength`,
-        // `dict`, etc.) still passes cleanly: `is_known_tcl_builtin`
-        // filters those, and there's no namespaced homonym.
+        // Unknown call. Every call must resolve to a proc in the
+        // signature table, a Tcl core builtin, a compiler-provided
+        // prelude proc, or be spelled `extern::name` — there are no
+        // implicit pass-through commands. A bare call to a proc that
+        // was renamed or never `src`d (`plumb_dcmac` after the proc
+        // became `plumb_dcmac_vpk120`) is exactly the mistake this
+        // catches; raw Vivado / Tcl procs go through `extern::`.
         //
         // Short-circuit builtins FIRST — every `if`, `set`, `puts`,
         // `list`, etc. hits this path and there can be tens of
         // thousands of such call sites in a healthy source. The
-        // downstream `suffix_index` and fuzzy sweep are cheap per
-        // call (index is O(1), fuzzy allocs a bare-name Vec) but
-        // even cheap-per-call adds up at that scale.
+        // "did you mean" search below is only paid on calls that
+        // are about to error anyway.
         if is_known_tcl_builtin(call_name)
             || is_primitive_prelude_proc(call_name)
+            || env.enum_procs.contains(call_name)
         {
             return;
         }
-        let uses_keyword = cmd.words.iter().skip(1).any(|w| {
-            w.as_text()
-                .is_some_and(|t| t.starts_with('-') && t.len() > 1)
+        let hint = undefined_proc_hint(call_name, table, env);
+        // `extern::` already roots the name, so `::vw::foo` is
+        // spelled `extern::vw::foo`.
+        let rooted = call_name.trim_start_matches("::");
+        diags.push(Diagnostic {
+            severity: Severity::Error,
+            message: format!(
+                "undefined proc `{call_name}`{hint}; either \
+                 `src` a module that defines it or use \
+                 `extern::{rooted}` to call the underlying \
+                 Tcl proc directly"
+            ),
+            span: cmd.words[0].span,
         });
-        let namespaced_match = if !call_name.contains("::") {
-            env.suffix_index
-                .get(call_name)
-                .and_then(|qs| qs.iter().min_by_key(|s| s.len()))
-                .map(|s| s.to_string())
-        } else {
-            None
-        };
-        // A Levenshtein-close hit against a proc the table already
-        // knows about is strong evidence the call is USER code with a
-        // typo. Compute lazily — only after we've confirmed the call
-        // isn't a builtin or prelude proc, so `bare_names` isn't
-        // allocated on every one of the thousands of legitimate
-        // builtin calls in a large workspace.
-        //
-        // Match against BOTH qualified names (`ip::generate_dcmac`)
-        // and their bare suffixes (`generate_dcmac`). Bare calls in
-        // the same namespace as the target are the common case —
-        // e.g. inside `namespace eval ip { ... }`, a call to
-        // `generate_dcmacc` fuzzy-matches the bare `generate_dcmac`
-        // at distance 1, but the qualified `ip::generate_dcmac` at
-        // distance 5 (past the length-scaled threshold). Rebuild
-        // the qualified name for the "did you mean" hint by
-        // finding the table entry whose suffix matches.
-        let need_fuzzy = !uses_keyword && namespaced_match.is_none();
-        let (fuzzy_match, fuzzy_hint) = if need_fuzzy {
-            let suggestion =
-                suggest_name(call_name, env.qualified_names.iter().copied())
-                    .or_else(|| {
-                        suggest_name(
-                            call_name,
-                            env.bare_names.iter().map(String::as_str),
-                        )
-                    });
-            let hint_name = suggestion.as_ref().map(|s| {
-                if s.contains("::") {
-                    s.clone()
-                } else {
-                    env.suffix_index
-                        .get(s.as_str())
-                        .and_then(|qs| qs.iter().min_by_key(|k| k.len()))
-                        .map(|q| q.to_string())
-                        .or_else(|| table.get(s.as_str()).map(|_| s.clone()))
-                        .unwrap_or_else(|| s.clone())
-                }
-            });
-            (suggestion, hint_name)
-        } else {
-            // Non-fuzzy path: `-flag` args or an exact namespaced
-            // homonym trip the diagnostic on their own; the
-            // suggestion (when the -flag path fires) comes from
-            // the plain `suggest_name` sweep below.
-            (None, None)
-        };
-        let should_flag =
-            uses_keyword || namespaced_match.is_some() || fuzzy_match.is_some();
-        if should_flag {
-            // Prefer the exact namespaced match as the "did you
-            // mean" — it's a stronger signal than the fuzzy
-            // Levenshtein suggestion, which for the bare-name
-            // case would surface the same or a nearby name
-            // anyway.
-            let hint = if let Some(qualified) = &namespaced_match {
-                format!(" — did you mean `{qualified}`?")
-            } else if let Some(s) = fuzzy_hint {
-                format!(" — did you mean `{s}`?")
-            } else {
-                match suggest_name(
-                    call_name,
-                    env.qualified_names.iter().copied(),
-                ) {
-                    Some(s) => format!(" — did you mean `{s}`?"),
-                    None => String::new(),
-                }
-            };
-            diags.push(Diagnostic {
-                severity: Severity::Error,
-                message: format!(
-                    "undefined proc `{call_name}`{hint}; either \
-                     `src` a module that defines it or use \
-                     `extern::{call_name}` to call the underlying \
-                     Tcl proc directly"
-                ),
-                span: cmd.words[0].span,
-            });
-        }
         return;
     };
 
@@ -3929,9 +4058,8 @@ namespace eval ip {
     }
 
     #[test]
-    fn positional_unknown_call_is_allowed() {
-        // No `-flag` args → looks like a positional Tcl builtin
-        // call (puts, set, etc.). Pass through silently.
+    fn positional_builtin_call_is_allowed() {
+        // Tcl core builtins resolve without a signature.
         let src = "puts hello\n";
         assert!(diags(src).is_empty());
     }
@@ -3967,16 +4095,148 @@ puts [get_thing X]
     }
 
     #[test]
-    fn positional_call_with_no_namespaced_match_still_passes() {
-        // No matching namespaced proc → keep the "raw Tcl
-        // builtin assumption" semantics for positional calls.
-        // A bare `some_native X` with nothing named `*::some_native`
-        // in scope stays silent.
+    fn positional_call_with_no_namespaced_match_is_flagged() {
+        // No implicit pass-through for unknown names: a raw Tcl
+        // proc is spelled `extern::some_native`.
         let src = "puts [some_native X]\n";
         let d = diags(src);
         assert!(
+            d.iter()
+                .any(|e| e.message.contains("undefined proc `some_native`")),
+            "expected undefined-proc diag, got: {d:?}",
+        );
+    }
+
+    #[test]
+    fn expanded_dynamic_call_is_not_flagged() {
+        let src = "proc f {} string {\n  set cmd [list ::current_project]\n  return [{*}$cmd]\n}\n";
+        let d = diags(src);
+        assert!(
             d.iter().all(|e| !e.message.contains("undefined proc")),
-            "unexpected diag: {d:?}",
+            "{d:?}",
+        );
+    }
+
+    #[test]
+    fn call_to_renamed_proc_is_flagged() {
+        // Motivating case: `plumb_dcmac` was renamed to
+        // `plumb_dcmac_vpk120` and the zero-arg caller was left
+        // behind. Too far apart for a "did you mean", still an error.
+        let src = "\
+proc plumb_dcmac_vpk120 {} unit {}
+proc configure_dcmac {} unit {
+  plumb_dcmac
+}
+";
+        let d = diags(src);
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("undefined proc `plumb_dcmac`")),
+            "expected undefined-proc diag, got: {d:?}",
+        );
+    }
+
+    #[test]
+    fn rooted_unknown_call_hint_spells_extern_once() {
+        let src = "puts [::vw::json_string x]\n";
+        let d = diags(src);
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("`extern::vw::json_string`")),
+            "{d:?}",
+        );
+    }
+
+    #[test]
+    fn enum_prelude_procs_are_not_undefined() {
+        // `emit_enum_prelude` ships constructors and accessors at
+        // session start; they're never `src`d.
+        let src = "\
+enum Shape = {
+  Dot: string
+  Empty
+}
+proc f {x: string} Shape {
+  puts [Shape::tag [Shape::Empty]]
+  return [Shape::Dot $x]
+}
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|e| !e.message.contains("undefined proc")),
+            "{d:?}",
+        );
+    }
+
+    #[test]
+    fn calls_inside_control_flow_bodies_are_checked() {
+        let src = "\
+proc f {x: string} unit {
+  if {$x eq \"\"} { nope_if } elseif {[nope_cond]} { puts a } else { nope_else }
+  foreach i $x { nope_foreach }
+  while {1} { nope_while }
+  for {set i 0} {$i < 3} {incr i} { nope_for }
+  catch { nope_catch } err
+  try { nope_try } on error {m} { nope_on } finally { nope_finally }
+  dict for {k v} $x { nope_dict }
+  switch -- $x {
+    a { nope_switch }
+    b -
+    c { puts ok }
+  }
+  switch $x a { nope_switch_inline } default { puts d }
+  set l [lmap i $x { nope_lmap }]
+  set y [expr {[nope_expr] + 1}]
+}
+";
+        let d = diags(src);
+        for name in [
+            "nope_if",
+            "nope_cond",
+            "nope_else",
+            "nope_foreach",
+            "nope_while",
+            "nope_for",
+            "nope_catch",
+            "nope_try",
+            "nope_on",
+            "nope_finally",
+            "nope_dict",
+            "nope_switch",
+            "nope_switch_inline",
+            "nope_lmap",
+            "nope_expr",
+        ] {
+            assert!(
+                d.iter().any(|e| e
+                    .message
+                    .contains(&format!("undefined proc `{name}`"))),
+                "missing `{name}` in {d:?}",
+            );
+        }
+        let undefined = d
+            .iter()
+            .filter(|e| e.message.contains("undefined proc"))
+            .count();
+        assert_eq!(undefined, 15, "{d:?}");
+    }
+
+    #[test]
+    fn control_flow_conditions_are_not_calls() {
+        // Conditions are expressions — `1`, `true`, `abs(…)` are
+        // operands, not command names.
+        let src = "\
+proc f {x: string} unit {
+  while {1} { break }
+  if {true} { puts a } elseif {abs(1) > 0 && $x eq \"\"} { puts b }
+  for {set i 0} {$i < 3} {incr i} { puts $i }
+  set y [expr {abs(-1) + 1}]
+}
+";
+        let d = diags(src);
+        assert!(
+            d.iter().all(|e| !e.message.contains("undefined proc")),
+            "{d:?}",
         );
     }
 
@@ -4189,13 +4449,16 @@ namespace eval vivado {
     }
 
     #[test]
-    fn unknown_positional_call_is_not_validated() {
-        // Bare positional call to an unknown name (could be a Tcl
-        // builtin) is silently accepted. Unknown calls with
-        // `-flag` args are the *only* unknown-call case that
-        // errors — see `unknown_keyword_call_is_an_error`.
+    fn unknown_positional_call_is_an_error() {
+        // Same rule as `unknown_keyword_call_is_an_error`: positional
+        // args don't make an unknown name a Tcl builtin.
         let src = "axis_interface tkeep_yes 1\n";
-        assert!(diags(src).is_empty());
+        let d = diags(src);
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("undefined proc `axis_interface`")),
+            "{d:?}",
+        );
     }
 
     // --- type-decl triplet enforcement (step 1b) ----------------
