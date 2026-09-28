@@ -87,6 +87,15 @@ pub trait LanguageBackend: Send + Sync {
     /// because most backends won't care.
     async fn set_workspace_roots(&self, _roots: Vec<std::path::PathBuf>) {}
 
+    /// The editor's `variant` setting changed (see
+    /// [`crate::VariantSetting`]). Re-analyze whatever depends on
+    /// it. Returns the documents whose diagnostics the server
+    /// should re-publish once their re-analysis lands; backends
+    /// that push their own diagnostics return none.
+    async fn variant_changed(&self) -> Vec<Url> {
+        Vec::new()
+    }
+
     /// The editor observed one of the paths this backend registered
     /// as a "watched file" changing on disk. Called from
     /// [`LanguageServer::did_change_watched_files`]. Backends that

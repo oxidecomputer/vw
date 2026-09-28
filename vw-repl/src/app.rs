@@ -4251,7 +4251,8 @@ fn resolve_worker_selection(
         else {
             return Ok((None, None));
         };
-        let persist_dir = prepare_repl_persist_dir(ws, &ws_info.name);
+        let persist_dir =
+            prepare_repl_persist_dir(ws, &ws_info.name, Some(&v.name));
         return Ok((
             Some(vw_vivado::AutoProject {
                 name: ws_info.name.clone(),
@@ -4264,7 +4265,7 @@ fn resolve_worker_selection(
     let selected = ws_info
         .select_target_part(part)
         .map_err(|e| e.to_string())?;
-    let persist_dir = prepare_repl_persist_dir(ws, &ws_info.name);
+    let persist_dir = prepare_repl_persist_dir(ws, &ws_info.name, None);
     Ok((
         selected.map(|p| vw_vivado::AutoProject {
             name: ws_info.name.clone(),
@@ -4287,8 +4288,9 @@ fn resolve_worker_selection(
 fn prepare_repl_persist_dir(
     ws: &camino::Utf8Path,
     name: &str,
+    variant: Option<&str>,
 ) -> Option<std::path::PathBuf> {
-    match vw_lib::prepare_vw_project_dir(ws, name) {
+    match vw_lib::prepare_vw_project_dir(ws, name, variant) {
         Ok(prep) => {
             if prep.legacy_cache_removed > 0 {
                 tracing::info!(

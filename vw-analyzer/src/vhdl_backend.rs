@@ -54,6 +54,9 @@ struct WorkspaceHandle {
     /// Workspace root (the dir holding `vw.toml`) — kept so the
     /// config can be re-rendered when the file set shifts.
     root: Utf8PathBuf,
+    /// The editor's `variant` setting, which picks the design
+    /// files every render maps into `defaultlib`.
+    variant: Arc<crate::VariantSetting>,
     /// Every file the *currently installed* config maps into a
     /// library, normalized the same way `vhdl_lang` normalizes
     /// source paths. A `.vhd` that isn't in here is invisible to
@@ -102,7 +105,7 @@ impl WorkspaceHandle {
         if !force && !self.absent.lock().unwrap().insert(path.clone()) {
             return;
         }
-        let cfg = match vw_lib::render_vhdl_lang_config(&self.root, None) {
+        let cfg = match self.render_config() {
             Ok(c) => c,
             Err(e) => {
                 warn!(
@@ -123,6 +126,35 @@ impl WorkspaceHandle {
         // only do it when the enumeration actually moved.
         if self.install_files(files) {
             let _ = self.tx.send(Message::UpdateConfig(cfg));
+        }
+    }
+
+    /// Render the workspace's config for the variant the editor
+    /// is set to.
+    fn render_config(&self) -> vw_lib::Result<vhdl_lang::Config> {
+        let variant = self.variant.for_workspace(&self.root);
+        vw_lib::render_vhdl_lang_config(&self.root, variant.as_deref())
+    }
+
+    /// Re-render the config from scratch and hand it to the wrapped
+    /// server — the workspace's file set, or which variant's files
+    /// it includes, may have moved.
+    fn reload(&self) {
+        match self.render_config() {
+            Ok(cfg) => {
+                // Keep the membership cache in step with what the
+                // server is about to be told, so a file this reload
+                // just added doesn't trigger a second re-render when
+                // it's opened.
+                self.install_files(config_file_set(&cfg));
+                let _ = self.tx.send(Message::UpdateConfig(cfg));
+            }
+            Err(e) => {
+                warn!(
+                    "vhdl_backend: config re-render failed for {}: {e}",
+                    self.root
+                );
+            }
         }
     }
 
@@ -201,6 +233,8 @@ enum Message {
 pub struct VhdlBackend {
     client: Client,
     workspaces: TokioMutex<HashMap<Utf8PathBuf, Arc<WorkspaceHandle>>>,
+    /// The editor's `variant` setting, shared with every worker.
+    variant: Arc<crate::VariantSetting>,
     /// `Some(handle)` in production; captured at construction so
     /// worker threads can hand outbound notifications back to
     /// tower_lsp via `handle.spawn`. Tests skip this by leaving it
@@ -210,9 +244,20 @@ pub struct VhdlBackend {
 
 impl VhdlBackend {
     pub fn new(client: Client) -> Self {
+        let variant = Arc::new(crate::VariantSetting::new(client.clone()));
+        Self::with_variant(client, variant)
+    }
+
+    /// A backend that follows the server's shared `variant`
+    /// setting.
+    pub fn with_variant(
+        client: Client,
+        variant: Arc<crate::VariantSetting>,
+    ) -> Self {
         Self {
             client,
             workspaces: TokioMutex::new(HashMap::new()),
+            variant,
             runtime: tokio::runtime::Handle::current(),
         }
     }
@@ -232,7 +277,9 @@ impl VhdlBackend {
         if let Some(existing) = map.get(&ws) {
             return Some(existing.clone());
         }
-        let cfg = match vw_lib::render_vhdl_lang_config(&ws, None) {
+        let variant = self.variant.for_workspace(&ws);
+        let cfg = match vw_lib::render_vhdl_lang_config(&ws, variant.as_deref())
+        {
             Ok(c) => c,
             Err(e) => {
                 warn!("vhdl_backend: config render failed for {ws}: {e}");
@@ -251,6 +298,7 @@ impl VhdlBackend {
             .map(|p| p.to_string());
         let handle = spawn_workspace_worker(
             ws.clone(),
+            self.variant.clone(),
             self.client.clone(),
             self.runtime.clone(),
             cfg,
@@ -278,6 +326,7 @@ impl VhdlBackend {
 
 fn spawn_workspace_worker(
     root: Utf8PathBuf,
+    variant: Arc<crate::VariantSetting>,
     client: Client,
     runtime: tokio::runtime::Handle,
     initial_config: vhdl_lang::Config,
@@ -299,6 +348,7 @@ fn spawn_workspace_worker(
     Arc::new(WorkspaceHandle {
         tx,
         root,
+        variant,
         project_files: StdMutex::new(project_files),
         absent: StdMutex::new(HashSet::new()),
         _thread: StdMutex::new(Some(thread)),
@@ -578,23 +628,19 @@ impl LanguageBackend for VhdlBackend {
                 // build a fresh server from the current state.
                 continue;
             };
-            match vw_lib::render_vhdl_lang_config(&ws, None) {
-                Ok(cfg) => {
-                    // Keep the membership cache in step with what
-                    // the server is about to be told, so a file
-                    // this event just added doesn't trigger a
-                    // second re-render when it's opened.
-                    handle.install_files(config_file_set(&cfg));
-                    let _ = handle.tx.send(Message::UpdateConfig(cfg));
-                }
-                Err(e) => {
-                    warn!(
-                        "vhdl_backend: config re-render failed for \
-                         {ws}: {e}"
-                    );
-                }
-            }
+            handle.reload();
         }
+    }
+
+    async fn variant_changed(&self) -> Vec<Url> {
+        // Every live workspace swaps to the new variant's design
+        // files. Diagnostics come back through the wrapped server's
+        // own publish path, so there's nothing for the server to
+        // re-publish.
+        for handle in self.workspaces.lock().await.values() {
+            handle.reload();
+        }
+        Vec::new()
     }
 
     async fn close(&self, uri: &Url) {
@@ -804,6 +850,7 @@ mod tests {
         let handle = WorkspaceHandle {
             tx,
             root: ws.clone(),
+            variant: Arc::default(),
             project_files: StdMutex::new(config_file_set(&cfg)),
             absent: StdMutex::new(HashSet::new()),
             _thread: StdMutex::new(None),
@@ -818,6 +865,48 @@ mod tests {
         std::fs::create_dir_all(ws.join("hdl")).unwrap();
         std::fs::write(ws.join("hdl/existing.vhd"), "").unwrap();
         (tmp, ws)
+    }
+
+    /// The analyzer's `variant` setting picks which board's design
+    /// files the wrapped server sees, and changing it swaps them.
+    #[test]
+    fn variant_setting_selects_design_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"ws\"\nversion = \"0.1.0\"\n\n\
+             [[workspace.variants]]\nname = \"a\"\npart = \"p\"\n\
+             default = true\nexclusive = [\"hdl/top-a.vhd\"]\n\n\
+             [[workspace.variants]]\nname = \"b\"\npart = \"p\"\n\
+             exclusive = [\"hdl/top-b.vhd\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.join("hdl")).unwrap();
+        std::fs::write(ws.join("hdl/top-a.vhd"), "").unwrap();
+        std::fs::write(ws.join("hdl/top-b.vhd"), "").unwrap();
+        let (mut handle, rx) = handle_for(&ws);
+        let variant = Arc::new(crate::VariantSetting::default());
+        handle.variant = variant.clone();
+        let has = |h: &WorkspaceHandle, f: &str| {
+            let files = config_file_set(&h.render_config().unwrap());
+            files.contains(&normalize(ws.join(f).as_std_path()))
+        };
+
+        // Unset → the default variant.
+        assert!(has(&handle, "hdl/top-a.vhd"));
+        assert!(!has(&handle, "hdl/top-b.vhd"));
+
+        variant.set(Some("b".into()));
+        assert!(has(&handle, "hdl/top-b.vhd"));
+        assert!(!has(&handle, "hdl/top-a.vhd"));
+        handle.reload();
+        assert!(took_update_config(&rx));
+
+        // A name the workspace doesn't declare falls back to the
+        // default rather than dropping every board's files.
+        variant.set(Some("c".into()));
+        assert!(has(&handle, "hdl/top-a.vhd"));
     }
 
     fn took_update_config(rx: &Receiver<Message>) -> bool {

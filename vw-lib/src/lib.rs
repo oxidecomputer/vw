@@ -2335,6 +2335,19 @@ pub fn vhdl_design_sources_for_variant(
     let mut files =
         find_vhdl_files(hdl_dir.as_std_path(), /*recursive=*/ true, &[])?;
     files.sort();
+    retain_variant_files(workspace_dir, files, active_variant)
+}
+
+/// Drop the files another variant owns: keep shared files (in no
+/// variant's `exclusive` set) plus those `active_variant` owns.
+/// The one filter behind every per-variant source list, VHDL and
+/// constraints alike, so `exclusive` means the same thing for
+/// both.
+fn retain_variant_files(
+    workspace_dir: &Utf8Path,
+    mut files: Vec<PathBuf>,
+    active_variant: Option<&str>,
+) -> Result<Vec<PathBuf>> {
     // Compile each variant's `exclusive` globs relative to the
     // workspace root. Empty variants list → nothing to filter,
     // early-return keeps the common no-variants path cheap.
@@ -2381,38 +2394,130 @@ fn build_variant_ownership(
         std::collections::HashMap::new();
     for variant in &ws.variants {
         for pattern in &variant.exclusive {
-            // Absolutize relative-to-workspace patterns so the
-            // glob crate walks the right filesystem tree.
-            let abs_pattern = workspace_dir.as_std_path().join(pattern);
-            let pattern_str =
-                abs_pattern.to_str().ok_or_else(|| VwError::FileSystem {
-                    message: format!(
-                        "variant `{}` exclusive pattern is not valid UTF-8: {}",
-                        variant.name,
-                        abs_pattern.display(),
-                    ),
-                })?;
-            let entries =
-                glob::glob(pattern_str).map_err(|e| VwError::FileSystem {
-                    message: format!(
-                        "variant `{}` invalid glob `{pattern}`: {e}",
-                        variant.name,
-                    ),
-                })?;
-            for entry in entries.flatten() {
-                if !entry.is_file() {
-                    continue;
-                }
+            for entry in
+                exclusive_matches(workspace_dir, &variant.name, pattern)?
+            {
                 // First-writer wins: if two variants claim the
                 // same file exclusively, the first entry in the
                 // list owns it. That's a config bug the user
-                // should fix; we don't error to keep the surface
-                // predictable in the interim.
+                // should fix — [`variant_exclusive_warnings`]
+                // reports it — but we don't error, to keep the
+                // surface predictable in the interim.
                 owners.entry(entry).or_insert_with(|| variant.name.clone());
             }
         }
     }
     Ok(VariantOwnership { owners })
+}
+
+/// The files one `exclusive` pattern matches, as absolute paths.
+/// Patterns are workspace-relative globs; directories never match.
+fn exclusive_matches(
+    workspace_dir: &Utf8Path,
+    variant: &str,
+    pattern: &str,
+) -> Result<Vec<PathBuf>> {
+    // Absolutize relative-to-workspace patterns so the glob crate
+    // walks the right filesystem tree.
+    let abs_pattern = workspace_dir.as_std_path().join(pattern);
+    let pattern_str =
+        abs_pattern.to_str().ok_or_else(|| VwError::FileSystem {
+            message: format!(
+                "variant `{variant}` exclusive pattern is not valid UTF-8: {}",
+                abs_pattern.display(),
+            ),
+        })?;
+    let entries = glob::glob(pattern_str).map_err(|e| VwError::FileSystem {
+        message: format!("variant `{variant}` invalid glob `{pattern}`: {e}"),
+    })?;
+    Ok(entries.flatten().filter(|p| p.is_file()).collect())
+}
+
+/// Problems with the workspace's `[[workspace.variants]]`
+/// `exclusive` lists that would otherwise pass silently, one
+/// message per problem:
+///
+/// - a pattern that matches no file (a typo, or a file that was
+///   renamed or deleted);
+/// - a pattern whose matches are all files `exclusive` has no
+///   effect on — only VHDL under `hdl/` and constraint files under
+///   `constraints/` are filtered by variant;
+/// - a file claimed by more than one variant, where only the
+///   first claim takes effect.
+///
+/// Empty when the workspace declares no variants or has no
+/// `vw.toml`.
+pub fn variant_exclusive_warnings(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<String>> {
+    let Ok(cfg) = load_workspace_config(workspace_dir) else {
+        return Ok(Vec::new());
+    };
+    let variants = &cfg.workspace.variants;
+    if variants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let filtered: std::collections::HashSet<PathBuf> =
+        vhdl_design_sources_all_variants(workspace_dir)?
+            .into_iter()
+            .chain(design_constraints_all_variants(workspace_dir)?)
+            .collect();
+    let rel = |p: &Path| {
+        p.strip_prefix(workspace_dir.as_std_path())
+            .unwrap_or(p)
+            .display()
+            .to_string()
+    };
+    let mut warnings = Vec::new();
+    // First claimant per file, for the duplicate-claim check.
+    let mut claimed: std::collections::HashMap<PathBuf, &str> =
+        std::collections::HashMap::new();
+    for variant in variants {
+        for pattern in &variant.exclusive {
+            let name = &variant.name;
+            let matches = exclusive_matches(workspace_dir, name, pattern)?;
+            if matches.is_empty() {
+                warnings.push(format!(
+                    "variant `{name}` exclusive pattern `{pattern}` matches \
+                     no files"
+                ));
+                continue;
+            }
+            if !matches.iter().any(|m| filtered.contains(m)) {
+                let mut shown: Vec<String> =
+                    matches.iter().take(3).map(|m| rel(m)).collect();
+                if matches.len() > shown.len() {
+                    shown.push(format!(
+                        "… {} more",
+                        matches.len() - shown.len()
+                    ));
+                }
+                warnings.push(format!(
+                    "variant `{name}` exclusive pattern `{pattern}` has no \
+                     effect: it matches only {}, and `exclusive` applies \
+                     only to VHDL under `hdl/` and constraint files under \
+                     `constraints/`",
+                    shown.join(", "),
+                ));
+            }
+            for m in matches {
+                match claimed.get(&m) {
+                    None => {
+                        claimed.insert(m, name);
+                    }
+                    Some(first) if *first != name.as_str() => {
+                        warnings.push(format!(
+                            "`{}` is exclusive to both `{first}` and \
+                             `{name}`; only `{first}` gets it",
+                            rel(&m),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    Ok(warnings)
 }
 
 /// Enumerate every Vivado design-constraint file under
@@ -2424,8 +2529,28 @@ fn build_variant_ownership(
 /// constraints have their own file kind and a different
 /// consumption command (`read_xdc` vs. `read_vhdl`).
 ///
+/// Filtered by variant the same way as
+/// [`vhdl_design_sources_for_variant`]: a constraint file listed
+/// in a variant's `exclusive` set contributes only when that
+/// variant is active.
+///
 /// Empty vec when `constraints/` doesn't exist yet.
-pub fn design_constraints(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+pub fn design_constraints(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let files = design_constraints_in(workspace_dir, None)?;
+    retain_variant_files(workspace_dir, files, active_variant)
+}
+
+/// Every constraint file under `<workspace_dir>/constraints/`,
+/// regardless of which variant owns it. The constraints
+/// counterpart of [`vhdl_design_sources_all_variants`], for
+/// callers that want the whole input surface rather than one
+/// build's.
+pub fn design_constraints_all_variants(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<PathBuf>> {
     design_constraints_in(workspace_dir, None)
 }
 
@@ -2434,11 +2559,14 @@ pub fn design_constraints(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
 /// hand synthesis-only constraints to `read_xdc -used_in
 /// synthesis` (or the equivalent set_property USED_IN) so
 /// route/place-only constraints don't spuriously apply during
-/// synth. Empty vec when the subdir doesn't exist.
+/// synth. Empty vec when the subdir doesn't exist. Variant-filtered
+/// like [`design_constraints`].
 pub fn design_synth_constraints(
     workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
-    design_constraints_in(workspace_dir, Some("synth"))
+    let files = design_constraints_in(workspace_dir, Some("synth"))?;
+    retain_variant_files(workspace_dir, files, active_variant)
 }
 
 /// Enumerate only the `place`-scoped constraints under
@@ -2447,8 +2575,10 @@ pub fn design_synth_constraints(
 /// vec when the subdir doesn't exist.
 pub fn design_place_constraints(
     workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
-    design_constraints_in(workspace_dir, Some("place"))
+    let files = design_constraints_in(workspace_dir, Some("place"))?;
+    retain_variant_files(workspace_dir, files, active_variant)
 }
 
 /// Enumerate only the `route`-scoped constraints under
@@ -2457,8 +2587,10 @@ pub fn design_place_constraints(
 /// vec when the subdir doesn't exist.
 pub fn design_route_constraints(
     workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
-    design_constraints_in(workspace_dir, Some("route"))
+    let files = design_constraints_in(workspace_dir, Some("route"))?;
+    retain_variant_files(workspace_dir, files, active_variant)
 }
 
 /// Enumeration primitive shared by [`design_constraints`] and
@@ -2724,7 +2856,7 @@ fn synth_source_paths(
         active_variant,
     )?);
     sources.extend(vhdl_ip_sources(workspace_dir)?);
-    sources.extend(design_synth_constraints(workspace_dir)?);
+    sources.extend(design_synth_constraints(workspace_dir, active_variant)?);
     sources.extend(list_workspace_htcl_files(workspace_dir)?);
     // Dependency VHDL — same surface `vw::synth` feeds into
     // `read_vhdl`. Matters for path deps (whose files change
@@ -3026,9 +3158,10 @@ pub fn synth_needs_update(
 fn place_source_paths(
     workspace_dir: &Utf8Path,
     synth_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let mut sources: Vec<PathBuf> = Vec::new();
-    sources.extend(design_place_constraints(workspace_dir)?);
+    sources.extend(design_place_constraints(workspace_dir, active_variant)?);
     sources.push(synth_checkpoint.to_path_buf());
     sources.sort();
     sources.dedup();
@@ -3041,8 +3174,10 @@ fn place_source_paths(
 pub fn place_source_fingerprint(
     workspace_dir: &Utf8Path,
     synth_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<u64> {
-    let paths = place_source_paths(workspace_dir, synth_checkpoint)?;
+    let paths =
+        place_source_paths(workspace_dir, synth_checkpoint, active_variant)?;
     Ok(fingerprint_paths(workspace_dir, &paths))
 }
 
@@ -3053,8 +3188,13 @@ pub fn write_place_checkpoint_manifest(
     workspace_dir: &Utf8Path,
     place_checkpoint: &Path,
     synth_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<()> {
-    let fp = place_source_fingerprint(workspace_dir, synth_checkpoint)?;
+    let fp = place_source_fingerprint(
+        workspace_dir,
+        synth_checkpoint,
+        active_variant,
+    )?;
     write_checkpoint_manifest_with_fingerprint(place_checkpoint, fp)
 }
 
@@ -3066,8 +3206,13 @@ pub fn place_needs_update(
     workspace_dir: &Utf8Path,
     place_checkpoint: &Path,
     synth_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<bool> {
-    let current_fp = place_source_fingerprint(workspace_dir, synth_checkpoint)?;
+    let current_fp = place_source_fingerprint(
+        workspace_dir,
+        synth_checkpoint,
+        active_variant,
+    )?;
     Ok(checkpoint_needs_update_with_fingerprint(
         place_checkpoint,
         current_fp,
@@ -3091,9 +3236,10 @@ pub fn place_needs_update(
 fn route_source_paths(
     workspace_dir: &Utf8Path,
     place_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let mut sources: Vec<PathBuf> = Vec::new();
-    sources.extend(design_route_constraints(workspace_dir)?);
+    sources.extend(design_route_constraints(workspace_dir, active_variant)?);
     sources.push(place_checkpoint.to_path_buf());
     sources.sort();
     sources.dedup();
@@ -3106,8 +3252,10 @@ fn route_source_paths(
 pub fn route_source_fingerprint(
     workspace_dir: &Utf8Path,
     place_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<u64> {
-    let paths = route_source_paths(workspace_dir, place_checkpoint)?;
+    let paths =
+        route_source_paths(workspace_dir, place_checkpoint, active_variant)?;
     Ok(fingerprint_paths(workspace_dir, &paths))
 }
 
@@ -3118,8 +3266,13 @@ pub fn write_route_checkpoint_manifest(
     workspace_dir: &Utf8Path,
     route_checkpoint: &Path,
     place_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<()> {
-    let fp = route_source_fingerprint(workspace_dir, place_checkpoint)?;
+    let fp = route_source_fingerprint(
+        workspace_dir,
+        place_checkpoint,
+        active_variant,
+    )?;
     write_checkpoint_manifest_with_fingerprint(route_checkpoint, fp)
 }
 
@@ -3131,8 +3284,13 @@ pub fn route_needs_update(
     workspace_dir: &Utf8Path,
     route_checkpoint: &Path,
     place_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<bool> {
-    let current_fp = route_source_fingerprint(workspace_dir, place_checkpoint)?;
+    let current_fp = route_source_fingerprint(
+        workspace_dir,
+        place_checkpoint,
+        active_variant,
+    )?;
     Ok(checkpoint_needs_update_with_fingerprint(
         route_checkpoint,
         current_fp,
@@ -3206,9 +3364,50 @@ fn project_source_paths(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
 
 /// Combined fingerprint over the on-disk-project source set.
 /// Backs [`project_needs_wipe`] and [`write_project_manifest`].
-pub fn project_source_fingerprint(workspace_dir: &Utf8Path) -> Result<u64> {
+///
+/// In a variant-mode workspace the active variant is folded in too:
+/// there's one persisted project per workspace, and the IP it holds
+/// is configured for one variant (its part, and whatever `ip/`
+/// htcl does with `vw::active_variant`). Switching variants has to
+/// look stale, or `vw::configure_ip` would see a configured project
+/// and keep the other variant's IP. The variant's part lives in
+/// `vw.toml`, which is already hashed, so the name is enough.
+/// `active_variant = None` means the workspace default, same as
+/// every other variant selector. Workspaces without variants hash
+/// exactly as before.
+pub fn project_source_fingerprint(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<u64> {
     let paths = project_source_paths(workspace_dir)?;
-    Ok(fingerprint_paths(workspace_dir, &paths))
+    let mut fp = fingerprint_paths(workspace_dir, &paths);
+    if let Some(variant) = project_variant(workspace_dir, active_variant) {
+        fp = fnv1a_64_extend(fp, b"\0variant\0");
+        fp = fnv1a_64_extend(fp, variant.as_bytes());
+    }
+    Ok(fp)
+}
+
+/// The variant a persisted project is configured for: `active_variant`
+/// when given, else the workspace default. `None` for workspaces
+/// without variants.
+fn project_variant(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Option<String> {
+    let cfg = load_workspace_config(workspace_dir).ok()?;
+    if cfg.workspace.variants.is_empty() {
+        return None;
+    }
+    match active_variant {
+        Some(v) => Some(v.to_string()),
+        None => cfg
+            .workspace
+            .default_variant()
+            .ok()
+            .flatten()
+            .map(|v| v.name.clone()),
+    }
 }
 
 /// Absolute path of the `.xpr` inside the on-disk project dir.
@@ -3235,8 +3434,9 @@ pub fn write_project_manifest(
     workspace_dir: &Utf8Path,
     project_dir: &Path,
     name: &str,
+    active_variant: Option<&str>,
 ) -> Result<()> {
-    let fp = project_source_fingerprint(workspace_dir)?;
+    let fp = project_source_fingerprint(workspace_dir, active_variant)?;
     write_checkpoint_manifest_with_fingerprint(
         &vw_project_xpr(project_dir, name),
         fp,
@@ -3257,8 +3457,9 @@ pub fn project_needs_wipe(
     workspace_dir: &Utf8Path,
     project_dir: &Path,
     name: &str,
+    active_variant: Option<&str>,
 ) -> Result<bool> {
-    let current_fp = project_source_fingerprint(workspace_dir)?;
+    let current_fp = project_source_fingerprint(workspace_dir, active_variant)?;
     Ok(checkpoint_needs_update_with_fingerprint(
         &vw_project_xpr(project_dir, name),
         current_fp,
@@ -3356,12 +3557,17 @@ pub struct PreparedProjectDir {
 pub fn prepare_vw_project_dir(
     workspace_dir: &Utf8Path,
     name: &str,
+    active_variant: Option<&str>,
 ) -> Result<PreparedProjectDir> {
     let project_dir = vw_project_dir(workspace_dir);
     let legacy_cache_removed = cleanup_legacy_ip_cache(workspace_dir);
     let mut wiped_project = None;
-    if project_needs_wipe(workspace_dir, project_dir.as_std_path(), name)?
-        && project_dir.exists()
+    if project_needs_wipe(
+        workspace_dir,
+        project_dir.as_std_path(),
+        name,
+        active_variant,
+    )? && project_dir.exists()
     {
         fs::remove_dir_all(project_dir.as_std_path())?;
         wiped_project = Some(project_dir.clone());
@@ -4165,6 +4371,84 @@ pub fn check_vhdl(
             .then(a.column.cmp(&b.column))
     });
     Ok(out)
+}
+
+/// The variant an editor session analyzes, and why it might not be
+/// the one that was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorVariant {
+    /// The variant to analyze. `None` when the workspace declares
+    /// no variants (nothing to filter), or declares several with
+    /// no default and none was requested.
+    pub variant: Option<String>,
+    /// Set when the requested name isn't one of the workspace's
+    /// variants, and `variant` fell back to the default instead.
+    pub warning: Option<String>,
+}
+
+/// Pick the variant an editor session analyzes `workspace_dir` as.
+///
+/// Precedence: `requested` (the language server's `variant`
+/// setting), then the `VW_ACTIVE_VARIANT` environment variable, then
+/// the workspace's default variant. A requested name that the
+/// workspace doesn't declare falls back to the default with a
+/// warning naming the valid choices — an editor-wide setting has to
+/// survive projects that name their variants differently, so this
+/// isn't an error. Workspaces without variants ignore the request.
+pub fn editor_variant(
+    workspace_dir: &Utf8Path,
+    requested: Option<&str>,
+) -> EditorVariant {
+    let none = EditorVariant {
+        variant: None,
+        warning: None,
+    };
+    let Ok(cfg) = load_workspace_config(workspace_dir) else {
+        return none;
+    };
+    let ws = &cfg.workspace;
+    if ws.variants.is_empty() {
+        return none;
+    }
+    let default = ws.default_variant().ok().flatten().map(|v| v.name.clone());
+    let env = std::env::var("VW_ACTIVE_VARIANT").ok();
+    let (name, source) = match (requested, env.as_deref().map(str::trim)) {
+        (Some(r), _) if !r.trim().is_empty() => {
+            (r.trim(), "the language server's `variant` setting")
+        }
+        (_, Some(e)) if !e.is_empty() => (e, "`VW_ACTIVE_VARIANT`"),
+        _ => {
+            return EditorVariant {
+                variant: default,
+                warning: None,
+            }
+        }
+    };
+    if ws.variants.iter().any(|v| v.name == name) {
+        return EditorVariant {
+            variant: Some(name.to_string()),
+            warning: None,
+        };
+    }
+    let valid: Vec<String> = ws
+        .variants
+        .iter()
+        .map(|v| format!("`{}`", v.name))
+        .collect();
+    let fallback = match &default {
+        Some(d) => format!("analyzing the default variant `{d}`"),
+        None => {
+            "no default variant, so analyzing shared files only".to_string()
+        }
+    };
+    EditorVariant {
+        variant: default,
+        warning: Some(format!(
+            "{workspace_dir}: variant `{name}` from {source} is not declared \
+             in vw.toml (variants: {}); {fallback}",
+            valid.join(", "),
+        )),
+    }
 }
 
 /// Resolve which variant the LSP renderer should filter to.
@@ -7373,7 +7657,7 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
     fn design_constraints_empty_when_no_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        assert!(design_constraints(&ws).unwrap().is_empty());
+        assert!(design_constraints(&ws, None).unwrap().is_empty());
     }
 
     #[test]
@@ -7393,21 +7677,21 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         std::fs::write(c.join("place/only.xdc"), "").unwrap();
         std::fs::write(c.join("route/only.xdc"), "").unwrap();
 
-        let synth = design_synth_constraints(&ws).unwrap();
+        let synth = design_synth_constraints(&ws, None).unwrap();
         assert_eq!(synth.len(), 1);
         assert!(synth[0].ends_with("synth/only.xdc"));
 
-        let place = design_place_constraints(&ws).unwrap();
+        let place = design_place_constraints(&ws, None).unwrap();
         assert_eq!(place.len(), 1);
         assert!(place[0].ends_with("place/only.xdc"));
 
-        let route = design_route_constraints(&ws).unwrap();
+        let route = design_route_constraints(&ws, None).unwrap();
         assert_eq!(route.len(), 1);
         assert!(route[0].ends_with("route/only.xdc"));
 
         // Aggregate walk returns everything under constraints/
         // regardless of subdir.
-        let all = design_constraints(&ws).unwrap();
+        let all = design_constraints(&ws, None).unwrap();
         assert_eq!(all.len(), 4);
     }
 
@@ -7421,9 +7705,9 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         std::fs::create_dir_all(c.join("place")).unwrap();
         std::fs::write(c.join("place/only.xdc"), "").unwrap();
 
-        assert!(design_synth_constraints(&ws).unwrap().is_empty());
-        assert!(design_route_constraints(&ws).unwrap().is_empty());
-        assert_eq!(design_place_constraints(&ws).unwrap().len(), 1);
+        assert!(design_synth_constraints(&ws, None).unwrap().is_empty());
+        assert!(design_route_constraints(&ws, None).unwrap().is_empty());
+        assert_eq!(design_place_constraints(&ws, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -7438,7 +7722,7 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         // Non-constraint sibling — should be skipped.
         std::fs::write(c.join("readme.md"), "").unwrap();
 
-        let files = design_constraints(&ws).unwrap();
+        let files = design_constraints(&ws, None).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -7727,6 +8011,197 @@ exclusive = ["hdl/ethernet-metro.vhd"]
         assert!(names.contains(&"shared.vhd".to_string()));
         assert!(names.contains(&"ethernet-metro.vhd".to_string()));
         assert!(!names.contains(&"ethernet-vpk120.vhd".to_string()));
+    }
+
+    /// Place XDCs split per board the way redhawk-metroid does:
+    /// one shared file plus one pin file per variant, each listed
+    /// in its variant's `exclusive`.
+    fn make_variant_constraints_ws(tmp: &tempfile::TempDir) -> Utf8PathBuf {
+        let ws = tmp.path().to_path_buf();
+        let place = ws.join("constraints/place");
+        std::fs::create_dir_all(&place).unwrap();
+        std::fs::write(place.join("timing.xdc"), "# shared\n").unwrap();
+        std::fs::write(place.join("pins-vpk120.xdc"), "# vpk120\n").unwrap();
+        std::fs::write(place.join("pins-metro.xdc"), "# metro\n").unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[[workspace.variants]]
+name = "vpk120"
+part = "xcvp1202-vsva2785-2MHP-e-S"
+default = true
+exclusive = ["constraints/place/pins-vpk120.xdc"]
+
+[[workspace.variants]]
+name = "metro"
+part = "xcvp1202-vsva2785-3HP-e-S"
+exclusive = ["constraints/place/pins-metro.xdc"]
+"#,
+        )
+        .unwrap();
+        Utf8PathBuf::from_path_buf(ws).unwrap()
+    }
+
+    fn file_names(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn constraints_filter_by_active_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_constraints_ws(&tmp);
+
+        let place = design_place_constraints(&ws, Some("vpk120")).unwrap();
+        assert_eq!(file_names(&place), vec!["pins-vpk120.xdc", "timing.xdc"]);
+        let all = design_constraints(&ws, Some("vpk120")).unwrap();
+        assert_eq!(file_names(&all), vec!["pins-vpk120.xdc", "timing.xdc"]);
+
+        let place = design_place_constraints(&ws, Some("metro")).unwrap();
+        assert_eq!(file_names(&place), vec!["pins-metro.xdc", "timing.xdc"]);
+
+        // Same rule as VHDL: no active variant keeps only shared files.
+        let place = design_place_constraints(&ws, None).unwrap();
+        assert_eq!(file_names(&place), vec!["timing.xdc"]);
+    }
+
+    #[test]
+    fn constraints_all_variants_is_unfiltered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_constraints_ws(&tmp);
+        let all = design_constraints_all_variants(&ws).unwrap();
+        assert_eq!(
+            file_names(&all),
+            vec!["pins-metro.xdc", "pins-vpk120.xdc", "timing.xdc"]
+        );
+    }
+
+    #[test]
+    fn place_checkpoint_ignores_other_variants_constraints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_constraints_ws(&tmp);
+        let synth_dcp = ws.join("target/synth/top.dcp").into_std_path_buf();
+        let place_dcp = ws.join("target/place/top.dcp").into_std_path_buf();
+        std::fs::create_dir_all(synth_dcp.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(place_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&synth_dcp, "").unwrap();
+        std::fs::write(&place_dcp, "").unwrap();
+        let v = Some("vpk120");
+        write_place_checkpoint_manifest(&ws, &place_dcp, &synth_dcp, v)
+            .unwrap();
+        assert!(!place_needs_update(&ws, &place_dcp, &synth_dcp, v).unwrap());
+
+        // The other board's pins aren't part of this build.
+        let place = ws.join("constraints/place");
+        std::fs::write(place.join("pins-metro.xdc"), "# edited\n").unwrap();
+        assert!(!place_needs_update(&ws, &place_dcp, &synth_dcp, v).unwrap());
+
+        // This board's pins are.
+        std::fs::write(place.join("pins-vpk120.xdc"), "# edited\n").unwrap();
+        assert!(place_needs_update(&ws, &place_dcp, &synth_dcp, v).unwrap());
+    }
+
+    #[test]
+    fn editor_variant_selects_requested_or_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_ws(&tmp);
+        let pick = |r: Option<&str>| editor_variant(&ws, r);
+        assert_eq!(pick(Some("metro")).variant.as_deref(), Some("metro"));
+        assert_eq!(pick(Some("metro")).warning, None);
+        assert_eq!(pick(None).variant.as_deref(), Some("vpk120"));
+        assert_eq!(pick(Some("  ")).variant.as_deref(), Some("vpk120"));
+
+        // Unknown name: default, plus a warning listing the choices.
+        let bad = pick(Some("metr"));
+        assert_eq!(bad.variant.as_deref(), Some("vpk120"));
+        let w = bad.warning.unwrap();
+        assert!(w.contains("variant `metr`"), "{w}");
+        assert!(w.contains("`vpk120`, `metro`"), "{w}");
+    }
+
+    #[test]
+    fn editor_variant_ignored_without_variants() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("vw.toml"),
+            "[workspace]\nname = \"ws\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let pick = editor_variant(&ws, Some("metro"));
+        assert_eq!(
+            pick,
+            EditorVariant {
+                variant: None,
+                warning: None
+            }
+        );
+    }
+
+    #[test]
+    fn exclusive_warnings_clean_for_working_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_constraints_ws(&tmp);
+        assert!(variant_exclusive_warnings(&ws).unwrap().is_empty());
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_ws(&tmp);
+        assert!(variant_exclusive_warnings(&ws).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exclusive_warnings_flag_dead_and_duplicate_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("hdl")).unwrap();
+        std::fs::create_dir_all(ws.join("ip")).unwrap();
+        std::fs::write(ws.join("hdl/top-a.vhd"), "").unwrap();
+        std::fs::write(ws.join("hdl/shared.vhd"), "").unwrap();
+        std::fs::write(ws.join("ip/a.htcl"), "").unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[[workspace.variants]]
+name = "a"
+part = "xcvp1202-vsva2785-2MHP-e-S"
+default = true
+exclusive = ["hdl/top-a.vhd", "hdl/top-a.vdh", "ip/a.htcl"]
+
+[[workspace.variants]]
+name = "b"
+part = "xcvp1202-vsva2785-3HP-e-S"
+exclusive = ["hdl/top-a.vhd"]
+"#,
+        )
+        .unwrap();
+        let ws = Utf8PathBuf::from_path_buf(ws.to_path_buf()).unwrap();
+        let w = variant_exclusive_warnings(&ws).unwrap();
+        assert_eq!(w.len(), 3, "{w:#?}");
+        assert!(
+            w[0].contains("`hdl/top-a.vdh` matches no files"),
+            "{}",
+            w[0]
+        );
+        assert!(
+            w[1].contains("`ip/a.htcl` has no effect")
+                && w[1].contains("matches only ip/a.htcl"),
+            "{}",
+            w[1]
+        );
+        assert!(
+            w[2].contains("`hdl/top-a.vhd` is exclusive to both `a` and `b`"),
+            "{}",
+            w[2]
+        );
     }
 
     #[test]
@@ -8119,9 +8594,13 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = vw_project_dir(&ws);
-        assert!(
-            project_needs_wipe(&ws, project_dir.as_std_path(), "prws").unwrap()
-        );
+        assert!(project_needs_wipe(
+            &ws,
+            project_dir.as_std_path(),
+            "prws",
+            None
+        )
+        .unwrap());
     }
 
     /// `.xpr` present but manifest missing → wipe. This is the
@@ -8132,7 +8611,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        assert!(project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// Fresh manifest matching current fingerprint → do NOT
@@ -8143,8 +8622,54 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
-        assert!(!project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
+        assert!(!project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
+    }
+
+    /// There's one persisted project per workspace, configured for
+    /// one variant. Switching variants must read as stale, or
+    /// `vw::configure_ip` keeps the other variant's IP.
+    #[test]
+    fn project_needs_wipe_when_variant_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_project_ws(&tmp);
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"prws\"\nversion = \"0.1.0\"\n\n\
+             [[workspace.variants]]\nname = \"vpk120\"\npart = \"p2\"\n\
+             default = true\n\n\
+             [[workspace.variants]]\nname = \"metro\"\npart = \"p3\"\n",
+        )
+        .unwrap();
+        let project_dir = touch_placeholder_xpr(&ws, "prws");
+        let wipe =
+            |v| project_needs_wipe(&ws, &project_dir, "prws", v).unwrap();
+
+        write_project_manifest(&ws, &project_dir, "prws", Some("vpk120"))
+            .unwrap();
+        assert!(!wipe(Some("vpk120")));
+        // `None` is the default variant — the same project.
+        assert!(!wipe(None));
+        assert!(wipe(Some("metro")));
+
+        write_project_manifest(&ws, &project_dir, "prws", Some("metro"))
+            .unwrap();
+        assert!(!wipe(Some("metro")));
+        assert!(wipe(Some("vpk120")));
+        assert!(wipe(None));
+    }
+
+    /// Workspaces without variants hash exactly as before, so an
+    /// upgrade doesn't wipe every existing project.
+    #[test]
+    fn project_fingerprint_unchanged_without_variants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_project_ws(&tmp);
+        let paths = project_source_paths(&ws).unwrap();
+        assert_eq!(
+            project_source_fingerprint(&ws, None).unwrap(),
+            fingerprint_paths(&ws, &paths),
+        );
     }
 
     /// Editing any `.htcl` under `<ws>/ip/` invalidates. Key
@@ -8155,9 +8680,9 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
         std::fs::write(ws.join("ip/cips.htcl"), "# cips updated\n").unwrap();
-        assert!(project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// Editing `vw.toml` (target-part, deps list, etc.) also
@@ -8168,13 +8693,13 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
         std::fs::write(
             ws.join("vw.toml"),
             "[workspace]\nname = \"prws\"\nversion = \"0.2.0\"\n",
         )
         .unwrap();
-        assert!(project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// Editing a workspace htcl OUTSIDE ip/ (e.g. design.htcl)
@@ -8188,9 +8713,9 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let ws = make_project_ws(&tmp);
         std::fs::write(ws.join("design.htcl"), "# design\n").unwrap();
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
         std::fs::write(ws.join("design.htcl"), "# design updated\n").unwrap();
-        assert!(!project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(!project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// The regression parallel to the synth case: rewriting an
@@ -8201,10 +8726,10 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(ws.join("ip/cips.htcl"), "# cips\n").unwrap();
-        assert!(!project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(!project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// Minimal workspace scaffold for `place_needs_update` tests:
@@ -8243,7 +8768,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8260,12 +8786,14 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             place_dcp.as_path(),
             synth_dcp.as_path(),
+            None,
         )
         .unwrap();
         assert!(!place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8283,6 +8811,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             place_dcp.as_path(),
             synth_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(
@@ -8293,7 +8822,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8312,13 +8842,15 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             place_dcp.as_path(),
             synth_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(&synth_dcp, "different bytes").unwrap();
         assert!(place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8337,13 +8869,15 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             place_dcp.as_path(),
             synth_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(ws.join("design.htcl"), "# design updated\n").unwrap();
         assert!(!place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8384,7 +8918,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8401,12 +8936,14 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             route_dcp.as_path(),
             place_dcp.as_path(),
+            None,
         )
         .unwrap();
         assert!(!route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8424,6 +8961,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             route_dcp.as_path(),
             place_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(
@@ -8434,7 +8972,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8453,13 +8992,15 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             route_dcp.as_path(),
             place_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(&place_dcp, "different bytes").unwrap();
         assert!(route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8480,6 +9021,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             route_dcp.as_path(),
             place_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(place_xdc_dir.join("place.xdc"), "# place updated\n")
@@ -8487,7 +9029,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(!route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }

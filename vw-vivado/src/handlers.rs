@@ -43,8 +43,9 @@
 //!   because wrappers have their own regen lifecycle and
 //!   typically compile into a distinct library (`ip`).
 //! - `design_constraints` — every Vivado constraint file under
-//!   `<workspace>/constraints/**/*.{xdc,sdc}`. Fed to `read_xdc`
-//!   during synth prep.
+//!   `<workspace>/constraints/**/*.{xdc,sdc}`, minus files another
+//!   variant's `exclusive` list owns (same variant resolution as
+//!   `vhdl_design_sources`). Fed to `read_xdc` during synth prep.
 //! - `design_synth_constraints` / `design_place_constraints` /
 //!   `design_route_constraints` — phase-scoped variants that
 //!   walk `constraints/synth/`, `constraints/place/`,
@@ -290,16 +291,25 @@ async fn dispatch(
             extract_variant(&args).or_else(|| active_variant.map(String::from)),
         ),
         "vhdl_ip_sources" => vhdl_ip_sources(workspace_root),
-        "design_constraints" => design_constraints(workspace_root),
-        "design_synth_constraints" => {
-            design_phase_constraints(workspace_root, ConstraintPhase::Synth)
-        }
-        "design_place_constraints" => {
-            design_phase_constraints(workspace_root, ConstraintPhase::Place)
-        }
-        "design_route_constraints" => {
-            design_phase_constraints(workspace_root, ConstraintPhase::Route)
-        }
+        "design_constraints" => design_constraints(
+            workspace_root,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
+        "design_synth_constraints" => design_phase_constraints(
+            workspace_root,
+            ConstraintPhase::Synth,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
+        "design_place_constraints" => design_phase_constraints(
+            workspace_root,
+            ConstraintPhase::Place,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
+        "design_route_constraints" => design_phase_constraints(
+            workspace_root,
+            ConstraintPhase::Route,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
         "synth_needs_update" => {
             synth_needs_update(workspace_root, active_variant, args, reporter)
         }
@@ -307,12 +317,20 @@ async fn dispatch(
             synth_mark_checkpoint(workspace_root, active_variant, args)
         }
         "mark_project_configured" => {
-            mark_project_configured(workspace_root, args)
+            mark_project_configured(workspace_root, active_variant, args)
         }
-        "place_needs_update" => place_needs_update(workspace_root, args),
-        "place_mark_checkpoint" => place_mark_checkpoint(workspace_root, args),
-        "route_needs_update" => route_needs_update(workspace_root, args),
-        "route_mark_checkpoint" => route_mark_checkpoint(workspace_root, args),
+        "place_needs_update" => {
+            place_needs_update(workspace_root, active_variant, args)
+        }
+        "place_mark_checkpoint" => {
+            place_mark_checkpoint(workspace_root, active_variant, args)
+        }
+        "route_needs_update" => {
+            route_needs_update(workspace_root, active_variant, args)
+        }
+        "route_mark_checkpoint" => {
+            route_mark_checkpoint(workspace_root, active_variant, args)
+        }
         "compile_htcl_module" => {
             compile_htcl_module(workspace_root, args, preloaded).await
         }
@@ -731,6 +749,7 @@ fn preload_fingerprint(
 /// no matching `project_needs_update` RPC.
 fn mark_project_configured(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -743,8 +762,13 @@ fn mark_project_configured(
         "mark_project_configured: missing string `name` field".to_string()
     })?;
     let project_dir = vw_lib::vw_project_dir(&ws);
-    vw_lib::write_project_manifest(&ws, project_dir.as_std_path(), name)
-        .map_err(|e| format!("writing project manifest: {e}"))?;
+    vw_lib::write_project_manifest(
+        &ws,
+        project_dir.as_std_path(),
+        name,
+        active_variant,
+    )
+    .map_err(|e| format!("writing project manifest: {e}"))?;
     Ok(Value::Null)
 }
 
@@ -758,6 +782,7 @@ fn mark_project_configured(
 /// missing or the fingerprints disagree.
 fn place_needs_update(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -768,6 +793,7 @@ fn place_needs_update(
         &ws,
         std::path::Path::new(&checkpoint),
         std::path::Path::new(&synth_checkpoint),
+        active_variant,
     )
     .map_err(|e| format!("checking place checkpoint freshness: {e}"))?;
     Ok(Value::Bool(needs))
@@ -780,6 +806,7 @@ fn place_needs_update(
 /// after `vivado_cmd::write_checkpoint`.
 fn place_mark_checkpoint(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -790,6 +817,7 @@ fn place_mark_checkpoint(
         &ws,
         std::path::Path::new(&checkpoint),
         std::path::Path::new(&synth_checkpoint),
+        active_variant,
     )
     .map_err(|e| format!("writing place checkpoint manifest: {e}"))?;
     Ok(Value::Null)
@@ -824,6 +852,7 @@ fn extract_synth_checkpoint_arg(
 /// fingerprints disagree.
 fn route_needs_update(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -834,6 +863,7 @@ fn route_needs_update(
         &ws,
         std::path::Path::new(&checkpoint),
         std::path::Path::new(&place_checkpoint),
+        active_variant,
     )
     .map_err(|e| format!("checking route checkpoint freshness: {e}"))?;
     Ok(Value::Bool(needs))
@@ -846,6 +876,7 @@ fn route_needs_update(
 /// after `vivado_cmd::write_checkpoint`.
 fn route_mark_checkpoint(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -856,6 +887,7 @@ fn route_mark_checkpoint(
         &ws,
         std::path::Path::new(&checkpoint),
         std::path::Path::new(&place_checkpoint),
+        active_variant,
     )
     .map_err(|e| format!("writing route checkpoint manifest: {e}"))?;
     Ok(Value::Null)
@@ -1218,13 +1250,17 @@ fn vhdl_ip_sources(
 
 /// `design_constraints` — return every constraint file under
 /// `<workspace>/constraints/**/*.{xdc,sdc}` as a JSON array of
-/// absolute-path strings. Empty array when the workspace has no
+/// absolute-path strings, minus files another variant's
+/// `exclusive` list owns. Variant resolution matches
+/// [`vhdl_design_sources`]. Empty array when the workspace has no
 /// `constraints/` dir.
 fn design_constraints(
     workspace_root: Option<&std::path::Path>,
+    variant: Option<String>,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
-    let paths = vw_lib::design_constraints(&ws)
+    let variant = variant.or_else(|| workspace_default_variant_name(&ws));
+    let paths = vw_lib::design_constraints(&ws, variant.as_deref())
         .map_err(|e| format!("enumerating constraint files: {e}"))?;
     Ok(paths_to_json_array(paths))
 }
@@ -1242,12 +1278,21 @@ enum ConstraintPhase {
 fn design_phase_constraints(
     workspace_root: Option<&std::path::Path>,
     phase: ConstraintPhase,
+    variant: Option<String>,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
+    let variant = variant.or_else(|| workspace_default_variant_name(&ws));
+    let variant = variant.as_deref();
     let paths = match phase {
-        ConstraintPhase::Synth => vw_lib::design_synth_constraints(&ws),
-        ConstraintPhase::Place => vw_lib::design_place_constraints(&ws),
-        ConstraintPhase::Route => vw_lib::design_route_constraints(&ws),
+        ConstraintPhase::Synth => {
+            vw_lib::design_synth_constraints(&ws, variant)
+        }
+        ConstraintPhase::Place => {
+            vw_lib::design_place_constraints(&ws, variant)
+        }
+        ConstraintPhase::Route => {
+            vw_lib::design_route_constraints(&ws, variant)
+        }
     }
     .map_err(|e| format!("enumerating phase-scoped constraint files: {e}"))?;
     Ok(paths_to_json_array(paths))

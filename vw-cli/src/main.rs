@@ -1727,53 +1727,6 @@ async fn main() {
             // on an unresolved import. Shared with `run`/`bench`/`repl`.
             ensure_workspace_deps(&cwd).await;
             let mut had_errors = false;
-            // Upfront IP regeneration when the user asked for it AND
-            // wrappers are stale. This runs BEFORE the HTCL/VHDL
-            // checks so subsequent analyses see the fresh wrappers
-            // and the staleness gate at the bottom of the check no
-            // longer trips. Regeneration is the same in-process
-            // `configure_ip -generate_targets false` +
-            // `generate_ip_stubs` path used when VHDL diagnostics
-            // report missing libraries — no synthesis, no full
-            // Vivado run. Failure here is downgraded to a warning:
-            // the check will still run and surface whatever it finds
-            // (including the staleness error if regen didn't take).
-            if ip_generate {
-                if let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path())
-                {
-                    if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
-                        let project_dir = vw_lib::vw_project_dir(&ws);
-                        let stale = vw_lib::project_needs_wipe(
-                            &ws,
-                            project_dir.as_std_path(),
-                            &cfg.workspace.name,
-                        )
-                        .unwrap_or(false);
-                        if stale {
-                            println!(
-                                "{} regenerating IP wrappers \
-                                 (--ip-generate, `ip/**.htcl` changed)…",
-                                "note:".bright_yellow(),
-                            );
-                            if let Err(e) = ensure_ip_generated(
-                                &ws,
-                                cloud.as_ref(),
-                                None,
-                                None,
-                                vw_vivado::LogLevel::Warning,
-                            )
-                            .await
-                            {
-                                eprintln!(
-                                    "{} IP regeneration did not complete \
-                                     cleanly: {e}",
-                                    "warning:".yellow(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
             // conflicts_with on the clap args guarantees at most
             // one non-Default source at a time. Map both flag
             // families to the same PartSelector; the resolver
@@ -1814,16 +1767,127 @@ async fn main() {
             // batch alongside the htcl check. Skipped entirely for a
             // pure-htcl workspace (nothing rendered into a VHDL library).
             if let Some(ws) = vw_lib::find_workspace_dir(cwd.as_std_path()) {
-                if vw_lib::workspace_has_vhdl(&ws, None) {
-                    // Make sure the VHDL standard library is available —
-                    // fetched into the dep cache on first use so a
-                    // machine without a system rust_hdl install still
-                    // analyzes. On failure, fall back to vhdl_lang's
-                    // built-in search (`None`), which just skips VHDL if
-                    // nothing is found.
-                    let stdlib = vw_lib::ensure_vhdl_stdlib().await.ok();
-                    let mut vhdl_result =
-                        vw_lib::check_vhdl(&ws, None, stdlib.as_deref());
+                // `exclusive` entries that don't do what they look
+                // like they do. Nothing downstream would notice: a
+                // pattern that matches nothing just filters nothing.
+                match vw_lib::variant_exclusive_warnings(&ws) {
+                    Ok(warnings) => {
+                        for w in warnings {
+                            eprintln!("{} vw.toml: {w}", "warning:".yellow());
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "{} could not check variant `exclusive` lists: {e}",
+                        "warning:".yellow(),
+                    ),
+                }
+                // Which variants to regenerate IP for and analyze VHDL
+                // against — the same selection the htcl check just ran
+                // against. `None` is the workspace default (or, with no
+                // variants, the whole `hdl/` tree).
+                let check_variants: Vec<Option<String>> =
+                    match vw_lib::load_workspace_config(&ws) {
+                        Ok(cfg) if !cfg.workspace.variants.is_empty() => {
+                            if all_variants {
+                                cfg.workspace
+                                    .variants
+                                    .iter()
+                                    .map(|v| Some(v.name.clone()))
+                                    .collect()
+                            } else if let Some(v) = variant.as_deref() {
+                                // An unknown name was already reported
+                                // (and failed the run) by the htcl
+                                // check; don't repeat it.
+                                match cfg.workspace.select_variant(Some(v)) {
+                                    Ok(_) => vec![Some(v.to_string())],
+                                    Err(_) => Vec::new(),
+                                }
+                            } else {
+                                vec![None]
+                            }
+                        }
+                        _ => vec![None],
+                    };
+                // Label output per variant only when there's a choice
+                // being made — a plain `vw check` reads as before.
+                let label_variants = variant.is_some() || all_variants;
+                let has_vhdl = vw_lib::workspace_has_vhdl(&ws, None);
+                // Make sure the VHDL standard library is available —
+                // fetched into the dep cache on first use so a
+                // machine without a system rust_hdl install still
+                // analyzes. On failure, fall back to vhdl_lang's
+                // built-in search (`None`), which just skips VHDL if
+                // nothing is found.
+                let stdlib = if has_vhdl {
+                    vw_lib::ensure_vhdl_stdlib().await.ok()
+                } else {
+                    None
+                };
+                for vhdl_variant in &check_variants {
+                    let vhdl_variant = vhdl_variant.as_deref();
+                    let scope = match vhdl_variant {
+                        Some(v) if label_variants => {
+                            format!(" (variant `{v}`)")
+                        }
+                        _ => String::new(),
+                    };
+                    // IP regeneration when the user asked for it AND
+                    // this variant's wrappers are stale — per variant,
+                    // right before its VHDL check, because the IP is
+                    // configured for one variant at a time (the
+                    // project fingerprint includes it). Regeneration
+                    // is the same in-process `configure_ip
+                    // -generate_targets false` + `generate_ip_stubs`
+                    // path used when VHDL diagnostics report missing
+                    // libraries — no synthesis, no full Vivado run.
+                    // Failure here is downgraded to a warning: the
+                    // check will still run and surface whatever it
+                    // finds (including the staleness error if regen
+                    // didn't take).
+                    if ip_generate {
+                        let stale = vw_lib::load_workspace_config(&ws)
+                            .ok()
+                            .and_then(|cfg| {
+                                vw_lib::project_needs_wipe(
+                                    &ws,
+                                    vw_lib::vw_project_dir(&ws).as_std_path(),
+                                    &cfg.workspace.name,
+                                    vhdl_variant,
+                                )
+                                .ok()
+                            })
+                            .unwrap_or(false);
+                        if stale {
+                            println!(
+                                "{} regenerating IP wrappers{scope} \
+                                 (--ip-generate, IP config changed)…",
+                                "note:".bright_yellow(),
+                            );
+                            if let Err(e) = ensure_ip_generated(
+                                &ws,
+                                cloud.as_ref(),
+                                None,
+                                vhdl_variant,
+                                vw_vivado::LogLevel::Warning,
+                            )
+                            .await
+                            {
+                                eprintln!(
+                                    "{} IP regeneration did not complete \
+                                     cleanly: {e}",
+                                    "warning:".yellow(),
+                                );
+                            }
+                        }
+                    }
+                    if !has_vhdl {
+                        continue;
+                    }
+                    let mut vhdl_result = vw_lib::check_vhdl(
+                        &ws,
+                        vhdl_variant,
+                        stdlib.as_deref(),
+                    );
                     // A design that instantiates `entity ip.<x>` /
                     // `entity xil_defaultlib.<x>` needs Vivado-generated
                     // wrappers/stubs under `target/`. Whether the
@@ -1852,7 +1916,7 @@ async fn main() {
                             &ws,
                             cloud.as_ref(),
                             None,
-                            None,
+                            vhdl_variant,
                             // Terse: the check only cares about VHDL
                             // resolution, so suppress the Vivado
                             // firehose (NONE/INFO) and surface just
@@ -1868,8 +1932,11 @@ async fn main() {
                                 "warning:".yellow(),
                             );
                         }
-                        vhdl_result =
-                            vw_lib::check_vhdl(&ws, None, stdlib.as_deref());
+                        vhdl_result = vw_lib::check_vhdl(
+                            &ws,
+                            vhdl_variant,
+                            stdlib.as_deref(),
+                        );
                     }
                     match vhdl_result {
                         Ok(diags) if !diags.is_empty() => {
@@ -1900,7 +1967,7 @@ async fn main() {
                                 );
                             }
                             eprintln!(
-                                "VHDL: {errs} error(s), {warns} warning(s)"
+                                "VHDL{scope}: {errs} error(s), {warns} warning(s)"
                             );
                             if errs > 0 {
                                 had_errors = true;
@@ -1910,7 +1977,7 @@ async fn main() {
                         Err(e) => {
                             had_errors = true;
                             eprintln!(
-                                "{} vhdl check failed: {e}",
+                                "{} vhdl check{scope} failed: {e}",
                                 "error:".bright_red(),
                             );
                         }
@@ -1948,20 +2015,26 @@ async fn main() {
                     if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
                         let name = &cfg.workspace.name;
                         let project_dir = vw_lib::vw_project_dir(&ws);
+                        // Against the variant the loop above ended
+                        // on — the one `target/ip/` now holds.
+                        let last_variant =
+                            check_variants.last().cloned().flatten();
                         match vw_lib::project_needs_wipe(
                             &ws,
                             project_dir.as_std_path(),
                             name,
+                            last_variant.as_deref(),
                         ) {
                             Ok(true) if project_dir.exists() => {
                                 had_errors = true;
                                 eprintln!(
                                     "{} IP wrappers under `target/ip/` are \
                                  stale — the `ip/**.htcl` config has \
-                                 changed since the last generation. Run \
-                                 `vw check --ip-generate` to regenerate \
-                                 just the wrappers in-process (no \
-                                 synthesis) and re-check.",
+                                 changed since the last generation, or \
+                                 it was generated for another variant. \
+                                 Run `vw check --ip-generate` to \
+                                 regenerate just the wrappers in-process \
+                                 (no synthesis) and re-check.",
                                     "error:".bright_red(),
                                 );
                             }
@@ -5012,7 +5085,7 @@ fn list_sources(
             // the ones that name files this repository does not contain.
             paths.extend(vw_lib::vhdl_design_sources_all_variants(ws)?);
             paths.extend(vw_lib::vhdl_bench_sources(ws)?);
-            paths.extend(vw_lib::design_constraints(ws)?);
+            paths.extend(vw_lib::design_constraints_all_variants(ws)?);
             paths.extend(vw_lib::list_workspace_htcl_files(ws)?);
             paths.push(ws.join("vw.toml").into_std_path_buf());
             paths.push(ws.join("vw.lock").into_std_path_buf());

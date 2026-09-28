@@ -14,12 +14,14 @@ mod backend;
 mod htcl_backend;
 mod server;
 mod src_complete;
+mod variant;
 mod vhdl_backend;
 mod workspace;
 
 pub use backend::{LanguageBackend, SymbolInfo};
 pub use htcl_backend::HtclBackend;
 pub use server::Analyzer;
+pub use variant::VariantSetting;
 pub use vhdl_backend::VhdlBackend;
 
 use tokio::io::{

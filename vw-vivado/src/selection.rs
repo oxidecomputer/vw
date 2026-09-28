@@ -76,7 +76,8 @@ pub fn resolve_workspace_selection(
                 notes,
             });
         };
-        let persist_dir = persist_dir(ws, &ws_info.name, &mut notes);
+        let persist_dir =
+            persist_dir(ws, &ws_info.name, Some(&v.name), &mut notes);
         Ok(Selection {
             auto_project: Some(AutoProject {
                 name: ws_info.name.clone(),
@@ -90,7 +91,7 @@ pub fn resolve_workspace_selection(
         let selected = ws_info
             .select_target_part(part)
             .map_err(|e| e.to_string())?;
-        let persist_dir = persist_dir(ws, &ws_info.name, &mut notes);
+        let persist_dir = persist_dir(ws, &ws_info.name, None, &mut notes);
         Ok(Selection {
             auto_project: selected.map(|p| AutoProject {
                 name: ws_info.name.clone(),
@@ -112,9 +113,10 @@ pub fn resolve_workspace_selection(
 fn persist_dir(
     ws: &Utf8Path,
     name: &str,
+    variant: Option<&str>,
     notes: &mut Vec<String>,
 ) -> Option<std::path::PathBuf> {
-    match vw_lib::prepare_vw_project_dir(ws, name) {
+    match vw_lib::prepare_vw_project_dir(ws, name, variant) {
         Ok(prep) => {
             if prep.legacy_cache_removed > 0 {
                 notes.push(format!(
