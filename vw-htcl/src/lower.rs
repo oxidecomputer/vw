@@ -525,7 +525,11 @@ pub fn is_extern_call(call_name: &str) -> bool {
 ///   bodies collapse to one Tcl statement by construction.
 /// - Braced words are literal text — Tcl never substitutes inside
 ///   `{ … }`, so the parser doesn't even surface `CmdSubst` parts
-///   for them; we ship them as raw source.
+///   for them; we ship them as raw source. The exception is a
+///   control-flow script body (`if`/`foreach`/`try`/… — whatever
+///   `parser::populate_control_flow_bodies` parsed onto
+///   [`Word::body`]): that's htcl, lowered statement by statement
+///   like a proc body (see [`lower_braced_body`]).
 fn lower_words(
     words: &[Word],
     source: &str,
@@ -575,8 +579,88 @@ fn lower_word(
             );
             format!("\"{inner}\"")
         }
-        WordForm::Braced => word.span.slice(source).to_string(),
+        WordForm::Braced => match &word.body {
+            Some(body) if !body.is_empty() => lower_braced_body(
+                word, body, source, table, putr_map, line_index,
+            ),
+            _ => word.span.slice(source).to_string(),
+        },
     }
+}
+
+/// Lower a control-flow script body (`if {…} { <body> }`,
+/// `foreach x $xs { <body> }`, …) the way a proc body is lowered:
+/// statement by statement, rather than shipping its source text.
+///
+/// Shipping the text verbatim hands Tcl htcl it can't read. The
+/// motivating case is a multi-line keyword call —
+///
+/// ```text
+/// if {[vw::active_variant] eq "vpk120"} {
+///   vivado_cmd::assign_bd_address
+///     -offset 0x00000000
+///     -range  0x00040000
+/// }
+/// ```
+///
+/// — where the newline ends the command in Tcl, so the proc runs
+/// with no arguments and `-offset` is then run as a command of its
+/// own. Lowering each statement joins the call onto one line, and
+/// applies everything else top-level statements get (`putr`
+/// rewrites, nested bodies, multi-line `[ … ]`).
+///
+/// Line numbers are kept the same way [`lower_proc_decl`] keeps
+/// them: each lowered statement is padded onto the line it started
+/// on in the source, and the closing brace onto its own line, so
+/// statements after the body and `info frame` line numbers inside
+/// it still match the source. Statements that shared a line in the
+/// source are joined with `;`.
+fn lower_braced_body(
+    word: &Word,
+    body: &[Stmt],
+    source: &str,
+    table: &SignatureTable<'_>,
+    putr_map: &crate::putr::RewriteMap,
+    line_index: &LineIndex,
+) -> String {
+    let mut out = String::from("{");
+    let mut cur_line = line_index.position(word.span.start).line;
+    // Whether the current output line already holds a statement,
+    // so a second one on the same source line needs a separator.
+    let mut line_has_stmt = false;
+    for stmt in body {
+        let Stmt::Command(cmd) = stmt else { continue };
+        let line = lower_command_with_putr_and_index(
+            cmd, source, table, putr_map, line_index,
+        );
+        if line.trim().is_empty() {
+            continue;
+        }
+        let stmt_line = line_index.position(cmd.span.start).line;
+        if stmt_line > cur_line {
+            while cur_line < stmt_line {
+                out.push('\n');
+                cur_line += 1;
+            }
+        } else if line_has_stmt {
+            out.push(';');
+        }
+        out.push(' ');
+        out.push_str(&line);
+        cur_line += line.matches('\n').count() as u32;
+        line_has_stmt = true;
+    }
+    let close_line = line_index.position(word.span.end.saturating_sub(1)).line;
+    if close_line > cur_line {
+        while cur_line < close_line {
+            out.push('\n');
+            cur_line += 1;
+        }
+    } else {
+        out.push(' ');
+    }
+    out.push('}');
+    out
 }
 
 fn lower_word_parts(
@@ -925,5 +1009,318 @@ set proj [
             "default should appear quoted in the sig dict: {}",
             out[0]
         );
+    }
+}
+
+/// Control-flow bodies (`if`/`foreach`/`try`/…) are htcl too, and
+/// lowered like proc bodies (see `lower_braced_body`). The shape that
+/// broke redhawk's vpk120 build was a multi-line keyword call inside an
+/// `if`: shipped verbatim, Tcl ran the call with no arguments and then
+/// `-offset` as a command of its own.
+#[cfg(test)]
+mod braced_body_tests {
+    use super::*;
+    use crate::parser::parse;
+
+    /// Lower every top-level statement the way `vw run` does, `putr`
+    /// rewrites included.
+    fn lower_src(src: &str) -> String {
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let table = signature_table(&parsed.document);
+        let putr = crate::putr::rewrite(src, &parsed.document);
+        let index = LineIndex::new(src);
+        parsed
+            .document
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Command(c) => Some(lower_command_with_putr_and_index(
+                    c, src, &table, &putr, &index,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    const ASSIGN: &str = "\
+proc assign {
+  offset: string
+  range: string
+} unit {
+  puts \"assign offset=$offset range=$range\"
+}
+";
+
+    #[test]
+    fn multi_line_call_in_an_if_body_is_joined() {
+        let src = format!(
+            "{ASSIGN}proc f {{}} unit {{
+  if {{1}} {{
+    assign
+      -offset 0x0
+      -range 0x40000
+  }}
+}}
+"
+        );
+        let out = lower_src(&src);
+        assert!(
+            out.contains("assign -offset 0x0 -range 0x40000"),
+            "call not joined:\n{out}"
+        );
+    }
+
+    #[test]
+    fn every_kind_of_body_is_lowered() {
+        let call = "a\n    -x 1";
+        let bodies = [
+            format!("if {{1}} {{ {call} }} elseif {{0}} {{ {call} }} else {{ {call} }}"),
+            format!("foreach i {{1 2}} {{ {call} }}"),
+            format!("while {{0}} {{ {call} }}"),
+            format!("for {{set i 0}} {{$i < 1}} {{incr i}} {{ {call} }}"),
+            format!("catch {{ {call} }}"),
+            format!("try {{ {call} }} on error {{m}} {{ {call} }} finally {{ {call} }}"),
+            format!("switch -- $v a {{ {call} }} default {{ {call} }}"),
+            format!("dict for {{k v}} {{a 1}} {{ {call} }}"),
+            format!("set l [lmap i {{1}} {{ {call} }}]"),
+        ];
+        for body in bodies {
+            let src = format!("proc a {{x: int}} unit {{}}\nproc f {{v: string}} unit {{\n  {body}\n}}\n");
+            let out = lower_src(&src);
+            let expected = body.matches("{ a\n").count();
+            assert_eq!(
+                out.matches("a -x 1").count(),
+                expected,
+                "{body}\nlowered to:\n{out}"
+            );
+            assert!(!out.contains("\n    -x 1"), "{body}\nlowered to:\n{out}");
+        }
+    }
+
+    #[test]
+    fn non_script_braces_are_untouched() {
+        // Conditions, list literals and string literals aren't scripts.
+        let src = "\
+proc f {} unit {
+  if {$x eq \"a  b\"} { puts {two  spaces} }
+  set l {a
+    b}
+  foreach {k v} {1 2} { puts $k }
+}
+";
+        let out = lower_src(src);
+        for kept in [
+            "{$x eq \"a  b\"}",
+            "{two  spaces}",
+            "{a\n    b}",
+            "{k v}",
+            "{1 2}",
+        ] {
+            assert!(out.contains(kept), "lost {kept:?}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn statements_sharing_a_line_stay_separate() {
+        let src = "proc f {} unit {\n  if {1} { puts a; puts b }\n}\n";
+        let out = lower_src(src);
+        assert!(out.contains("{ puts a; puts b }"), "{out}");
+    }
+
+    #[test]
+    fn nested_bodies_are_lowered() {
+        let src = "\
+proc a {x: int} unit {}
+proc f {} unit {
+  if {1} {
+    foreach i {1 2} {
+      a
+        -x 1
+    }
+  }
+}
+";
+        assert!(lower_src(src).contains("a -x 1"));
+    }
+
+    #[test]
+    fn putr_in_a_body_is_rewritten() {
+        // `putr` isn't a Tcl command: it only works once rewritten,
+        // which a verbatim body never was.
+        let src = "proc f {l: string} unit {\n  foreach i $l {\n    putr $i\n  }\n}\n";
+        let out = lower_src(src);
+        assert!(!out.contains("putr"), "{out}");
+        assert!(out.contains("puts $i"), "{out}");
+    }
+
+    /// Line N of the lowered proc must still be line N of the source,
+    /// or `info frame` / error traces point at the wrong line.
+    #[test]
+    fn source_lines_are_preserved() {
+        let src = "\
+proc f {} unit {
+  if {1} {
+    assign
+      -offset 0x0
+      -range 0x40000
+
+    puts inside
+  }
+  puts after
+}
+";
+        let out = lower_src(src);
+        let line_of = |text: &str, needle: &str| {
+            text.lines().position(|l| l.contains(needle)).unwrap()
+        };
+        for needle in ["puts inside", "puts after"] {
+            assert_eq!(
+                line_of(&out, needle),
+                line_of(src, needle),
+                "{needle}:\n{out}"
+            );
+        }
+        // The closing braces too: nothing after them moves.
+        assert_eq!(out.lines().count(), src.lines().count(), "{out}");
+    }
+
+    /// `#` starts a comment mid-command in htcl (for commenting out an
+    /// argument line), but `#0` is Tcl's level syntax. vw.htcl's
+    /// `configure_ip` runs `uplevel #0 $tcl` inside an `if`.
+    #[test]
+    fn uplevel_level_is_not_a_comment() {
+        let src = "\
+proc f {tcl: string} unit {
+  if {1} {
+    uplevel #0 $tcl
+    upvar #0 g local
+  }
+}
+";
+        let out = lower_src(src);
+        assert!(out.contains("uplevel #0 $tcl"), "{out}");
+        assert!(out.contains("upvar #0 g local"), "{out}");
+        // The idiom the mid-command rule exists for — commenting out an
+        // argument line inside `[ … ]` — still works.
+        let src = "proc a {x: int} unit {}\nproc f {} unit {\n  if {1} {\n    set r [\n      a\n        #-y 2\n        -x 1\n    ]\n  }\n}\n";
+        let out = lower_src(src);
+        assert!(out.contains("a -x 1"), "{out}");
+        assert!(!out.contains("-y 2"), "{out}");
+    }
+
+    #[test]
+    fn commented_out_arg_line_in_a_body_keeps_the_call_whole() {
+        let src = "\
+proc a {x: int y: int} unit {}
+proc f {} unit {
+  if {1} {
+    a
+      -x 1
+      #-y 2
+      -y 3
+  }
+}
+";
+        let out = lower_src(src);
+        assert!(out.contains("a -x 1 -y 3"), "{out}");
+        assert!(!out.contains("-y 2"), "{out}");
+    }
+
+    /// Run the lowered program in a real Tcl interpreter with the
+    /// shim's `::vw::kwargs`. Skipped without `tclsh` unless
+    /// `VW_REQUIRE_TCLSH` is set (CI sets it).
+    fn run_tcl(lowered: &str, script: &str) -> Option<String> {
+        let tclsh = match std::process::Command::new("tclsh")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("VW_REQUIRE_TCLSH").is_none(),
+                    "tclsh is required (VW_REQUIRE_TCLSH is set): {e}"
+                );
+                eprintln!("skipping: no tclsh ({e})");
+                return None;
+            }
+        };
+        let shim = include_str!("../../vw-vivado/shim/vivado-shim.tcl");
+        let start = shim.find("proc ::vw::kwargs ").expect("kwargs in shim");
+        let end =
+            start + shim[start..].find("\n}\n").expect("end of kwargs") + 3;
+        let program = format!(
+            "namespace eval ::vw {{}}\n{}\n{lowered}\n{script}\n",
+            &shim[start..end]
+        );
+        let mut child = tclsh;
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(program.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        Some(format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+
+    /// redhawk's `txr0_register_address_space`, which failed with
+    /// `invalid command name "-offset"`.
+    #[test]
+    fn redhawk_register_address_space_runs() {
+        let src = format!(
+            "{ASSIGN}proc register_address_space {{variant: string}} unit {{
+  assign
+    -offset 0x00000000
+    -range  0x00040000
+
+  if {{$variant eq \"vpk120\"}} {{
+    # Quad 1
+    assign
+      -offset 0x00000000
+      -range  0x00040000
+  }}
+}}
+"
+        );
+        let Some(out) =
+            run_tcl(&lower_src(&src), "register_address_space -variant vpk120")
+        else {
+            return;
+        };
+        assert_eq!(
+            out,
+            "assign offset=0x00000000 range=0x00040000\n\
+             assign offset=0x00000000 range=0x00040000\n",
+        );
+    }
+
+    #[test]
+    fn error_lines_inside_a_body_match_the_source() {
+        let src = format!(
+            "{ASSIGN}proc f {{}} unit {{
+  if {{1}} {{
+    assign
+      -offset 0x0
+      -range 0x1
+    error boom
+  }}
+}}
+"
+        );
+        // `error boom` is on line 6 of `f`, counting its `proc` line as 1.
+        let Some(out) = run_tcl(&lower_src(&src), "catch f; puts $::errorInfo")
+        else {
+            return;
+        };
+        assert!(out.contains("(procedure \"f\" line 6)"), "{out}");
     }
 }
