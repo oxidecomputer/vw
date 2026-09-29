@@ -626,8 +626,14 @@ fn compile_htcl_module_blocking(
     // preload hash matches (same set of files already-loaded).
     // Silent on write errors — cache misses on next run are
     // annoying but not incorrect.
+    //
+    // Both files are replaced whole (`write_atomic`): concurrent
+    // sessions on one cloud instance share this workspace-level cache,
+    // and a plain write would let one load the other's half-written
+    // Tcl. The Tcl goes first, so a manifest that matches always has
+    // complete Tcl beside it.
     let _ = std::fs::create_dir_all(target_dir.as_std_path());
-    let _ = std::fs::write(cache_tcl.as_std_path(), &out);
+    let _ = vw_lib::write_atomic(cache_tcl.as_std_path(), out.as_bytes());
     let _ = write_compile_manifest(
         cache_manifest.as_std_path(),
         &program,
@@ -666,7 +672,7 @@ fn write_compile_manifest(
         };
         writeln!(body, "{} {}", dur.as_nanos(), f.path.display()).ok();
     }
-    std::fs::write(manifest_path, body)
+    vw_lib::write_atomic(manifest_path, body.as_bytes())
 }
 
 /// Try to serve a compile from the cache. Returns `Some(tcl)` iff
@@ -1561,5 +1567,68 @@ mod variant_build_dir_tests {
                 .join("target/alpha/ip/txr0/wrapper.vhd")
                 .as_str()])
         );
+    }
+}
+
+#[cfg(test)]
+mod compile_cache_tests {
+    use super::*;
+
+    /// Concurrent sessions on one cloud instance share the workspace's
+    /// compile cache. Many compiles of one module at once — cache misses
+    /// writing it while hits read it — must all get the whole module.
+    #[test]
+    fn concurrent_compiles_never_see_a_partial_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"cache\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        // Big enough that a write takes long enough to be caught in.
+        let module: String = (0..2000)
+            .map(|i| format!("proc p{i} {{x: int}} unit {{\n  puts $x\n}}\n"))
+            .collect();
+        std::fs::write(ws.join("big.htcl"), module).unwrap();
+
+        let expected = compile_htcl_module_blocking(
+            ws.clone(),
+            "big.htcl".into(),
+            Default::default(),
+        )
+        .unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let ws = ws.clone();
+                std::thread::spawn(move || {
+                    let mut outs = Vec::new();
+                    for i in 0..10 {
+                        // Some threads keep invalidating the cache so the
+                        // others' hits race real rewrites.
+                        if t % 2 == 0 && i % 2 == 0 {
+                            let _ = std::fs::remove_file(ws.join(
+                                "target/.vw-compile-big.htcl.tcl.manifest",
+                            ));
+                        }
+                        outs.push(
+                            compile_htcl_module_blocking(
+                                ws.clone(),
+                                "big.htcl".into(),
+                                Default::default(),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    outs
+                })
+            })
+            .collect();
+        for t in threads {
+            for out in t.join().unwrap() {
+                assert_eq!(out, expected);
+            }
+        }
     }
 }

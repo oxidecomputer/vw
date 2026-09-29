@@ -6210,11 +6210,46 @@ fn write_lock_file(
     let toml_content = toml::to_string_pretty(lock_file)?;
     let lock_path = workspace_dir.join("vw.lock");
 
-    fs::write(&lock_path, toml_content).map_err(|e| VwError::FileSystem {
-        message: format!("Failed to write vw.lock file: {e}"),
-    })?;
+    // Every dependency fetch ends here, including the implicit one each
+    // cloud session makes — so two sessions on one instance both write
+    // this file, while a third may be fingerprinting it for a
+    // checkpoint. Leave an unchanged lock alone, and replace a changed
+    // one whole.
+    if fs::read_to_string(&lock_path).is_ok_and(|c| c == toml_content) {
+        return Ok(());
+    }
+    write_atomic(lock_path.as_std_path(), toml_content.as_bytes()).map_err(
+        |e| VwError::FileSystem {
+            message: format!("Failed to write vw.lock file: {e}"),
+        },
+    )?;
 
     Ok(())
+}
+
+/// Replace `path` with `contents` in one step: write a private
+/// sibling, then `rename` it over the original.
+///
+/// For files that another process may read while this one writes them —
+/// on a cloud instance, concurrent sessions share a workspace — where a
+/// plain write would let a reader see the file truncated or half
+/// written. The rename is atomic within a filesystem, so a reader sees
+/// either the old file or the new one. The sibling name is unique per
+/// process and call, so two writers never share one.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let temp = path
+        .with_file_name(format!(".{name}.{}-{seq}.tmp", std::process::id()));
+    fs::write(&temp, contents)?;
+    fs::rename(&temp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
 }
 
 /// Build a Rust library for a testbench.
@@ -9561,6 +9596,45 @@ mod workspace_name_tests {
 
         assert!(e.to_string().contains("Red_Hawk"), "{e}");
         assert!(!dir.join("vw.toml").exists(), "a vw.toml was left behind");
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f.tcl");
+        write_atomic(&path, b"one").unwrap();
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        let entries: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "a temporary was left behind");
+    }
+
+    /// Every cloud session's implicit dependency fetch writes the lock;
+    /// one that hasn't changed is left exactly as it is.
+    #[test]
+    fn an_unchanged_lock_is_not_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let lock = LockFile {
+            dependencies: BTreeMap::new(),
+        };
+        write_lock_file(&ws, &lock).unwrap();
+        let path = ws.join("vw.lock");
+        let old = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_000_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        write_lock_file(&ws, &lock).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), old);
     }
 }
 
