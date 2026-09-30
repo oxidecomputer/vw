@@ -378,9 +378,18 @@ impl InstanceKind {
     /// work it does is moving bytes between a socket and a disk. Sizing it
     /// like a build machine only takes cores away from environments that
     /// would use them.
+    ///
+    /// Vivado gets twice the memory of the kernel build. One environment runs
+    /// every variant's build, and two concurrent Versal synths of redhawk
+    /// saturated 32 GiB — even with `synth.maxThreads` cut, since synthesis
+    /// splits the same work over however many workers it has.
     pub(crate) fn shape(&self) -> Shape {
         match self {
-            Self::Vivado | Self::Helios => Shape {
+            Self::Vivado => Shape {
+                vcpus: 16,
+                memory_gib: 64,
+            },
+            Self::Helios => Shape {
                 vcpus: 16,
                 memory_gib: 32,
             },
