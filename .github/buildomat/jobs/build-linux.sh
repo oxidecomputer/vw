@@ -36,7 +36,11 @@ set -o errexit
 set -o pipefail
 set -o xtrace
 
-sudo apt-get install build-essential pkg-config libssl-dev libfontconfig-dev -y
+sudo apt-get install build-essential pkg-config libssl-dev libfontconfig-dev tcl -y
+
+# Lowering tests run the lowered Tcl in a real interpreter; without this
+# they skip when `tclsh` is missing, which in CI would hide a failure.
+export VW_REQUIRE_TCLSH=1
 
 cargo --version
 rustc --version

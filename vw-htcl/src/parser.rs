@@ -202,6 +202,29 @@ pub(crate) fn populate_procs(
     }
 }
 
+/// Index of the first pattern/body word of a `switch` command:
+/// past the options (`-matchvar` / `-indexvar` take a value, `--`
+/// ends them) and the STRING being matched.
+pub(crate) fn switch_arms_index(cmd: &crate::ast::Command) -> usize {
+    let n = cmd.words.len();
+    let mut i = 1;
+    while let Some(t) = cmd.words.get(i).and_then(|w| w.as_text()) {
+        // The last word left is STRING even if it starts with `-`.
+        if !t.starts_with('-') || i + 1 >= n {
+            break;
+        }
+        i += if matches!(t, "-matchvar" | "-indexvar") {
+            2
+        } else {
+            1
+        };
+        if t == "--" {
+            break;
+        }
+    }
+    i + 1
+}
+
 /// Body-arg positions per builtin. Word-index 0 is the head, so
 /// `foreach var list body` puts the body at word 3. `dict for
 /// {kv} dict body` is the two-word head form.
@@ -221,18 +244,56 @@ fn populate_control_flow_bodies(
     // a script. Multiple positions handle `for INIT COND STEP
     // BODY` and `if COND BODY [elseif COND BODY]* [else BODY]`.
     let body_positions: Vec<usize> = match head {
-        "foreach" => vec![cmd.words.len().saturating_sub(1)],
+        "foreach" | "lmap" => vec![cmd.words.len().saturating_sub(1)],
         "while" => vec![2],
         "for" => vec![1, 3, 4], // init, step, body — cond is an expr
-        "catch" => vec![1],
+        "catch" | "time" => vec![1],
         "dict"
             // `dict for {kv} DICT BODY` — head is the two-word
-            // sub-command form. Only recognize the `for` variant
-            // for body descent; other `dict` sub-commands have no
-            // script args.
-            if cmd.words.get(1).and_then(|w| w.as_text()) == Some("for") => {
+            // sub-command form. `map` / `update` / `with` also take
+            // the script as their last arg; other `dict`
+            // sub-commands have no script args.
+            if matches!(
+                cmd.words.get(1).and_then(|w| w.as_text()),
+                Some("for" | "map" | "update" | "with")
+            ) =>
+            {
                 vec![cmd.words.len().saturating_sub(1)]
             }
+        "switch" => {
+            // Inline-arm form, `switch ?OPTS? STRING PAT BODY …`:
+            // every second word after STRING is a body (`-` falls
+            // through). The single-braced-list form has no body
+            // words of its own.
+            let arms = switch_arms_index(cmd);
+            if arms + 1 >= cmd.words.len() {
+                return;
+            }
+            (arms + 1..cmd.words.len())
+                .step_by(2)
+                .filter(|&j| cmd.words[j].as_text() != Some("-"))
+                .collect()
+        }
+        "try" => {
+            // `try BODY (on CODE VARS BODY | trap PAT VARS BODY)*
+            // ?finally BODY?`.
+            let mut out = vec![1];
+            let mut i = 2usize;
+            while i < cmd.words.len() {
+                match cmd.words[i].as_text() {
+                    Some("on" | "trap") => {
+                        out.push(i + 3);
+                        i += 4;
+                    }
+                    Some("finally") => {
+                        out.push(i + 1);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            out
+        }
         "if" => {
             // `if COND BODY [elseif COND BODY]* [else BODY]`.
             // Scan word-by-word: after `if`/`elseif` we skip the
@@ -924,7 +985,15 @@ fn parse_command(
         // enclosing `[…]` was already parsed as a CmdSubst so any
         // `#` INSIDE the subst body's first command *does* have
         // words already (the command name).
-        if c == '#' && !words.is_empty() {
+        //
+        // Except Tcl's level syntax: `#0` / `#1` in `uplevel #0 $script`
+        // and `upvar #0 name local` is an argument, not a comment —
+        // eating it turned `uplevel #0 $tcl` into a bare `uplevel`.
+        let is_level = source[input.location()..]
+            .chars()
+            .nth(1)
+            .is_some_and(|n| n.is_ascii_digit());
+        if c == '#' && !words.is_empty() && !is_level {
             skip_to_end_of_line(input, source);
             continue;
         }
@@ -1400,10 +1469,26 @@ fn next_line_is_flag_continuation(input: &Input<'_>, source: &str) -> bool {
     let bytes = source.as_bytes();
     // Cursor sits on `\n`; look ahead starting at the byte after.
     let mut i = input.location() + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b' ' | b'\t' | b'\r' => i += 1,
-            _ => break,
+    loop {
+        while i < bytes.len() {
+            match bytes[i] {
+                b' ' | b'\t' | b'\r' => i += 1,
+                _ => break,
+            }
+        }
+        // Comment lines between argument lines don't end the command:
+        // a commented-out argument (`#-flag value`) or a note about the
+        // next one. Look past them to the first real line; the
+        // mid-command `#` rule in `parse_command` then eats them. `#0`
+        // is Tcl's level syntax, an argument, so it isn't skipped.
+        let is_comment = bytes.get(i) == Some(&b'#')
+            && !bytes.get(i + 1).is_some_and(u8::is_ascii_digit);
+        if !is_comment {
+            break;
+        }
+        match bytes[i..].iter().position(|&b| b == b'\n') {
+            Some(nl) => i += nl + 1,
+            None => return false,
         }
     }
     if i >= bytes.len() || bytes[i] != b'-' {
@@ -2325,6 +2410,84 @@ set cfg [
             vec!["configure", "-enable_reg_interface", "1"],
             "expected the commented arg line to be gone",
         );
+    }
+
+    /// Word texts of each top-level command, for the statement-mode
+    /// comment tests below.
+    fn command_words(src: &str) -> Vec<Vec<String>> {
+        let out = parse(src);
+        assert!(out.errors.is_empty(), "parse errors: {:?}", out.errors);
+        out.document
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Command(c) => Some(
+                    c.words
+                        .iter()
+                        .map(|w| w.as_text().unwrap_or("<expr>").to_string())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The same idiom outside `[ … ]`, where newlines end commands: a
+    /// commented-out argument line between flag lines must not split
+    /// the call in two.
+    #[test]
+    fn commented_out_arg_line_in_statement_keeps_the_call_whole() {
+        let src = "\
+assign
+  -offset 0x0
+  #-range 0x40000
+  -force true
+";
+        assert_eq!(
+            command_words(src),
+            [["assign", "-offset", "0x0", "-force", "true"]],
+        );
+    }
+
+    #[test]
+    fn notes_between_arg_lines_keep_the_call_whole() {
+        let src = "\
+assign
+  -offset 0x0
+  # Quad 1 only exists on vpk120.
+  #-range 0x40000
+
+  # (blank line above ends it)
+  -force true
+";
+        // Comments are skipped, but a blank line still ends the command,
+        // as it always has.
+        assert_eq!(
+            command_words(src),
+            [vec!["assign", "-offset", "0x0"], vec!["-force", "true"]],
+        );
+    }
+
+    #[test]
+    fn comment_after_the_last_arg_line_ends_the_call() {
+        let src = "\
+assign
+  -offset 0x0
+  #-range 0x40000
+puts done
+";
+        assert_eq!(
+            command_words(src),
+            [vec!["assign", "-offset", "0x0"], vec!["puts", "done"]],
+        );
+    }
+
+    #[test]
+    fn a_level_line_is_not_a_comment_to_skip() {
+        // `#0` is Tcl's level syntax; a line starting with it isn't a
+        // comment, so it doesn't carry the command on to the next line.
+        let src = "uplevel\n  #0 $script\n  -x 1\n";
+        assert_eq!(command_words(src)[0], ["uplevel"]);
     }
 
     #[test]

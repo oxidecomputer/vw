@@ -700,12 +700,47 @@ fn analyze_file(
 
     // Add symbols to the map
 
+    // Every kind a serialized type can be built out of. Subtypes and arrays
+    // are here because a tagged record's fields are routinely neither a
+    // record nor an enum — `data: beat` is a subtype of a vector, and
+    // resolving it means being able to look `beat` up.
+    //
+    // This map is keyed by bare name across the whole design, so two things
+    // called the same thing collide and the last one read wins. Two rules
+    // keep the collisions that actually happen from being the damaging kind;
+    // a design with two packages declaring the same type name is still
+    // beyond it, and would need qualified keys.
     for symbol in file_finder.get_symbols() {
         match symbol.kind {
+            // A constant only qualifies if it is declared in a package. One
+            // inside a function is invisible to anything that could use it
+            // anyway — and `ethernet.vhd` has a local `constant mty` in a
+            // package body that was displacing the `subtype mty` the design's
+            // records are built from.
+            SymbolKind::Constant(_) if symbol.containing_pkg.is_none() => {}
             SymbolKind::Enum(_)
             | SymbolKind::Record(_)
-            | SymbolKind::Constant(_) => {
+            | SymbolKind::Constant(_)
+            | SymbolKind::Subtype(_)
+            | SymbolKind::Array(_) => {
                 let name = symbol.get_name().to_string();
+                // A type is never displaced by a constant of the same name.
+                // Resolution needs the type; nothing needs a constant it
+                // cannot tell apart from one.
+                let displaces_a_type =
+                    matches!(symbol.kind, SymbolKind::Constant(_))
+                        && matches!(
+                            processor.symbols.get(&name).map(|s| &s.kind),
+                            Some(
+                                SymbolKind::Record(_)
+                                    | SymbolKind::Enum(_)
+                                    | SymbolKind::Subtype(_)
+                                    | SymbolKind::Array(_)
+                            )
+                        );
+                if displaces_a_type {
+                    continue;
+                }
                 processor.symbols.insert(name.clone(), symbol.clone());
                 processor.symbol_to_file.insert(name, file_str.clone());
             }

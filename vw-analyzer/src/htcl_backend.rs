@@ -39,6 +39,9 @@ pub struct HtclBackend {
     /// editor-root workspace fail to resolve and every `@name/…`
     /// import in the visited file goes dead.
     workspace_roots: Arc<RwLock<Vec<std::path::PathBuf>>>,
+    /// The editor's `variant` setting. Picks the part the
+    /// target-compatibility check runs against.
+    variant: Arc<crate::VariantSetting>,
 }
 
 /// Cached analysis for one open document. Populated by the
@@ -101,6 +104,15 @@ struct DocState {
 impl HtclBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A backend that follows the server's shared `variant`
+    /// setting instead of its own (always-default) one.
+    pub fn with_variant(variant: Arc<crate::VariantSetting>) -> Self {
+        Self {
+            variant,
+            ..Self::default()
+        }
     }
 
     /// Test-only convenience: update text and wait for the indexer
@@ -256,6 +268,7 @@ impl HtclBackend {
         uri: &Url,
         text: String,
         workspace_roots: &[std::path::PathBuf],
+        variant: &crate::VariantSetting,
     ) -> Arc<DocAnalysis> {
         let view = crate::workspace::build_view(uri, &text, workspace_roots);
         let parsed_local = parse(&text);
@@ -274,20 +287,21 @@ impl HtclBackend {
                 file_path.parent().and_then(vw_lib::find_workspace_dir)
             {
                 if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
-                    // LSP checks the DEFAULT part only — cheap and
-                    // reflects what `vw run` would boot with. In
-                    // variant-mode workspaces the default variant's
-                    // part is what runs by default; in part-mode
-                    // workspaces we fall back to the default target
-                    // part. The CLI's `vw check --all-parts` /
-                    // `--all-variants` covers the wider matrix on
-                    // demand.
+                    // LSP checks one part only — cheap and reflects
+                    // what the session is about. In variant-mode
+                    // workspaces that's the part of the editor's
+                    // `variant` setting (default variant when
+                    // unset); in part-mode workspaces we fall back
+                    // to the default target part. The CLI's
+                    // `vw check --all-parts` / `--all-variants`
+                    // covers the wider matrix on demand.
                     let resolved_part: Option<String> =
                         if !cfg.workspace.variants.is_empty() {
+                            let name = variant.for_workspace(&ws);
                             cfg.workspace
-                                .default_variant()
-                                .ok()
-                                .flatten()
+                                .variants
+                                .iter()
+                                .find(|v| Some(&v.name) == name.as_ref())
                                 .map(|v| v.part.clone())
                         } else {
                             cfg.workspace
@@ -490,6 +504,7 @@ impl HtclBackend {
         spawn_indexer_task(
             self.docs.clone(),
             self.workspace_roots.clone(),
+            self.variant.clone(),
             uri,
             text,
             generation,
@@ -506,6 +521,7 @@ impl HtclBackend {
 fn spawn_indexer_task(
     docs: Arc<RwLock<HashMap<Url, DocState>>>,
     workspace_roots: Arc<RwLock<Vec<std::path::PathBuf>>>,
+    variant: Arc<crate::VariantSetting>,
     uri: Url,
     text: String,
     generation: u64,
@@ -517,8 +533,14 @@ fn spawn_indexer_task(
         }
         let roots = workspace_roots.read().await.clone();
         let uri_inner = uri.clone();
+        let variant_inner = variant.clone();
         let analysis = match tokio::task::spawn_blocking(move || {
-            HtclBackend::build_analysis(&uri_inner, text, &roots)
+            HtclBackend::build_analysis(
+                &uri_inner,
+                text,
+                &roots,
+                &variant_inner,
+            )
         })
         .await
         {
@@ -560,7 +582,7 @@ fn spawn_indexer_task(
         // per commit (there's no re-entry: A's rebuild doesn't
         // re-fire B's, since B's imports of A haven't changed).
         if committed {
-            reindex_importers_of(&docs, &workspace_roots, &uri).await;
+            reindex_importers_of(&docs, &workspace_roots, &variant, &uri).await;
         }
     })
 }
@@ -577,6 +599,7 @@ fn spawn_indexer_task(
 async fn reindex_importers_of(
     docs: &Arc<RwLock<HashMap<Url, DocState>>>,
     workspace_roots: &Arc<RwLock<Vec<std::path::PathBuf>>>,
+    variant: &Arc<crate::VariantSetting>,
     changed: &Url,
 ) {
     // Collect the (uri, text, new_generation, prev_task) tuples under
@@ -625,6 +648,7 @@ async fn reindex_importers_of(
         let handle = spawn_indexer_task(
             docs.clone(),
             workspace_roots.clone(),
+            variant.clone(),
             u.clone(),
             text,
             gen,
@@ -723,6 +747,46 @@ impl LanguageBackend for HtclBackend {
             handle.abort();
         }
         let _ = tx; // silence unused warning when watching sends aren't used further
+    }
+
+    async fn variant_changed(&self) -> Vec<Url> {
+        // Every doc's target-compatibility diagnostics may have
+        // moved, so re-index them all — immediately, like a save.
+        // Same bump-generation-then-spawn dance as
+        // `reindex_importers_of`.
+        let mut to_spawn = Vec::new();
+        {
+            let mut docs = self.docs.write().await;
+            for (uri, state) in docs.iter_mut() {
+                state.generation += 1;
+                if let Some(h) = state.index_task.take() {
+                    h.abort();
+                }
+                to_spawn.push((
+                    uri.clone(),
+                    state.text.clone(),
+                    state.generation,
+                ));
+            }
+        }
+        let mut uris = Vec::with_capacity(to_spawn.len());
+        for (uri, text, generation) in to_spawn {
+            let handle = self.spawn_indexer(
+                uri.clone(),
+                text,
+                generation,
+                std::time::Duration::ZERO,
+            );
+            let mut docs = self.docs.write().await;
+            match docs.get_mut(&uri) {
+                Some(state) if state.generation == generation => {
+                    state.index_task = Some(handle);
+                }
+                _ => handle.abort(),
+            }
+            uris.push(uri);
+        }
+        uris
     }
 
     async fn set_workspace_roots(&self, roots: Vec<std::path::PathBuf>) {

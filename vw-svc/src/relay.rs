@@ -32,6 +32,8 @@ fn agent_url(address: std::net::IpAddr) -> String {
 pub(crate) enum RelayError {
     #[error("environment does not exist")]
     NoSuchEnvironment,
+    #[error("'{workspace}' is not a usable workspace name: {detail}")]
+    BadWorkspace { workspace: String, detail: String },
     #[error("the {kind} instance for this environment does not exist yet")]
     NoInstance { kind: TargetKind },
     #[error(
@@ -53,10 +55,17 @@ pub(crate) enum RelayError {
     },
 }
 
-/// A connection to the agent serving one half of one environment.
+/// A connection to the agent serving one half of one environment, pointed at
+/// one workspace on it.
+///
+/// An instance holds a tree per workspace, so every relayed call has to say
+/// which. Carried on the handle rather than passed to each call: a request is
+/// about one workspace from beginning to end, and the alternative is thirteen
+/// call sites that could each pass the wrong one.
 pub(crate) struct Agent {
     pub(crate) client: vw_api_client::agent::Client,
     pub(crate) environment: String,
+    pub(crate) workspace: String,
     pub(crate) kind: TargetKind,
 }
 
@@ -66,6 +75,31 @@ impl Agent {
     /// Everything this needs is already recorded by the reconciler, so no call
     /// to the rack is made to work out where to send things.
     pub(crate) fn resolve(
+        user: &str,
+        name: &str,
+        workspace: &str,
+        kind: TargetKind,
+        args: &crate::ServerArgs,
+    ) -> Result<Agent, RelayError> {
+        // The agent checks this too, on arrival, and that is the check
+        // standing between a name and a path outside its tree. This one is so
+        // the refusal reaches the caller while they are still the person who
+        // typed it, rather than as a relayed error from a machine they have
+        // never heard of.
+        vw_lib::validate_workspace_name(workspace).map_err(|e| {
+            RelayError::BadWorkspace {
+                workspace: workspace.to_owned(),
+                detail: e.to_string(),
+            }
+        })?;
+
+        let mut agent = Agent::for_instance(user, name, kind, args)?;
+        agent.workspace = workspace.to_owned();
+        Ok(agent)
+    }
+
+    /// The instance serving `kind`, with no workspace named yet.
+    fn for_instance(
         user: &str,
         name: &str,
         kind: TargetKind,
@@ -78,7 +112,7 @@ impl Agent {
             TargetKind::Helios => args.helios_agent.as_deref(),
         };
         if let Some(address) = override_address {
-            return Agent::at(&format!("http://{address}"), name, kind);
+            return Agent::at(&format!("http://{address}"), name, "", kind);
         }
 
         let environment =
@@ -107,7 +141,54 @@ impl Agent {
         let address =
             instance.internal_ip.ok_or(RelayError::NoAddress { kind })?;
 
-        Agent::at(&agent_url(address), name, kind)
+        Agent::at(&agent_url(address), name, "", kind)
+    }
+
+    /// Find the instance serving `kind`, with no workspace in mind.
+    ///
+    /// For the two questions that are about the machine rather than about
+    /// anything on it: what workspaces it is holding, and putting credentials
+    /// in place. The handle this returns carries an empty workspace, so
+    /// nothing that names a tree may be called on it.
+    pub(crate) fn resolve_instance(
+        user: &str,
+        name: &str,
+        kind: TargetKind,
+        args: &crate::ServerArgs,
+    ) -> Result<Agent, RelayError> {
+        // Straight to the constructor rather than through `resolve`, whose
+        // first act is to refuse a workspace name like this one.
+        Agent::for_instance(user, name, kind, args)
+    }
+
+    /// What workspaces this instance is holding.
+    ///
+    /// Asked of the instance rather than read from this service's own records,
+    /// because this service has none: a workspace is on an instance because
+    /// somebody synchronized one there, and a second account kept here could
+    /// only ever disagree with the first.
+    pub(crate) async fn workspaces(
+        &self,
+        measure: bool,
+    ) -> Result<Vec<vw_api_types_versions::latest::Workspace>, RelayError> {
+        Ok(self
+            .client
+            .get_workspaces(&self.environment, Some(measure))
+            .await
+            .map_err(|e| self.failed(e))?
+            .into_inner())
+    }
+
+    /// Remove a workspace from this instance.
+    pub(crate) async fn forget_workspace(
+        &self,
+    ) -> Result<vw_api_types_versions::latest::CleanResult, RelayError> {
+        Ok(self
+            .client
+            .forget_workspace(&self.environment, &self.workspace)
+            .await
+            .map_err(|e| self.failed(e))?
+            .into_inner())
     }
 
     /// Find the instance that runs this environment's object store.
@@ -118,12 +199,26 @@ impl Agent {
     pub(crate) fn resolve_artifact(
         user: &str,
         name: &str,
+        workspace: &str,
         args: &crate::ServerArgs,
     ) -> Result<Agent, RelayError> {
+        // The agent checks this too, on arrival, and that is the check
+        // standing between a name and a path outside its tree. This one is so
+        // the refusal reaches the caller while they are still the person who
+        // typed it, rather than as a relayed error from a machine they have
+        // never heard of.
+        vw_lib::validate_workspace_name(workspace).map_err(|e| {
+            RelayError::BadWorkspace {
+                workspace: workspace.to_owned(),
+                detail: e.to_string(),
+            }
+        })?;
+
         if let Some(address) = args.artifact_agent.as_deref() {
             return Agent::at(
                 &format!("http://{address}"),
                 name,
+                workspace,
                 TargetKind::Vivado,
             );
         }
@@ -153,6 +248,7 @@ impl Agent {
         Agent::at(
             &agent_url(address),
             name,
+            workspace,
             // Only used for error text; there is no artifact target kind and
             // inventing one would put it in the public API for no reason.
             TargetKind::Vivado,
@@ -171,7 +267,7 @@ impl Agent {
     ) -> Result<vw_api_types_versions::latest::S3Credentials, RelayError> {
         let mut credentials = self
             .client
-            .get_object_store(&self.environment, Some(&kind))
+            .get_object_store(&self.environment, &self.workspace, Some(&kind))
             .await
             .map_err(|e| self.failed(e))?
             .into_inner();
@@ -194,7 +290,7 @@ impl Agent {
     ) -> Result<vw_api_types_versions::latest::S3Credentials, RelayError> {
         Ok(self
             .client
-            .get_artifact_target(&self.environment)
+            .get_artifact_target(&self.environment, &self.workspace)
             .await
             .map_err(|e| self.failed(e))?
             .into_inner())
@@ -206,7 +302,11 @@ impl Agent {
         credentials: &vw_api_types_versions::latest::S3Credentials,
     ) -> Result<(), RelayError> {
         self.client
-            .put_artifact_target(&self.environment, credentials)
+            .put_artifact_target(
+                &self.environment,
+                &self.workspace,
+                credentials,
+            )
             .await
             .map_err(|e| self.failed(e))?;
         Ok(())
@@ -215,12 +315,14 @@ impl Agent {
     fn at(
         base_url: &str,
         environment: &str,
+        workspace: &str,
         kind: TargetKind,
     ) -> Result<Agent, RelayError> {
         Ok(Agent {
             client: vw_api_client::agent_client(base_url)
                 .map_err(RelayError::Client)?,
             environment: environment.to_owned(),
+            workspace: workspace.to_owned(),
             kind,
         })
     }
@@ -278,6 +380,7 @@ impl Agent {
             .client
             .vivado_session(
                 &self.environment,
+                &self.workspace,
                 Some(query.info_with_stack),
                 query.part.as_deref(),
                 query.variant.as_deref(),
@@ -302,8 +405,32 @@ impl Agent {
             .client
             .driver_build(
                 &self.environment,
+                &self.workspace,
                 query.args.as_deref(),
                 Some(query.release),
+            )
+            .await
+            .map_err(|e| self.failed(e))?
+            .into_inner();
+
+        join(client, upgraded).await;
+
+        Ok(())
+    }
+
+    /// Anodize the instance's workspace, joined to `client`.
+    pub(crate) async fn join_anodize(
+        &self,
+        client: dropshot::WebsocketConnection,
+        query: &vw_api_types_versions::latest::AnodizeQuery,
+    ) -> Result<(), RelayError> {
+        let upgraded = self
+            .client
+            .anodize(
+                &self.environment,
+                &self.workspace,
+                query.bench.as_deref(),
+                query.standard.as_deref(),
             )
             .await
             .map_err(|e| self.failed(e))?
@@ -329,6 +456,7 @@ impl Agent {
             .client
             .bench_session(
                 &self.environment,
+                &self.workspace,
                 query.concurrency,
                 query.filter.as_deref(),
                 query.ignore.as_deref(),

@@ -18,10 +18,13 @@ use tracing::{debug, info};
 
 use crate::backend::LanguageBackend;
 use crate::htcl_backend::HtclBackend;
+use crate::variant::{variant_from_settings, VariantSetting};
 
 pub struct Analyzer {
     client: Client,
     backends: Vec<Arc<dyn LanguageBackend>>,
+    /// The editor's `variant` setting, shared with every backend.
+    variant: Arc<VariantSetting>,
     /// Monotonic counter for `$/progress` tokens. Every user-facing
     /// slow operation (diagnostics, goto-def, hover, completion)
     /// generates a fresh token and reports begin/end so Helix and
@@ -34,13 +37,18 @@ pub struct Analyzer {
 
 impl Analyzer {
     pub fn new(client: Client) -> Self {
+        let variant = Arc::new(VariantSetting::new(client.clone()));
         let backends: Vec<Arc<dyn LanguageBackend>> = vec![
-            Arc::new(HtclBackend::new()),
-            Arc::new(crate::VhdlBackend::new(client.clone())),
+            Arc::new(HtclBackend::with_variant(variant.clone())),
+            Arc::new(crate::VhdlBackend::with_variant(
+                client.clone(),
+                variant.clone(),
+            )),
         ];
         Self {
             client,
             backends,
+            variant,
             progress_seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -199,6 +207,11 @@ impl LanguageServer for Analyzer {
         for backend in &self.backends {
             backend.set_workspace_roots(roots.clone()).await;
         }
+        // `initializationOptions: { variant }` — nothing has been
+        // analyzed yet, so no backend needs telling.
+        if let Some(opts) = &params.initialization_options {
+            self.variant.set(variant_from_settings(opts));
+        }
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "vw-analyzer".into(),
@@ -332,6 +345,29 @@ impl LanguageServer for Analyzer {
     ) {
         for backend in &self.backends {
             backend.did_change_watched_files(&params).await;
+        }
+    }
+
+    async fn did_change_configuration(
+        &self,
+        params: DidChangeConfigurationParams,
+    ) {
+        // Same `{ variant }` shape as `initializationOptions`. Some
+        // clients (Helix among them) send their whole config here
+        // right after `initialized`; an unchanged variant is a no-op.
+        // A `null` payload is only a "settings changed, go pull
+        // them" nudge, which says nothing about the variant.
+        if params.settings.is_null() {
+            return;
+        }
+        if !self.variant.set(variant_from_settings(&params.settings)) {
+            return;
+        }
+        info!("variant setting changed; re-analyzing");
+        for backend in &self.backends {
+            for uri in backend.variant_changed().await {
+                self.spawn_publish_diagnostics(uri, None);
+            }
         }
     }
 

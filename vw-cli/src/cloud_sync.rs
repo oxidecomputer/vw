@@ -31,7 +31,7 @@ use colored::*;
 
 use futures::{StreamExt, TryStreamExt};
 
-use crate::cloud::CloudError;
+use crate::cloud::{CloudError, Target};
 
 /// How many pieces of content are sent at once.
 ///
@@ -51,7 +51,7 @@ pub const TARGETS: [types::TargetKind; 2] =
 /// Push the workspace to an environment, once or continuously.
 pub async fn run(
     session: &crate::cloud::Session,
-    environment: &str,
+    target: &Target,
     force: bool,
     watch: bool,
     debounce: std::time::Duration,
@@ -65,17 +65,17 @@ pub async fn run(
         .into_iter()
         .filter(|kind| only.is_none_or(|only| only == *kind))
         .collect();
-    announce(&workspace);
+    announce(&workspace, target);
 
     // Only ever the first pass. Forcing is an answer to a doubt about what is
     // on the instance, and once the sync below has settled it there is nothing
     // left to doubt — re-clearing on every file save would mean re-uploading
     // the whole workspace to see a one line edit.
     if force {
-        clear(session, environment, &targets).await?;
+        clear(session, target, &targets).await?;
     }
 
-    sync_once(session, environment, &workspace, &targets, true).await?;
+    sync_once(session, target, &workspace, &targets, true).await?;
 
     if !watch {
         return Ok(());
@@ -100,7 +100,7 @@ pub async fn run(
         while tokio::time::timeout(debounce, changes.recv()).await.is_ok() {}
 
         if let Err(e) =
-            sync_once(session, environment, &workspace, &targets, false).await
+            sync_once(session, target, &workspace, &targets, false).await
         {
             // A failed sync is not a reason to stop watching. The next save
             // tries again, and an instance that is still coming up will be
@@ -110,18 +110,21 @@ pub async fn run(
     }
 }
 
-/// Say which workspace is being pushed.
+/// Say which workspace is being pushed, where to, and under what name.
 ///
-/// Worth the line because a sync can be run from anywhere inside a workspace,
+/// Worth the lines because a sync can be run from anywhere inside a workspace,
 /// and "which one did that just send" is not a question anyone should have to
-/// answer by remembering where they were standing. Which instances are getting
-/// it is left to the reports below, which name them either way.
-fn announce(workspace: &Utf8Path) {
+/// answer by remembering where they were standing. The second line matters
+/// more now that an environment holds several trees: two checkouts that
+/// resolve to one slot overwrite each other on every sync, and this is the
+/// only place that would ever show it.
+fn announce(workspace: &Utf8Path, target: &Target) {
     println!(
         "{} {}",
         "\u{2192}".bright_black(),
         workspace.as_str().bright_black(),
     );
+    target.announce();
 }
 
 /// Throw away what every target's instance has.
@@ -133,12 +136,16 @@ fn announce(workspace: &Utf8Path) {
 /// there is to do.
 async fn clear(
     session: &crate::cloud::Session,
-    environment: &str,
+    target: &Target,
     targets: &[types::TargetKind],
 ) -> Result<(), CloudError> {
     for kind in targets {
         let result = vw_api_client::retrying(|| {
-            session.client.sync_clear(environment, kind)
+            session.client.sync_clear(
+                &target.environment,
+                &target.workspace,
+                kind,
+            )
         })
         .await
         .map_err(|e| session.error(e))?
@@ -158,7 +165,7 @@ async fn clear(
 /// One pass over every target.
 async fn sync_once(
     session: &crate::cloud::Session,
-    environment: &str,
+    target: &Target,
     workspace: &Utf8Path,
     targets: &[types::TargetKind],
     announce: bool,
@@ -172,7 +179,12 @@ async fn sync_once(
 
     for kind in targets {
         let plan = vw_api_client::retrying(|| {
-            session.client.sync_plan(environment, kind, &manifest)
+            session.client.sync_plan(
+                &target.environment,
+                &target.workspace,
+                kind,
+                &manifest,
+            )
         })
         .await
         .map_err(|e| session.error(e))?
@@ -202,7 +214,8 @@ async fn sync_once(
                 // hundreds of megabytes an artifact runs to.
                 vw_api_client::retrying(|| {
                     session.client.sync_blob(
-                        environment,
+                        &target.environment,
+                        &target.workspace,
                         kind,
                         digest.0.as_str(),
                         contents.clone(),
@@ -221,7 +234,12 @@ async fn sync_once(
             .await?;
 
         let result = vw_api_client::retrying(|| {
-            session.client.sync_commit(environment, kind, &manifest)
+            session.client.sync_commit(
+                &target.environment,
+                &target.workspace,
+                kind,
+                &manifest,
+            )
         })
         .await
         .map_err(|e| session.error(e))?
@@ -295,7 +313,7 @@ fn report(
 ///
 /// Walks up from the current directory, the way cargo and git do, so it can be
 /// run from anywhere inside a workspace rather than only at its root.
-fn workspace_root() -> Result<Utf8PathBuf, CloudError> {
+pub(crate) fn workspace_root() -> Result<Utf8PathBuf, CloudError> {
     let cwd = std::env::current_dir().map_err(|_| CloudError::NoWorkspace)?;
     let mut dir =
         Utf8PathBuf::from_path_buf(cwd).map_err(|_| CloudError::NoWorkspace)?;
@@ -350,11 +368,15 @@ fn watcher(
 /// other would be a surprising thing for one command to do.
 pub async fn clean(
     session: &crate::cloud::Session,
-    environment: &str,
+    target: &Target,
 ) -> Result<(), CloudError> {
     for kind in TARGETS {
         let result = vw_api_client::retrying(|| {
-            session.client.clean_build_output(environment, &kind)
+            session.client.clean_build_output(
+                &target.environment,
+                &target.workspace,
+                &kind,
+            )
         })
         .await
         .map_err(|e| session.error(e))?

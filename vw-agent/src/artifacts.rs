@@ -23,8 +23,9 @@ use vw_api_types_versions::latest::S3Credentials;
 
 /// Where a build leaves things worth keeping, and what to keep from each.
 ///
-/// Directories under the workspace's `target`, paired with the extension that
-/// matters there. Everything else a build writes — checkpoints, logs, journal
+/// Directories under each build directory (`target`, or `target/<variant>`
+/// in a workspace with variants — see `vw_lib::build_dir`), paired with the
+/// extension that matters there. Everything else a build writes — checkpoints, logs, journal
 /// files, the vivado project — is either enormous, only meaningful on the
 /// machine that made it, or both.
 ///
@@ -133,12 +134,19 @@ pub(crate) enum ArtifactError {
     Corrupt,
 }
 
-/// Remember where artifacts go, so a restart does not have to be told again.
+/// Remember where one workspace's artifacts go, so a restart does not have to
+/// be told again.
 ///
 /// The instance can reboot between one build and the next, and whoever told it
 /// where to put things may not think to say so a second time.
+///
+/// One file holding every workspace's answer rather than a file each. They are
+/// written one at a time and read all at once — at startup, to bring back what
+/// this instance already knew — and a directory of small files would make the
+/// second of those a walk in order to save nothing on the first.
 pub(crate) fn remember(
     path: &Utf8Path,
+    workspace: &str,
     credentials: &S3Credentials,
 ) -> Result<(), ArtifactError> {
     if let Some(parent) = path.parent() {
@@ -146,12 +154,18 @@ pub(crate) fn remember(
             .map_err(|e| ArtifactError::Write(parent.to_owned(), e))?;
     }
 
-    let encoded = serde_json::to_string_pretty(credentials)
+    // Read, amend, write. Two workspaces being told where their artifacts go
+    // at the same moment is possible, and the loser of a blind write would
+    // take the winner's entry out with it.
+    let mut targets = recall(path)?;
+    targets.insert(workspace.to_owned(), credentials.clone());
+
+    let encoded = serde_json::to_string_pretty(&targets)
         .map_err(|_| ArtifactError::Corrupt)?;
     std::fs::write(path, encoded)
         .map_err(|e| ArtifactError::Write(path.to_owned(), e))?;
 
-    // It holds a secret key.
+    // It holds secret keys.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -162,19 +176,33 @@ pub(crate) fn remember(
     Ok(())
 }
 
-/// What was remembered, if anything.
+/// Where each workspace's artifacts were last said to go.
 pub(crate) fn recall(
     path: &Utf8Path,
-) -> Result<Option<S3Credentials>, ArtifactError> {
+) -> Result<HashMap<String, S3Credentials>, ArtifactError> {
     if !path.is_file() {
-        return Ok(None);
+        return Ok(HashMap::new());
     }
 
     let stored = std::fs::read_to_string(path)
         .map_err(|e| ArtifactError::Read(path.to_owned(), e))?;
-    serde_json::from_str(&stored)
-        .map(Some)
-        .map_err(|_| ArtifactError::Corrupt)
+    serde_json::from_str(&stored).map_err(|_| ArtifactError::Corrupt)
+}
+
+/// Stop remembering a workspace's target, because the workspace is going.
+pub(crate) fn forget(
+    path: &Utf8Path,
+    workspace: &str,
+) -> Result<(), ArtifactError> {
+    let mut targets = recall(path)?;
+    if targets.remove(workspace).is_none() {
+        return Ok(());
+    }
+
+    let encoded = serde_json::to_string_pretty(&targets)
+        .map_err(|_| ArtifactError::Corrupt)?;
+    std::fs::write(path, encoded)
+        .map_err(|e| ArtifactError::Write(path.to_owned(), e))
 }
 
 /// Watch `root`'s image directory and upload whatever appears in it.
@@ -430,9 +458,22 @@ struct Found {
 /// stage directory is neither small nor meaningful anywhere else.
 fn artifacts(root: &Utf8Path) -> Vec<Found> {
     let mut found = Vec::new();
+    let output = root.join(BUILD_OUTPUT);
 
-    for (directory, extension) in GATHERED {
-        let source = root.join(BUILD_OUTPUT).join(directory);
+    // Every variant's build, keyed by its path under `target` — so each
+    // variant's image and reports are their own objects (`vpk120/image/…`)
+    // rather than overwriting another variant's of the same name.
+    let gathered = vw_lib::build_dirs(root).into_iter().flat_map(|build| {
+        GATHERED.iter().map(move |(directory, extension)| {
+            (build.join(directory), *extension)
+        })
+    });
+    for (source, extension) in gathered {
+        let Some(prefix) =
+            source.strip_prefix(&output).ok().map(Utf8Path::to_owned)
+        else {
+            continue;
+        };
         let Ok(entries) = std::fs::read_dir(&source) else {
             // A build that has not reached this stage yet, which is the
             // ordinary case for most of them most of the time.
@@ -449,7 +490,7 @@ fn artifacts(root: &Utf8Path) -> Vec<Found> {
                 continue;
             };
             found.push(Found {
-                key: format!("{directory}/{name}"),
+                key: format!("{prefix}/{name}"),
                 path,
             });
         }
@@ -648,6 +689,62 @@ mod test {
     /// A mixed-signal bench writes a directory of its own, one level below
     /// everything else. The flat walk that finds images and netlists cannot
     /// see into it, so this is the thing that would silently ship nothing.
+    /// A workspace with two variants, which build into `target/<variant>`.
+    fn two_variants(root: &Utf8Path) {
+        std::fs::write(
+            root.join("vw.toml"),
+            "[workspace]\nname = \"twin\"\nversion = \"0.1.0\"\n\n\
+             [[workspace.variants]]\nname = \"alpha\"\npart = \"p\"\n\
+             default = true\n\n\
+             [[workspace.variants]]\nname = \"beta\"\npart = \"p\"\n",
+        )
+        .expect("vw.toml");
+    }
+
+    #[test]
+    fn each_variants_build_is_its_own_set_of_objects() {
+        // The same report name out of both variants: two objects, named
+        // for the variant that built each.
+        let (_dir, root) = scratch();
+        two_variants(&root);
+        build_output(&root, "alpha/image/alpha.pdi", "image");
+        build_output(&root, "alpha/reports/worst-paths.csv", "a");
+        build_output(&root, "beta/reports/worst-paths.csv", "b");
+        build_output(&root, "beta/route/top_beta-netlist.edif", "netlist");
+        // Not build output, and not a variant's: still gathered as before.
+        build_output(&root, "bench/tx-eq/eye.png", "a plot");
+
+        let keys: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(
+            keys,
+            [
+                "alpha/image/alpha.pdi",
+                "alpha/reports/worst-paths.csv",
+                "bench/tx-eq/eye.png",
+                "beta/reports/worst-paths.csv",
+                "beta/route/top_beta-netlist.edif",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_workspace_without_variants_keeps_its_names() {
+        let (_dir, root) = scratch();
+        std::fs::write(
+            root.join("vw.toml"),
+            "[workspace]\nname = \"flat\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("vw.toml");
+        build_output(&root, "image/flat.pdi", "image");
+
+        let keys: Vec<String> =
+            artifacts(&root).into_iter().map(|f| f.key).collect();
+
+        assert_eq!(keys, ["image/flat.pdi"]);
+    }
+
     #[test]
     fn a_mixed_signal_benchs_results_are_gathered() {
         let (_dir, root) = scratch();
@@ -785,11 +882,46 @@ mod test {
         let (_dir, root) = scratch();
         let path = root.join("artifact-target.json");
 
-        remember(&path, &credentials()).expect("remember");
-        let recalled = recall(&path).expect("recall").expect("something");
+        remember(&path, "redhawk", &credentials()).expect("remember");
+        let recalled = recall(&path).expect("recall");
+        let target = recalled.get("redhawk").expect("something");
 
-        assert_eq!(recalled.bucket, "vivado-darmok");
-        assert_eq!(recalled.access_key_id, "GK00000000000000000000000");
+        assert_eq!(target.bucket, "vivado-darmok");
+        assert_eq!(target.access_key_id, "GK00000000000000000000000");
+    }
+
+    /// One instance holds several workspaces, each writing to its own
+    /// bucket, so remembering where one goes cannot be allowed to lose
+    /// where another does.
+    #[test]
+    fn one_workspace_target_does_not_displace_another() {
+        let (_dir, root) = scratch();
+        let path = root.join("artifact-target.json");
+
+        remember(&path, "redhawk", &credentials()).expect("remember");
+        let mut other = credentials();
+        other.bucket = "vivado-darmok-scratch".to_owned();
+        remember(&path, "scratch", &other).expect("remember");
+
+        let recalled = recall(&path).expect("recall");
+        assert_eq!(recalled.len(), 2);
+        assert_eq!(recalled["redhawk"].bucket, "vivado-darmok");
+        assert_eq!(recalled["scratch"].bucket, "vivado-darmok-scratch");
+    }
+
+    /// And forgetting one leaves the rest where they were.
+    #[test]
+    fn forgetting_one_target_keeps_the_others() {
+        let (_dir, root) = scratch();
+        let path = root.join("artifact-target.json");
+
+        remember(&path, "redhawk", &credentials()).expect("remember");
+        remember(&path, "scratch", &credentials()).expect("remember");
+        forget(&path, "scratch").expect("forget");
+
+        let recalled = recall(&path).expect("recall");
+        assert_eq!(recalled.len(), 1);
+        assert!(recalled.contains_key("redhawk"));
     }
 
     #[test]
@@ -797,7 +929,7 @@ mod test {
         let (_dir, root) = scratch();
         assert!(recall(&root.join("nothing.json"))
             .expect("recall")
-            .is_none());
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -807,7 +939,7 @@ mod test {
         let (_dir, root) = scratch();
         let path = root.join("artifact-target.json");
 
-        remember(&path, &credentials()).expect("remember");
+        remember(&path, "redhawk", &credentials()).expect("remember");
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);

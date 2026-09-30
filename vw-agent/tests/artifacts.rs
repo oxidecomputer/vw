@@ -28,6 +28,10 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How many times to try for a port before calling it a real failure.
 const STARTUP_ATTEMPTS: usize = 5;
 const ENVIRONMENT: &str = "darmok";
+
+/// The workspace every test builds in. `--root` names the directory
+/// the trees sit under, so this one is a level below it.
+const WORKSPACE: &str = "redhawk";
 const BUCKET: &str = "vivado-darmok";
 
 /// Long enough for the poller to have noticed several times over.
@@ -206,9 +210,7 @@ async fn listening(
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if client
-            .get(format!(
-                "{base_url}/environment/{ENVIRONMENT}/artifact-target"
-            ))
+            .get(format!("{base_url}/environment/{ENVIRONMENT}/workspaces"))
             .send()
             .await
             .is_ok()
@@ -241,7 +243,8 @@ impl Agent {
         let base = Utf8Path::from_path(dir.path())
             .expect("utf8 scratch directory")
             .to_owned();
-        let root = base.join("root");
+        let trees = base.join("root");
+        let root = trees.join(WORKSPACE);
         std::fs::create_dir_all(&root).expect("workspace");
         let client = versioned_client();
 
@@ -251,7 +254,7 @@ impl Agent {
         // and there is nothing to do about it but pick another.
         for _ in 0..STARTUP_ATTEMPTS {
             let port = free_port();
-            let mut child = spawn_agent(&base, &root, port);
+            let mut child = spawn_agent(&base, &trees, port);
             let base_url = format!("http://127.0.0.1:{port}");
 
             if listening(&client, &base_url, &mut child).await {
@@ -276,7 +279,7 @@ impl Agent {
         let response = self
             .client
             .put(format!(
-                "{}/environment/{ENVIRONMENT}/artifact-target",
+                "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/artifact-target",
                 self.base_url
             ))
             .json(&store.credentials())
@@ -309,7 +312,7 @@ impl Agent {
         let response = self
             .client
             .post(format!(
-                "{}/environment/{ENVIRONMENT}/artifact-flush",
+                "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/artifact-flush",
                 self.base_url
             ))
             .send()

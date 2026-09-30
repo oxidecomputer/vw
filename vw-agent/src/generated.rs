@@ -20,13 +20,35 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use vw_api_types_versions::latest::{FileEntry, TreeManifest};
 
-/// Where vivado leaves generated VHDL, and how to recognise it.
+/// Where vivado leaves generated VHDL within a build directory, and how to
+/// recognise it.
 ///
-/// Block design IP gets a wrapper per design under `target/ip`; standalone IP
-/// gets a stub deep inside the vivado project's generated sources. The two
-/// live nowhere near each other because vivado decides where they go, not us.
+/// Block design IP gets a wrapper per design under `ip`; standalone IP gets a
+/// stub deep inside the vivado project's generated sources. The two live
+/// nowhere near each other because vivado decides where they go, not us.
 const GENERATED: [(&str, &str); 2] =
-    [("target/ip", ".vhd"), ("target/vw-project", "_stub.vhdl")];
+    [("ip", ".vhd"), ("vw-project", "_stub.vhdl")];
+
+/// Every directory generated VHDL can be in, relative to the workspace, with
+/// the suffix that marks it.
+///
+/// One set per build directory: a workspace with variants keeps each
+/// variant's IP apart under `target/<variant>` (see `vw_lib::build_dir`), and
+/// all of them are handed out — the client writes each file back to the same
+/// path, so the variants stay apart on that side too.
+fn generated_dirs(root: &Utf8Path) -> Vec<(Utf8PathBuf, &'static str)> {
+    vw_lib::build_dirs(root)
+        .into_iter()
+        .filter_map(|build| {
+            build.strip_prefix(root).ok().map(Utf8Path::to_owned)
+        })
+        .flat_map(|build| {
+            GENERATED.iter().map(move |(directory, suffix)| {
+                (build.join(directory), *suffix)
+            })
+        })
+        .collect()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GeneratedError {
@@ -58,7 +80,7 @@ pub(crate) fn prepare(root: &Utf8Path) -> usize {
 pub(crate) fn manifest(root: &Utf8Path) -> TreeManifest {
     let mut entries = Vec::new();
 
-    for (directory, suffix) in GENERATED {
+    for (directory, suffix) in generated_dirs(root) {
         collect(root, &root.join(directory), suffix, &mut entries);
     }
 
@@ -130,7 +152,7 @@ pub(crate) fn read(
     }
 
     // Only the places generated VHDL lives, and only files that look like it.
-    let allowed = GENERATED.iter().any(|(directory, suffix)| {
+    let allowed = generated_dirs(root).iter().any(|(directory, suffix)| {
         path.starts_with(&format!("{directory}/")) && path.ends_with(suffix)
     });
     if !allowed {
@@ -232,6 +254,60 @@ mod test {
             .collect();
 
         assert_eq!(paths.len(), 4, "only the wrappers and stubs: {paths:?}");
+    }
+
+    #[test]
+    fn every_variants_generated_vhdl_is_handed_over() {
+        // Each variant generates into `target/<variant>`, often with the
+        // same IP names. The client writes each file back to the same
+        // path, so both variants' IP arrive and stay apart.
+        let (_dir, root) = scratch();
+        write(
+            &root,
+            "vw.toml",
+            "[workspace]\nname = \"twin\"\nversion = \"0.1.0\"\n\n\
+             [[workspace.variants]]\nname = \"alpha\"\npart = \"p\"\n\
+             default = true\n\n\
+             [[workspace.variants]]\nname = \"beta\"\npart = \"p\"\n",
+        );
+        write(&root, "target/alpha/ip/txr0/wrapper.vhd", "-- dual quad");
+        write(&root, "target/beta/ip/txr0/wrapper.vhd", "-- single quad");
+        write(
+            &root,
+            "target/beta/vw-project/twin/twin.gen/sources_1/ip/clk_eth/\
+             clk_eth_stub.vhdl",
+            "-- clk_eth",
+        );
+        // Left over from the flat layout; not where this workspace's IP is.
+        write(&root, "target/ip/txr0/wrapper.vhd", "-- stale");
+
+        let paths: Vec<String> = manifest(&root)
+            .entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+
+        assert_eq!(
+            paths,
+            [
+                "target/alpha/ip/txr0/wrapper.vhd",
+                "target/beta/ip/txr0/wrapper.vhd",
+                "target/beta/vw-project/twin/twin.gen/sources_1/ip/clk_eth/\
+                 clk_eth_stub.vhdl",
+            ],
+        );
+        assert_eq!(
+            read(&root, "target/beta/ip/txr0/wrapper.vhd").expect("served"),
+            b"-- single quad",
+        );
+        assert!(matches!(
+            read(&root, "target/ip/txr0/wrapper.vhd"),
+            Err(GeneratedError::UnsafePath(_)),
+        ));
+        assert!(matches!(
+            read(&root, "target/beta/image/beta.pdi"),
+            Err(GeneratedError::UnsafePath(_)),
+        ));
     }
 
     #[test]

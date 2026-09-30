@@ -51,12 +51,155 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 /// see [`InstanceKind::shape`].
 const BOOT_DISK_GIB: u64 = 600;
 
-/// Instances are named `vwsvc-{user}-{env}-{kind}`, and this prefix is the
-/// only thing that marks an Oxide instance as ours.
+/// What marks an Oxide object as some vw service's.
 ///
-/// Anything without it is somebody else's and is never touched, which is what
-/// keeps a reconciler pass from deleting unrelated instances in the project.
-pub(crate) const INSTANCE_PREFIX: &str = "vwsvc";
+/// Never used on its own. Every object is named `vwsvc-{deployment}-...`, with
+/// the deployment always present, so that no deployment's prefix can be a
+/// prefix of another's — see [`validate_deployment_name`].
+const OBJECT_MARKER: &str = "vwsvc";
+
+/// What marks a silo ssh key as some vw service's.
+///
+/// Deliberately not [`OBJECT_MARKER`], and the reason is the one asymmetry in
+/// this whole scheme. Instances and disks live in a project, and a project is a
+/// boundary: a vw service cannot see, let alone reap, another project's. The
+/// silo ssh key list is scoped by nothing — it belongs to the token's user —
+/// so it is the single place where one service can reach another's work, and
+/// the only defence available is the name.
+///
+/// A name is not enough on its own, because it has to be recognized by the
+/// *other* service's rule, which may be older than any rule written here. A
+/// vw-svc predating deployment names claims every key beginning `vwsvc-` that
+/// its own database does not want — which is every name a named deployment
+/// produces. It re-reads that list every pass, so a key is gone within seconds
+/// of being registered and an instance booting in that window comes up with no
+/// way in. Nothing in this binary can change the old one's rule.
+///
+/// So keys are named outside the namespace that rule watches. `vwkey-` is not
+/// `vwsvc-`, and a service looking for the latter cannot see these at all.
+const KEY_MARKER: &str = "vwkey";
+
+/// The deployment the name-handling functions assume when nothing has
+/// initialized the global.
+///
+/// Only ever reached from tests: `serve` calls [`init_deployment`] before
+/// anything can name or parse an object.
+const TEST_DEPLOYMENT: &str = "test";
+
+/// The prefix a deployment names and recognizes its objects by.
+///
+/// Instances are `vwsvc-{deployment}-{user}-{env}-{kind}` and their boot disks
+/// take the instance's name. This prefix is the only thing that marks either as
+/// this deployment's. Silo ssh keys are named apart, by
+/// [`deployment_key_prefix`], for a reason that is worth reading before
+/// changing anything here.
+///
+/// Anything without it belongs to somebody else — another deployment, or no vw
+/// service at all — and is never touched, which is what keeps a reconciler pass
+/// from deleting things that are not its business.
+///
+/// The deployment name is also what lets two vw services share an Oxide silo
+/// user, and so a single `OXIDE_TOKEN`, without reaping each other's work. A
+/// project separates the instances and disks, but it cannot separate the ssh
+/// keys: the silo key list belongs to the token's user and is not scoped by
+/// project, so nothing but this name reaches it.
+fn deployment_prefix(deployment: &str) -> String {
+    format!("{OBJECT_MARKER}-{deployment}")
+}
+
+/// The prefix a deployment names and recognizes its silo ssh keys by.
+///
+/// Keys are `vwkey-{deployment}-{user}-{env}`. Same shape as everything else
+/// and the same disjointness argument — a deployment name cannot contain a
+/// hyphen, so no deployment's key names begin with another's prefix — but
+/// under a marker of their own. See [`KEY_MARKER`].
+fn deployment_key_prefix(deployment: &str) -> String {
+    format!("{KEY_MARKER}-{deployment}")
+}
+
+/// Which deployment this process is, as the prefix it names objects with.
+///
+/// Unset until [`init_deployment`] runs.
+static PREFIX: OnceLock<String> = OnceLock::new();
+
+/// The same, for the silo ssh keys it registers.
+static KEY_PREFIX: OnceLock<String> = OnceLock::new();
+
+/// Record which deployment this process is.
+///
+/// Called before anything can name or parse an Oxide object, which in practice
+/// means first thing in `serve`. A second call is refused rather than allowed
+/// to change the answer underneath objects already named by the first.
+pub(crate) fn init_deployment(deployment: &str) -> Result<(), InitError> {
+    validate_deployment_name(deployment)
+        .map_err(InitError::InvalidDeployment)?;
+    PREFIX
+        .set(deployment_prefix(deployment))
+        .map_err(|_| InitError::DeploymentAlreadyInitialized)?;
+    KEY_PREFIX
+        .set(deployment_key_prefix(deployment))
+        .map_err(|_| InitError::DeploymentAlreadyInitialized)
+}
+
+/// Reject a deployment name that would not keep two deployments apart.
+///
+/// Ownership everywhere comes down to "the name starts with `{prefix}-`", and
+/// a prefix is `vwsvc-{deployment}`. That rule only separates two deployments
+/// when neither name is the other followed by a hyphen. Otherwise
+/// `vwsvc-prod-west-ferris-alpha-vivado` starts with `vwsvc-prod-`, and `prod`
+/// parses it as user `west-ferris` in environment `alpha` — a well formed
+/// instance that is not in its database, so `prod` deletes it, reaps its boot
+/// disk and reaps its ssh key.
+///
+/// Forbidding the hyphen outright makes every deployment's name space disjoint
+/// from every other's without any deployment having to know what the others are
+/// called. It is the same rule environment names follow, in
+/// [`crate::reconciler::validate_environment_name`], for the same reason.
+pub(crate) fn validate_deployment_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(String::from("deployment name cannot be empty"));
+    }
+    if name.contains('-') {
+        return Err(format!(
+            "'{name}' cannot contain '-'; it separates the parts of the \
+             object names below it, and a deployment whose name were another's \
+             plus a suffix would claim that deployment's instances"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err(format!(
+            "'{name}' may only contain lowercase letters and digits"
+        ));
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(format!("'{name}' must start with a lowercase letter"));
+    }
+    Ok(())
+}
+
+/// The prefix this deployment names and recognizes objects by.
+///
+/// A test deployment's when [`init_deployment`] has not run, so that the pure
+/// name-handling functions below can be unit tested without a global to set up.
+/// `serve` initializes before anything reads this, so the fallback is not
+/// reachable in a running service — and it matters that it is not, since a
+/// service that fell back would be naming and reaping objects as a deployment
+/// that is not the one it was asked to be.
+pub(crate) fn instance_prefix() -> &'static str {
+    PREFIX
+        .get_or_init(|| deployment_prefix(TEST_DEPLOYMENT))
+        .as_str()
+}
+
+/// The prefix this deployment names and recognizes its silo ssh keys by.
+pub(crate) fn ssh_key_prefix() -> &'static str {
+    KEY_PREFIX
+        .get_or_init(|| deployment_key_prefix(TEST_DEPLOYMENT))
+        .as_str()
+}
 
 /// How to reach the Oxide API, recorded at startup.
 ///
@@ -76,6 +219,10 @@ static OXIDE: OnceLock<Option<OxideConfig>> = OnceLock::new();
 pub(crate) enum InitError {
     #[error("the oxide configuration has already been initialized")]
     AlreadyInitialized,
+    #[error("the deployment has already been initialized")]
+    DeploymentAlreadyInitialized,
+    #[error("invalid deployment name: {0}")]
+    InvalidDeployment(String),
 }
 
 /// Error conditions for opening a session against the Oxide API.
@@ -300,6 +447,13 @@ impl Session {
     /// register it — the one that got there first won, and the other two
     /// failed on a name that now existed, taking their instance creates down
     /// with them.
+    ///
+    /// Run over every environment on every pass rather than only the ones
+    /// being created, because the silo key list is shared by every deployment
+    /// on one token and so is not ours alone to rely on. A key somebody else
+    /// deleted is put back here; without that the loss is permanent, since an
+    /// instance reads its keys once at boot. The cost when nothing is wrong is
+    /// one listing and no writes.
     pub(crate) async fn ensure_ssh_keys(
         &self,
         instances: &InstanceMap,
@@ -399,9 +553,10 @@ impl Session {
             .stream();
         while let Some(key) = keys.next().await {
             let name = key?.name.to_string();
-            // Ours by the same prefix rule as everything else: this key list
-            // belongs to a silo user that may well have keys of their own.
-            if name.starts_with(&format!("{INSTANCE_PREFIX}-"))
+            // Ours by the same prefix rule as everything else, on the key
+            // marker: this list belongs to a silo user who may well have keys
+            // of their own, and to any number of other vw services.
+            if name.starts_with(&format!("{}-", ssh_key_prefix()))
                 && !wanted.contains(&name)
             {
                 names.push(name);
@@ -573,17 +728,29 @@ impl Session {
         Ok(plan)
     }
 
-    /// Every image the service can see, from both the project and the silo.
+    /// Every image this deployment may boot: its own project's, and nothing
+    /// else.
     ///
-    /// Project images shadow silo images of the same name, matching how the
-    /// control plane resolves them.
+    /// Deliberately not the silo's as well. Images carry no prefix of ours to
+    /// go on — they are named for the kind they boot, `vw-vivado-*` and the
+    /// rest, by whoever built them, with nothing in the name to say which
+    /// deployment they belong to. The project is the only thing that says.
+    ///
+    /// And they are not interchangeable: an image carries the vw-agent this
+    /// service talks to, and a deployment exists precisely so that side of the
+    /// API is free to differ from another's. Booting the wrong one does not
+    /// fail when the environment is created — it comes up and answers the wrong
+    /// protocol.
+    ///
+    /// A silo image is visible from every project, so from here the silo is
+    /// exactly the set of images somebody else published. Since a kind left
+    /// unnamed resolves to the *newest* match, another deployment's image
+    /// promoted to the silo would not merely be visible to an environment here,
+    /// it would be what that environment booted. Skipping the silo list makes
+    /// this deployment's project the complete and only account of what it can
+    /// boot.
     async fn visible_images(&self) -> Result<Vec<types::Image>, ImageError> {
         let mut images = Vec::new();
-
-        let mut silo = self.client.image_list().limit(PAGE_SIZE).stream();
-        while let Some(image) = silo.next().await {
-            images.push(image?);
-        }
 
         let mut project = self
             .client
@@ -749,9 +916,12 @@ impl Session {
 /// NOTE the Oxide Cloud Computer does not have tags, so we need to encode
 /// vw instance semantics in names. The format is
 ///
-///   vwsvc-{user name}-{env name}-{instance kind}
+///   {prefix}-{user name}-{env name}-{instance kind}
 ///
-/// where instance kind is currently one of vivado, helios or artifact.
+/// where instance kind is currently one of vivado, helios or artifact, and
+/// the prefix is this deployment's — see [`instance_prefix`]. An instance
+/// carrying the other deployment's prefix is somebody else's by exactly the
+/// same rule as one carrying no prefix of ours at all.
 ///
 /// This is the only thing standing between a reconciler pass and somebody
 /// else's instances: the project holds more than ours, and an instance that
@@ -826,7 +996,7 @@ pub(crate) fn run_action(instance: &UserInstance) -> RunAction {
 ///
 /// ```text
 /// status: 400 Bad Request; value: Error { error_code: Some("ObjectAlreadyExists"),
-/// message: "already exists: ssh-key \"vwsvc-rcgoodfellow-darmok\"", .. }
+/// message: "already exists: ssh-key \"vwsvc-test-rcgoodfellow-darmok\"", .. }
 /// ```
 fn already_exists(error: &OxideError) -> bool {
     match error {
@@ -900,7 +1070,17 @@ fn reapable(
 /// [`crate::reconciler::validate_environment_name`] — so whatever sits between
 /// the prefix and those two is the user, hyphens and all.
 pub(crate) fn parse_instance_name(name: &str) -> Option<UserInstance> {
-    let rest = name.strip_prefix(INSTANCE_PREFIX)?.strip_prefix('-')?;
+    parse_named(instance_prefix(), name)
+}
+
+/// [`parse_instance_name`], against a prefix given explicitly.
+///
+/// Split out so that both deployments' rules can be exercised in one process:
+/// the prefix actually in force is a `OnceLock` that a test has no business
+/// setting, and the property worth testing is that neither prefix accepts the
+/// other's names.
+fn parse_named(prefix: &str, name: &str) -> Option<UserInstance> {
+    let rest = name.strip_prefix(prefix)?.strip_prefix('-')?;
 
     let (rest, kind) = rest.rsplit_once('-')?;
     let kind = kind.parse().ok()?;
@@ -1110,18 +1290,18 @@ mod test {
         // happens to live there. Only ours may come out the other side,
         // because whatever does is a candidate for deletion.
         let map = ours([
-            listed("vwsvc-ferris-alpha-vivado"),
-            listed("vwsvc-ferris-alpha-helios"),
-            listed("vwsvc-foo-bar-beta-artifact"),
+            listed("vwsvc-test-ferris-alpha-vivado"),
+            listed("vwsvc-test-ferris-alpha-helios"),
+            listed("vwsvc-test-foo-bar-beta-artifact"),
             // Not ours, and deleting any of these would be somebody's bad day.
             listed("build-runner-3"),
             listed("gimlet-dev"),
             listed("vwsvc"),
-            listed("vwsvc-ferris"),
-            listed("vwsvc-ferris-alpha"),
-            listed("vwsvc-ferris-alpha-mystery"),
-            listed("notvwsvc-ferris-alpha-vivado"),
-            listed("vwsvcferris-alpha-vivado"),
+            listed("vwsvc-test-ferris"),
+            listed("vwsvc-test-ferris-alpha"),
+            listed("vwsvc-test-ferris-alpha-mystery"),
+            listed("notvwsvc-test-ferris-alpha-vivado"),
+            listed("vwsvctest-ferris-alpha-vivado"),
         ]);
 
         let mut names: Vec<String> =
@@ -1130,9 +1310,9 @@ mod test {
         assert_eq!(
             names,
             [
-                "vwsvc-ferris-alpha-helios",
-                "vwsvc-ferris-alpha-vivado",
-                "vwsvc-foo-bar-beta-artifact",
+                "vwsvc-test-ferris-alpha-helios",
+                "vwsvc-test-ferris-alpha-vivado",
+                "vwsvc-test-foo-bar-beta-artifact",
             ]
         );
     }
@@ -1141,7 +1321,7 @@ mod test {
     fn a_managed_instance_keeps_its_identity_and_state() {
         let id = Uuid::new_v4();
         let map = ours([(
-            String::from("vwsvc-foo-bar-alpha-vivado"),
+            String::from("vwsvc-test-foo-bar-alpha-vivado"),
             id,
             types::InstanceState::Stopped,
         )]);
@@ -1155,7 +1335,7 @@ mod test {
         // is aimed at. A lossy round trip would target the wrong instance.
         assert_eq!(
             instance.oxide_instance_name(),
-            "vwsvc-foo-bar-alpha-vivado"
+            "vwsvc-test-foo-bar-alpha-vivado"
         );
 
         let oxide = instance.oxide_instance.as_ref().expect("carries state");
@@ -1192,9 +1372,9 @@ mod test {
         }
 
         for ours in [
-            "vwsvc-rcgoodfellow-darmok-vivado",
-            "vwsvc-rcgoodfellow-darmok-helios",
-            "vwsvc-rcgoodfellow-darmok-artifact",
+            "vwsvc-test-rcgoodfellow-darmok-vivado",
+            "vwsvc-test-rcgoodfellow-darmok-helios",
+            "vwsvc-test-rcgoodfellow-darmok-artifact",
         ] {
             assert!(
                 reapable(ours, &types::DiskState::Detached, &target),
@@ -1205,16 +1385,16 @@ mod test {
 
     #[test]
     fn a_disk_its_environment_still_wants_is_kept() {
-        let target = wanted(&["vwsvc-rcgoodfellow-darmok-vivado"]);
+        let target = wanted(&["vwsvc-test-rcgoodfellow-darmok-vivado"]);
 
         assert!(!reapable(
-            "vwsvc-rcgoodfellow-darmok-vivado",
+            "vwsvc-test-rcgoodfellow-darmok-vivado",
             &types::DiskState::Detached,
             &target,
         ));
         // A sibling whose environment was deleted is still fair game.
         assert!(reapable(
-            "vwsvc-rcgoodfellow-darmok-helios",
+            "vwsvc-test-rcgoodfellow-darmok-helios",
             &types::DiskState::Detached,
             &target,
         ));
@@ -1223,7 +1403,7 @@ mod test {
     #[test]
     fn a_disk_still_in_use_is_left_for_a_later_pass() {
         let target = wanted(&[]);
-        let name = "vwsvc-rcgoodfellow-darmok-vivado";
+        let name = "vwsvc-test-rcgoodfellow-darmok-vivado";
         let instance = Uuid::new_v4();
 
         // Only a detached disk can be deleted; the rest are mid-transition.
@@ -1271,8 +1451,9 @@ mod test {
     }
 
     fn recorded(state: Option<types::InstanceState>) -> UserInstance {
-        let mut instance = parse_instance_name("vwsvc-ferris-alpha-vivado")
-            .expect("a well formed name");
+        let mut instance =
+            parse_instance_name("vwsvc-test-ferris-alpha-vivado")
+                .expect("a well formed name");
         instance.oxide_instance = state.map(|state| OxideInstance {
             id: Some(Uuid::new_v4()),
             state,
@@ -1339,7 +1520,7 @@ mod test {
             (InstanceKind::Artifact, "artifact-darmok"),
         ] {
             let mut instance =
-                parse_instance_name("vwsvc-rcgoodfellow-darmok-vivado")
+                parse_instance_name("vwsvc-test-rcgoodfellow-darmok-vivado")
                     .expect("a well formed name");
             instance.kind = kind;
 
@@ -1365,10 +1546,197 @@ mod test {
         // Github names may carry hyphens, which are fine in a hostname label
         // but would put the owner into a name nobody inside the environment
         // needs to read.
-        let instance = parse_instance_name("vwsvc-foo-bar-darmok-vivado")
+        let instance = parse_instance_name("vwsvc-test-foo-bar-darmok-vivado")
             .expect("a well formed name");
         assert_eq!(instance.user, "foo-bar");
         assert_eq!(instance.hostname(), "vivado-darmok");
+    }
+
+    /// Deployment names that have to stay out of each other's way. The last
+    /// two are the pair the hyphen rule exists for: `prodwest` is `prod`
+    /// followed by a word, and is only safe because it cannot be spelled
+    /// `prod-west`.
+    const DEPLOYMENTS: [&str; 4] = ["prod", "beta", "acme2", "prodwest"];
+
+    /// Every name a deployment might put in its project.
+    fn objects(deployment: &str) -> Vec<String> {
+        let prefix = deployment_prefix(deployment);
+        [
+            // Instances, and the boot disks that take their names.
+            "ferris-alpha-vivado",
+            "ferris-alpha-helios",
+            "ferris-alpha-artifact",
+            "foo-bar-darmok-vivado",
+        ]
+        .iter()
+        .map(|suffix| format!("{prefix}-{suffix}"))
+        .collect()
+    }
+
+    /// And every silo ssh key it might register, which carry no kind and sit
+    /// under a marker of their own.
+    fn ssh_keys(deployment: &str) -> Vec<String> {
+        let prefix = deployment_key_prefix(deployment);
+        ["ferris-alpha", "foo-bar-darmok"]
+            .iter()
+            .map(|suffix| format!("{prefix}-{suffix}"))
+            .collect()
+    }
+
+    #[test]
+    fn every_deployment_name_is_one_this_service_would_accept() {
+        // The rest of these tests only mean anything about deployments that
+        // could exist.
+        for name in DEPLOYMENTS {
+            assert!(
+                validate_deployment_name(name).is_ok(),
+                "{name} should be a usable deployment name",
+            );
+        }
+    }
+
+    #[test]
+    fn no_deployment_claims_anothers_instances() {
+        // Instances and disks are claimed by parsing, so this is the rule
+        // `ours` and `reapable` come down to. A name the wrong deployment
+        // parses is a name it will delete.
+        for mine in DEPLOYMENTS {
+            let prefix = deployment_prefix(mine);
+            for theirs in DEPLOYMENTS.iter().filter(|d| **d != mine) {
+                for name in objects(theirs) {
+                    assert!(
+                        parse_named(&prefix, &name).is_none(),
+                        "{mine} claimed {name}",
+                    );
+                }
+            }
+            for name in objects(mine) {
+                // Only the four-field names are instances; the two-field ssh
+                // key names are not meant to parse either way.
+                if name.ends_with("-vivado")
+                    || name.ends_with("-helios")
+                    || name.ends_with("-artifact")
+                {
+                    assert!(
+                        parse_named(&prefix, &name).is_some(),
+                        "{mine} disowned {name}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_deployment_reaps_anothers_ssh_keys() {
+        // `reap_ssh_keys` decides ownership with `starts_with("{prefix}-")`
+        // rather than by parsing, because a key name is
+        // `{prefix}-{user}-{env}` and the user may contain hyphens. Same
+        // disjointness, different rule, so it gets its own test -- and this is
+        // the one that matters most, since the silo key list is not scoped by
+        // project and is therefore shared by every deployment on one token.
+        for mine in DEPLOYMENTS {
+            let owned = format!("{}-", deployment_key_prefix(mine));
+            for theirs in DEPLOYMENTS.iter().filter(|d| **d != mine) {
+                for name in ssh_keys(theirs) {
+                    assert!(
+                        !name.starts_with(&owned),
+                        "{mine} would reap {name}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The case the hyphen rule cannot cover, and the reason ssh keys are
+    /// named apart from everything else.
+    ///
+    /// Before deployments had names a service's prefix was the bare marker,
+    /// and it reaps every silo key starting `vwsvc-` that its own database
+    /// does not want. Nothing here can change that rule: it is compiled into a
+    /// binary still running in front of a production build service that cannot
+    /// be touched. What this code can do is name its keys where that rule is
+    /// not looking.
+    ///
+    /// This cost a developer three unreachable instances twice over, so it is
+    /// asserted for every deployment name rather than argued about.
+    #[test]
+    fn a_service_predating_deployment_names_cannot_see_our_keys() {
+        let legacy = format!("{OBJECT_MARKER}-");
+        for deployment in DEPLOYMENTS {
+            for name in ssh_keys(deployment) {
+                assert!(
+                    !name.starts_with(&legacy),
+                    "{name} is a key a pre-naming service would delete",
+                );
+            }
+        }
+    }
+
+    /// The two markers cannot be confused for one another by a rule that only
+    /// ever sees a string, in either direction.
+    #[test]
+    fn the_two_markers_do_not_overlap() {
+        for deployment in DEPLOYMENTS {
+            let keys = format!("{}-", deployment_key_prefix(deployment));
+            let rest = format!("{}-", deployment_prefix(deployment));
+            for name in objects(deployment) {
+                assert!(!name.starts_with(&keys), "{name} reads as a key");
+            }
+            for name in ssh_keys(deployment) {
+                assert!(
+                    !name.starts_with(&rest),
+                    "{name} reads as an instance",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_hyphen_in_a_deployment_name_is_what_would_break_this() {
+        // The whole disjointness argument rests on the hyphen rule. Spelled
+        // `prod-west`, this deployment's objects would start with `vwsvc-prod-`
+        // and be production's to parse -- as user `west-ferris` in environment
+        // `alpha`, which is not in production's database, so production would
+        // delete the instance and reap its disk and key.
+        let hyphenated = "vwsvc-prod-west-ferris-alpha-vivado";
+        let prod = deployment_prefix("prod");
+        let claimed =
+            parse_named(&prod, hyphenated).expect("prod parses this name");
+        assert_eq!(claimed.user, "west-ferris");
+        assert_eq!(claimed.environment, "alpha");
+
+        // Which is why the name cannot be spelled that way at all.
+        assert!(validate_deployment_name("prod-west").is_err());
+    }
+
+    #[test]
+    fn the_service_host_is_not_mistaken_for_an_environment_instance() {
+        // vw-svc runs on an instance in the same project it reconciles, named
+        // for the commit it was deployed from. It is safe only because
+        // `vw-svc-` is not `vwsvc-`, which is one character of margin -- and
+        // `reapable` gates on this same parse, so a name that slipped through
+        // would cost the service its own boot disk.
+        for deployment in DEPLOYMENTS {
+            let prefix = deployment_prefix(deployment);
+            for name in [
+                "vw-svc-e6f562be",
+                "vw-svc-prod-e6f562be",
+                "vw-svc-e6f562be-boot",
+            ] {
+                assert!(
+                    parse_named(&prefix, name).is_none(),
+                    "{deployment} claimed the service host {name}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_test_deployment_is_what_an_uninitialized_prefix_means() {
+        // The rest of this module's tests parse against the global, which no
+        // test sets. They are all asking about that deployment, and this is
+        // why.
+        assert_eq!(instance_prefix(), deployment_prefix(TEST_DEPLOYMENT));
     }
 }
 

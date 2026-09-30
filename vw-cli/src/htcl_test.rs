@@ -560,7 +560,7 @@ async fn run_one_test(
 }
 
 // The RUN/PASS/FAIL line machinery lives in `crate::test_ui`, shared
-// with the `vw bench` runner so the two look identical.
+// with the `vw bench run` runner so the two look identical.
 
 async fn spawn_backend(
     ws: &Utf8Path,

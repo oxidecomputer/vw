@@ -43,8 +43,9 @@
 //!   because wrappers have their own regen lifecycle and
 //!   typically compile into a distinct library (`ip`).
 //! - `design_constraints` — every Vivado constraint file under
-//!   `<workspace>/constraints/**/*.{xdc,sdc}`. Fed to `read_xdc`
-//!   during synth prep.
+//!   `<workspace>/constraints/**/*.{xdc,sdc}`, minus files another
+//!   variant's `exclusive` list owns (same variant resolution as
+//!   `vhdl_design_sources`). Fed to `read_xdc` during synth prep.
 //! - `design_synth_constraints` / `design_place_constraints` /
 //!   `design_route_constraints` — phase-scoped variants that
 //!   walk `constraints/synth/`, `constraints/place/`,
@@ -289,17 +290,30 @@ async fn dispatch(
             workspace_root,
             extract_variant(&args).or_else(|| active_variant.map(String::from)),
         ),
-        "vhdl_ip_sources" => vhdl_ip_sources(workspace_root),
-        "design_constraints" => design_constraints(workspace_root),
-        "design_synth_constraints" => {
-            design_phase_constraints(workspace_root, ConstraintPhase::Synth)
-        }
-        "design_place_constraints" => {
-            design_phase_constraints(workspace_root, ConstraintPhase::Place)
-        }
-        "design_route_constraints" => {
-            design_phase_constraints(workspace_root, ConstraintPhase::Route)
-        }
+        "vhdl_ip_sources" => vhdl_ip_sources(
+            workspace_root,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
+        "target_dir" => target_dir(workspace_root, active_variant),
+        "design_constraints" => design_constraints(
+            workspace_root,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
+        "design_synth_constraints" => design_phase_constraints(
+            workspace_root,
+            ConstraintPhase::Synth,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
+        "design_place_constraints" => design_phase_constraints(
+            workspace_root,
+            ConstraintPhase::Place,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
+        "design_route_constraints" => design_phase_constraints(
+            workspace_root,
+            ConstraintPhase::Route,
+            extract_variant(&args).or_else(|| active_variant.map(String::from)),
+        ),
         "synth_needs_update" => {
             synth_needs_update(workspace_root, active_variant, args, reporter)
         }
@@ -307,12 +321,20 @@ async fn dispatch(
             synth_mark_checkpoint(workspace_root, active_variant, args)
         }
         "mark_project_configured" => {
-            mark_project_configured(workspace_root, args)
+            mark_project_configured(workspace_root, active_variant, args)
         }
-        "place_needs_update" => place_needs_update(workspace_root, args),
-        "place_mark_checkpoint" => place_mark_checkpoint(workspace_root, args),
-        "route_needs_update" => route_needs_update(workspace_root, args),
-        "route_mark_checkpoint" => route_mark_checkpoint(workspace_root, args),
+        "place_needs_update" => {
+            place_needs_update(workspace_root, active_variant, args)
+        }
+        "place_mark_checkpoint" => {
+            place_mark_checkpoint(workspace_root, active_variant, args)
+        }
+        "route_needs_update" => {
+            route_needs_update(workspace_root, active_variant, args)
+        }
+        "route_mark_checkpoint" => {
+            route_mark_checkpoint(workspace_root, active_variant, args)
+        }
         "compile_htcl_module" => {
             compile_htcl_module(workspace_root, args, preloaded).await
         }
@@ -604,8 +626,14 @@ fn compile_htcl_module_blocking(
     // preload hash matches (same set of files already-loaded).
     // Silent on write errors — cache misses on next run are
     // annoying but not incorrect.
+    //
+    // Both files are replaced whole (`write_atomic`): concurrent
+    // sessions on one cloud instance share this workspace-level cache,
+    // and a plain write would let one load the other's half-written
+    // Tcl. The Tcl goes first, so a manifest that matches always has
+    // complete Tcl beside it.
     let _ = std::fs::create_dir_all(target_dir.as_std_path());
-    let _ = std::fs::write(cache_tcl.as_std_path(), &out);
+    let _ = vw_lib::write_atomic(cache_tcl.as_std_path(), out.as_bytes());
     let _ = write_compile_manifest(
         cache_manifest.as_std_path(),
         &program,
@@ -644,7 +672,7 @@ fn write_compile_manifest(
         };
         writeln!(body, "{} {}", dur.as_nanos(), f.path.display()).ok();
     }
-    std::fs::write(manifest_path, body)
+    vw_lib::write_atomic(manifest_path, body.as_bytes())
 }
 
 /// Try to serve a compile from the cache. Returns `Some(tcl)` iff
@@ -731,6 +759,7 @@ fn preload_fingerprint(
 /// no matching `project_needs_update` RPC.
 fn mark_project_configured(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -742,9 +771,14 @@ fn mark_project_configured(
     let name = obj.get("name").and_then(Value::as_str).ok_or_else(|| {
         "mark_project_configured: missing string `name` field".to_string()
     })?;
-    let project_dir = vw_lib::vw_project_dir(&ws);
-    vw_lib::write_project_manifest(&ws, project_dir.as_std_path(), name)
-        .map_err(|e| format!("writing project manifest: {e}"))?;
+    let project_dir = vw_lib::vw_project_dir(&ws, active_variant);
+    vw_lib::write_project_manifest(
+        &ws,
+        project_dir.as_std_path(),
+        name,
+        active_variant,
+    )
+    .map_err(|e| format!("writing project manifest: {e}"))?;
     Ok(Value::Null)
 }
 
@@ -758,6 +792,7 @@ fn mark_project_configured(
 /// missing or the fingerprints disagree.
 fn place_needs_update(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -768,6 +803,7 @@ fn place_needs_update(
         &ws,
         std::path::Path::new(&checkpoint),
         std::path::Path::new(&synth_checkpoint),
+        active_variant,
     )
     .map_err(|e| format!("checking place checkpoint freshness: {e}"))?;
     Ok(Value::Bool(needs))
@@ -780,6 +816,7 @@ fn place_needs_update(
 /// after `vivado_cmd::write_checkpoint`.
 fn place_mark_checkpoint(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -790,6 +827,7 @@ fn place_mark_checkpoint(
         &ws,
         std::path::Path::new(&checkpoint),
         std::path::Path::new(&synth_checkpoint),
+        active_variant,
     )
     .map_err(|e| format!("writing place checkpoint manifest: {e}"))?;
     Ok(Value::Null)
@@ -824,6 +862,7 @@ fn extract_synth_checkpoint_arg(
 /// fingerprints disagree.
 fn route_needs_update(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -834,6 +873,7 @@ fn route_needs_update(
         &ws,
         std::path::Path::new(&checkpoint),
         std::path::Path::new(&place_checkpoint),
+        active_variant,
     )
     .map_err(|e| format!("checking route checkpoint freshness: {e}"))?;
     Ok(Value::Bool(needs))
@@ -846,6 +886,7 @@ fn route_needs_update(
 /// after `vivado_cmd::write_checkpoint`.
 fn route_mark_checkpoint(
     workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
     args: Value,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
@@ -856,6 +897,7 @@ fn route_mark_checkpoint(
         &ws,
         std::path::Path::new(&checkpoint),
         std::path::Path::new(&place_checkpoint),
+        active_variant,
     )
     .map_err(|e| format!("writing route checkpoint manifest: {e}"))?;
     Ok(Value::Null)
@@ -1203,28 +1245,50 @@ fn top_value(
     )
 }
 
-/// `vhdl_ip_sources` — return every generated IP wrapper under
-/// `<workspace>/target/ip/**/*.vhd` as a JSON array of
-/// absolute-path strings. Empty array when nothing has been
+/// `vhdl_ip_sources` — return every generated IP wrapper under the
+/// variant's `<build>/ip/**/*.vhd` (see `vw_lib::build_dir`) as a
+/// JSON array of absolute-path strings. Variant resolution matches
+/// [`vhdl_design_sources`]. Empty array when nothing has been
 /// wrapped yet.
 fn vhdl_ip_sources(
     workspace_root: Option<&std::path::Path>,
+    variant: Option<String>,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
-    let paths = vw_lib::vhdl_ip_sources(&ws)
+    let variant = variant.or_else(|| workspace_default_variant_name(&ws));
+    let paths = vw_lib::vhdl_ip_sources(&ws, variant.as_deref())
         .map_err(|e| format!("enumerating VHDL IP sources: {e}"))?;
     Ok(paths_to_json_array(paths))
 }
 
+/// `target_dir` — the absolute directory this session's build writes
+/// its outputs to (`vw_lib::build_dir`): `<ws>/target/<variant>` in a
+/// variant-mode workspace, `<ws>/target` otherwise. vw.htcl builds
+/// every IP, checkpoint, report and image path from this rather than
+/// from `workspace_root`, so the layout lives in one place.
+fn target_dir(
+    workspace_root: Option<&std::path::Path>,
+    active_variant: Option<&str>,
+) -> Result<Value, String> {
+    let ws = workspace_root_or_error(workspace_root)?;
+    Ok(Value::String(
+        vw_lib::build_dir(&ws, active_variant).into_string(),
+    ))
+}
+
 /// `design_constraints` — return every constraint file under
 /// `<workspace>/constraints/**/*.{xdc,sdc}` as a JSON array of
-/// absolute-path strings. Empty array when the workspace has no
+/// absolute-path strings, minus files another variant's
+/// `exclusive` list owns. Variant resolution matches
+/// [`vhdl_design_sources`]. Empty array when the workspace has no
 /// `constraints/` dir.
 fn design_constraints(
     workspace_root: Option<&std::path::Path>,
+    variant: Option<String>,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
-    let paths = vw_lib::design_constraints(&ws)
+    let variant = variant.or_else(|| workspace_default_variant_name(&ws));
+    let paths = vw_lib::design_constraints(&ws, variant.as_deref())
         .map_err(|e| format!("enumerating constraint files: {e}"))?;
     Ok(paths_to_json_array(paths))
 }
@@ -1242,12 +1306,21 @@ enum ConstraintPhase {
 fn design_phase_constraints(
     workspace_root: Option<&std::path::Path>,
     phase: ConstraintPhase,
+    variant: Option<String>,
 ) -> Result<Value, String> {
     let ws = workspace_root_or_error(workspace_root)?;
+    let variant = variant.or_else(|| workspace_default_variant_name(&ws));
+    let variant = variant.as_deref();
     let paths = match phase {
-        ConstraintPhase::Synth => vw_lib::design_synth_constraints(&ws),
-        ConstraintPhase::Place => vw_lib::design_place_constraints(&ws),
-        ConstraintPhase::Route => vw_lib::design_route_constraints(&ws),
+        ConstraintPhase::Synth => {
+            vw_lib::design_synth_constraints(&ws, variant)
+        }
+        ConstraintPhase::Place => {
+            vw_lib::design_place_constraints(&ws, variant)
+        }
+        ConstraintPhase::Route => {
+            vw_lib::design_route_constraints(&ws, variant)
+        }
     }
     .map_err(|e| format!("enumerating phase-scoped constraint files: {e}"))?;
     Ok(paths_to_json_array(paths))
@@ -1413,4 +1486,149 @@ fn render_unified_diff(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod variant_build_dir_tests {
+    use super::*;
+
+    /// Call an RPC method the way the shim does, with `active_variant`
+    /// being what the session was started with.
+    async fn call(
+        ws: &std::path::Path,
+        variant: Option<&str>,
+        method: &str,
+        args: Value,
+    ) -> Value {
+        let preloaded: SharedPreload = Arc::new(RwLock::new(HashMap::new()));
+        let cw: SharedCriticalWarningCount = Arc::default();
+        dispatch(method, args, Some(ws), variant, &preloaded, &cw, None)
+            .await
+            .unwrap()
+    }
+
+    fn two_variant_ws() -> (tempfile::TempDir, camino::Utf8PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"twin\"\nversion = \"0.1.0\"\n\n\
+             [[workspace.variants]]\nname = \"alpha\"\npart = \"p\"\n\
+             default = true\n\n\
+             [[workspace.variants]]\nname = \"beta\"\npart = \"p\"\n",
+        )
+        .unwrap();
+        for v in ["alpha", "beta"] {
+            let wrapper = ws.join(format!("target/{v}/ip/txr0/wrapper.vhd"));
+            std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+            std::fs::write(wrapper, "").unwrap();
+        }
+        (tmp, ws)
+    }
+
+    /// vw.htcl builds every IP, checkpoint, report and image path from
+    /// this answer.
+    #[tokio::test]
+    async fn target_dir_is_the_sessions_variants_build_dir() {
+        let (_tmp, ws) = two_variant_ws();
+        let dir = |v| call(ws.as_std_path(), v, "target_dir", Value::Null);
+        assert_eq!(dir(Some("beta")).await, ws.join("target/beta").as_str());
+        assert_eq!(dir(None).await, ws.join("target/alpha").as_str());
+    }
+
+    #[tokio::test]
+    async fn ip_sources_are_the_sessions_variants() {
+        let (_tmp, ws) = two_variant_ws();
+        let beta = call(
+            ws.as_std_path(),
+            Some("beta"),
+            "vhdl_ip_sources",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            beta,
+            serde_json::json!([ws
+                .join("target/beta/ip/txr0/wrapper.vhd")
+                .as_str()])
+        );
+        // An explicit `variant` argument wins, as for `vhdl_design_sources`.
+        let alpha = call(
+            ws.as_std_path(),
+            Some("beta"),
+            "vhdl_ip_sources",
+            serde_json::json!({ "variant": "alpha" }),
+        )
+        .await;
+        assert_eq!(
+            alpha,
+            serde_json::json!([ws
+                .join("target/alpha/ip/txr0/wrapper.vhd")
+                .as_str()])
+        );
+    }
+}
+
+#[cfg(test)]
+mod compile_cache_tests {
+    use super::*;
+
+    /// Concurrent sessions on one cloud instance share the workspace's
+    /// compile cache. Many compiles of one module at once — cache misses
+    /// writing it while hits read it — must all get the whole module.
+    #[test]
+    fn concurrent_compiles_never_see_a_partial_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"cache\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        // Big enough that a write takes long enough to be caught in.
+        let module: String = (0..2000)
+            .map(|i| format!("proc p{i} {{x: int}} unit {{\n  puts $x\n}}\n"))
+            .collect();
+        std::fs::write(ws.join("big.htcl"), module).unwrap();
+
+        let expected = compile_htcl_module_blocking(
+            ws.clone(),
+            "big.htcl".into(),
+            Default::default(),
+        )
+        .unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let ws = ws.clone();
+                std::thread::spawn(move || {
+                    let mut outs = Vec::new();
+                    for i in 0..10 {
+                        // Some threads keep invalidating the cache so the
+                        // others' hits race real rewrites.
+                        if t % 2 == 0 && i % 2 == 0 {
+                            let _ = std::fs::remove_file(ws.join(
+                                "target/.vw-compile-big.htcl.tcl.manifest",
+                            ));
+                        }
+                        outs.push(
+                            compile_htcl_module_blocking(
+                                ws.clone(),
+                                "big.htcl".into(),
+                                Default::default(),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    outs
+                })
+            })
+            .collect();
+        for t in threads {
+            for out in t.join().unwrap() {
+                assert_eq!(out, expected);
+            }
+        }
+    }
 }

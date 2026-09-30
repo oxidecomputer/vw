@@ -24,6 +24,12 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_ATTEMPTS: usize = 5;
 const ENVIRONMENT: &str = "darmok";
 
+/// The workspace every test synchronizes into.
+///
+/// An instance holds a tree per workspace now, so `--root` names the
+/// directory those sit under and a tree is one level below it.
+const WORKSPACE: &str = "redhawk";
+
 /// Start an agent on `port`, with everything it needs under `base`.
 fn spawn_agent(
     base: &Utf8Path,
@@ -58,9 +64,7 @@ async fn listening(
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if client
-            .get(format!(
-                "{base_url}/environment/{ENVIRONMENT}/artifact-target"
-            ))
+            .get(format!("{base_url}/environment/{ENVIRONMENT}/workspaces"))
             .send()
             .await
             .is_ok()
@@ -100,6 +104,24 @@ fn versioned_client() -> reqwest::Client {
         .expect("build a client")
 }
 
+/// A client speaking a named version rather than the current one.
+///
+/// For exercising what a `vw` too old to know about workspaces sends.
+fn client_speaking(version: &str) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HeaderName::from_static(
+            vw_sync_api::API_VERSION_HEADER,
+        ),
+        reqwest::header::HeaderValue::from_str(version)
+            .expect("a version is a valid header value"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build a client")
+}
+
 /// A running agent with a tree and a content store of its own.
 struct Agent {
     child: Child,
@@ -116,7 +138,8 @@ impl Agent {
         let base = Utf8Path::from_path(dir.path())
             .expect("utf8 temp dir")
             .to_owned();
-        let root = base.join("tree");
+        let trees = base.join("tree");
+        let root = trees.join(WORKSPACE);
         let netrc = base.join("home/.netrc");
         let client = versioned_client();
 
@@ -126,7 +149,7 @@ impl Agent {
         // and there is nothing to do about it but pick another.
         for _ in 0..STARTUP_ATTEMPTS {
             let port = free_port();
-            let mut child = spawn_agent(&base, &root, &netrc, port);
+            let mut child = spawn_agent(&base, &trees, &netrc, port);
             let base_url = format!("http://127.0.0.1:{port}");
 
             if listening(&client, &base_url, &mut child).await {
@@ -154,7 +177,7 @@ impl Agent {
     ) -> reqwest::Result<reqwest::Response> {
         self.client
             .post(format!(
-                "{}/environment/{environment}/sync/plan",
+                "{}/environment/{environment}/workspace/{WORKSPACE}/sync/plan",
                 self.base_url
             ))
             .json(manifest)
@@ -178,7 +201,7 @@ impl Agent {
     ) -> reqwest::Response {
         self.client
             .put(format!(
-                "{}/environment/{ENVIRONMENT}/sync/blob/{digest}",
+                "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/sync/blob/{digest}",
                 self.base_url
             ))
             .body(contents.to_vec())
@@ -190,7 +213,7 @@ impl Agent {
     async fn commit_raw(&self, manifest: &TreeManifest) -> reqwest::Response {
         self.client
             .post(format!(
-                "{}/environment/{ENVIRONMENT}/sync/commit",
+                "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/sync/commit",
                 self.base_url
             ))
             .json(manifest)
@@ -201,7 +224,10 @@ impl Agent {
 
     async fn clear_raw(&self, environment: &str) -> reqwest::Response {
         self.client
-            .delete(format!("{}/environment/{environment}/sync", self.base_url))
+            .delete(format!(
+                "{}/environment/{environment}/workspace/{WORKSPACE}/sync",
+                self.base_url
+            ))
             .send()
             .await
             .expect("clear request")
@@ -232,7 +258,7 @@ impl Agent {
     async fn clean_raw(&self, environment: &str) -> reqwest::Response {
         self.client
             .delete(format!(
-                "{}/environment/{environment}/build-output",
+                "{}/environment/{environment}/workspace/{WORKSPACE}/build-output",
                 self.base_url
             ))
             .send()
@@ -456,7 +482,7 @@ async fn a_request_that_names_no_api_version_is_refused() {
 
     let response = reqwest::Client::new()
         .post(format!(
-            "{}/environment/{ENVIRONMENT}/sync/plan",
+            "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/sync/plan",
             agent.base_url
         ))
         .json(&TreeManifest::default())
@@ -480,7 +506,7 @@ async fn flushing_before_anyone_said_where_artifacts_go_is_refused() {
     let response = agent
         .client
         .post(format!(
-            "{}/environment/{ENVIRONMENT}/artifact-flush",
+            "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/artifact-flush",
             agent.base_url
         ))
         .send()
@@ -671,4 +697,118 @@ async fn cleaning_another_environment_is_refused() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(agent.root.join("target/keep.me").exists());
+}
+
+/// A client from before workspaces existed still synchronizes, and lands in
+/// the reserved slot rather than in somebody else's tree.
+///
+/// This is the whole of what keeping the prior API versions buys. The routes
+/// compiling is not the same as them working, and the difference is a
+/// developer who has not upgraded `vw` finding that builds simply stop.
+#[tokio::test]
+async fn a_client_from_before_workspaces_still_synchronizes() {
+    let agent = Agent::start().await;
+    let old = client_speaking("1.0.0");
+
+    let contents = b"entity top is end entity;";
+    let digest = vw_sync::digest_bytes(contents);
+    let manifest = TreeManifest {
+        entries: vec![FileEntry {
+            path: String::from("hdl/top.vhd"),
+            digest: digest.clone(),
+            executable: false,
+        }],
+    };
+
+    // The old routes: an environment and nothing else.
+    let plan: SyncPlan = old
+        .post(format!(
+            "{}/environment/{ENVIRONMENT}/sync/plan",
+            agent.base_url
+        ))
+        .json(&manifest)
+        .send()
+        .await
+        .expect("plan request")
+        .json()
+        .await
+        .expect("decode plan");
+    assert_eq!(plan.missing, vec![digest.clone()]);
+
+    let response = old
+        .put(format!(
+            "{}/environment/{ENVIRONMENT}/sync/blob/{digest}",
+            agent.base_url
+        ))
+        .body(contents.to_vec())
+        .send()
+        .await
+        .expect("blob request");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let result: CommitResult = old
+        .post(format!(
+            "{}/environment/{ENVIRONMENT}/sync/commit",
+            agent.base_url
+        ))
+        .json(&manifest)
+        .send()
+        .await
+        .expect("commit request")
+        .json()
+        .await
+        .expect("decode commit");
+    assert_eq!(result.created, 1);
+
+    // Into the reserved slot, which is a sibling of the tree a current
+    // client would have used rather than the same directory.
+    let legacy = agent
+        .root
+        .parent()
+        .expect("the trees have a parent")
+        .join(vw_api_types_versions::latest::LEGACY_WORKSPACE);
+    assert_eq!(
+        std::fs::read_to_string(legacy.join("hdl/top.vhd")).expect("read"),
+        String::from_utf8_lossy(contents),
+    );
+    assert!(
+        !agent.root.join("hdl/top.vhd").exists(),
+        "an old client wrote into a current client's tree",
+    );
+}
+
+/// And the listing sees it, so it can be found and removed like any other.
+#[tokio::test]
+async fn the_reserved_slot_is_an_ordinary_workspace() {
+    let agent = Agent::start().await;
+    let old = client_speaking("1.0.0");
+
+    old.post(format!(
+        "{}/environment/{ENVIRONMENT}/sync/commit",
+        agent.base_url
+    ))
+    .json(&TreeManifest::default())
+    .send()
+    .await
+    .expect("commit request");
+
+    let held: Vec<vw_api_types_versions::latest::Workspace> = agent
+        .client
+        .get(format!(
+            "{}/environment/{ENVIRONMENT}/workspaces",
+            agent.base_url
+        ))
+        .send()
+        .await
+        .expect("list request")
+        .json()
+        .await
+        .expect("decode listing");
+
+    assert!(
+        held.iter().any(|workspace| {
+            workspace.name == vw_api_types_versions::latest::LEGACY_WORKSPACE
+        }),
+        "{held:?}",
+    );
 }

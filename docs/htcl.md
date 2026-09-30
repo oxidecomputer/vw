@@ -727,6 +727,22 @@ The validator runs the rules described above:
 - `vw analyzer` — the LSP server (stdio). Editors point at it for
   completion, hover, signature help, goto, and live error
   reporting. The errors are exactly what `vw check` reports.
+  In a workspace with `[[workspace.variants]]`, the `variant`
+  setting (LSP `initializationOptions`, updated live through
+  `workspace/didChangeConfiguration`) picks which variant the
+  session analyzes — the VHDL design files and the part htcl
+  dependencies are checked against — the same way
+  `vw check --variant` does. Unset, it falls back to the
+  `VW_ACTIVE_VARIANT` environment variable, then the default
+  variant; a name the workspace doesn't declare falls back to the
+  default with a warning. In Helix:
+
+  ```toml
+  [language-server.vw-analyzer]
+  command = "vw"
+  args = ["analyzer"]
+  config = { variant = "metro" }
+  ```
 - `vw ip generate <component.xml>` — generates an htcl wrapper
   from an IP-XACT component. The generated file is itself a fully
   valid htcl library; reading one is a fast way to see a real

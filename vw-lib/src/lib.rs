@@ -39,6 +39,9 @@ use serde::{Deserialize, Serialize};
 use crate::nvc_helpers::{run_nvc_analysis, run_nvc_elab, run_nvc_sim};
 use vw_core::parse_entities;
 
+pub mod bench_init;
+pub mod cosim;
+pub mod depcache;
 pub mod parts;
 pub mod sim;
 
@@ -51,6 +54,24 @@ pub use vw_core::{
     VhdlLsConfig, VhdlLsLibrary, VhdlStandard, VwError,
 };
 pub use vw_core::{mapping, nvc_helpers, visitor};
+
+/// Start a `cargo` that resolves its own toolchain.
+///
+/// A bench workspace pins its toolchain — anodizer's output needs nightly —
+/// and rustup resolves that from the directory being built in. But cargo
+/// exports these to anything it spawns, and `RUSTUP_TOOLCHAIN` beats the
+/// directory: inherited, a bench builds with whatever toolchain launched
+/// `vw` instead of the one it asked for, and fails on a `#![feature]` that
+/// is perfectly legal where it is written. Nothing sets them outside a cargo
+/// invocation, so clearing them costs nothing and restores the pin when
+/// something does.
+pub fn cargo_command() -> std::process::Command {
+    let mut command = std::process::Command::new("cargo");
+    for leaked in ["RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "CARGO"] {
+        command.env_remove(leaked);
+    }
+    command
+}
 
 /// Workspace-relative directory for vw's own testbench simulation build (the
 /// nvc `work` + dependency libraries). Kept under `target/` so all generated
@@ -1014,6 +1035,11 @@ pub fn init_workspace(
             message: format!("vw.toml already exists in {workspace_dir}"),
         });
     }
+    // Before anything is written, so a name the loader would refuse
+    // never becomes a workspace that cannot be opened again.
+    validate_workspace_name(&name).map_err(|detail| VwError::Config {
+        message: format!("`[workspace] name`: {detail}"),
+    })?;
 
     let target_parts = target_part
         .map(|part| {
@@ -1287,6 +1313,11 @@ async fn build_dependency_graph(
         dependencies: BTreeMap::new(),
     });
     let deps_dir = deps_directory()?;
+    // Reclaim what a killed process left behind. Here rather than in
+    // `deps_directory`, which every cache reader calls and none of
+    // them can orphan anything: this is the one place a download is
+    // about to happen, and once per resolution is enough.
+    depcache::sweep(&deps_dir);
     let mut graph: DiGraph<DepGraphNode, ()> = DiGraph::new();
     // First-seen (entry-wins) node per dep name; also the cycle guard.
     let mut node_by_name: HashMap<String, NodeIndex> = HashMap::new();
@@ -1304,8 +1335,18 @@ async fn build_dependency_graph(
     // Worklist of (parent node, workspace root, is_entry).
     let mut queue = vec![(entry_idx, entry_root, true)];
     while let Some((parent, ws, is_entry)) = queue.pop() {
-        let Ok(config) = load_workspace_config(&ws) else {
-            continue;
+        // The entry's own manifest is the caller's to fix, so a problem with
+        // it is reported rather than stepped over. A dependency's is not:
+        // skipping one there costs an unresolved import later, while failing
+        // would make somebody else's manifest able to stop this build
+        // outright.
+        let config = if is_entry {
+            load_workspace_config(&ws)?
+        } else {
+            let Ok(config) = load_workspace_config(&ws) else {
+                continue;
+            };
+            config
         };
         // The entry contributes its dev-deps too; transitive deps only
         // propagate their regular `[dependencies]`.
@@ -1356,21 +1397,22 @@ async fn build_dependency_graph(
                             })?,
                         };
                     let root = deps_dir.join(format!("{name}-{sha}"));
-                    // A dir left by a PARTIAL/failed prior download
-                    // (created but empty) must not count as cached.
-                    let was_cached = root.exists()
-                        && fs::read_dir(&root)
-                            .map(|mut d| d.next().is_some())
-                            .unwrap_or(false);
+                    // Only a published tree counts. A directory that
+                    // merely exists is either a download in flight or
+                    // one that was killed, and building against
+                    // either is how half a dependency gets linked.
+                    let was_cached = depcache::is_complete(&root);
                     if !was_cached {
-                        if root.exists() {
-                            let _ = fs::remove_dir_all(&root);
-                        }
+                        // Assembled somewhere private and moved into
+                        // place whole, so that a second process
+                        // fetching this same dependency neither sees
+                        // ours part-written nor writes over it.
+                        let staged = depcache::Staged::new(&deps_dir)?;
                         download_dependency(
                             repo,
                             &sha,
                             &dep.src,
-                            &root,
+                            staged.path(),
                             dep.recursive,
                             &dep.exclude,
                             *submodules,
@@ -1385,6 +1427,7 @@ async fn build_dependency_graph(
                             ),
                             }
                         })?;
+                        staged.publish(&root)?;
                     }
                     let root =
                         Utf8PathBuf::from_path_buf(root).map_err(|p| {
@@ -1502,13 +1545,20 @@ pub fn dependencies_present(workspace_dir: &Utf8Path) -> bool {
     else {
         return true;
     };
+    let Ok(deps_dir) = deps_directory() else {
+        return true;
+    };
     for (_name, path) in paths {
-        // Path deps resolve to real source trees (always present); git
-        // deps resolve into the cache and may be absent or empty.
-        let present = path.exists()
-            && fs::read_dir(&path)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
+        // Path deps resolve to real source trees, which are present by
+        // definition and carry no marker of their own. Git deps
+        // resolve into the cache, where only a published tree counts:
+        // a `vw clear`ed entry, or one a killed download left behind,
+        // is as absent as one that was never fetched at all.
+        let present = if path.starts_with(&deps_dir) {
+            depcache::is_complete(&path)
+        } else {
+            path.exists()
+        };
         if !present {
             return false;
         }
@@ -1658,6 +1708,16 @@ pub fn clear_cache(workspace_dir: &Utf8Path) -> Result<Vec<String>> {
                     if file_name_str.starts_with(&format!("{name}-")) {
                         let dep_path = entry.path();
                         if dep_path.is_dir() {
+                            // Retract it before removing it. The cache
+                            // is shared, so another workspace may be
+                            // about to read this tree; with the marker
+                            // gone nothing considers it usable, and
+                            // whoever wanted it fetches a copy of its
+                            // own rather than reading one that is
+                            // disappearing underneath them.
+                            let _ = fs::remove_file(
+                                dep_path.join(depcache::COMPLETE_MARKER),
+                            );
                             fs::remove_dir_all(&dep_path)
                                 .map_err(|e| VwError::FileSystem {
                                     message: format!("Failed to remove cached dependency at {dep_path:?}: {e}")
@@ -2275,6 +2335,19 @@ pub fn vhdl_design_sources_for_variant(
     let mut files =
         find_vhdl_files(hdl_dir.as_std_path(), /*recursive=*/ true, &[])?;
     files.sort();
+    retain_variant_files(workspace_dir, files, active_variant)
+}
+
+/// Drop the files another variant owns: keep shared files (in no
+/// variant's `exclusive` set) plus those `active_variant` owns.
+/// The one filter behind every per-variant source list, VHDL and
+/// constraints alike, so `exclusive` means the same thing for
+/// both.
+fn retain_variant_files(
+    workspace_dir: &Utf8Path,
+    mut files: Vec<PathBuf>,
+    active_variant: Option<&str>,
+) -> Result<Vec<PathBuf>> {
     // Compile each variant's `exclusive` globs relative to the
     // workspace root. Empty variants list → nothing to filter,
     // early-return keeps the common no-variants path cheap.
@@ -2321,38 +2394,130 @@ fn build_variant_ownership(
         std::collections::HashMap::new();
     for variant in &ws.variants {
         for pattern in &variant.exclusive {
-            // Absolutize relative-to-workspace patterns so the
-            // glob crate walks the right filesystem tree.
-            let abs_pattern = workspace_dir.as_std_path().join(pattern);
-            let pattern_str =
-                abs_pattern.to_str().ok_or_else(|| VwError::FileSystem {
-                    message: format!(
-                        "variant `{}` exclusive pattern is not valid UTF-8: {}",
-                        variant.name,
-                        abs_pattern.display(),
-                    ),
-                })?;
-            let entries =
-                glob::glob(pattern_str).map_err(|e| VwError::FileSystem {
-                    message: format!(
-                        "variant `{}` invalid glob `{pattern}`: {e}",
-                        variant.name,
-                    ),
-                })?;
-            for entry in entries.flatten() {
-                if !entry.is_file() {
-                    continue;
-                }
+            for entry in
+                exclusive_matches(workspace_dir, &variant.name, pattern)?
+            {
                 // First-writer wins: if two variants claim the
                 // same file exclusively, the first entry in the
                 // list owns it. That's a config bug the user
-                // should fix; we don't error to keep the surface
-                // predictable in the interim.
+                // should fix — [`variant_exclusive_warnings`]
+                // reports it — but we don't error, to keep the
+                // surface predictable in the interim.
                 owners.entry(entry).or_insert_with(|| variant.name.clone());
             }
         }
     }
     Ok(VariantOwnership { owners })
+}
+
+/// The files one `exclusive` pattern matches, as absolute paths.
+/// Patterns are workspace-relative globs; directories never match.
+fn exclusive_matches(
+    workspace_dir: &Utf8Path,
+    variant: &str,
+    pattern: &str,
+) -> Result<Vec<PathBuf>> {
+    // Absolutize relative-to-workspace patterns so the glob crate
+    // walks the right filesystem tree.
+    let abs_pattern = workspace_dir.as_std_path().join(pattern);
+    let pattern_str =
+        abs_pattern.to_str().ok_or_else(|| VwError::FileSystem {
+            message: format!(
+                "variant `{variant}` exclusive pattern is not valid UTF-8: {}",
+                abs_pattern.display(),
+            ),
+        })?;
+    let entries = glob::glob(pattern_str).map_err(|e| VwError::FileSystem {
+        message: format!("variant `{variant}` invalid glob `{pattern}`: {e}"),
+    })?;
+    Ok(entries.flatten().filter(|p| p.is_file()).collect())
+}
+
+/// Problems with the workspace's `[[workspace.variants]]`
+/// `exclusive` lists that would otherwise pass silently, one
+/// message per problem:
+///
+/// - a pattern that matches no file (a typo, or a file that was
+///   renamed or deleted);
+/// - a pattern whose matches are all files `exclusive` has no
+///   effect on — only VHDL under `hdl/` and constraint files under
+///   `constraints/` are filtered by variant;
+/// - a file claimed by more than one variant, where only the
+///   first claim takes effect.
+///
+/// Empty when the workspace declares no variants or has no
+/// `vw.toml`.
+pub fn variant_exclusive_warnings(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<String>> {
+    let Ok(cfg) = load_workspace_config(workspace_dir) else {
+        return Ok(Vec::new());
+    };
+    let variants = &cfg.workspace.variants;
+    if variants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let filtered: std::collections::HashSet<PathBuf> =
+        vhdl_design_sources_all_variants(workspace_dir)?
+            .into_iter()
+            .chain(design_constraints_all_variants(workspace_dir)?)
+            .collect();
+    let rel = |p: &Path| {
+        p.strip_prefix(workspace_dir.as_std_path())
+            .unwrap_or(p)
+            .display()
+            .to_string()
+    };
+    let mut warnings = Vec::new();
+    // First claimant per file, for the duplicate-claim check.
+    let mut claimed: std::collections::HashMap<PathBuf, &str> =
+        std::collections::HashMap::new();
+    for variant in variants {
+        for pattern in &variant.exclusive {
+            let name = &variant.name;
+            let matches = exclusive_matches(workspace_dir, name, pattern)?;
+            if matches.is_empty() {
+                warnings.push(format!(
+                    "variant `{name}` exclusive pattern `{pattern}` matches \
+                     no files"
+                ));
+                continue;
+            }
+            if !matches.iter().any(|m| filtered.contains(m)) {
+                let mut shown: Vec<String> =
+                    matches.iter().take(3).map(|m| rel(m)).collect();
+                if matches.len() > shown.len() {
+                    shown.push(format!(
+                        "… {} more",
+                        matches.len() - shown.len()
+                    ));
+                }
+                warnings.push(format!(
+                    "variant `{name}` exclusive pattern `{pattern}` has no \
+                     effect: it matches only {}, and `exclusive` applies \
+                     only to VHDL under `hdl/` and constraint files under \
+                     `constraints/`",
+                    shown.join(", "),
+                ));
+            }
+            for m in matches {
+                match claimed.get(&m) {
+                    None => {
+                        claimed.insert(m, name);
+                    }
+                    Some(first) if *first != name.as_str() => {
+                        warnings.push(format!(
+                            "`{}` is exclusive to both `{first}` and \
+                             `{name}`; only `{first}` gets it",
+                            rel(&m),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    Ok(warnings)
 }
 
 /// Enumerate every Vivado design-constraint file under
@@ -2364,8 +2529,28 @@ fn build_variant_ownership(
 /// constraints have their own file kind and a different
 /// consumption command (`read_xdc` vs. `read_vhdl`).
 ///
+/// Filtered by variant the same way as
+/// [`vhdl_design_sources_for_variant`]: a constraint file listed
+/// in a variant's `exclusive` set contributes only when that
+/// variant is active.
+///
 /// Empty vec when `constraints/` doesn't exist yet.
-pub fn design_constraints(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+pub fn design_constraints(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let files = design_constraints_in(workspace_dir, None)?;
+    retain_variant_files(workspace_dir, files, active_variant)
+}
+
+/// Every constraint file under `<workspace_dir>/constraints/`,
+/// regardless of which variant owns it. The constraints
+/// counterpart of [`vhdl_design_sources_all_variants`], for
+/// callers that want the whole input surface rather than one
+/// build's.
+pub fn design_constraints_all_variants(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<PathBuf>> {
     design_constraints_in(workspace_dir, None)
 }
 
@@ -2374,11 +2559,14 @@ pub fn design_constraints(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
 /// hand synthesis-only constraints to `read_xdc -used_in
 /// synthesis` (or the equivalent set_property USED_IN) so
 /// route/place-only constraints don't spuriously apply during
-/// synth. Empty vec when the subdir doesn't exist.
+/// synth. Empty vec when the subdir doesn't exist. Variant-filtered
+/// like [`design_constraints`].
 pub fn design_synth_constraints(
     workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
-    design_constraints_in(workspace_dir, Some("synth"))
+    let files = design_constraints_in(workspace_dir, Some("synth"))?;
+    retain_variant_files(workspace_dir, files, active_variant)
 }
 
 /// Enumerate only the `place`-scoped constraints under
@@ -2387,8 +2575,10 @@ pub fn design_synth_constraints(
 /// vec when the subdir doesn't exist.
 pub fn design_place_constraints(
     workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
-    design_constraints_in(workspace_dir, Some("place"))
+    let files = design_constraints_in(workspace_dir, Some("place"))?;
+    retain_variant_files(workspace_dir, files, active_variant)
 }
 
 /// Enumerate only the `route`-scoped constraints under
@@ -2397,8 +2587,10 @@ pub fn design_place_constraints(
 /// vec when the subdir doesn't exist.
 pub fn design_route_constraints(
     workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
-    design_constraints_in(workspace_dir, Some("route"))
+    let files = design_constraints_in(workspace_dir, Some("route"))?;
+    retain_variant_files(workspace_dir, files, active_variant)
 }
 
 /// Enumeration primitive shared by [`design_constraints`] and
@@ -2485,16 +2677,22 @@ fn find_constraint_files_impl(
 /// `read_vhdl` would trigger `[filemgmt 20-1440] already exists
 /// in the project as a part of sub-design file` CRITICAL WARNINGs.
 ///
-/// Empty vec when `target/ip/` doesn't exist yet — a fresh
+/// One build's wrappers: `ip/` under the variant's [`build_dir`].
+///
+/// Empty vec when that `ip/` doesn't exist yet — a fresh
 /// workspace hasn't run `vw::make_wrapper` for anything.
-pub fn vhdl_ip_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
-    let ip_dir = workspace_dir.join("target").join("ip");
+pub fn vhdl_ip_sources(
+    workspace_dir: &Utf8Path,
+    variant: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let build = build_dir(workspace_dir, variant);
+    let ip_dir = build.join("ip");
     if !ip_dir.exists() {
         return Ok(Vec::new());
     }
     let bd_cache = ip_dir.join("bd");
     let xci_cache = ip_dir.join("xci");
-    let vw_project = workspace_dir.join("target").join("vw-project");
+    let vw_project = build.join("vw-project");
     let mut files =
         find_vhdl_files(ip_dir.as_std_path(), /*recursive=*/ true, &[])?;
     // `starts_with` on each canonical prefix filters every
@@ -2663,8 +2861,8 @@ fn synth_source_paths(
         workspace_dir,
         active_variant,
     )?);
-    sources.extend(vhdl_ip_sources(workspace_dir)?);
-    sources.extend(design_synth_constraints(workspace_dir)?);
+    sources.extend(vhdl_ip_sources(workspace_dir, active_variant)?);
+    sources.extend(design_synth_constraints(workspace_dir, active_variant)?);
     sources.extend(list_workspace_htcl_files(workspace_dir)?);
     // Dependency VHDL — same surface `vw::synth` feeds into
     // `read_vhdl`. Matters for path deps (whose files change
@@ -2966,9 +3164,10 @@ pub fn synth_needs_update(
 fn place_source_paths(
     workspace_dir: &Utf8Path,
     synth_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let mut sources: Vec<PathBuf> = Vec::new();
-    sources.extend(design_place_constraints(workspace_dir)?);
+    sources.extend(design_place_constraints(workspace_dir, active_variant)?);
     sources.push(synth_checkpoint.to_path_buf());
     sources.sort();
     sources.dedup();
@@ -2981,8 +3180,10 @@ fn place_source_paths(
 pub fn place_source_fingerprint(
     workspace_dir: &Utf8Path,
     synth_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<u64> {
-    let paths = place_source_paths(workspace_dir, synth_checkpoint)?;
+    let paths =
+        place_source_paths(workspace_dir, synth_checkpoint, active_variant)?;
     Ok(fingerprint_paths(workspace_dir, &paths))
 }
 
@@ -2993,8 +3194,13 @@ pub fn write_place_checkpoint_manifest(
     workspace_dir: &Utf8Path,
     place_checkpoint: &Path,
     synth_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<()> {
-    let fp = place_source_fingerprint(workspace_dir, synth_checkpoint)?;
+    let fp = place_source_fingerprint(
+        workspace_dir,
+        synth_checkpoint,
+        active_variant,
+    )?;
     write_checkpoint_manifest_with_fingerprint(place_checkpoint, fp)
 }
 
@@ -3006,8 +3212,13 @@ pub fn place_needs_update(
     workspace_dir: &Utf8Path,
     place_checkpoint: &Path,
     synth_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<bool> {
-    let current_fp = place_source_fingerprint(workspace_dir, synth_checkpoint)?;
+    let current_fp = place_source_fingerprint(
+        workspace_dir,
+        synth_checkpoint,
+        active_variant,
+    )?;
     Ok(checkpoint_needs_update_with_fingerprint(
         place_checkpoint,
         current_fp,
@@ -3031,9 +3242,10 @@ pub fn place_needs_update(
 fn route_source_paths(
     workspace_dir: &Utf8Path,
     place_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let mut sources: Vec<PathBuf> = Vec::new();
-    sources.extend(design_route_constraints(workspace_dir)?);
+    sources.extend(design_route_constraints(workspace_dir, active_variant)?);
     sources.push(place_checkpoint.to_path_buf());
     sources.sort();
     sources.dedup();
@@ -3046,8 +3258,10 @@ fn route_source_paths(
 pub fn route_source_fingerprint(
     workspace_dir: &Utf8Path,
     place_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<u64> {
-    let paths = route_source_paths(workspace_dir, place_checkpoint)?;
+    let paths =
+        route_source_paths(workspace_dir, place_checkpoint, active_variant)?;
     Ok(fingerprint_paths(workspace_dir, &paths))
 }
 
@@ -3058,8 +3272,13 @@ pub fn write_route_checkpoint_manifest(
     workspace_dir: &Utf8Path,
     route_checkpoint: &Path,
     place_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<()> {
-    let fp = route_source_fingerprint(workspace_dir, place_checkpoint)?;
+    let fp = route_source_fingerprint(
+        workspace_dir,
+        place_checkpoint,
+        active_variant,
+    )?;
     write_checkpoint_manifest_with_fingerprint(route_checkpoint, fp)
 }
 
@@ -3071,8 +3290,13 @@ pub fn route_needs_update(
     workspace_dir: &Utf8Path,
     route_checkpoint: &Path,
     place_checkpoint: &Path,
+    active_variant: Option<&str>,
 ) -> Result<bool> {
-    let current_fp = route_source_fingerprint(workspace_dir, place_checkpoint)?;
+    let current_fp = route_source_fingerprint(
+        workspace_dir,
+        place_checkpoint,
+        active_variant,
+    )?;
     Ok(checkpoint_needs_update_with_fingerprint(
         route_checkpoint,
         current_fp,
@@ -3122,13 +3346,216 @@ pub fn list_ip_htcl_files(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
 // and `vw::mark_project_configured` writes a fresh manifest.
 // ---------------------------------------------------------------------
 
+/// Subdirectories one build writes under its [`build_dir`]: the
+/// Vivado project, the IP wrappers generated from it, each stage's
+/// checkpoints and netlists, the reports, and the device image.
+pub const BUILD_OUTPUT_DIRS: [&str; 7] = [
+    "vw-project",
+    "ip",
+    "synth",
+    "place",
+    "route",
+    "reports",
+    "image",
+];
+
+/// Names under `target/` that aren't build output directories but
+/// that vw still writes, next to the variants' ones: REPL logs,
+/// testbench runs and their simulator work libraries, and cosim
+/// codegen. A variant can't be named after any of these or after
+/// a [`BUILD_OUTPUT_DIRS`] entry — its `target/<variant>/` would
+/// collide.
+const RESERVED_TARGET_NAMES: [&str; 4] = ["logs", "bench", "sim", "anodizer"];
+
+/// Where one build's outputs live: the Vivado project, generated IP,
+/// synth/place/route checkpoints, reports and the image (see
+/// [`BUILD_OUTPUT_DIRS`]).
+///
+/// In a variant-mode workspace that's `target/<variant>/`, so each
+/// variant keeps its own IP and checkpoints and switching between
+/// them rebuilds nothing — generating IP alone takes minutes, and
+/// the stages after it far longer. `variant = None` means the
+/// workspace default. Workspaces without variants (or with several
+/// and no default, when none is named) use `target/` itself, the
+/// layout from before variants existed.
+pub fn build_dir(
+    workspace_dir: &Utf8Path,
+    variant: Option<&str>,
+) -> Utf8PathBuf {
+    let target = workspace_dir.join("target");
+    match build_variant(workspace_dir, variant) {
+        Some(v) => target.join(v),
+        None => target,
+    }
+}
+
+/// Every build directory the workspace can have: one per variant,
+/// or just `target/` without variants. For code that has to see all
+/// of them regardless of which variant is active — the cloud agent
+/// handing generated files back, or the stub writer.
+pub fn build_dirs(workspace_dir: &Utf8Path) -> Vec<Utf8PathBuf> {
+    let target = workspace_dir.join("target");
+    match load_workspace_config(workspace_dir) {
+        Ok(cfg) if !cfg.workspace.variants.is_empty() => cfg
+            .workspace
+            .variants
+            .iter()
+            .map(|v| target.join(&v.name))
+            .collect(),
+        _ => vec![target],
+    }
+}
+
+/// The variant [`build_dir`] nests under: `variant` when the
+/// workspace declares variants, else its default. `None` without
+/// variants.
+fn build_variant(
+    workspace_dir: &Utf8Path,
+    variant: Option<&str>,
+) -> Option<String> {
+    let cfg = load_workspace_config(workspace_dir).ok()?;
+    if cfg.workspace.variants.is_empty() {
+        return None;
+    }
+    match variant {
+        Some(v) => Some(v.to_string()),
+        None => cfg
+            .workspace
+            .default_variant()
+            .ok()
+            .flatten()
+            .map(|v| v.name.clone()),
+    }
+}
+
+/// What [`migrate_flat_build_output`] did with a flat pre-variant
+/// `target/`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlatMigration {
+    /// Directories moved into the default variant's build directory.
+    pub moved: Vec<Utf8PathBuf>,
+    /// Generated IP removed because nothing shows which variant it
+    /// was generated for.
+    pub discarded: Vec<Utf8PathBuf>,
+}
+
+/// Carry build output from the flat pre-variant layout
+/// (`target/{ip,vw-project,synth,…}`) over to the per-variant one
+/// ([`build_dir`]). No-op outside variant mode.
+///
+/// Which variant a flat directory was built for isn't recorded
+/// anywhere, and guessing wrong is worse than rebuilding: redhawk's
+/// flat `target/ip/` held metro's single-quad `txr0` wrapper, which
+/// filed under the default vpk120 turned into hundreds of bogus port
+/// errors. So:
+///
+/// - **Stage output** (`synth`, `place`, `route`, `reports`, `image`)
+///   moves into the default variant's directory. Checkpoints are
+///   named after their top entity and carry a content fingerprint of
+///   their inputs that's checked before reuse, so one built for
+///   another variant is never used — and one that does match (a
+///   synth checkpoint is worth an hour) is kept.
+/// - **Generated IP** (`vw-project` and the `ip` wrappers made from
+///   it) moves only as a pair and only when the project's manifest
+///   proves it was configured for the default variant — the project
+///   fingerprint includes the variant. Otherwise both are removed and
+///   regenerate on first use, which is what a stale project gets
+///   anyway.
+///
+/// An entry that already exists in the variant's directory is left
+/// alone, flat copy included.
+pub fn migrate_flat_build_output(workspace_dir: &Utf8Path) -> FlatMigration {
+    let mut done = FlatMigration::default();
+    let Some(variant) = build_variant(workspace_dir, None) else {
+        return done;
+    };
+    let target = workspace_dir.join("target");
+    let dest_root = target.join(&variant);
+    let move_dir = |name: &str, done: &mut FlatMigration| {
+        let (from, to) = (target.join(name), dest_root.join(name));
+        if from.is_dir()
+            && !to.exists()
+            && fs::create_dir_all(dest_root.as_std_path()).is_ok()
+            && fs::rename(from.as_std_path(), to.as_std_path()).is_ok()
+        {
+            done.moved.push(from);
+        }
+    };
+
+    let ip_pair = ["vw-project", "ip"];
+    let flat_ip: Vec<&str> = ip_pair
+        .into_iter()
+        .filter(|name| target.join(name).is_dir())
+        .collect();
+    let blocked = ip_pair.iter().any(|name| dest_root.join(name).exists());
+    if !flat_ip.is_empty() && !blocked {
+        if flat_project_is_for(workspace_dir, &variant) {
+            for name in flat_ip {
+                move_dir(name, &mut done);
+            }
+        } else {
+            for name in flat_ip {
+                let dir = target.join(name);
+                if fs::remove_dir_all(dir.as_std_path()).is_ok() {
+                    done.discarded.push(dir);
+                }
+            }
+        }
+    }
+    for name in BUILD_OUTPUT_DIRS {
+        if !ip_pair.contains(&name) {
+            move_dir(name, &mut done);
+        }
+    }
+    done
+}
+
+impl FlatMigration {
+    /// One line per directory touched, for the caller to show.
+    pub fn notes(&self) -> Vec<String> {
+        let moved = self.moved.iter().map(|d| {
+            format!(
+                "moved {d} into the default variant's build directory \
+                 (build output is now per variant)"
+            )
+        });
+        let discarded = self.discarded.iter().map(|d| {
+            format!(
+                "removed {d}: build output is now per variant, and nothing \
+                 shows which variant this IP was generated for; it \
+                 regenerates on first use"
+            )
+        });
+        moved.chain(discarded).collect()
+    }
+}
+
+/// Whether the flat `target/vw-project/` holds a project whose
+/// manifest matches `variant`'s current source fingerprint — i.e. it
+/// was configured for that variant, from these sources.
+fn flat_project_is_for(workspace_dir: &Utf8Path, variant: &str) -> bool {
+    let Ok(cfg) = load_workspace_config(workspace_dir) else {
+        return false;
+    };
+    let Ok(fp) = project_source_fingerprint(workspace_dir, Some(variant))
+    else {
+        return false;
+    };
+    let flat = workspace_dir.join("target").join("vw-project");
+    let xpr = vw_project_xpr(flat.as_std_path(), &cfg.workspace.name);
+    xpr.exists() && !checkpoint_needs_update_with_fingerprint(&xpr, fp)
+}
+
 /// Absolute path of the on-disk Vivado project directory vw
-/// manages. The `.xpr` itself lives at
-/// `<returned_path>/<project_name>/<project_name>.xpr` (Vivado's
-/// `create_project -dir` convention — it always nests one level
-/// deep under the given dir).
-pub fn vw_project_dir(workspace_dir: &Utf8Path) -> Utf8PathBuf {
-    workspace_dir.join("target").join("vw-project")
+/// manages for one build (see [`build_dir`]). The `.xpr` itself
+/// lives at `<returned_path>/<project_name>/<project_name>.xpr`
+/// (Vivado's `create_project -dir` convention — it always nests one
+/// level deep under the given dir).
+pub fn vw_project_dir(
+    workspace_dir: &Utf8Path,
+    variant: Option<&str>,
+) -> Utf8PathBuf {
+    build_dir(workspace_dir, variant).join("vw-project")
 }
 
 /// Path list feeding [`project_source_fingerprint`]. Sorted +
@@ -3146,9 +3573,50 @@ fn project_source_paths(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
 
 /// Combined fingerprint over the on-disk-project source set.
 /// Backs [`project_needs_wipe`] and [`write_project_manifest`].
-pub fn project_source_fingerprint(workspace_dir: &Utf8Path) -> Result<u64> {
+///
+/// In a variant-mode workspace the active variant is folded in too:
+/// there's one persisted project per workspace, and the IP it holds
+/// is configured for one variant (its part, and whatever `ip/`
+/// htcl does with `vw::active_variant`). Switching variants has to
+/// look stale, or `vw::configure_ip` would see a configured project
+/// and keep the other variant's IP. The variant's part lives in
+/// `vw.toml`, which is already hashed, so the name is enough.
+/// `active_variant = None` means the workspace default, same as
+/// every other variant selector. Workspaces without variants hash
+/// exactly as before.
+pub fn project_source_fingerprint(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<u64> {
     let paths = project_source_paths(workspace_dir)?;
-    Ok(fingerprint_paths(workspace_dir, &paths))
+    let mut fp = fingerprint_paths(workspace_dir, &paths);
+    if let Some(variant) = project_variant(workspace_dir, active_variant) {
+        fp = fnv1a_64_extend(fp, b"\0variant\0");
+        fp = fnv1a_64_extend(fp, variant.as_bytes());
+    }
+    Ok(fp)
+}
+
+/// The variant a persisted project is configured for: `active_variant`
+/// when given, else the workspace default. `None` for workspaces
+/// without variants.
+fn project_variant(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Option<String> {
+    let cfg = load_workspace_config(workspace_dir).ok()?;
+    if cfg.workspace.variants.is_empty() {
+        return None;
+    }
+    match active_variant {
+        Some(v) => Some(v.to_string()),
+        None => cfg
+            .workspace
+            .default_variant()
+            .ok()
+            .flatten()
+            .map(|v| v.name.clone()),
+    }
 }
 
 /// Absolute path of the `.xpr` inside the on-disk project dir.
@@ -3175,8 +3643,9 @@ pub fn write_project_manifest(
     workspace_dir: &Utf8Path,
     project_dir: &Path,
     name: &str,
+    active_variant: Option<&str>,
 ) -> Result<()> {
-    let fp = project_source_fingerprint(workspace_dir)?;
+    let fp = project_source_fingerprint(workspace_dir, active_variant)?;
     write_checkpoint_manifest_with_fingerprint(
         &vw_project_xpr(project_dir, name),
         fp,
@@ -3197,8 +3666,9 @@ pub fn project_needs_wipe(
     workspace_dir: &Utf8Path,
     project_dir: &Path,
     name: &str,
+    active_variant: Option<&str>,
 ) -> Result<bool> {
-    let current_fp = project_source_fingerprint(workspace_dir)?;
+    let current_fp = project_source_fingerprint(workspace_dir, active_variant)?;
     Ok(checkpoint_needs_update_with_fingerprint(
         &vw_project_xpr(project_dir, name),
         current_fp,
@@ -3252,12 +3722,16 @@ pub fn cleanup_legacy_ip_cache(workspace_dir: &Utf8Path) -> usize {
 /// vw-lib itself intentionally doesn't do user-facing IO.
 #[derive(Debug, Clone)]
 pub struct PreparedProjectDir {
-    /// Absolute path of `<ws>/target/vw-project/`, ready to pass
-    /// as `AutoProject::persist_dir = Some(...)`.
+    /// Absolute path of the build's `vw-project/` (see
+    /// [`vw_project_dir`]), ready to pass as
+    /// `AutoProject::persist_dir = Some(...)`.
     pub project_dir: Utf8PathBuf,
     /// Number of legacy `<ws>/target/ip/{bd,xci,.ip-cache*}`
     /// entries removed by the one-shot Phase 6 migration cleanup.
     pub legacy_cache_removed: usize,
+    /// What happened to a flat pre-variant `target/` (see
+    /// [`migrate_flat_build_output`]).
+    pub migrated: FlatMigration,
     /// `Some(path)` iff the persist dir existed AND
     /// [`project_needs_wipe`] returned true, so we wiped it before
     /// returning. The caller can log this as the reason for the
@@ -3296,12 +3770,20 @@ pub struct PreparedProjectDir {
 pub fn prepare_vw_project_dir(
     workspace_dir: &Utf8Path,
     name: &str,
+    active_variant: Option<&str>,
 ) -> Result<PreparedProjectDir> {
-    let project_dir = vw_project_dir(workspace_dir);
+    // Legacy caches first: they sit in the flat `target/ip/` that
+    // the migration below would otherwise carry into a variant.
     let legacy_cache_removed = cleanup_legacy_ip_cache(workspace_dir);
+    let migrated = migrate_flat_build_output(workspace_dir);
+    let project_dir = vw_project_dir(workspace_dir, active_variant);
     let mut wiped_project = None;
-    if project_needs_wipe(workspace_dir, project_dir.as_std_path(), name)?
-        && project_dir.exists()
+    if project_needs_wipe(
+        workspace_dir,
+        project_dir.as_std_path(),
+        name,
+        active_variant,
+    )? && project_dir.exists()
     {
         fs::remove_dir_all(project_dir.as_std_path())?;
         wiped_project = Some(project_dir.clone());
@@ -3310,6 +3792,7 @@ pub fn prepare_vw_project_dir(
     Ok(PreparedProjectDir {
         project_dir,
         legacy_cache_removed,
+        migrated,
         wiped_project,
     })
 }
@@ -3339,6 +3822,90 @@ pub async fn ensure_anodized(
     vhdl_std: VhdlStandard,
     active_variant: Option<&str>,
 ) -> Result<()> {
+    anodize(workspace_dir, vhdl_std, active_variant, Freshness::IfStale)
+        .await
+        .map(|_| ())
+}
+
+/// Whether an anodization pass may decide it has nothing to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    /// Skip when the design sources have not changed since the last pass.
+    /// What every build path wants: the generated file is a pure function of
+    /// those sources, so regenerating an unchanged one only costs an nvc run
+    /// and a rebuild of everything downstream of it.
+    IfStale,
+    /// Regenerate regardless. What `vw cosim anodize` wants: a developer
+    /// working on the anodizer itself is asking to watch it run, and a pass
+    /// that reports "already current" answers a question nobody asked.
+    Always,
+}
+
+/// What an anodization pass found and did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnodizeReport {
+    /// Design sources considered.
+    pub sources: usize,
+    /// How many of them carry a `serialize_rust` attribute.
+    ///
+    /// Zero is a real answer and worth reporting rather than passing over in
+    /// silence: a developer who has just tagged a record and sees zero has
+    /// learnt that the file they edited is not in the design set.
+    pub tagged: usize,
+    /// Where the generated Rust went, when there was any to write.
+    pub generated: Option<Utf8PathBuf>,
+    /// How many lines it came to.
+    pub lines: usize,
+    /// Whether this pass ran the anodizer, or found the last one's output
+    /// still current.
+    pub regenerated: bool,
+}
+
+/// What an anodization pass would look at, without running one.
+///
+/// Returns the number of design sources and how many of them carry a
+/// `serialize_rust` attribute. Cheap — it is the same scan the generator gates
+/// itself on — and worth having separately so a caller can say what is about
+/// to happen *before* it happens. A pass that fails is exactly when knowing
+/// how much it was looking at matters most.
+pub fn anodize_scope(
+    workspace_dir: &Utf8Path,
+    active_variant: Option<&str>,
+) -> Result<(usize, usize)> {
+    let config = render_vhdl_ls_config(workspace_dir, active_variant, false)?;
+    let files = config
+        .libraries
+        .get("defaultlib")
+        .map(|lib| lib.files.clone())
+        .unwrap_or_default();
+    let tagged = tagged_sources(&files);
+    Ok((files.len(), tagged))
+}
+
+/// How many of these sources ask for anything to be generated.
+fn tagged_sources(files: &[PathBuf]) -> usize {
+    files
+        .iter()
+        .filter(|f| {
+            fs::read_to_string(f)
+                .map(|c| c.contains("serialize_rust"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Generate anodizer Rust structs for the workspace's `serialize_rust`-tagged
+/// VHDL records, and say what happened.
+///
+/// [`ensure_anodized`] is this with [`Freshness::IfStale`] and the answer
+/// thrown away — which is what a build wants, since a build only cares that
+/// the file is there and current.
+pub async fn anodize(
+    workspace_dir: &Utf8Path,
+    vhdl_std: VhdlStandard,
+    active_variant: Option<&str>,
+    freshness: Freshness,
+) -> Result<AnodizeReport> {
     let config = render_vhdl_ls_config(workspace_dir, active_variant, false)?;
 
     // Tagged records live in the design sources, i.e. `defaultlib`.
@@ -3347,18 +3914,15 @@ pub async fn ensure_anodized(
         .get("defaultlib")
         .map(|lib| lib.files.clone())
         .unwrap_or_default();
-    if defaultlib_files.is_empty() {
-        return Ok(());
-    }
 
-    // Stage 1: cheap gate — is anything tagged for serialization at all?
-    let any_tagged = defaultlib_files.iter().any(|f| {
-        fs::read_to_string(f)
-            .map(|c| c.contains("serialize_rust"))
-            .unwrap_or(false)
-    });
-    if !any_tagged {
-        return Ok(());
+    let mut report = AnodizeReport {
+        sources: defaultlib_files.len(),
+        // Stage 1: cheap gate — is anything tagged for serialization at all?
+        tagged: tagged_sources(&defaultlib_files),
+        ..Default::default()
+    };
+    if report.tagged == 0 {
+        return Ok(report);
     }
 
     // Stage 2: regenerate only when the design sources changed.
@@ -3370,16 +3934,26 @@ pub async fn ensure_anodized(
     let stored = fs::read_to_string(&fingerprint_file)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());
-    if generated.exists() && stored == Some(fingerprint) {
-        return Ok(());
+    let current = generated.exists() && stored == Some(fingerprint);
+    if current && freshness == Freshness::IfStale {
+        report.generated = Some(generated);
+        return Ok(report);
     }
 
     let build_dir = workspace_dir.join(ANODIZER_BUILD_SUBDIR);
     fs::create_dir_all(&gen_dir)?;
     anodizer::anodize(&config, &build_dir, &gen_dir, vhdl_std).await?;
 
+    // Written even for a forced pass: the work was done, and leaving the
+    // fingerprint stale would make the next build redo it for nothing.
     fs::write(&fingerprint_file, fingerprint.to_string())?;
-    Ok(())
+
+    report.lines = fs::read_to_string(&generated)
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    report.generated = Some(generated);
+    report.regenerated = true;
+    Ok(report)
 }
 
 /// Run a testbench using NVC simulator.
@@ -3410,6 +3984,10 @@ fn dir_is_rust_crate(dir: &Path) -> bool {
 /// discovered) for their crate to need to exist. `write_file` is
 /// content-aware, so unchanged scaffolds don't touch the tree.
 pub fn ensure_bench_scaffolds(workspace_dir: &Utf8Path) -> Result<()> {
+    // A cosim crate's `build.rs` is generated too, and goes missing the same
+    // ways — see `bench_init::heal_cosim_scaffolds`.
+    bench_init::heal_cosim_scaffolds(workspace_dir)?;
+
     let bench_dir = workspace_dir.join("bench");
     let Ok(entries) = fs::read_dir(bench_dir.as_std_path()) else {
         return Ok(()); // no bench dir → nothing to scaffold
@@ -3462,8 +4040,28 @@ pub async fn run_testbench(
     scaffold: bool,
     build_dir: &str,
 ) -> Result<()> {
-    // Check for mixed-signal test (mist.toml in bench/<name>/)
     let bench_test_dir = workspace_dir.join("bench").join(&testbench_name);
+
+    // A cosim bench that drives a design entity directly: `cosim.toml` names
+    // the entity, nvc elaborates that entity as the top level, and the crate
+    // beside the config is the only thing driving it. No VHDL harness is
+    // involved, so none of the testbench-file machinery below applies.
+    let cosim_toml = bench_test_dir.join("cosim.toml");
+    if cosim_toml.exists() {
+        let config = cosim::read_config(cosim_toml.as_std_path())?;
+        return cosim::run(
+            workspace_dir,
+            &testbench_name,
+            &bench_test_dir,
+            &config,
+            vhdl_std,
+            build_dir,
+            runtime_flags,
+        )
+        .await;
+    }
+
+    // Check for mixed-signal test (mist.toml in bench/<name>/)
     let mist_toml = bench_test_dir.join("mist.toml");
     if mist_toml.exists() {
         let mist_content =
@@ -3477,11 +4075,11 @@ pub async fn run_testbench(
         if scaffold {
             return sim::scaffold(&bench_test_dir, &mist_config);
         }
-        // Auto-scaffold before simulating so `vw bench` works straight
+        // Auto-scaffold before simulating so `vw bench run` works straight
         // from a clean checkout (`git clean -fdx` wipes the generated
         // bridge crate — `Cargo.toml`, `build.rs`, generated sources —
         // that `run_analog_test`'s `build_bridge_library` needs) without
-        // a manual `vw bench --scaffold <name>` pre-step. `scaffold`
+        // a manual `vw bench run <name> --scaffold` pre-step. `scaffold`
         // regenerates only the boilerplate (the user-owned `src/lib.rs`
         // is left alone) and `write_file` is content-aware, so this is a
         // cheap no-op when nothing changed.
@@ -3655,10 +4253,11 @@ pub async fn run_testbench(
 ///
 /// Populated libraries:
 /// - `defaultlib` = design VHDL under `<ws>/hdl/**` (variant-filtered).
-/// - `ip` = IP wrappers under `<ws>/target/ip/<name>/wrapper.vhd`
+/// - `ip` = IP wrappers under `<build>/ip/<name>/wrapper.vhd`, for the
+///   active variant's [`build_dir`]
 ///   (Vivado cache subtrees are excluded by `vhdl_ip_sources`).
 /// - `xil_defaultlib` = Vivado-generated BD RTL under
-///   `<ws>/target/vw-project/**/*.gen/sources_1/bd/**/*.vhd`,
+///   `<build>/vw-project/**/*.gen/sources_1/bd/**/*.vhd`,
 ///   present only when the on-disk Vivado project exists.
 /// - one library per dep name (hyphens→underscores via
 ///   `library_name_for_dep`), sourced from
@@ -3704,7 +4303,10 @@ pub fn render_vhdl_ls_config(
         );
     }
 
-    let ip_files = vhdl_ip_sources(workspace_dir)?;
+    // The IP generated for the same variant as the design files, so
+    // switching variants swaps the wrappers and BD RTL along with
+    // the HDL (see `build_dir`).
+    let ip_files = vhdl_ip_sources(workspace_dir, resolved_variant.as_deref())?;
     if !ip_files.is_empty() {
         libraries.insert(
             "ip".to_string(),
@@ -3716,7 +4318,8 @@ pub fn render_vhdl_ls_config(
         );
     }
 
-    let bd_rtl = vivado_generated_sources(workspace_dir)?;
+    let bd_rtl =
+        vivado_generated_sources(workspace_dir, resolved_variant.as_deref())?;
     if !bd_rtl.is_empty() {
         libraries.insert(
             "xil_defaultlib".to_string(),
@@ -3822,12 +4425,15 @@ fn find_cached_vhdl_stdlib(deps_dir: &Path) -> Option<Utf8PathBuf> {
         if !entry.file_name().to_string_lossy().starts_with("rust_hdl-") {
             continue;
         }
+        // Published or nothing: a checkout still being copied here
+        // has a `vhdl_libraries` long before it has all of it, and
+        // handing that to vhdl_lang produces errors about the
+        // standard library that lead nowhere.
+        if !depcache::is_complete(&entry.path()) {
+            continue;
+        }
         let libs = entry.path().join("vhdl_libraries");
-        let present = libs.exists()
-            && fs::read_dir(&libs)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
-        if present {
+        if libs.is_dir() {
             if let Ok(u) = Utf8PathBuf::from_path_buf(libs) {
                 return Some(u);
             }
@@ -3845,6 +4451,7 @@ fn find_cached_vhdl_stdlib(deps_dir: &Path) -> Option<Utf8PathBuf> {
 /// `download_dependency` machinery as any other git dependency.
 pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
     let deps_dir = deps_directory()?;
+    depcache::sweep(&deps_dir);
     if let Some(libs) = find_cached_vhdl_stdlib(&deps_dir) {
         return Ok(libs);
     }
@@ -3856,20 +4463,13 @@ pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
     )
     .await?;
     let dep_path = deps_dir.join(format!("rust_hdl-{sha}"));
-    let libs = dep_path.join("vhdl_libraries");
-    let present = libs.exists()
-        && fs::read_dir(&libs)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-    if !present {
-        if dep_path.exists() {
-            let _ = fs::remove_dir_all(&dep_path);
-        }
+    if !depcache::is_complete(&dep_path) {
+        let staged = depcache::Staged::new(&deps_dir)?;
         download_dependency(
             VHDL_STDLIB_REPO,
             &sha,
             &[],
-            &dep_path,
+            staged.path(),
             false,
             &[],
             false,
@@ -3877,7 +4477,9 @@ pub async fn ensure_vhdl_stdlib() -> Result<Utf8PathBuf> {
             Some("vhdl_libraries"),
         )
         .await?;
+        staged.publish(&dep_path)?;
     }
+    let libs = dep_path.join("vhdl_libraries");
     Utf8PathBuf::from_path_buf(libs).map_err(|p| VwError::FileSystem {
         message: format!("VHDL stdlib path is not UTF-8: {}", p.display()),
     })
@@ -3993,6 +4595,84 @@ pub fn check_vhdl(
     Ok(out)
 }
 
+/// The variant an editor session analyzes, and why it might not be
+/// the one that was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorVariant {
+    /// The variant to analyze. `None` when the workspace declares
+    /// no variants (nothing to filter), or declares several with
+    /// no default and none was requested.
+    pub variant: Option<String>,
+    /// Set when the requested name isn't one of the workspace's
+    /// variants, and `variant` fell back to the default instead.
+    pub warning: Option<String>,
+}
+
+/// Pick the variant an editor session analyzes `workspace_dir` as.
+///
+/// Precedence: `requested` (the language server's `variant`
+/// setting), then the `VW_ACTIVE_VARIANT` environment variable, then
+/// the workspace's default variant. A requested name that the
+/// workspace doesn't declare falls back to the default with a
+/// warning naming the valid choices — an editor-wide setting has to
+/// survive projects that name their variants differently, so this
+/// isn't an error. Workspaces without variants ignore the request.
+pub fn editor_variant(
+    workspace_dir: &Utf8Path,
+    requested: Option<&str>,
+) -> EditorVariant {
+    let none = EditorVariant {
+        variant: None,
+        warning: None,
+    };
+    let Ok(cfg) = load_workspace_config(workspace_dir) else {
+        return none;
+    };
+    let ws = &cfg.workspace;
+    if ws.variants.is_empty() {
+        return none;
+    }
+    let default = ws.default_variant().ok().flatten().map(|v| v.name.clone());
+    let env = std::env::var("VW_ACTIVE_VARIANT").ok();
+    let (name, source) = match (requested, env.as_deref().map(str::trim)) {
+        (Some(r), _) if !r.trim().is_empty() => {
+            (r.trim(), "the language server's `variant` setting")
+        }
+        (_, Some(e)) if !e.is_empty() => (e, "`VW_ACTIVE_VARIANT`"),
+        _ => {
+            return EditorVariant {
+                variant: default,
+                warning: None,
+            }
+        }
+    };
+    if ws.variants.iter().any(|v| v.name == name) {
+        return EditorVariant {
+            variant: Some(name.to_string()),
+            warning: None,
+        };
+    }
+    let valid: Vec<String> = ws
+        .variants
+        .iter()
+        .map(|v| format!("`{}`", v.name))
+        .collect();
+    let fallback = match &default {
+        Some(d) => format!("analyzing the default variant `{d}`"),
+        None => {
+            "no default variant, so analyzing shared files only".to_string()
+        }
+    };
+    EditorVariant {
+        variant: default,
+        warning: Some(format!(
+            "{workspace_dir}: variant `{name}` from {source} is not declared \
+             in vw.toml (variants: {}); {fallback}",
+            valid.join(", "),
+        )),
+    }
+}
+
 /// Resolve which variant the LSP renderer should filter to.
 ///
 /// Precedence:
@@ -4030,7 +4710,8 @@ fn resolve_active_variant(
         .map(|v| v.name.clone())
 }
 
-/// Walk `<ws>/target/vw-project/*/*.gen/sources_1/**/*.{vhd,vhdl}`,
+/// Walk `<build>/vw-project/*/*.gen/sources_1/**/*.{vhd,vhdl}` for one
+/// build (see [`build_dir`]),
 /// keeping only the files vhdl_lang can meaningfully analyze from
 /// Vivado's output tree.
 ///
@@ -4048,8 +4729,11 @@ fn resolve_active_variant(
 ///
 /// Kept: `bd/*/hdl/*_wrapper.vhd`, `bd/*/synth/**/*.{vhd,vhdl}`,
 /// `bd/*/ip/**/synth/**/*.{vhd,vhdl}`, `ip/*/*_stub.{vhd,vhdl}`.
-fn vivado_generated_sources(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
-    let project_root = workspace_dir.join("target/vw-project");
+fn vivado_generated_sources(
+    workspace_dir: &Utf8Path,
+    variant: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let project_root = vw_project_dir(workspace_dir, variant);
     if !project_root.exists() {
         return Ok(Vec::new());
     }
@@ -4220,19 +4904,24 @@ fn vho_component_to_entity(vho: &str) -> Option<String> {
 /// (`<ip>.vho`) into a black-box `<ip>_stub.vhdl` alongside it, so the
 /// static VHDL check can resolve `entity xil_defaultlib.<ip>` without
 /// the IP ever being synthesized. Scans
-/// `target/vw-project/*/*.gen/sources_1/ip/*/` for a top-level `.vho`
-/// (the top IP; sub-IP templates in nested dirs are skipped). Writes
-/// only when content changed, and is a no-op when there are no
-/// templates. Returns how many stubs were (re)written.
+/// `<build>/vw-project/*/*.gen/sources_1/ip/*/` in every build
+/// directory (see [`build_dirs`]) for a top-level `.vho` (the top IP;
+/// sub-IP templates in nested dirs are skipped) — every variant's,
+/// since callers run it after a Vivado pass without knowing which
+/// variant that was. Writes only when content changed, and is a
+/// no-op when there are no templates. Returns how many stubs were
+/// (re)written.
 pub fn write_ip_stubs_from_templates(
     workspace_dir: &Utf8Path,
 ) -> Result<usize> {
-    let project_root = workspace_dir.join("target/vw-project");
-    let Ok(projects) = fs::read_dir(project_root.as_std_path()) else {
-        return Ok(0);
-    };
     let mut written = 0usize;
-    for project in projects.flatten() {
+    let projects = build_dirs(workspace_dir).into_iter().flat_map(|build| {
+        fs::read_dir(build.join("vw-project").as_std_path())
+            .into_iter()
+            .flatten()
+            .flatten()
+    });
+    for project in projects {
         let name = project.file_name();
         let ip_root = project
             .path()
@@ -4475,8 +5164,72 @@ pub fn load_workspace_config(
         })?;
 
     let config: WorkspaceConfig = toml::from_str(&config_content)?;
+    validate_workspace_name(&config.workspace.name).map_err(|detail| {
+        VwError::Config {
+            message: format!("`[workspace] name` in {config_path}: {detail}"),
+        }
+    })?;
     validate_variant_shape(&config.workspace)?;
     Ok(config)
+}
+
+/// The longest a workspace name may be on its own.
+///
+/// The name becomes the last component of an object store bucket
+/// called `{kind}-{environment}-{workspace}`, and S3 stops at 63
+/// characters. A fixed cap here cannot be the whole check — how much
+/// room is left over depends on an environment name this side has
+/// never heard of — so the assembled name is checked again where both
+/// halves are known. What this catches is the name that would not
+/// have fitted whatever it was paired with.
+const MAX_WORKSPACE_NAME: usize = 40;
+
+/// Reject a workspace name that cannot do what a workspace name is
+/// used for.
+///
+/// Checked when `vw.toml` is parsed, so a bad name stops every
+/// command rather than only the ones that reach a cloud environment.
+/// That is deliberate: the name is not decoration. It is the module a
+/// workspace's own imports resolve through (`src @foo/bar`), the
+/// answer `vw::project_name` hands a design, and — once one cloud
+/// environment holds several workspaces — a directory on a build
+/// instance and a bucket in an object store. Somewhere in that list
+/// is a rule every candidate name has to satisfy, and the moment to
+/// hear about a name that does not is `vw init`, not a first sync
+/// months later.
+///
+/// Fails with a `String` rather than a [`VwError`] because the same
+/// name is checked in four places that each know something this one
+/// does not — which file it came from, which request carried it — and
+/// a message naming `vw.toml` would be wrong in three of them.
+pub fn validate_workspace_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err(String::from("a workspace name cannot be empty"));
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(format!("'{name}' must start with a lowercase letter"));
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'))
+    {
+        return Err(format!(
+            "'{name}' cannot contain '{c}'; only lowercase letters, \
+             digits and '-' are allowed"
+        ));
+    }
+    // It is the tail of a bucket name, and a bucket name cannot end with
+    // one.
+    if name.ends_with('-') {
+        return Err(format!("'{name}' cannot end with '-'"));
+    }
+    if name.len() > MAX_WORKSPACE_NAME {
+        return Err(format!(
+            "'{name}' is {} characters; the limit is {MAX_WORKSPACE_NAME}",
+            name.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Post-deserialize validation for the `[[target-parts]]` /
@@ -4493,6 +5246,29 @@ fn validate_variant_shape(ws: &WorkspaceInfo) -> Result<()> {
     let mut seen: std::collections::HashSet<&str> =
         std::collections::HashSet::new();
     for v in &ws.variants {
+        // The name becomes `target/<name>/` (see `build_dir`).
+        let n = v.name.as_str();
+        let plain = n.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+        if !plain {
+            return Err(VwError::Config {
+                message: format!(
+                    "variant name `{n}` must start with a letter or digit \
+                     and contain only letters, digits, `-`, `_` and `.` — \
+                     it names the variant's build directory, `target/{n}/`"
+                ),
+            });
+        }
+        if BUILD_OUTPUT_DIRS.contains(&n) || RESERVED_TARGET_NAMES.contains(&n)
+        {
+            return Err(VwError::Config {
+                message: format!(
+                    "variant name `{n}` is reserved: vw already uses \
+                     `target/{n}/` for something else"
+                ),
+            });
+        }
         if !seen.insert(v.name.as_str()) {
             return Err(VwError::Config {
                 message: VariantSelectError::DuplicateName {
@@ -5434,11 +6210,46 @@ fn write_lock_file(
     let toml_content = toml::to_string_pretty(lock_file)?;
     let lock_path = workspace_dir.join("vw.lock");
 
-    fs::write(&lock_path, toml_content).map_err(|e| VwError::FileSystem {
-        message: format!("Failed to write vw.lock file: {e}"),
-    })?;
+    // Every dependency fetch ends here, including the implicit one each
+    // cloud session makes — so two sessions on one instance both write
+    // this file, while a third may be fingerprinting it for a
+    // checkpoint. Leave an unchanged lock alone, and replace a changed
+    // one whole.
+    if fs::read_to_string(&lock_path).is_ok_and(|c| c == toml_content) {
+        return Ok(());
+    }
+    write_atomic(lock_path.as_std_path(), toml_content.as_bytes()).map_err(
+        |e| VwError::FileSystem {
+            message: format!("Failed to write vw.lock file: {e}"),
+        },
+    )?;
 
     Ok(())
+}
+
+/// Replace `path` with `contents` in one step: write a private
+/// sibling, then `rename` it over the original.
+///
+/// For files that another process may read while this one writes them —
+/// on a cloud instance, concurrent sessions share a workspace — where a
+/// plain write would let a reader see the file truncated or half
+/// written. The rename is atomic within a filesystem, so a reader sees
+/// either the old file or the new one. The sibling name is unique per
+/// process and call, so two writers never share one.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let temp = path
+        .with_file_name(format!(".{name}.{}-{seq}.tmp", std::process::id()));
+    fs::write(&temp, contents)?;
+    fs::rename(&temp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
 }
 
 /// Build a Rust library for a testbench.
@@ -5481,7 +6292,7 @@ async fn build_rust_library(
     // Run cargo build in the testbench directory
     let testbench_dir_owned = testbench_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("cargo")
+        let output = cargo_command()
             .arg("build")
             .current_dir(&testbench_dir_owned)
             .output()
@@ -5550,14 +6361,21 @@ mod locked_resolution_tests {
 
     /// A dependency already downloaded: what every CI worker's cache looks
     /// like once the first job in the pipeline has run.
+    ///
+    /// Published the way a real fetch publishes it rather than written
+    /// straight into place, so that what the cache checks look for
+    /// here is exactly what they look for in earnest — a tree that
+    /// merely exists is not one anybody is entitled to read.
     fn seed_cache(name: &str, sha: &str) {
-        let root = deps_cache().join(format!("{name}-{sha}"));
-        fs::create_dir_all(&root).unwrap();
+        let cache = deps_cache();
+        let staged = depcache::Staged::new(cache.as_std_path()).unwrap();
         fs::write(
-            root.join("vw.toml"),
+            staged.path().join("vw.toml"),
             format!("[workspace]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
         )
         .unwrap();
+        let root = cache.join(format!("{name}-{sha}"));
+        staged.publish(root.as_std_path()).unwrap();
     }
 
     /// A workspace whose only dependency is `name`, declared and locked as
@@ -7128,7 +7946,7 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
     fn design_constraints_empty_when_no_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        assert!(design_constraints(&ws).unwrap().is_empty());
+        assert!(design_constraints(&ws, None).unwrap().is_empty());
     }
 
     #[test]
@@ -7148,21 +7966,21 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         std::fs::write(c.join("place/only.xdc"), "").unwrap();
         std::fs::write(c.join("route/only.xdc"), "").unwrap();
 
-        let synth = design_synth_constraints(&ws).unwrap();
+        let synth = design_synth_constraints(&ws, None).unwrap();
         assert_eq!(synth.len(), 1);
         assert!(synth[0].ends_with("synth/only.xdc"));
 
-        let place = design_place_constraints(&ws).unwrap();
+        let place = design_place_constraints(&ws, None).unwrap();
         assert_eq!(place.len(), 1);
         assert!(place[0].ends_with("place/only.xdc"));
 
-        let route = design_route_constraints(&ws).unwrap();
+        let route = design_route_constraints(&ws, None).unwrap();
         assert_eq!(route.len(), 1);
         assert!(route[0].ends_with("route/only.xdc"));
 
         // Aggregate walk returns everything under constraints/
         // regardless of subdir.
-        let all = design_constraints(&ws).unwrap();
+        let all = design_constraints(&ws, None).unwrap();
         assert_eq!(all.len(), 4);
     }
 
@@ -7176,9 +7994,9 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         std::fs::create_dir_all(c.join("place")).unwrap();
         std::fs::write(c.join("place/only.xdc"), "").unwrap();
 
-        assert!(design_synth_constraints(&ws).unwrap().is_empty());
-        assert!(design_route_constraints(&ws).unwrap().is_empty());
-        assert_eq!(design_place_constraints(&ws).unwrap().len(), 1);
+        assert!(design_synth_constraints(&ws, None).unwrap().is_empty());
+        assert!(design_route_constraints(&ws, None).unwrap().is_empty());
+        assert_eq!(design_place_constraints(&ws, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -7193,7 +8011,7 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         // Non-constraint sibling — should be skipped.
         std::fs::write(c.join("readme.md"), "").unwrap();
 
-        let files = design_constraints(&ws).unwrap();
+        let files = design_constraints(&ws, None).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -7209,7 +8027,7 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
     fn vhdl_ip_sources_empty_when_no_target_ip_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        assert!(vhdl_ip_sources(&ws).unwrap().is_empty());
+        assert!(vhdl_ip_sources(&ws, None).unwrap().is_empty());
     }
 
     #[test]
@@ -7224,7 +8042,7 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         // Non-VHDL siblings shouldn't get pulled in.
         std::fs::write(ip.join("clocky/notes.md"), "").unwrap();
 
-        let sources = vhdl_ip_sources(&ws).unwrap();
+        let sources = vhdl_ip_sources(&ws, None).unwrap();
         let names: Vec<String> = sources
             .iter()
             .map(|p| {
@@ -7283,7 +8101,7 @@ exclude = ["**/sims/**", "**/*_tb.vhd"]
         std::fs::create_dir_all(&vw_proj_gen).unwrap();
         std::fs::write(vw_proj_gen.join("cips.vhd"), "").unwrap();
 
-        let sources = vhdl_ip_sources(&ws).unwrap();
+        let sources = vhdl_ip_sources(&ws, None).unwrap();
         assert_eq!(sources.len(), 2, "{sources:?}");
         for p in &sources {
             let s = p.to_string_lossy();
@@ -7482,6 +8300,197 @@ exclusive = ["hdl/ethernet-metro.vhd"]
         assert!(names.contains(&"shared.vhd".to_string()));
         assert!(names.contains(&"ethernet-metro.vhd".to_string()));
         assert!(!names.contains(&"ethernet-vpk120.vhd".to_string()));
+    }
+
+    /// Place XDCs split per board the way redhawk-metroid does:
+    /// one shared file plus one pin file per variant, each listed
+    /// in its variant's `exclusive`.
+    fn make_variant_constraints_ws(tmp: &tempfile::TempDir) -> Utf8PathBuf {
+        let ws = tmp.path().to_path_buf();
+        let place = ws.join("constraints/place");
+        std::fs::create_dir_all(&place).unwrap();
+        std::fs::write(place.join("timing.xdc"), "# shared\n").unwrap();
+        std::fs::write(place.join("pins-vpk120.xdc"), "# vpk120\n").unwrap();
+        std::fs::write(place.join("pins-metro.xdc"), "# metro\n").unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[[workspace.variants]]
+name = "vpk120"
+part = "xcvp1202-vsva2785-2MHP-e-S"
+default = true
+exclusive = ["constraints/place/pins-vpk120.xdc"]
+
+[[workspace.variants]]
+name = "metro"
+part = "xcvp1202-vsva2785-3HP-e-S"
+exclusive = ["constraints/place/pins-metro.xdc"]
+"#,
+        )
+        .unwrap();
+        Utf8PathBuf::from_path_buf(ws).unwrap()
+    }
+
+    fn file_names(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn constraints_filter_by_active_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_constraints_ws(&tmp);
+
+        let place = design_place_constraints(&ws, Some("vpk120")).unwrap();
+        assert_eq!(file_names(&place), vec!["pins-vpk120.xdc", "timing.xdc"]);
+        let all = design_constraints(&ws, Some("vpk120")).unwrap();
+        assert_eq!(file_names(&all), vec!["pins-vpk120.xdc", "timing.xdc"]);
+
+        let place = design_place_constraints(&ws, Some("metro")).unwrap();
+        assert_eq!(file_names(&place), vec!["pins-metro.xdc", "timing.xdc"]);
+
+        // Same rule as VHDL: no active variant keeps only shared files.
+        let place = design_place_constraints(&ws, None).unwrap();
+        assert_eq!(file_names(&place), vec!["timing.xdc"]);
+    }
+
+    #[test]
+    fn constraints_all_variants_is_unfiltered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_constraints_ws(&tmp);
+        let all = design_constraints_all_variants(&ws).unwrap();
+        assert_eq!(
+            file_names(&all),
+            vec!["pins-metro.xdc", "pins-vpk120.xdc", "timing.xdc"]
+        );
+    }
+
+    #[test]
+    fn place_checkpoint_ignores_other_variants_constraints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_constraints_ws(&tmp);
+        let synth_dcp = ws.join("target/synth/top.dcp").into_std_path_buf();
+        let place_dcp = ws.join("target/place/top.dcp").into_std_path_buf();
+        std::fs::create_dir_all(synth_dcp.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(place_dcp.parent().unwrap()).unwrap();
+        std::fs::write(&synth_dcp, "").unwrap();
+        std::fs::write(&place_dcp, "").unwrap();
+        let v = Some("vpk120");
+        write_place_checkpoint_manifest(&ws, &place_dcp, &synth_dcp, v)
+            .unwrap();
+        assert!(!place_needs_update(&ws, &place_dcp, &synth_dcp, v).unwrap());
+
+        // The other board's pins aren't part of this build.
+        let place = ws.join("constraints/place");
+        std::fs::write(place.join("pins-metro.xdc"), "# edited\n").unwrap();
+        assert!(!place_needs_update(&ws, &place_dcp, &synth_dcp, v).unwrap());
+
+        // This board's pins are.
+        std::fs::write(place.join("pins-vpk120.xdc"), "# edited\n").unwrap();
+        assert!(place_needs_update(&ws, &place_dcp, &synth_dcp, v).unwrap());
+    }
+
+    #[test]
+    fn editor_variant_selects_requested_or_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_ws(&tmp);
+        let pick = |r: Option<&str>| editor_variant(&ws, r);
+        assert_eq!(pick(Some("metro")).variant.as_deref(), Some("metro"));
+        assert_eq!(pick(Some("metro")).warning, None);
+        assert_eq!(pick(None).variant.as_deref(), Some("vpk120"));
+        assert_eq!(pick(Some("  ")).variant.as_deref(), Some("vpk120"));
+
+        // Unknown name: default, plus a warning listing the choices.
+        let bad = pick(Some("metr"));
+        assert_eq!(bad.variant.as_deref(), Some("vpk120"));
+        let w = bad.warning.unwrap();
+        assert!(w.contains("variant `metr`"), "{w}");
+        assert!(w.contains("`vpk120`, `metro`"), "{w}");
+    }
+
+    #[test]
+    fn editor_variant_ignored_without_variants() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("vw.toml"),
+            "[workspace]\nname = \"ws\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let pick = editor_variant(&ws, Some("metro"));
+        assert_eq!(
+            pick,
+            EditorVariant {
+                variant: None,
+                warning: None
+            }
+        );
+    }
+
+    #[test]
+    fn exclusive_warnings_clean_for_working_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_constraints_ws(&tmp);
+        assert!(variant_exclusive_warnings(&ws).unwrap().is_empty());
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_variant_ws(&tmp);
+        assert!(variant_exclusive_warnings(&ws).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exclusive_warnings_flag_dead_and_duplicate_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("hdl")).unwrap();
+        std::fs::create_dir_all(ws.join("ip")).unwrap();
+        std::fs::write(ws.join("hdl/top-a.vhd"), "").unwrap();
+        std::fs::write(ws.join("hdl/shared.vhd"), "").unwrap();
+        std::fs::write(ws.join("ip/a.htcl"), "").unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "ws"
+version = "0.1.0"
+
+[[workspace.variants]]
+name = "a"
+part = "xcvp1202-vsva2785-2MHP-e-S"
+default = true
+exclusive = ["hdl/top-a.vhd", "hdl/top-a.vdh", "ip/a.htcl"]
+
+[[workspace.variants]]
+name = "b"
+part = "xcvp1202-vsva2785-3HP-e-S"
+exclusive = ["hdl/top-a.vhd"]
+"#,
+        )
+        .unwrap();
+        let ws = Utf8PathBuf::from_path_buf(ws.to_path_buf()).unwrap();
+        let w = variant_exclusive_warnings(&ws).unwrap();
+        assert_eq!(w.len(), 3, "{w:#?}");
+        assert!(
+            w[0].contains("`hdl/top-a.vdh` matches no files"),
+            "{}",
+            w[0]
+        );
+        assert!(
+            w[1].contains("`ip/a.htcl` has no effect")
+                && w[1].contains("matches only ip/a.htcl"),
+            "{}",
+            w[1]
+        );
+        assert!(
+            w[2].contains("`hdl/top-a.vhd` is exclusive to both `a` and `b`"),
+            "{}",
+            w[2]
+        );
     }
 
     #[test]
@@ -7710,7 +8719,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
     /// the `.xpr` is missing, so tests that want to exercise the
     /// manifest branch need one present.
     fn touch_placeholder_xpr(ws: &Utf8Path, name: &str) -> PathBuf {
-        let project_dir = vw_project_dir(ws);
+        let project_dir = vw_project_dir(ws, None);
         let inner = project_dir.join(name);
         std::fs::create_dir_all(inner.as_std_path()).unwrap();
         let xpr = inner.join(format!("{name}.xpr"));
@@ -7873,10 +8882,14 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
     fn project_needs_wipe_true_when_xpr_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
-        let project_dir = vw_project_dir(&ws);
-        assert!(
-            project_needs_wipe(&ws, project_dir.as_std_path(), "prws").unwrap()
-        );
+        let project_dir = vw_project_dir(&ws, None);
+        assert!(project_needs_wipe(
+            &ws,
+            project_dir.as_std_path(),
+            "prws",
+            None
+        )
+        .unwrap());
     }
 
     /// `.xpr` present but manifest missing → wipe. This is the
@@ -7887,7 +8900,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        assert!(project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// Fresh manifest matching current fingerprint → do NOT
@@ -7898,8 +8911,54 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
-        assert!(!project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
+        assert!(!project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
+    }
+
+    /// There's one persisted project per workspace, configured for
+    /// one variant. Switching variants must read as stale, or
+    /// `vw::configure_ip` keeps the other variant's IP.
+    #[test]
+    fn project_needs_wipe_when_variant_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_project_ws(&tmp);
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"prws\"\nversion = \"0.1.0\"\n\n\
+             [[workspace.variants]]\nname = \"vpk120\"\npart = \"p2\"\n\
+             default = true\n\n\
+             [[workspace.variants]]\nname = \"metro\"\npart = \"p3\"\n",
+        )
+        .unwrap();
+        let project_dir = touch_placeholder_xpr(&ws, "prws");
+        let wipe =
+            |v| project_needs_wipe(&ws, &project_dir, "prws", v).unwrap();
+
+        write_project_manifest(&ws, &project_dir, "prws", Some("vpk120"))
+            .unwrap();
+        assert!(!wipe(Some("vpk120")));
+        // `None` is the default variant — the same project.
+        assert!(!wipe(None));
+        assert!(wipe(Some("metro")));
+
+        write_project_manifest(&ws, &project_dir, "prws", Some("metro"))
+            .unwrap();
+        assert!(!wipe(Some("metro")));
+        assert!(wipe(Some("vpk120")));
+        assert!(wipe(None));
+    }
+
+    /// Workspaces without variants hash exactly as before, so an
+    /// upgrade doesn't wipe every existing project.
+    #[test]
+    fn project_fingerprint_unchanged_without_variants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_project_ws(&tmp);
+        let paths = project_source_paths(&ws).unwrap();
+        assert_eq!(
+            project_source_fingerprint(&ws, None).unwrap(),
+            fingerprint_paths(&ws, &paths),
+        );
     }
 
     /// Editing any `.htcl` under `<ws>/ip/` invalidates. Key
@@ -7910,9 +8969,9 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
         std::fs::write(ws.join("ip/cips.htcl"), "# cips updated\n").unwrap();
-        assert!(project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// Editing `vw.toml` (target-part, deps list, etc.) also
@@ -7923,13 +8982,13 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
         std::fs::write(
             ws.join("vw.toml"),
             "[workspace]\nname = \"prws\"\nversion = \"0.2.0\"\n",
         )
         .unwrap();
-        assert!(project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// Editing a workspace htcl OUTSIDE ip/ (e.g. design.htcl)
@@ -7943,9 +9002,9 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let ws = make_project_ws(&tmp);
         std::fs::write(ws.join("design.htcl"), "# design\n").unwrap();
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
         std::fs::write(ws.join("design.htcl"), "# design updated\n").unwrap();
-        assert!(!project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(!project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// The regression parallel to the synth case: rewriting an
@@ -7956,10 +9015,10 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         let tmp = tempfile::tempdir().unwrap();
         let ws = make_project_ws(&tmp);
         let project_dir = touch_placeholder_xpr(&ws, "prws");
-        write_project_manifest(&ws, &project_dir, "prws").unwrap();
+        write_project_manifest(&ws, &project_dir, "prws", None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(ws.join("ip/cips.htcl"), "# cips\n").unwrap();
-        assert!(!project_needs_wipe(&ws, &project_dir, "prws").unwrap());
+        assert!(!project_needs_wipe(&ws, &project_dir, "prws", None).unwrap());
     }
 
     /// Minimal workspace scaffold for `place_needs_update` tests:
@@ -7998,7 +9057,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8015,12 +9075,14 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             place_dcp.as_path(),
             synth_dcp.as_path(),
+            None,
         )
         .unwrap();
         assert!(!place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8038,6 +9100,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             place_dcp.as_path(),
             synth_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(
@@ -8048,7 +9111,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8067,13 +9131,15 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             place_dcp.as_path(),
             synth_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(&synth_dcp, "different bytes").unwrap();
         assert!(place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8092,13 +9158,15 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             place_dcp.as_path(),
             synth_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(ws.join("design.htcl"), "# design updated\n").unwrap();
         assert!(!place_needs_update(
             &ws,
             place_dcp.as_path(),
-            synth_dcp.as_path()
+            synth_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8139,7 +9207,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8156,12 +9225,14 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             route_dcp.as_path(),
             place_dcp.as_path(),
+            None,
         )
         .unwrap();
         assert!(!route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8179,6 +9250,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             route_dcp.as_path(),
             place_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(
@@ -8189,7 +9261,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8208,13 +9281,15 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             route_dcp.as_path(),
             place_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(&place_dcp, "different bytes").unwrap();
         assert!(route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8235,6 +9310,7 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
             &ws,
             route_dcp.as_path(),
             place_dcp.as_path(),
+            None,
         )
         .unwrap();
         std::fs::write(place_xdc_dir.join("place.xdc"), "# place updated\n")
@@ -8242,7 +9318,8 @@ exclusive = ["hdl/board-metro/**/*.vhd"]
         assert!(!route_needs_update(
             &ws,
             route_dcp.as_path(),
-            place_dcp.as_path()
+            place_dcp.as_path(),
+            None
         )
         .unwrap());
     }
@@ -8422,5 +9499,537 @@ mod download_tests {
             dest.join("meta_sync.vhd").exists(),
             "the pinned revision's sources are in the cache"
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_name_tests {
+    use super::*;
+
+    fn rejected(name: &str) -> String {
+        match validate_workspace_name(name) {
+            Err(message) => message,
+            Ok(()) => panic!("'{name}' was accepted"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_name_is_accepted() {
+        validate_workspace_name("redhawk").unwrap();
+    }
+
+    /// Hyphens are fine here, unlike in an environment name — that ban
+    /// exists because instance names are parsed by splitting on `-`,
+    /// and a workspace name never becomes part of one.
+    #[test]
+    fn a_hyphenated_name_is_accepted() {
+        validate_workspace_name("clk-wizard").unwrap();
+        validate_workspace_name("a1-b2-c3").unwrap();
+    }
+
+    #[test]
+    fn a_name_must_say_something() {
+        assert!(rejected("").contains("cannot be empty"));
+    }
+
+    /// A bucket name cannot end with a hyphen, and the workspace is
+    /// the tail of one.
+    #[test]
+    fn a_name_may_not_end_with_a_hyphen() {
+        assert!(rejected("redhawk-").contains("cannot end with '-'"));
+    }
+
+    #[test]
+    fn a_name_must_start_with_a_letter() {
+        assert!(rejected("2fast").contains("must start with"));
+        assert!(rejected("-leading").contains("must start with"));
+    }
+
+    #[test]
+    fn uppercase_and_underscores_are_out() {
+        assert!(rejected("Redhawk").contains("must start with"));
+        assert!(rejected("red_hawk").contains("cannot contain '_'"));
+        assert!(rejected("redHawk").contains("cannot contain 'H'"));
+    }
+
+    /// The one in `docs/snippets/vw.toml` until this landed, and the
+    /// reason a name has to be checked before it becomes a directory.
+    #[test]
+    fn a_name_that_is_a_path_component_is_out() {
+        assert!(rejected(".").contains("must start with"));
+        assert!(rejected("..").contains("must start with"));
+        assert!(rejected("a/b").contains("cannot contain '/'"));
+    }
+
+    #[test]
+    fn a_name_too_long_for_a_bucket_is_out() {
+        let long = "a".repeat(MAX_WORKSPACE_NAME + 1);
+        assert!(rejected(&long).contains("the limit is"));
+        validate_workspace_name(&"a".repeat(MAX_WORKSPACE_NAME)).unwrap();
+    }
+
+    /// The loader is where the invariant is actually held: a bad name
+    /// stops every command, not only the ones that reach the cloud.
+    #[test]
+    fn the_loader_refuses_a_bad_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = Utf8Path::from_path(dir.path()).unwrap();
+        fs::write(
+            dir.join("vw.toml"),
+            "[workspace]\nname = \"Red_Hawk\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let e = load_workspace_config(dir).unwrap_err();
+        assert!(e.to_string().contains("Red_Hawk"), "{e}");
+    }
+
+    /// And `vw init` refuses it first, so nobody ends up with a
+    /// workspace that cannot be opened again.
+    #[test]
+    fn init_refuses_a_name_the_loader_would_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = Utf8Path::from_path(dir.path()).unwrap();
+
+        let e =
+            init_workspace(dir, String::from("Red_Hawk"), None).unwrap_err();
+
+        assert!(e.to_string().contains("Red_Hawk"), "{e}");
+        assert!(!dir.join("vw.toml").exists(), "a vw.toml was left behind");
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f.tcl");
+        write_atomic(&path, b"one").unwrap();
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        let entries: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "a temporary was left behind");
+    }
+
+    /// Every cloud session's implicit dependency fetch writes the lock;
+    /// one that hasn't changed is left exactly as it is.
+    #[test]
+    fn an_unchanged_lock_is_not_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let lock = LockFile {
+            dependencies: BTreeMap::new(),
+        };
+        write_lock_file(&ws, &lock).unwrap();
+        let path = ws.join("vw.lock");
+        let old = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_000_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        write_lock_file(&ws, &lock).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), old);
+    }
+}
+
+/// Per-variant build directories (`build_dir`), exercised on a small
+/// synthetic two-variant workspace shaped after redhawk-metroid: both
+/// variants generate IP with the *same* names (redhawk's `txr0` is a
+/// dual-quad transceiver on vpk120 and a single-quad one on metro), so
+/// anything that mixes the two variants' outputs shows up as the wrong
+/// wrapper or a duplicate entity rather than as a missing file.
+#[cfg(test)]
+mod variant_build_dir_tests {
+    use super::*;
+
+    /// `alpha` (default) and `beta`, each owning a top-level file.
+    fn two_variant_ws(tmp: &tempfile::TempDir) -> Utf8PathBuf {
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            r#"
+[workspace]
+name = "twin"
+version = "0.1.0"
+
+[[workspace.variants]]
+name = "alpha"
+part = "xcvp1202-vsva2785-2MHP-e-S"
+top = "top_alpha"
+default = true
+exclusive = ["hdl/top-alpha.vhd"]
+
+[[workspace.variants]]
+name = "beta"
+part = "xcvp1202-vsva2785-3HP-e-S"
+top = "top_beta"
+exclusive = ["hdl/top-beta.vhd"]
+"#,
+        )
+        .unwrap();
+        let hdl = ws.join("hdl");
+        std::fs::create_dir_all(&hdl).unwrap();
+        std::fs::write(hdl.join("shared.vhd"), "").unwrap();
+        std::fs::write(hdl.join("top-alpha.vhd"), "").unwrap();
+        std::fs::write(hdl.join("top-beta.vhd"), "").unwrap();
+        ws
+    }
+
+    fn write(path: &Utf8Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// What one Vivado IP pass leaves in a build directory: a
+    /// `make_wrapper` output under `ip/`, the block design's own
+    /// wrapper inside the project's generated sources, and a
+    /// standalone IP's instantiation template.
+    fn generate_ip(ws: &Utf8Path, variant: &str, flavor: &str) {
+        let build = ws.join("target").join(variant);
+        write(
+            &build.join("ip/txr0/wrapper.vhd"),
+            &format!("-- txr0 ({flavor})\nentity txr0 is end;\n"),
+        );
+        let gen = build.join("vw-project/twin/twin.gen/sources_1");
+        write(
+            &gen.join("bd/txr0/hdl/txr0_wrapper.vhd"),
+            &format!("-- {flavor}\nentity txr0_wrapper is end;\n"),
+        );
+        write(
+            &gen.join("ip/clk_eth/clk_eth.vho"),
+            "COMPONENT clk_eth\n  PORT (\n    clk_in : IN STD_LOGIC\n  );\n\
+             END COMPONENT;\n",
+        );
+    }
+
+    fn rel(ws: &Utf8Path, paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| p.strip_prefix(ws).unwrap().display().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn build_dir_is_per_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        assert_eq!(build_dir(&ws, Some("beta")), ws.join("target/beta"));
+        assert_eq!(build_dir(&ws, Some("alpha")), ws.join("target/alpha"));
+        // No variant named: the default one's.
+        assert_eq!(build_dir(&ws, None), ws.join("target/alpha"));
+        assert_eq!(
+            build_dirs(&ws),
+            vec![ws.join("target/alpha"), ws.join("target/beta")]
+        );
+        assert_eq!(
+            vw_project_dir(&ws, Some("beta")),
+            ws.join("target/beta/vw-project")
+        );
+    }
+
+    #[test]
+    fn workspaces_without_variants_keep_the_flat_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"flat\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(build_dir(&ws, None), ws.join("target"));
+        assert_eq!(build_dirs(&ws), vec![ws.join("target")]);
+        assert_eq!(vw_project_dir(&ws, None), ws.join("target/vw-project"));
+        // And nothing to migrate.
+        write(&ws.join("target/ip/a/wrapper.vhd"), "");
+        assert_eq!(migrate_flat_build_output(&ws), FlatMigration::default());
+        assert!(ws.join("target/ip/a/wrapper.vhd").exists());
+    }
+
+    #[test]
+    fn variant_names_must_make_safe_directories() {
+        let parse = |name: &str| {
+            let toml = format!(
+                "[workspace]\nname = \"w\"\nversion = \"0.1.0\"\n\n\
+                 [[workspace.variants]]\nname = \"{name}\"\npart = \"p\"\n"
+            );
+            let cfg: WorkspaceConfig = toml::from_str(&toml).unwrap();
+            validate_variant_shape(&cfg.workspace)
+        };
+        for ok in ["vpk120", "metro", "rev-2.1", "a_b"] {
+            assert!(parse(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in ["", "..", "a/b", "-x", "ip", "vw-project", "synth", "logs"]
+        {
+            assert!(parse(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn each_variant_sees_only_its_own_ip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        generate_ip(&ws, "alpha", "dual-quad");
+        generate_ip(&ws, "beta", "single-quad");
+
+        assert_eq!(
+            rel(&ws, &vhdl_ip_sources(&ws, Some("alpha")).unwrap()),
+            ["target/alpha/ip/txr0/wrapper.vhd"]
+        );
+        assert_eq!(
+            rel(&ws, &vhdl_ip_sources(&ws, Some("beta")).unwrap()),
+            ["target/beta/ip/txr0/wrapper.vhd"]
+        );
+        assert_eq!(
+            rel(&ws, &vivado_generated_sources(&ws, Some("beta")).unwrap()),
+            [
+                "target/beta/vw-project/twin/twin.gen/sources_1/bd/txr0/hdl/\
+              txr0_wrapper.vhd"
+            ]
+        );
+    }
+
+    /// What the analyzer and `vw check` hand vhdl_lang: one variant's
+    /// design files AND its generated IP, never both variants' — two
+    /// `entity txr0` would be a duplicate declaration.
+    #[test]
+    fn vhdl_config_pairs_design_files_with_their_variants_ip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        generate_ip(&ws, "alpha", "dual-quad");
+        generate_ip(&ws, "beta", "single-quad");
+
+        for (variant, other) in [("alpha", "beta"), ("beta", "alpha")] {
+            let cfg = render_vhdl_ls_config(&ws, Some(variant), false).unwrap();
+            let files: Vec<String> = cfg
+                .libraries
+                .values()
+                .flat_map(|lib| rel(&ws, &lib.files))
+                .collect();
+            let ip = rel(&ws, &cfg.libraries["ip"].files);
+            assert_eq!(ip, [format!("target/{variant}/ip/txr0/wrapper.vhd")]);
+            assert!(files.contains(&format!("hdl/top-{variant}.vhd")));
+            assert!(
+                !files.iter().any(|f| f.contains(other)),
+                "{variant} config reaches into {other}: {files:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stubs_are_written_in_every_variants_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        generate_ip(&ws, "alpha", "dual-quad");
+        generate_ip(&ws, "beta", "single-quad");
+        assert_eq!(write_ip_stubs_from_templates(&ws).unwrap(), 2);
+        for v in ["alpha", "beta"] {
+            assert!(ws
+                .join(format!(
+                    "target/{v}/vw-project/twin/twin.gen/sources_1/ip/\
+                     clk_eth/clk_eth_stub.vhdl"
+                ))
+                .exists());
+        }
+        // Content-aware: nothing to rewrite the second time.
+        assert_eq!(write_ip_stubs_from_templates(&ws).unwrap(), 0);
+    }
+
+    /// The point of the whole layout: going alpha → beta → alpha keeps
+    /// alpha's configured project instead of wiping and regenerating it.
+    #[test]
+    fn switching_variants_keeps_each_configured_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        let configure = |variant: &str| {
+            let prep =
+                prepare_vw_project_dir(&ws, "twin", Some(variant)).unwrap();
+            assert_eq!(
+                prep.project_dir,
+                ws.join(format!("target/{variant}/vw-project"))
+            );
+            // What Vivado + `vw::mark_project_configured` leave behind.
+            let xpr = vw_project_xpr(prep.project_dir.as_std_path(), "twin");
+            if !xpr.exists() {
+                write(&Utf8PathBuf::from_path_buf(xpr).unwrap(), "");
+                write_project_manifest(
+                    &ws,
+                    prep.project_dir.as_std_path(),
+                    "twin",
+                    Some(variant),
+                )
+                .unwrap();
+            }
+            prep
+        };
+        configure("alpha");
+        configure("beta");
+        let again = configure("alpha");
+        assert!(again.wiped_project.is_none(), "alpha's project was wiped");
+        let again = configure("beta");
+        assert!(again.wiped_project.is_none(), "beta's project was wiped");
+
+        // An IP config change still invalidates — per variant.
+        write(&ws.join("ip/module.htcl"), "# changed");
+        assert!(configure("alpha").wiped_project.is_some());
+    }
+
+    #[test]
+    fn a_checkpoint_only_depends_on_its_own_variants_ip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        generate_ip(&ws, "alpha", "dual-quad");
+        generate_ip(&ws, "beta", "single-quad");
+        let alpha = synth_source_fingerprint(&ws, Some("alpha")).unwrap();
+
+        write(
+            &ws.join("target/beta/ip/txr0/wrapper.vhd"),
+            "-- regenerated",
+        );
+        assert_eq!(
+            synth_source_fingerprint(&ws, Some("alpha")).unwrap(),
+            alpha
+        );
+
+        write(
+            &ws.join("target/alpha/ip/txr0/wrapper.vhd"),
+            "-- regenerated",
+        );
+        assert_ne!(
+            synth_source_fingerprint(&ws, Some("alpha")).unwrap(),
+            alpha
+        );
+    }
+
+    /// redhawk-metroid as found: a flat `target/` from before variants
+    /// had their own directories. Its `ip/` held metro's wrappers —
+    /// not the default variant's — with no project manifest to say so.
+    #[test]
+    fn flat_output_moves_into_the_default_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        write(&ws.join("target/ip/txr0/wrapper.vhd"), "-- beta's, really");
+        write(
+            &ws.join("target/vw-project/twin/twin.gen/sources_1/ip/clk_eth/clk_eth_stub.vhdl"),
+            "",
+        );
+        write(&ws.join("target/synth/top_alpha.dcp"), "checkpoint");
+        write(&ws.join("target/reports/worst-paths.csv"), "");
+        write(&ws.join("target/logs/vivado-1.log"), "");
+        // Already per-variant: left alone, not clobbered.
+        write(&ws.join("target/alpha/image/alpha.pdi"), "new");
+        write(&ws.join("target/image/alpha.pdi"), "old");
+
+        let done = migrate_flat_build_output(&ws);
+        let names = |dirs: &[Utf8PathBuf]| -> Vec<String> {
+            let mut v: Vec<String> = dirs
+                .iter()
+                .map(|d| d.strip_prefix(&ws).unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&done.moved), ["target/reports", "target/synth"]);
+        // Unprovable IP is dropped rather than filed under a guess.
+        assert_eq!(names(&done.discarded), ["target/ip", "target/vw-project"]);
+        assert!(!ws.join("target/ip").exists());
+        assert!(!ws.join("target/alpha/ip").exists());
+
+        let alpha = ws.join("target/alpha");
+        assert_eq!(
+            std::fs::read_to_string(alpha.join("synth/top_alpha.dcp")).unwrap(),
+            "checkpoint"
+        );
+        assert_eq!(
+            std::fs::read_to_string(alpha.join("image/alpha.pdi")).unwrap(),
+            "new"
+        );
+        assert!(ws.join("target/image/alpha.pdi").exists());
+        // Not build output: REPL logs stay put.
+        assert!(ws.join("target/logs/vivado-1.log").exists());
+        // Nothing left to do.
+        assert_eq!(migrate_flat_build_output(&ws), FlatMigration::default());
+    }
+
+    /// A flat project whose manifest was written for the default
+    /// variant (the project fingerprint includes it) is provably that
+    /// variant's: it moves, wrappers and all, and isn't regenerated.
+    #[test]
+    fn flat_ip_proven_to_be_the_defaults_moves_with_its_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        let flat = ws.join("target/vw-project");
+        write(
+            &Utf8PathBuf::from_path_buf(vw_project_xpr(
+                flat.as_std_path(),
+                "twin",
+            ))
+            .unwrap(),
+            "",
+        );
+        write_project_manifest(&ws, flat.as_std_path(), "twin", Some("alpha"))
+            .unwrap();
+        write(&ws.join("target/ip/txr0/wrapper.vhd"), "-- alpha's");
+
+        let done = migrate_flat_build_output(&ws);
+        assert_eq!(
+            done.moved,
+            vec![ws.join("target/vw-project"), ws.join("target/ip")]
+        );
+        assert!(done.discarded.is_empty());
+        assert!(!project_needs_wipe(
+            &ws,
+            vw_project_dir(&ws, Some("alpha")).as_std_path(),
+            "twin",
+            Some("alpha")
+        )
+        .unwrap());
+        assert!(ws.join("target/alpha/ip/txr0/wrapper.vhd").exists());
+    }
+
+    /// Written for another variant: not the default's, so not moved.
+    #[test]
+    fn flat_ip_proven_to_be_another_variants_is_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        let flat = ws.join("target/vw-project");
+        write(
+            &Utf8PathBuf::from_path_buf(vw_project_xpr(
+                flat.as_std_path(),
+                "twin",
+            ))
+            .unwrap(),
+            "",
+        );
+        write_project_manifest(&ws, flat.as_std_path(), "twin", Some("beta"))
+            .unwrap();
+        write(&ws.join("target/ip/txr0/wrapper.vhd"), "-- beta's");
+
+        let done = migrate_flat_build_output(&ws);
+        assert!(done.moved.is_empty());
+        assert_eq!(done.discarded.len(), 2);
+        assert!(!ws.join("target/alpha/ip").exists());
+    }
+
+    /// The migration runs where projects are opened, so a service that
+    /// already holds a flat project carries it over on first use.
+    #[test]
+    fn preparing_a_project_migrates_flat_output_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        write(&ws.join("target/synth/top_alpha.dcp"), "checkpoint");
+        write(&ws.join("target/ip/bd/legacy.bd"), "");
+        let prep = prepare_vw_project_dir(&ws, "twin", None).unwrap();
+        assert_eq!(prep.migrated.moved, vec![ws.join("target/synth")]);
+        assert_eq!(prep.migrated.discarded, vec![ws.join("target/ip")]);
+        assert!(ws.join("target/alpha/synth/top_alpha.dcp").exists());
+        // Legacy caches are removed before the move, not carried along.
+        assert_eq!(prep.legacy_cache_removed, 1);
+        assert!(!ws.join("target/alpha/ip/bd").exists());
     }
 }

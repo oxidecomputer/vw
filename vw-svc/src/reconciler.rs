@@ -71,6 +71,22 @@ impl InstanceReconciler {
         let current = session.get_instances().await?;
         let plan = self.plan(&target, &current, log);
 
+        // Every environment's key, on every pass, rather than only the ones
+        // whose instances are about to be made. The silo key list is not
+        // scoped by project, so it is shared mutable state that something
+        // else can damage -- and something did: a vw-svc predating deployment
+        // names claims every key beginning `vwsvc-`, which since deployment
+        // names arrived is every deployment's. Registering only at create
+        // time made that permanent, because an instance reads its keys once
+        // at boot and the environment never asks again. Doing it here means a
+        // key that goes missing is back within a tick, and the create that
+        // follows finds it.
+        //
+        // Before anything concurrent, for the reason it was before the
+        // creates when it lived there: an environment's three instances share
+        // one key, and racing to register it is how two of them fail.
+        session.ensure_ssh_keys(&target, log).await?;
+
         // Before acting, not after: the writes describe state read at the top
         // of this pass, and `execute` can spend a long time waiting on the
         // control plane. Deferring them would leave the environment looking
@@ -199,7 +215,7 @@ impl InstanceReconciler {
 /// Reject an environment name that would not survive the instance naming
 /// scheme.
 ///
-/// Instance names are `vwsvc-{user}-{env}-{kind}`, and they are taken back
+/// Instance names are `{prefix}-{user}-{env}-{kind}`, and they are taken back
 /// apart from the right so that a username may contain `-`. That only works if
 /// the environment name does not — otherwise the split lands in the wrong
 /// place and one environment can be mistaken for another. The remaining rules
@@ -260,6 +276,54 @@ pub(crate) fn validate_user_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The longest name the Oxide control plane will accept.
+const MAX_OBJECT_NAME: usize = 63;
+
+/// Reject an environment whose objects would not fit an Oxide name.
+///
+/// Four things go into an instance name — the deployment prefix, the user, the
+/// environment and the kind — and only two of them are the caller's. A long
+/// Github username can leave very little room, and the deployment prefix takes
+/// its share before anyone gets to choose anything.
+///
+/// Checked here rather than left to the control plane because of when the
+/// control plane would say so. Every field is individually legal, so the
+/// environment is accepted, recorded, and only fails on the reconciler's next
+/// pass as a 400 against a name nobody asked for by hand. Said here it names
+/// the field to shorten while there is still something to shorten.
+///
+/// The longest name is the instance's, so the ssh key's — which is the same
+/// name without a kind — is covered by checking it.
+pub(crate) fn validate_object_names(
+    user: &str,
+    environment: &str,
+) -> Result<(), String> {
+    let longest = InstanceKind::ALL
+        .iter()
+        .map(|kind| {
+            format!(
+                "{}-{}-{}-{}",
+                ox::instance_prefix(),
+                user,
+                environment,
+                kind
+            )
+        })
+        .max_by_key(String::len)
+        .expect("there is at least one instance kind");
+
+    if longest.len() > MAX_OBJECT_NAME {
+        let over = longest.len() - MAX_OBJECT_NAME;
+        return Err(format!(
+            "environment '{environment}' would need the instance name \
+             '{longest}', which is {} characters where the rack allows \
+             {MAX_OBJECT_NAME}; a name {over} shorter would fit",
+            longest.len(),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether the db's record of an instance already matches the rack's.
 fn same_state(
     recorded: &Option<OxideInstance>,
@@ -314,9 +378,18 @@ impl InstanceKind {
     /// work it does is moving bytes between a socket and a disk. Sizing it
     /// like a build machine only takes cores away from environments that
     /// would use them.
+    ///
+    /// Vivado gets twice the memory of the kernel build. One environment runs
+    /// every variant's build, and two concurrent Versal synths of redhawk
+    /// saturated 32 GiB — even with `synth.maxThreads` cut, since synthesis
+    /// splits the same work over however many workers it has.
     pub(crate) fn shape(&self) -> Shape {
         match self {
-            Self::Vivado | Self::Helios => Shape {
+            Self::Vivado => Shape {
+                vcpus: 16,
+                memory_gib: 64,
+            },
+            Self::Helios => Shape {
                 vcpus: 16,
                 memory_gib: 32,
             },
@@ -386,8 +459,18 @@ impl UserInstance {
     ///
     /// One key per environment rather than per instance, so a user has a
     /// single key to fetch and use against all three.
+    ///
+    /// The prefix is the deployment's, not a constant: the silo key list is
+    /// the token's user's and is not scoped by project, so this name is the
+    /// only thing keeping a beta service beside production from reaping
+    /// production's keys.
     pub(crate) fn ssh_key_name(&self) -> String {
-        format!("{}-{}-{}", ox::INSTANCE_PREFIX, self.user, self.environment)
+        format!(
+            "{}-{}-{}",
+            ox::ssh_key_prefix(),
+            self.user,
+            self.environment
+        )
     }
 
     /// The hostname the instance sees itself as.
@@ -410,7 +493,7 @@ impl UserInstance {
     pub(crate) fn oxide_instance_name(&self) -> String {
         format!(
             "{}-{}-{}-{}",
-            ox::INSTANCE_PREFIX,
+            ox::instance_prefix(),
             self.user,
             self.environment,
             self.kind
@@ -496,11 +579,6 @@ impl PassAction {
         // different functions cannot share a `Vec` without being boxed.
         // `FuturesUnordered` of boxed futures lets them all run together and
         // report back as they finish.
-        // Before anything concurrent: an environment's instances share one
-        // ssh key, and racing to register it is how two of the three end up
-        // failing.
-        session.ensure_ssh_keys(&self.to_create, log).await?;
-
         let mut tasks = FuturesUnordered::new();
         for inst in self.to_create.iter() {
             tasks.push(boxed(labeled(
@@ -830,7 +908,7 @@ mod test {
         for kind in InstanceKind::ALL {
             let original = instance("ferris", "alpha", kind, None);
             let name = original.oxide_instance_name();
-            assert_eq!(name, format!("vwsvc-ferris-alpha-{kind}"));
+            assert_eq!(name, format!("vwsvc-test-ferris-alpha-{kind}"));
 
             let parsed =
                 crate::oxide::parse_instance_name(&name).expect("parses back");
@@ -846,10 +924,10 @@ mod test {
         // pass would delete somebody else's work.
         for name in [
             "some-other-instance",
-            "vwsvc-ferris-alpha",
-            "vwsvc-ferris-alpha-vivado-extra",
-            "vwsvc-ferris-alpha-mystery",
-            "notvwsvc-ferris-alpha-vivado",
+            "vwsvc-test-ferris-alpha",
+            "vwsvc-test-ferris-alpha-vivado-extra",
+            "vwsvc-test-ferris-alpha-mystery",
+            "notvwsvc-test-ferris-alpha-vivado",
         ] {
             assert!(
                 crate::oxide::parse_instance_name(name).is_none(),
@@ -899,7 +977,7 @@ mod test {
         // reconciler would then recreate it on every pass.
         let original = instance("foo-bar", "alpha", InstanceKind::Vivado, None);
         let name = original.oxide_instance_name();
-        assert_eq!(name, "vwsvc-foo-bar-alpha-vivado");
+        assert_eq!(name, "vwsvc-test-foo-bar-alpha-vivado");
 
         let parsed =
             crate::oxide::parse_instance_name(&name).expect("parses back");

@@ -13,11 +13,12 @@ Wants=network-online.target
 [Service]
 Type=exec
 
-# Root because of the certificate. Certbot keeps /etc/letsencrypt/live and
-# archive at 0700 root and re-creates them on every renewal, so a
-# group-readable arrangement made once does not survive the first renewal --
-# and the alternative, handing the service a copy, is a copy that cannot be
-# hot-reloaded. The sandboxing below gives back most of what this costs.
+# Root because of the certificate, and because the user API answers on 443.
+# Certbot keeps /etc/letsencrypt/live and archive at 0700 root and re-creates
+# them on every renewal, so a group-readable arrangement made once does not
+# survive the first renewal -- and the alternative, handing the service a copy,
+# is a copy that cannot be hot-reloaded. The sandboxing below gives back most
+# of what this costs.
 User=root
 
 # 0600, because it holds the rack token.
@@ -29,9 +30,13 @@ EnvironmentFile=/etc/vw-svc/vw-svc.env
 #
 # --db-path is fixed here rather than left to the environment file because it
 # follows from StateDirectory below, and is not something a site chooses.
+#
+# $VW_SVC_DEPLOYMENT is the one variable with no sensible empty value: the
+# service refuses to start without --deployment, because a service that guessed
+# would name and reap Oxide objects as a deployment it is not.
 ExecStart=/usr/local/bin/vw-svc serve \
     --db-path /var/lib/vw-svc/vw-svc.redb \
-    $VW_SVC_TLS $VW_SVC_RACK $VW_SVC_ADMINS $VW_SVC_EXTRA
+    $VW_SVC_DEPLOYMENT $VW_SVC_TLS $VW_SVC_RACK $VW_SVC_ADMINS $VW_SVC_EXTRA
 
 # Creates /var/lib/vw-svc on every start. The environment database lives here
 # and outlives the service: it is the record of which environments exist.

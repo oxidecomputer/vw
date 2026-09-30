@@ -112,8 +112,38 @@ pub async fn run_nvc_elab(
     testbench_name: &str,
     capture_output: bool,
 ) -> Result<Option<(Vec<u8>, Vec<u8>)>, VwError> {
+    run_nvc_elab_with_generics(
+        std,
+        build_dir,
+        lib_name,
+        testbench_name,
+        &[],
+        capture_output,
+    )
+    .await
+}
+
+/// Elaborate `testbench_name`, overriding generics on the way in.
+///
+/// A testbench that drives a design entity directly has no wrapper to supply
+/// the entity's generics through, so it has to set them at elaboration. Every
+/// other caller goes through [`run_nvc_elab`] and passes none.
+pub async fn run_nvc_elab_with_generics(
+    std: VhdlStandard,
+    build_dir: &str,
+    lib_name: &str,
+    testbench_name: &str,
+    generics: &[(String, String)],
+    capture_output: bool,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, VwError> {
     let mut args = get_base_nvc_cmd_args(std, build_dir, lib_name);
     args.push("-e".to_string());
+    // Before the unit name: nvc reads `-g` as an option of the elaborate
+    // command, and anything after the unit belongs to the next one.
+    for (name, value) in generics {
+        args.push("-g".to_string());
+        args.push(format!("{name}={value}"));
+    }
     args.push(testbench_name.to_owned());
 
     if capture_output {
@@ -184,6 +214,61 @@ pub async fn run_nvc_sim(
     } else {
         let status = run_cmd(&args, envs.as_ref()).await?;
 
+        if !status.success() {
+            let cmd_str = format!("nvc {}", args.join(" "));
+            return Err(VwError::NvcSimulation { command: cmd_str });
+        }
+        Ok(None)
+    }
+}
+
+/// Run a design entity under NVC with a Rust cosim driver loaded.
+///
+/// The entity is the top level — there is no VHDL harness — so the driver is
+/// the only thing that touches its ports. Unlike [`run_nvc_cosim`] this still
+/// writes an FST, because a digital bench is read by looking at waveforms and
+/// there is no Xyce output standing in for them.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_nvc_driven(
+    std: VhdlStandard,
+    build_dir: &str,
+    lib_name: &str,
+    entity_name: &str,
+    driver_lib_path: &str,
+    wave_dir: &str,
+    runtime_flags: &[String],
+    capture_output: bool,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, VwError> {
+    let mut args = get_base_nvc_cmd_args(std, build_dir, lib_name);
+    args.push("-r".to_string());
+    args.push(entity_name.to_string());
+
+    for flag in runtime_flags {
+        args.push(flag.clone());
+    }
+
+    args.push("--dump-arrays".to_string());
+    args.push("--format=fst".to_string());
+    args.push(format!("--wave={wave_dir}/{entity_name}.fst"));
+    args.push(format!("--load={driver_lib_path}"));
+
+    let envs = vec![
+        ("GPI_USERS".to_string(), driver_lib_path.to_string()),
+        ("COCOTB_RUST_MODE".to_string(), "1".to_string()),
+        ("RUST_COSIM_OUTPUT_DIR".to_string(), wave_dir.to_string()),
+    ];
+
+    if capture_output {
+        let output = run_cmd_w_output(&args, Some(&envs)).await?;
+        if !output.status.success() {
+            let cmd_str = format!("nvc {}", args.join(" "));
+            std::io::stdout().write_all(&output.stdout)?;
+            std::io::stderr().write_all(&output.stderr)?;
+            return Err(VwError::NvcSimulation { command: cmd_str });
+        }
+        Ok(Some((output.stdout, output.stderr)))
+    } else {
+        let status = run_cmd(&args, Some(&envs)).await?;
         if !status.success() {
             let cmd_str = format!("nvc {}", args.join(" "));
             return Err(VwError::NvcSimulation { command: cmd_str });

@@ -420,6 +420,13 @@ fn materialized_cache_entry(cache: &Path, name: &str) -> Option<PathBuf> {
         if !entry.path().is_dir() {
             continue;
         }
+        // Existing is not the same as finished. A tree still being
+        // copied into the cache, or one left behind by a download that
+        // was killed, resolves imports against half a dependency and
+        // reports errors about a file that is merely not there yet.
+        if !vw_lib::depcache::is_complete(&entry.path()) {
+            continue;
+        }
         let mtime = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -531,6 +538,9 @@ mod tests {
     ) -> PathBuf {
         let root = cache.join(format!("{name}-{sha}"));
         fs::create_dir_all(&root).unwrap();
+        // What publishing leaves behind, and what the cache walk goes
+        // by: an entry without it is one no reader will pick up.
+        fs::write(root.join(vw_lib::depcache::COMPLETE_MARKER), []).unwrap();
         fs::write(
             root.join("vw.toml"),
             format!("[workspace]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),

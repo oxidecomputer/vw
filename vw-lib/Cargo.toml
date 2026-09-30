@@ -14,6 +14,9 @@ anodizer.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+# Used by bench_init to add a crate to bench/Cargo.toml without
+# reformatting the rest of it.
+toml_edit = "0.22"
 tokio.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
