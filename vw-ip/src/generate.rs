@@ -177,6 +177,16 @@ fn append_dict_sub_procs(
         if schema.fields.is_empty() {
             continue;
         }
+        // The CSV-driven schemas are discovered from the Xilinx data
+        // tree, not the component, so every IP under that tree gets
+        // offered them. Only emit for components that declare the
+        // param.
+        if !component
+            .component_parameters()
+            .any(|p| &p.name == param_name)
+        {
+            continue;
+        }
         writeln!(out).unwrap();
         // Top-level dict-schema procs (PS_PMC_CONFIG, etc.) live
         // directly under `<ip>::` — pass an empty namespace prefix.
@@ -362,6 +372,18 @@ fn emit_dict_sub_proc(
     // `emit_split_node_constructor` — same shape, same reason.
     for (raw_name, sub_ret_ty) in &sub_ctors {
         let arg = lowercase_ident(raw_name);
+        let unwrapped = format!("[{sub_ret_ty}::to -v ${arg}]");
+        // Pair-list sub-schemas (CIPS compound fields) re-encode the
+        // flat dict as `{KEY VAL} {KEY VAL}` — the only form Vivado
+        // honors for those; the flat form is silently ignored.
+        let value = if schema.sub_schemas[raw_name].pair_list {
+            format!(
+                "[lmap {{__vw_k __vw_v}} {unwrapped} \
+                 {{list $__vw_k $__vw_v}}]"
+            )
+        } else {
+            unwrapped
+        };
         // Wrap the dict-set in a `catch` that prepends the HTCL
         // arg name on error. Historically fired on the
         // `Properties::to_raw` mistake above; retained
@@ -373,8 +395,7 @@ fn emit_dict_sub_proc(
             body,
             "if {{${{__vw_kw_{arg}_set}}}} {{\n      \
                 if {{[catch {{\n        \
-                    dict set _vw_d {raw_name} \
-                    [{sub_ret_ty}::to -v ${arg}]\n      \
+                    dict set _vw_d {raw_name} {value}\n      \
                 }} __vw_msg]}} {{\n        \
                     error \"{arg}.$__vw_msg\"\n      \
                 }}\n    \
@@ -1589,6 +1610,7 @@ fn build_split_dict_schemas(
                 crate::DictSchema {
                     fields: Vec::new(),
                     sub_schemas: sub,
+                    pair_list: false,
                 },
             );
         }
@@ -2426,10 +2448,18 @@ fn dict_props_name(
 }
 
 /// Local (unqualified) form of the dict-schema newtype name —
-/// PascalCase of the param name.
+/// PascalCase of the param name. An underscore between two digits is
+/// kept so distinct params stay distinct: CIPS has both
+/// `PMC_TAMPER_SUP1_1` (`PmcTamperSup1_1`) and `PMC_TAMPER_SUP11`
+/// (`PmcTamperSup11`).
 fn dict_props_local(param_name: &str) -> String {
     let mut out = String::new();
     for seg in param_name.split('_').filter(|s| !s.is_empty()) {
+        if out.ends_with(|c: char| c.is_ascii_digit())
+            && seg.starts_with(|c: char| c.is_ascii_digit())
+        {
+            out.push('_');
+        }
         out.push_str(&pascal_case(seg));
     }
     out
@@ -3664,6 +3694,7 @@ mod tests {
                 },
             ],
             sub_schemas: Default::default(),
+            pair_list: false,
         };
         let opts = GenerateOptions::default();
         extrapolate_quad_schema(&mut schema, &component, "", &opts);
@@ -3676,5 +3707,54 @@ mod tests {
                 f.enum_values,
             );
         }
+    }
+
+    #[test]
+    fn dict_props_local_keeps_digit_boundaries() {
+        assert_eq!(dict_props_local("PS_PMC_CONFIG"), "PsPmcConfig");
+        assert_eq!(
+            dict_props_local("PMC_CLKMON0_CONFIG_1"),
+            "PmcClkmon0Config1"
+        );
+        // These two must not collide.
+        assert_eq!(dict_props_local("PMC_TAMPER_SUP1_1"), "PmcTamperSup1_1");
+        assert_eq!(dict_props_local("PMC_TAMPER_SUP11"), "PmcTamperSup11");
+    }
+
+    #[test]
+    fn pair_list_sub_schema_merges_as_list_of_pairs() {
+        let sub = crate::DictSchema {
+            fields: vec![crate::DictField {
+                name: "ENABLE".into(),
+                default: "0".into(),
+                ..Default::default()
+            }],
+            sub_schemas: Default::default(),
+            pair_list: true,
+        };
+        let schema = crate::DictSchema {
+            fields: Vec::new(),
+            sub_schemas: [("PMC_I2CPMC_PERIPHERAL".to_string(), sub)]
+                .into_iter()
+                .collect(),
+            pair_list: false,
+        };
+        let mut out = String::new();
+        emit_dict_sub_proc(
+            &mut out,
+            "versal_cips",
+            &[],
+            "PS_PMC_CONFIG",
+            &schema,
+            &GenerateOptions::default(),
+        );
+        assert!(
+            out.contains(
+                "dict set _vw_d PMC_I2CPMC_PERIPHERAL [lmap {__vw_k __vw_v} \
+                 [versal_cips::ps_pmc_config::PmcI2cpmcPeripheral::to \
+                 -v $pmc_i2cpmc_peripheral] {list $__vw_k $__vw_v}]"
+            ),
+            "{out}"
+        );
     }
 }

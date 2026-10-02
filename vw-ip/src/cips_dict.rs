@@ -30,7 +30,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::overrides::OverridesFile;
-use crate::paired_list::{parse_paired_list, PairedValue};
+use crate::paired_list::{parse_pair_items, parse_paired_list, PairedValue};
 
 #[derive(Debug, Clone, Default)]
 pub struct DictSchema {
@@ -44,6 +44,13 @@ pub struct DictSchema {
     /// `TX_HD_EN`, etc., emitted as
     /// `gtwiz_versal::intf::gt_settings::lr0_settings`.
     pub sub_schemas: BTreeMap<String, DictSchema>,
+    /// Wire encoding of this schema's value when it's nested inside
+    /// a parent dict. `false` (the default) is a flat Tcl dict —
+    /// `KEY VAL KEY VAL`. `true` is a Tcl list of two-element items —
+    /// `{KEY VAL} {KEY VAL}` — the only shape CIPS accepts for compound
+    /// `PS_PMC_CONFIG` fields like `PMC_I2CPMC_PERIPHERAL`; Vivado
+    /// silently ignores the flat form there.
+    pub pair_list: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -210,6 +217,7 @@ impl DictSchema {
         Self {
             fields,
             sub_schemas,
+            pair_list: false,
         }
     }
 }
@@ -264,19 +272,213 @@ fn load_ps_pmc_schema(data_root: &Path) -> Option<DictSchema> {
     if fields.is_empty() {
         return None;
     }
+    for (name, default) in UNLISTED_PS_PMC_KEYS {
+        fields.entry(name.to_string()).or_insert_with(|| DictField {
+            name: name.to_string(),
+            default: default.to_string(),
+            ..Default::default()
+        });
+    }
 
-    layer_param_info(&pspmc.join("guidata/ParamInfo.xml"), &mut fields);
-    layer_presets(&pspmc, &mut fields);
+    let mut index = FieldIndex::new(fields);
+    layer_param_info(&pspmc.join("guidata/ParamInfo.xml"), &mut index);
+    layer_presets(&pspmc, &mut index);
+    Some(index.into_schema())
+}
 
-    let mut sorted: Vec<DictField> = fields.into_values().collect();
-    sorted.sort_by(|a, b| a.name.cmp(&b.name));
-    Some(DictSchema {
-        fields: sorted,
-        // PS_PMC_CONFIG is a flat CSV-driven schema — no nested
-        // sub-slots. The from_paired_default path is what populates
-        // sub_schemas for XML-derived schemas.
-        sub_schemas: BTreeMap::new(),
-    })
+/// PS_PMC_CONFIG keys Vivado accepts that `param_mapping_direct.csv`
+/// doesn't list, with the default Vivado reports back for each.
+///
+/// No file in the Xilinx data tree names exactly these: ParamInfo.xml
+/// and the preset XMLs mention most of them, but alongside thousands
+/// of register-level names Vivado rejects, and the compound ones
+/// (`PMC_SD0`, `PMC_OSPI_PERIPHERAL`, …) never appear on their own at
+/// all. Found for Vivado 2025.1 by setting every candidate name from
+/// those files on a CIPS cell and keeping the ones Vivado echoed back
+/// in `CONFIG.PS_PMC_CONFIG` (unknown keys draw
+/// `[IP_Flow 19-7090] Invalid parameter … Ignoring`). Re-probe when
+/// upgrading Vivado.
+///
+/// Enums and doc text still come from the preset / ParamInfo layers.
+const UNLISTED_PS_PMC_KEYS: &[(&str, &str)] = &[
+    ("PMC_CIPS_MODE", "ADVANCE"),
+    ("PMC_CRP_NOC_REF_CTRL_DIVISOR0", "1"),
+    ("PMC_NOC_PMC_DATA_WIDTH", "128"),
+    ("PMC_PMC_NOC_DATA_WIDTH", "128"),
+    ("PMC_QSPI_BAUD_RATE_DIV", "8"),
+    ("PMC_QSPI_PERIPHERAL_ENABLE", "0"),
+    ("PMC_QSPI_PERIPHERAL_MODE", "Single"),
+    ("PMC_SD0_SLOT_TYPE", "SD 2.0"),
+    ("PMC_SD1_SLOT_TYPE", "SD 2.0"),
+    ("PMC_USE_PL_ERR0", "0"),
+    ("PMC_USE_PL_ERR1", "0"),
+    ("PMC_USE_PL_ERR2", "0"),
+    ("PMC_USE_PL_ERR3", "0"),
+    ("PS_M_AXI_GP4_DATA_WIDTH", "128"),
+    ("PS_NOC_PS_PCI_DATA_WIDTH", "128"),
+    ("PS_PS_NOC_PCI_DATA_WIDTH", "128"),
+    ("PS_RED_KEY_CLEAR_ENABLE", "0"),
+    ("PS_RED_KEY_CLEAR_ENABLE_1", "0"),
+    ("PS_RED_KEY_CLEAR_ENABLE_2", "0"),
+    ("PS_RED_KEY_CLEAR_ENABLE_3", "0"),
+    ("PS_USE_FPD_CCI_NOC0", "0"),
+    ("PS_USE_PS_NOC_PMC_0", "0"),
+    ("PS_USE_PS_NOC_PMC_1", "0"),
+    (
+        "PMC_OSPI_PERIPHERAL",
+        "{ENABLE 0} {IO {PMC_MIO 0 .. 11}} {MODE Single}",
+    ),
+    (
+        "PMC_SD0",
+        "{CD_ENABLE 0} {CD_IO {PMC_MIO 24}} {POW_ENABLE 0} \
+         {POW_IO {PMC_MIO 17}} {RESET_ENABLE 0} {RESET_IO {PMC_MIO 17}} \
+         {WP_ENABLE 0} {WP_IO {PMC_MIO 25}}",
+    ),
+    (
+        "PMC_SD0_PERIPHERAL",
+        "{CLK_100_SDR_OTAP_DLY 0x00} {CLK_200_SDR_OTAP_DLY 0x00} \
+         {CLK_50_DDR_ITAP_DLY 0x00} {CLK_50_DDR_OTAP_DLY 0x00} \
+         {CLK_50_SDR_ITAP_DLY 0x00} {CLK_50_SDR_OTAP_DLY 0x00} \
+         {ENABLE 0} {IO {PMC_MIO 13 .. 25}}",
+    ),
+    (
+        "PMC_SD1",
+        "{CD_ENABLE 0} {CD_IO {PMC_MIO 2}} {POW_ENABLE 0} \
+         {POW_IO {PMC_MIO 12}} {RESET_ENABLE 0} {RESET_IO {PMC_MIO 12}} \
+         {WP_ENABLE 0} {WP_IO {PMC_MIO 1}}",
+    ),
+    (
+        "PMC_SD1_PERIPHERAL",
+        "{CLK_100_SDR_OTAP_DLY 0x00} {CLK_200_SDR_OTAP_DLY 0x00} \
+         {CLK_50_DDR_ITAP_DLY 0x00} {CLK_50_DDR_OTAP_DLY 0x00} \
+         {CLK_50_SDR_ITAP_DLY 0x00} {CLK_50_SDR_OTAP_DLY 0x00} \
+         {ENABLE 0} {IO {PMC_MIO 0 .. 11}}",
+    ),
+    ("PMC_SMAP_PERIPHERAL", "{ENABLE 0} {IO {32 Bit}}"),
+];
+
+/// Every PS_PMC_CONFIG field, split into plain scalars and compound
+/// `{KEY VAL} {KEY VAL}` fields, plus a case-insensitive alias table
+/// so the ParamInfo / preset layers can find either kind by the name
+/// the Xilinx data files use.
+///
+/// Compound fields are how CIPS models a peripheral's pin routing:
+/// `PMC_I2CPMC_PERIPHERAL` defaults to `{ENABLE 0} {IO {PMC_MIO 2 .. 3}}`,
+/// and the GUI data describes its parts as two separate params,
+/// `pmc_i2cpmc_peripheral_enable` and `pmc_i2cpmc_peripheral_io`.
+/// The IO preset file enumerates every legal pin pair — exactly the
+/// list Vivado's validator reports when handed an invalid one — so
+/// splitting the compound into typed sub-fields lets those presets
+/// become `@enum(...)`s instead of leaving the caller to hand-write
+/// an opaque string.
+struct FieldIndex {
+    scalars: HashMap<String, DictField>,
+    compounds: BTreeMap<String, Vec<DictField>>,
+    /// Upper-cased Xilinx data-file name → where that field lives.
+    aliases: HashMap<String, FieldRef>,
+}
+
+#[derive(Clone)]
+enum FieldRef {
+    Scalar(String),
+    Sub(String, usize),
+}
+
+impl FieldIndex {
+    fn new(fields: HashMap<String, DictField>) -> Self {
+        let mut scalars = HashMap::new();
+        let mut compounds = BTreeMap::new();
+        let mut aliases = HashMap::new();
+        for (name, field) in fields {
+            let items = parse_pair_items(&field.default);
+            if items.is_empty() {
+                aliases.insert(
+                    name.to_ascii_uppercase(),
+                    FieldRef::Scalar(name.clone()),
+                );
+                scalars.insert(name, field);
+                continue;
+            }
+            let mut subs = Vec::with_capacity(items.len());
+            for (i, (key, default)) in items.into_iter().enumerate() {
+                for alias in compound_aliases(&name, &key) {
+                    aliases.insert(alias, FieldRef::Sub(name.clone(), i));
+                }
+                subs.push(DictField {
+                    name: key,
+                    default,
+                    ..Default::default()
+                });
+            }
+            compounds.insert(name, subs);
+        }
+        Self {
+            scalars,
+            compounds,
+            aliases,
+        }
+    }
+
+    fn get_mut(&mut self, name: &str) -> Option<&mut DictField> {
+        match self.aliases.get(&name.to_ascii_uppercase())?.clone() {
+            FieldRef::Scalar(n) => self.scalars.get_mut(&n),
+            FieldRef::Sub(n, i) => self.compounds.get_mut(&n)?.get_mut(i),
+        }
+    }
+
+    fn into_schema(self) -> DictSchema {
+        let mut fields: Vec<DictField> = self.scalars.into_values().collect();
+        fields.sort_by(|a, b| a.name.cmp(&b.name));
+        let sub_schemas = self
+            .compounds
+            .into_iter()
+            .map(|(name, mut subs)| {
+                for f in &mut subs {
+                    // Every CIPS compound `ENABLE` is a 0/1 switch, but
+                    // only some peripherals ship an `_enable` preset
+                    // file saying so.
+                    if f.name == "ENABLE"
+                        && f.enum_values.is_empty()
+                        && matches!(f.default.as_str(), "0" | "1")
+                    {
+                        f.enum_values =
+                            ["0", "1"].into_iter().map(String::from).collect();
+                    }
+                }
+                let schema = DictSchema {
+                    fields: subs,
+                    sub_schemas: BTreeMap::new(),
+                    pair_list: true,
+                };
+                (name, schema)
+            })
+            .collect();
+        DictSchema {
+            fields,
+            sub_schemas,
+            pair_list: false,
+        }
+    }
+}
+
+/// Upper-cased names the Xilinx GUI data uses for sub-field `key` of
+/// compound field `field`. Always `<FIELD>_<KEY>`
+/// (`PMC_I2CPMC_PERIPHERAL_IO`); when the field ends in a digit run,
+/// also the variant with an underscore before the digits, which is
+/// how the MIO pad data spells per-pin params (`PMC_MIO12` →
+/// `pmc_mio_12_direction`). Also `<FIELD>_GRP_<KEY>`, the SD pin
+/// group spelling (`PMC_SD0`'s `CD_IO` → `pmc_sd0_grp_cd_io`).
+fn compound_aliases(field: &str, key: &str) -> Vec<String> {
+    let field = field.to_ascii_uppercase();
+    let key = key.to_ascii_uppercase();
+    let mut out = vec![format!("{field}_{key}"), format!("{field}_GRP_{key}")];
+    let stem = field.trim_end_matches(|c: char| c.is_ascii_digit());
+    if stem.len() < field.len()
+        && stem.ends_with(|c: char| c.is_ascii_alphabetic())
+    {
+        out.push(format!("{stem}_{}_{key}", &field[stem.len()..]));
+    }
+    out
 }
 
 /// Names of `<spirit:parameter>` entries the CIPS IP-XACT exposes at
@@ -500,7 +702,7 @@ fn is_safe_key(s: &str) -> bool {
 /// Layer `<displayName>X</displayName>` text from a `ParamInfo.xml`
 /// onto matching field descriptions. Uses a tiny line-oriented scan
 /// — the schema is too irregular to demand a full XML parser.
-fn layer_param_info(path: &Path, fields: &mut HashMap<String, DictField>) {
+fn layer_param_info(path: &Path, fields: &mut FieldIndex) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
@@ -516,7 +718,9 @@ fn layer_param_info(path: &Path, fields: &mut HashMap<String, DictField>) {
                 let after = &line[start + "<displayName>".len()..];
                 if let Some(end) = after.find("</displayName>") {
                     let text = after[..end].trim();
-                    if !text.is_empty() {
+                    // Some entries just echo the param name back
+                    // (`pmc_i2cpmc_peripheral_io`) — not a description.
+                    if !text.is_empty() && !text.eq_ignore_ascii_case(name) {
                         if let Some(f) = fields.get_mut(name) {
                             f.description = Some(text.to_string());
                         }
@@ -540,11 +744,14 @@ fn layer_param_info(path: &Path, fields: &mut HashMap<String, DictField>) {
 /// `PMC_CRP_PL0_REF_CTRL_FREQMHZ` the user can supply any frequency
 /// the clock generator can synthesize (e.g. `250`, `195`), so
 /// treating `<set>` values as an `@enum` would wrongly reject those.
-fn layer_presets(pspmc_dir: &Path, fields: &mut HashMap<String, DictField>) {
+fn layer_presets(pspmc_dir: &Path, fields: &mut FieldIndex) {
     let mut paths = Vec::new();
     paths.push(pspmc_dir.join("global/global_preset.xml"));
     paths.push(pspmc_dir.join("global/global_presetForNonPS.xml"));
     walk_for_xml(&pspmc_dir.join("presets"), &mut paths);
+    // Per-pin MIO pad choices (`pmc_mio_12_pull`, `…_drive_strength`)
+    // for the compound `PMC_MIO<N>` / `PS_MIO<N>` fields.
+    walk_for_xml(&pspmc_dir.join("mio"), &mut paths);
 
     for p in paths {
         let Ok(text) = fs::read_to_string(&p) else {
@@ -554,6 +761,11 @@ fn layer_presets(pspmc_dir: &Path, fields: &mut HashMap<String, DictField>) {
             if let Some((param, val)) =
                 extract_two_attrs(line, "<preset", "param", "name")
             {
+                // Some peripherals ship a `name=""` preset for the
+                // "unset" state; it isn't a value a caller can pick.
+                if val.is_empty() {
+                    continue;
+                }
                 if let Some(f) = fields.get_mut(param) {
                     f.enum_values.insert(val.to_string());
                 }
@@ -698,6 +910,8 @@ mod tests {
             "\
 PCIE_APERTURES_DUAL_ENABLE,{0},PCIE_APERTURES_DUAL_ENABLE,{0}
 PS_PCIE_RESET,{{ENABLE 0}},PS_PCIE_RESET,{ENABLE 0 IO PS_MIO_18:19}
+PMC_I2CPMC_PERIPHERAL,{{ENABLE 0} {IO {PMC_MIO 2 .. 3}}},PMC_I2CPMC_PERIPHERAL,{ENABLE 0 IO PMC_MIO_2:3}
+PMC_MIO12,{{DIRECTION in} {PULL pullup}},PMC_MIO12,{}
 SMON_ALARMS,{Set_Alarms_On},SMON_ALARMS,{Set_Alarms_On}
 CPM_PCIE0_MODES,{None},CPM_PCIE0_MODES,{None}
 ",
@@ -721,6 +935,12 @@ CLOCK_MODE,REF CLK 33.33 MHz
     <parameter name="SMON_ALARMS">
         <displayName>What do you want to do with Alarms?</displayName>
     </parameter>
+    <parameter name="PMC_I2CPMC_PERIPHERAL_ENABLE">
+        <displayName>I2C PMC</displayName>
+    </parameter>
+    <parameter name="PMC_I2CPMC_PERIPHERAL_IO">
+        <displayName>pmc_i2cpmc_peripheral_io</displayName>
+    </parameter>
 </ParameterInfo>
 "#,
         )
@@ -730,6 +950,27 @@ CLOCK_MODE,REF CLK 33.33 MHz
             r#"<presets>
   <preset param="SMON_ALARMS" name="Set_Alarms_On"/>
   <preset param="SMON_ALARMS" name="Set_Alarms_Off"/>
+</presets>
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            presets.join("i2cpmc_preset.xml"),
+            r#"<presets>
+<preset param="pmc_i2cpmc_peripheral_enable" name="" strength="15">
+<preset param="pmc_i2cpmc_peripheral_io" name="EMIO" strength="5">
+<preset param="pmc_i2cpmc_peripheral_io" name="PMC_MIO 18 .. 19" strength="10">
+</presets>
+"#,
+        )
+        .unwrap();
+        let mio = pspmc.join("mio");
+        std::fs::create_dir_all(&mio).unwrap();
+        std::fs::write(
+            mio.join("mio_pad.xml"),
+            r#"<presets>
+  <preset param="pmc_mio_12_pull" name="pulldown" strength="15">
+  <preset param="pmc_mio_12_pull" name="pullup" strength="15">
 </presets>
 "#,
         )
@@ -753,10 +994,37 @@ CLOCK_MODE,REF CLK 33.33 MHz
         // From direct.csv (with CPM_ filtered out):
         assert!(by_name.contains_key("PCIE_APERTURES_DUAL_ENABLE"));
         assert_eq!(by_name["PCIE_APERTURES_DUAL_ENABLE"].default, "0");
-        assert_eq!(
-            by_name["PS_PCIE_RESET"].default, "{ENABLE 0}",
-            "should strip one brace layer"
-        );
+        // Compound `{KEY VAL} {KEY VAL}` fields become pair-list
+        // sub-schemas rather than opaque scalars.
+        assert!(!by_name.contains_key("PS_PCIE_RESET"));
+        let reset = &s.sub_schemas["PS_PCIE_RESET"];
+        assert!(reset.pair_list);
+        assert_eq!(reset.fields.len(), 1);
+        assert_eq!(reset.fields[0].name, "ENABLE");
+        assert_eq!(reset.fields[0].default, "0");
+        // No `_enable` preset shipped, but ENABLE is always 0/1.
+        assert!(reset.fields[0].enum_values.contains("1"));
+
+        let i2c = &s.sub_schemas["PMC_I2CPMC_PERIPHERAL"];
+        let i2c_io = i2c.fields.iter().find(|f| f.name == "IO").unwrap();
+        assert_eq!(i2c_io.default, "PMC_MIO 2 .. 3");
+        assert!(i2c_io.enum_values.contains("PMC_MIO 18 .. 19"));
+        assert!(i2c_io.enum_values.contains("EMIO"));
+        // Name-echo display names aren't descriptions.
+        assert_eq!(i2c_io.description, None);
+        let i2c_en = i2c.fields.iter().find(|f| f.name == "ENABLE").unwrap();
+        assert_eq!(i2c_en.description.as_deref(), Some("I2C PMC"));
+        // The `name=""` "unset" preset doesn't become an enum value.
+        assert!(!i2c_en.enum_values.contains(""));
+
+        // Keys Vivado accepts that the direct CSV doesn't list.
+        assert_eq!(by_name["PMC_QSPI_PERIPHERAL_ENABLE"].default, "0");
+        assert!(s.sub_schemas["PMC_SD0"].pair_list);
+
+        // Per-pin MIO pad presets spell the pin as `pmc_mio_12_…`.
+        let mio12 = &s.sub_schemas["PMC_MIO12"];
+        let pull = mio12.fields.iter().find(|f| f.name == "PULL").unwrap();
+        assert!(pull.enum_values.contains("pulldown"));
         // CPM_ keys are filtered out.
         assert!(!by_name.contains_key("CPM_PCIE0_MODES"));
         // From ParamInfo: description present for SMON_ALARMS.
