@@ -338,6 +338,11 @@ struct EffectiveArg {
     /// reject the `-flag` form with `[Common 17-170] Unknown
     /// option`.
     positional: bool,
+    /// True for the generic `operands` catch-all the parser
+    /// synthesizes when a man page documents no positional. Its
+    /// value is a list of raw words, so the body splices it with
+    /// `{*}`; a documented positional is passed as one word.
+    synthesized: bool,
 }
 
 fn effective_args(
@@ -446,6 +451,7 @@ fn effective_arg(arg: &Argument, over: Option<&ArgOverride>) -> EffectiveArg {
         typed,
         arg_type,
         positional: over.positional,
+        synthesized: arg.synthesized,
     }
 }
 
@@ -562,9 +568,17 @@ fn format_attribute_value(s: &str) -> String {
 ///   list via `lappend`. Each arg's kind drives its emit form —
 ///   `Boolean` → `if {$x} { lappend flags -flag }`, `Value` →
 ///   `if {$x ne ""} { lappend flags -flag $x }`, `Positional` →
-///   `if {$x ne ""} { lappend flags {*}$x }`. These values are all
-///   strings, so the lappend / `{*}`-expansion that follows is
-///   safe — string values don't have a typed Tcl_Obj to shimmer.
+///   `if {$x ne ""} { lappend flags $x }`. `lappend` stores the
+///   caller's `Tcl_Obj` itself, so object identity survives the
+///   final `{*}$flags` splice. Positionals must NOT be spliced with
+///   `{*}$x`: that converts `$x` to a list and appends *new*
+///   element objects. Vivado resolves some handles (`hw_cfgmem`,
+///   …) by `Tcl_Obj` identity, so a copy with the same text fails
+///   with `[Common 17-161] Invalid option value`. Vivado
+///   positionals also take a list as a single word — splicing
+///   `-patterns {a b}` yields `[Common 17-165] Too many positional
+///   options`. The only exception is the synthesized `operands`
+///   catch-all, which is a list of raw words by definition.
 /// - **Typed-handle args** (`-objects`/`-cell`/etc., per
 ///   [`TYPED_ARG_NAMES`] or per-arg `typed = true` override) are
 ///   passed **directly** to the underlying command via
@@ -586,9 +600,10 @@ fn build_body(orig: &str, effective: &[EffectiveArg]) -> String {
     let typed: Vec<&EffectiveArg> =
         effective.iter().filter(|a| a.typed).collect();
 
-    // Non-typed accumulator. `flags` is a plain Tcl list — only
-    // ever contains string values, so list-construction shimmer is
-    // a non-issue.
+    // Non-typed accumulator. `flags` holds the callers' Tcl_Objs
+    // by reference (`lappend`, never `{*}`-spliced per value), so
+    // any object handle in it reaches Vivado with its identity
+    // intact.
     writeln!(body, "set flags [list]").unwrap();
     for arg in &non_typed {
         let id = &arg.ident;
@@ -612,13 +627,17 @@ fn build_body(orig: &str, effective: &[EffectiveArg]) -> String {
                 }
             }
             ArgKind::Positional => {
+                let word = if arg.synthesized {
+                    format!("{{*}}${id}")
+                } else {
+                    format!("${id}")
+                };
                 if required {
-                    writeln!(body, "lappend flags {{*}}${id}").unwrap();
+                    writeln!(body, "lappend flags {word}").unwrap();
                 } else {
                     writeln!(
                         body,
-                        "if {{${id} ne \"\"}} \
-                         {{ lappend flags {{*}}${id} }}"
+                        "if {{${id} ne \"\"}} {{ lappend flags {word} }}"
                     )
                     .unwrap();
                 }
