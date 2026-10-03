@@ -5488,7 +5488,8 @@ fn resolve_local_dep_path(workspace_dir: &Utf8Path, path: &Path) -> PathBuf {
 /// pins the version for the whole graph).
 ///
 /// Returns an empty map (not an error) if the entry workspace has
-/// no deps. Per-dep failures (missing `vw.toml`, malformed config)
+/// no deps, and an error if the entry workspace's own `vw.toml` is
+/// rejected. Per-dep failures (missing `vw.toml`, malformed config)
 /// are skipped: a dep may not be its own htcl workspace, and that's
 /// fine — we just won't see *its* deps.
 pub fn transitive_dep_cache_paths(
@@ -5518,6 +5519,14 @@ pub fn transitive_dep_cache_paths_with_test(
     // dep roots `resolve_local_dep_path` produces — otherwise a
     // circular local dep (vw → testlib → vw) reappears as
     // `<vw>/testlib/..` and the walk never converges.
+    // The entry workspace's own config must load. Every later step
+    // swallows config errors (a dep may not be an htcl workspace), so
+    // without this a rejected entry `vw.toml` — say, a `[workspace]
+    // name` the validator refuses — silently yields no deps and
+    // surfaces downstream as a misleading `unknown dependency`.
+    if entry_workspace_dir.join("vw.toml").exists() {
+        load_workspace_config(entry_workspace_dir)?;
+    }
     let entry = entry_workspace_dir.as_std_path().to_path_buf();
     let entry = entry.canonicalize().unwrap_or(entry);
     let mut queue: Vec<PathBuf> = vec![entry];
@@ -6886,6 +6895,37 @@ your_instance_name : primary_clock\n\
         assert_eq!(resolved.get("cips"), Some(&cips));
         assert_eq!(resolved.get("vivado-cmd"), Some(&vivado_cmd));
         assert_eq!(resolved.len(), 2, "{resolved:?}");
+    }
+
+    /// A rejected entry `vw.toml` is an error, not an empty map. An
+    /// empty map surfaced to the user as `unknown dependency
+    /// `vivado-cmd`` on the first `src @vivado-cmd`, while the dep
+    /// was declared right there and the real problem — a workspace
+    /// named "." — was never mentioned.
+    #[test]
+    fn transitive_dep_resolution_reports_rejected_entry_config() {
+        let (_tmp, dir) = canonical_tempdir();
+        let ws = dir.as_path().join("ws");
+        let lib = dir.as_path().join("lib");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            ws.join("vw.toml"),
+            format!(
+                "[workspace]\nname=\".\"\nversion=\"0.1.0\"\n\n\
+                 [dependencies.lib]\npath = \"{}\"\n",
+                lib.display()
+            ),
+        )
+        .unwrap();
+
+        let ws_utf8 = Utf8PathBuf::from_path_buf(ws).unwrap();
+        let err = transitive_dep_cache_paths(&ws_utf8).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must start with a lowercase letter"),
+            "{err}"
+        );
     }
 
     #[test]

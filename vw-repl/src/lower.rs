@@ -32,6 +32,9 @@ pub enum LowerError {
     Load(#[from] vw_htcl::LoadError),
     #[error("{0}")]
     Parse(String),
+    /// The enclosing workspace's `vw.toml` was rejected.
+    #[error("{0}")]
+    Workspace(vw_lib::VwError),
 }
 
 /// Where in the loaded htcl tree a particular command came from.
@@ -173,7 +176,8 @@ pub fn prepare_with_observer(
     observer: &mut dyn vw_htcl::LoadObserver,
 ) -> Result<Prepared, LowerError> {
     let workspace_dir = vw_lib::find_workspace_dir(cwd);
-    let resolver = build_resolver(workspace_dir.as_deref());
+    let resolver = build_resolver(workspace_dir.as_deref())
+        .map_err(LowerError::Workspace)?;
 
     let scratch_dir = workspace_dir
         .as_deref()
@@ -861,17 +865,17 @@ fn render_location(
     format!("(input):{flat_line}")
 }
 
-fn build_resolver(workspace_dir: Option<&Utf8Path>) -> Resolver {
+fn build_resolver(
+    workspace_dir: Option<&Utf8Path>,
+) -> Result<Resolver, vw_lib::VwError> {
     let mut resolver = Resolver::new();
     let Some(ws) = workspace_dir else {
-        return resolver;
+        return Ok(resolver);
     };
-    if let Ok(paths) = vw_lib::transitive_dep_cache_paths(ws) {
-        for (name, path) in paths {
-            resolver = resolver.with_dep(name, path);
-        }
+    for (name, path) in vw_lib::transitive_dep_cache_paths(ws)? {
+        resolver = resolver.with_dep(name, path);
     }
-    resolver
+    Ok(resolver)
 }
 
 struct ScratchFile {

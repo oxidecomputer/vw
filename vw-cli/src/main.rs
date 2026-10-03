@@ -2655,19 +2655,24 @@ async fn load_htcl_program_with_mode(
     // Load the workspace config once — its `name` field feeds both
     // the progress bar's label AND the self-injection at the
     // bottom of this block.
+    //
+    // A rejected `vw.toml` fails the load here, with the config's own
+    // message. Carrying on with no deps would only resurface as an
+    // `unknown dependency` on the first `src @<dep>`.
     let workspace_cfg = workspace_dir
         .as_deref()
-        .and_then(|ws| vw_lib::load_workspace_config(ws).ok());
+        .map(vw_lib::load_workspace_config)
+        .transpose()?;
     if let Some(ws) = workspace_dir.as_deref() {
         // Transitive resolution so a library's `src @other/...`
         // import works even when the consumer hasn't redeclared
         // `other` in their own `vw.toml`.
-        if let Ok(paths) =
-            vw_lib::transitive_dep_cache_paths_with_test(ws, include_test_deps)
-        {
-            for (name, path) in paths {
-                resolver = resolver.with_dep(name, path);
-            }
+        let paths = vw_lib::transitive_dep_cache_paths_with_test(
+            ws,
+            include_test_deps,
+        )?;
+        for (name, path) in paths {
+            resolver = resolver.with_dep(name, path);
         }
         // Cargo-parity self-reference: a library named `foo` can
         // `src @foo/bar` to reach its own siblings without the
@@ -4758,10 +4763,9 @@ async fn ensure_ip_generated(
     // resolve. `configure_ip` is a normal (non-test) run, so
     // test-dependencies stay out.
     let mut resolver = vw_htcl::Resolver::new();
-    if let Ok(paths) = vw_lib::transitive_dep_cache_paths_with_test(ws, false) {
-        for (name, path) in paths {
-            resolver = resolver.with_dep(name, path);
-        }
+    for (name, path) in vw_lib::transitive_dep_cache_paths_with_test(ws, false)?
+    {
+        resolver = resolver.with_dep(name, path);
     }
     // Cargo-parity self-reference so a workspace can `src @<self>/…`.
     if let Ok(cfg) = vw_lib::load_workspace_config(ws) {
