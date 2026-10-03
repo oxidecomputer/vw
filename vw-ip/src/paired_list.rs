@@ -99,6 +99,32 @@ pub fn parse_paired_list(input: &str) -> Vec<(String, PairedValue)> {
     pairs
 }
 
+/// Parse a Tcl list of two-element `{KEY VAL}` items — the shape CIPS
+/// uses for compound `PS_PMC_CONFIG` fields, e.g.
+/// `{ENABLE 0} {IO {PMC_MIO 2 .. 3}}`. Values stay scalar (outer
+/// braces stripped, inner text verbatim).
+///
+/// Returns an empty list unless the input starts with `{` and every
+/// item is exactly a `KEY VAL` pair with an ident-shaped key. The
+/// leading-brace requirement keeps multi-word scalars like
+/// `JTAG Boot` from being misread as a single `JTAG → Boot` pair.
+pub fn parse_pair_items(input: &str) -> Vec<(String, String)> {
+    if !input.trim_start().starts_with('{') {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for item in tokenize(input) {
+        let mut kv = tokenize(&item);
+        if kv.len() != 2 || !is_ident_shaped(&kv[0]) {
+            return Vec::new();
+        }
+        let v = kv.pop().unwrap();
+        let k = kv.pop().unwrap();
+        out.push((k, v));
+    }
+    out
+}
+
 /// Classify a token as `Scalar` or `Nested` by attempting to re-parse
 /// its content as another paired list. If the re-parse yields at
 /// least one valid pair, it's `Nested`; otherwise it's a `Scalar`
@@ -342,5 +368,28 @@ mod tests {
         assert_eq!(toks.len(), 2);
         assert_eq!(toks[0], "K");
         assert!(toks[1].chars().all(char::is_whitespace) || toks[1].is_empty());
+    }
+
+    #[test]
+    fn pair_items_cips_compound_field() {
+        let got = parse_pair_items("{ENABLE 0} {IO {PMC_MIO 2 .. 3}}");
+        assert_eq!(
+            got,
+            vec![
+                ("ENABLE".to_string(), "0".to_string()),
+                ("IO".to_string(), "PMC_MIO 2 .. 3".to_string()),
+            ]
+        );
+        assert_eq!(parse_pair_items("{ENABLE 0}").len(), 1);
+    }
+
+    #[test]
+    fn pair_items_rejects_scalars() {
+        assert!(parse_pair_items("JTAG Boot").is_empty());
+        assert!(parse_pair_items("PMC_MIO 2 .. 3").is_empty());
+        assert!(parse_pair_items("0").is_empty());
+        assert!(parse_pair_items("").is_empty());
+        // Item with three tokens is not a pair.
+        assert!(parse_pair_items("{A B C} {D E}").is_empty());
     }
 }
