@@ -460,10 +460,12 @@ fn compile_htcl_module_blocking(
     // test deps here (the auto-load path never fires from inside
     // a test).
     let mut resolver = vw_htcl::Resolver::new();
-    if let Ok(paths) = vw_lib::transitive_dep_cache_paths(&ws) {
-        for (name, cache_path) in paths {
-            resolver = resolver.with_dep(name, cache_path);
-        }
+    let paths = vw_lib::transitive_dep_cache_paths(&ws).map_err(|e| {
+        tracing::error!(%ws, %path, error = %e, "compile_htcl_module: resolving deps");
+        format!("compile_htcl_module: {e}")
+    })?;
+    for (name, cache_path) in paths {
+        resolver = resolver.with_dep(name, cache_path);
     }
     if let Ok(cfg) = vw_lib::load_workspace_config(&ws) {
         resolver = resolver.with_dep_if_absent(

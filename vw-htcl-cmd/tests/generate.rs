@@ -162,6 +162,41 @@ fn synthesizes_operand_when_no_positional() {
     assert_reparses(&generate(&page, &GenerateOptions::default()));
 }
 
+/// A documented positional is passed as one word (`lappend flags $x`).
+/// Splicing it with `{*}` replaces a Vivado object handle with a
+/// same-text copy (rejected with `[Common 17-161]`, e.g.
+/// `program_hw_cfgmem`) and splits pattern lists into extra
+/// positionals (`[Common 17-165]`). Only the synthesized `operands`
+/// catch-all keeps the `{*}` splice.
+#[test]
+fn positionals_are_not_spliced() {
+    let page = parse_man_page(
+        "program_thing",
+        "\nArguments:\n\n  -force - (Optional) Force.\n\n  \
+         <hw_thing> - (Required) The thing to program.\n",
+    );
+    let htcl = generate(&page, &GenerateOptions::default());
+    assert!(
+        htcl.contains("lappend flags $hw_thing"),
+        "documented positional should lappend as one word: {htcl}"
+    );
+    assert!(
+        !htcl.contains("{*}$hw_thing"),
+        "documented positional must not be spliced: {htcl}"
+    );
+    assert_reparses(&htcl);
+
+    let page = parse_man_page(
+        "current_thing",
+        "\nArguments:\n\n  -quiet - (Optional) Quietly.\n",
+    );
+    let htcl = generate(&page, &GenerateOptions::default());
+    assert!(
+        htcl.contains("lappend flags {*}$operands"),
+        "synthesized operands should still splice: {htcl}"
+    );
+}
+
 #[test]
 fn empty_man_page_still_generates_valid_wrapper() {
     // No Description, no Arguments — the generator must still emit a

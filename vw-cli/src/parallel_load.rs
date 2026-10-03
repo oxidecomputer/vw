@@ -191,7 +191,7 @@ fn schedule_parse(
             Claim::Failed(msg) => {
                 return Err(LoadError::Io {
                     path: path.clone(),
-                    source: std::io::Error::other(msg),
+                    error: std::io::Error::other(msg),
                 });
             }
             Claim::AwaitPending(n) => {
@@ -247,11 +247,11 @@ fn schedule_parse(
                 return Err(err);
             };
             let resolved =
-                resolver.resolve(&parent_dir, raw).map_err(|source| {
+                resolver.resolve(&parent_dir, raw).map_err(|error| {
                     LoadError::Resolve {
                         importer: path.clone(),
                         raw: raw.to_string(),
-                        source,
+                        error,
                     }
                 })?;
             imports.push(ImportInfo {
@@ -350,7 +350,7 @@ fn schedule_parse(
 fn read_and_parse(path: &Path) -> Result<ParsedFile, LoadError> {
     let source = std::fs::read_to_string(path).map_err(|e| LoadError::Io {
         path: path.to_path_buf(),
-        source: e,
+        error: e,
     })?;
     let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
     let parsed = parse(&source);
@@ -428,13 +428,13 @@ fn stitch_file(
             Some(ParseSlot::Failed(msg)) => {
                 return Err(LoadError::Io {
                     path: path.to_path_buf(),
-                    source: std::io::Error::other(msg),
+                    error: std::io::Error::other(msg),
                 });
             }
             Some(ParseSlot::Pending(_)) | None => {
                 return Err(LoadError::Io {
                     path: path.to_path_buf(),
-                    source: std::io::Error::new(
+                    error: std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "parallel loader lost parse for this path",
                     ),
@@ -523,7 +523,7 @@ fn line_of(source: &str, byte: u32) -> u32 {
 fn join_err_to_load_err(e: JoinError) -> LoadError {
     LoadError::Io {
         path: PathBuf::new(),
-        source: std::io::Error::other(e.to_string()),
+        error: std::io::Error::other(e.to_string()),
     }
 }
 

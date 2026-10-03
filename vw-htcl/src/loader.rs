@@ -30,18 +30,17 @@ use crate::src_path::{ResolveError, Resolver};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
-    #[error("reading {path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("resolving `src {raw}` from {importer}: {source}")]
+    // The inner error is spelled into the message rather than
+    // exposed as `#[source]`: callers render this with plain
+    // `Display`, and a chain printer (`vw_remote::causes`) would
+    // otherwise print the cause twice.
+    #[error("reading {path}: {error}")]
+    Io { path: PathBuf, error: io::Error },
+    #[error("resolving `src {raw}` from {importer}: {error}")]
     Resolve {
         importer: PathBuf,
         raw: String,
-        #[source]
-        source: ResolveError,
+        error: ResolveError,
     },
     #[error(
         "`src` import at {importer}:{line} has a non-literal path (it \
@@ -376,7 +375,7 @@ impl State<'_, '_> {
                 let source =
                     fs::read_to_string(path).map_err(|e| LoadError::Io {
                         path: path.to_path_buf(),
-                        source: e,
+                        error: e,
                     })?;
                 // Stat right after the read so the recorded mtime
                 // matches the source we just captured. Failing to
@@ -440,11 +439,11 @@ impl State<'_, '_> {
                 });
             };
             let resolved =
-                self.resolver.resolve(parent_dir, raw).map_err(|source| {
+                self.resolver.resolve(parent_dir, raw).map_err(|error| {
                     LoadError::Resolve {
                         importer: path.to_path_buf(),
                         raw: raw.to_string(),
-                        source,
+                        error,
                     }
                 })?;
             if !self.loaded.contains(&resolved)
