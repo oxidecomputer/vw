@@ -3698,6 +3698,108 @@ fn overload_specialization_mangle(
     Some(vw_htcl::mangle_specialization(name, variant))
 }
 
+/// Upper bound on the Tcl text one [`DeclBatch`] eval carries. Keeps
+/// each request a modest WebSocket message on a remote session while
+/// still collapsing a ~20 MB program's ~20k declarations into a few
+/// dozen evals.
+const DECL_BATCH_BYTES: usize = 512 * 1024;
+
+/// True when `cmd` only *declares* — defining it runs nothing that can
+/// warn, print, or depend on what ran before it — so it can share an
+/// eval with its neighbours. Procs, newtype / enum declarations (which
+/// lower to nothing), and `namespace eval` blocks whose bodies hold
+/// only those. Anything else, including a `putr` rewrite target, keeps
+/// its own eval and origin marker.
+fn is_declaration_only(
+    cmd: &vw_htcl::Command,
+    putr_map: &vw_htcl::putr::RewriteMap,
+) -> bool {
+    if putr_map.contains_key(&cmd.span) {
+        return false;
+    }
+    match &cmd.kind {
+        vw_htcl::CommandKind::Proc(_)
+        | vw_htcl::CommandKind::TypeDecl(_)
+        | vw_htcl::CommandKind::EnumDecl(_) => true,
+        vw_htcl::CommandKind::NamespaceEval(ns) => {
+            ns.body.iter().all(|stmt| match stmt {
+                vw_htcl::Stmt::Command(c) => is_declaration_only(c, putr_map),
+                vw_htcl::Stmt::Comment(_) => true,
+                vw_htcl::Stmt::Error(_) => false,
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Lowered declarations waiting to be shipped together.
+///
+/// A loaded program is overwhelmingly declarations — redhawk's IP
+/// pre-pass is ~21.6k top-level statements, nearly all procs from the
+/// generated IP-wrapper libraries. One eval each is invisible locally
+/// but costs a network round trip per statement on a remote session,
+/// which turned `vw check --ip-generate` into a 5–10 minute wait.
+/// Declarations don't warn or produce output, so they lose nothing by
+/// sharing an eval (and the origin marker of the batch's first
+/// statement).
+#[derive(Default)]
+struct DeclBatch {
+    items: Vec<(String, vw_repl::Origin)>,
+    bytes: usize,
+}
+
+impl DeclBatch {
+    fn push(&mut self, tcl: String, origin: vw_repl::Origin) {
+        self.bytes += tcl.len() + 1;
+        self.items.push((tcl, origin));
+    }
+
+    /// Eval everything pending as one script. A failure stops Tcl at
+    /// the first bad declaration, leaving the rest undefined and the
+    /// error pointing at the batch's first statement, so on failure
+    /// replay each item on its own — redefining a proc is harmless —
+    /// to report the error against the declaration that caused it,
+    /// exactly as the one-eval-per-statement path did.
+    async fn flush(
+        &mut self,
+        backend: &mut dyn vw_eda::EdaBackend,
+        current_origin: &std::sync::Mutex<Option<vw_repl::Origin>>,
+    ) {
+        let items = std::mem::take(&mut self.items);
+        self.bytes = 0;
+        let Some((_, first_origin)) = items.first() else {
+            return;
+        };
+        let script = items
+            .iter()
+            .map(|(tcl, _)| tcl.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Ok(mut g) = current_origin.lock() {
+            *g = Some(first_origin.clone());
+        }
+        let tcl = vw_repl::wrap_tcl_with_origin_marker(&script, first_origin);
+        if backend.eval(&tcl).await.is_ok() {
+            return;
+        }
+        for (tcl, origin) in &items {
+            if let Ok(mut g) = current_origin.lock() {
+                *g = Some(origin.clone());
+            }
+            let tcl = vw_repl::wrap_tcl_with_origin_marker(tcl, origin);
+            match backend.eval(&tcl).await {
+                Ok(_) => {}
+                Err(vw_eda::BackendError::Tcl { message, .. }) => {
+                    eprintln!("{} {message}", "vivado:".bright_red());
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", "vivado:".bright_red());
+                }
+            }
+        }
+    }
+}
+
 /// Thin loader wrapper: resolve the entry's `src` imports into one
 /// flattened program, then hand it to [`run_loaded_program`].
 /// Run the anodizer, wherever this workspace builds.
@@ -4524,6 +4626,9 @@ async fn run_loaded_program(
         usize,
         vw_htcl::LineIndex,
     > = std::collections::HashMap::new();
+    // Consecutive declarations (procs, decl-only `namespace eval`s) are
+    // shipped as one eval rather than one each — see [`DeclBatch`].
+    let mut decl_batch = DeclBatch::default();
     for stmt in &parsed.document.stmts {
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
@@ -4569,16 +4674,12 @@ async fn run_loaded_program(
                     (None, lc.line + 1, snippet)
                 }
             };
-            let origin = vw_repl::Origin {
+            vw_repl::Origin {
                 file: file_path,
                 line,
                 snippet,
                 via: Vec::new(),
-            };
-            if let Ok(mut g) = current_origin.lock() {
-                *g = Some(origin.clone());
             }
-            origin
         };
         // Overload specializations lower under their mangled
         // names so the dispatcher's switch arms can find them.
@@ -4612,6 +4713,19 @@ async fn run_loaded_program(
         // body that forwards via `extern::` errors out at runtime
         // with `invalid command name "extern::create_project"`.
         let tcl = vw_htcl::rewrite_externs(&lowered).text;
+        if is_declaration_only(cmd, &putr_map) {
+            decl_batch.push(tcl, stmt_origin);
+            if decl_batch.bytes >= DECL_BATCH_BYTES {
+                decl_batch.flush(&mut *backend, &current_origin).await;
+            }
+            continue;
+        }
+        // Anything that executes runs after every declaration before
+        // it is in place.
+        decl_batch.flush(&mut *backend, &current_origin).await;
+        if let Ok(mut g) = current_origin.lock() {
+            *g = Some(stmt_origin.clone());
+        }
         // Wrap with a shim-side origin marker so any traceless
         // warning emitted during THIS eval stays anchored to
         // `stmt_origin` — see [`vw_repl::wrap_tcl_with_origin_marker`]
@@ -4671,6 +4785,7 @@ async fn run_loaded_program(
             }
         }
     }
+    decl_batch.flush(&mut *backend, &current_origin).await;
     let _ = backend.shutdown().await;
     // Flush any trailing NONE block the last chunk left in the
     // accumulator. Vivado's final write is often non-diagnostic
@@ -4930,6 +5045,148 @@ mod env_flag_tests {
         );
 
         std::env::remove_var("VW_ENV");
+    }
+}
+
+#[cfg(test)]
+mod decl_batch_tests {
+    use super::*;
+
+    /// Records every eval; fails any whose script contains `BOOM`.
+    #[derive(Default)]
+    struct Recorder {
+        evals: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl vw_eda::EdaBackend for Recorder {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+
+        async fn eval(
+            &mut self,
+            tcl: &str,
+        ) -> Result<vw_eda::EvalOutput, vw_eda::BackendError> {
+            self.evals.push(tcl.to_string());
+            if tcl.contains("BOOM") {
+                return Err(vw_eda::BackendError::Tcl {
+                    message: "boom".into(),
+                    code: None,
+                    info: None,
+                    stdout: String::new(),
+                });
+            }
+            Ok(vw_eda::EvalOutput {
+                value: String::new(),
+                stdout: String::new(),
+            })
+        }
+
+        async fn send(
+            &mut self,
+            _request: vw_eda::Request,
+        ) -> Result<vw_eda::Response, vw_eda::BackendError> {
+            unimplemented!()
+        }
+
+        fn set_stdout_sink(&mut self, _sink: vw_eda::StdoutSink) {}
+
+        async fn shutdown(&mut self) -> Result<(), vw_eda::BackendError> {
+            Ok(())
+        }
+    }
+
+    fn origin(line: u32) -> vw_repl::Origin {
+        vw_repl::Origin {
+            file: None,
+            line,
+            snippet: String::new(),
+            via: Vec::new(),
+        }
+    }
+
+    /// Top-level commands of `src`, paired with whether each batches.
+    fn classify(src: &str) -> Vec<bool> {
+        let parsed = vw_htcl::parse(src);
+        let putr_map = vw_htcl::putr::rewrite(src, &parsed.document);
+        parsed
+            .document
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                vw_htcl::Stmt::Command(c) => {
+                    Some(is_declaration_only(c, &putr_map))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Procs and namespaces of procs batch; anything that executes —
+    /// including a namespace body that does — does not.
+    #[test]
+    fn only_pure_declarations_batch() {
+        let src = "\
+proc a {} unit { puts hi }
+namespace eval ns {
+  # comment
+  proc b {} unit { return }
+  namespace eval inner { proc c {} unit { return } }
+}
+namespace eval ns2 {
+  variable x 1
+  proc d {} unit { return }
+}
+set y 2
+puts hello
+";
+        assert_eq!(classify(src), vec![true, true, false, false, false]);
+    }
+
+    #[tokio::test]
+    async fn declarations_ship_as_one_eval() {
+        let mut backend = Recorder::default();
+        let current = std::sync::Mutex::new(None);
+        let mut batch = DeclBatch::default();
+        batch.push("proc a {} {}".into(), origin(1));
+        batch.push("proc b {} {}".into(), origin(2));
+        batch.push("proc c {} {}".into(), origin(3));
+        batch.flush(&mut backend, &current).await;
+        assert_eq!(backend.evals.len(), 1);
+        let script = &backend.evals[0];
+        let (a, b, c) = (
+            script.find("proc a").unwrap(),
+            script.find("proc b").unwrap(),
+            script.find("proc c").unwrap(),
+        );
+        assert!(a < b && b < c, "declaration order must be preserved");
+        assert_eq!(current.lock().unwrap().as_ref().unwrap().line, 1);
+        assert_eq!(batch.bytes, 0);
+
+        // Nothing pending: no eval at all.
+        batch.flush(&mut backend, &current).await;
+        assert_eq!(backend.evals.len(), 1);
+    }
+
+    /// A failing batch replays item by item, so the error is reported
+    /// against the declaration that caused it and the declarations
+    /// after it still get defined.
+    #[tokio::test]
+    async fn failed_batch_replays_each_declaration() {
+        let mut backend = Recorder::default();
+        let current = std::sync::Mutex::new(None);
+        let mut batch = DeclBatch::default();
+        batch.push("proc a {} {}".into(), origin(1));
+        batch.push("BOOM".into(), origin(2));
+        batch.push("proc c {} {}".into(), origin(3));
+        batch.flush(&mut backend, &current).await;
+        assert_eq!(backend.evals.len(), 4);
+        assert!(backend.evals[1].contains("proc a"));
+        assert!(backend.evals[2].contains("BOOM"));
+        assert!(backend.evals[3].contains("proc c"));
+        assert!(!backend.evals[3].contains("proc a"));
+        assert_eq!(current.lock().unwrap().as_ref().unwrap().line, 3);
     }
 }
 

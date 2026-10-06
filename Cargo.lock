@@ -5755,6 +5755,7 @@ dependencies = [
 name = "vw"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "camino",
  "chrono",
  "clap",
