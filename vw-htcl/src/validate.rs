@@ -2811,9 +2811,6 @@ fn is_known_tcl_builtin(name: &str) -> bool {
             // through the fuzzy sweep — `if` alone can hit six
             // figures of call sites in a joined-source dump.
             | "if"
-            | "elseif"
-            | "else"
-            | "then"
             | "for"
             | "foreach"
             | "while"
@@ -3019,6 +3016,24 @@ fn validate_command(
     // braced `*` word. The callee is whatever `$cmd` holds at
     // runtime, as dynamic as a `$cmd` head, which isn't checked.
     if call_name == "*" && cmd.words[0].form == crate::ast::WordForm::Braced {
+        return;
+    }
+    // `elseif` / `else` / `then` are words of an `if`, never
+    // commands. One heading a command means the `if` ended at a
+    // newline before it — `}\nelseif {...}` — which Tcl then runs
+    // as a call and fails with `invalid command name "elseif"`.
+    if matches!(call_name, "elseif" | "else" | "then")
+        && cmd.words[0].form != crate::ast::WordForm::Braced
+    {
+        diags.push(Diagnostic {
+            severity: Severity::Error,
+            message: format!(
+                "`{call_name}` outside `if`/`else` block. \
+                 `{call_name}` must be on the same line as closing \
+                 `}}` from an `if` body"
+            ),
+            span: cmd.words[0].span,
+        });
         return;
     }
     let Some(sig) = table.get(call_name) else {
@@ -5602,6 +5617,40 @@ proc ok {} MyType {
 ";
         let d = diags(src);
         assert!(!has_fallthrough_diag(&d), "unexpected diags: {d:?}");
+    }
+
+    /// `}` then `elseif` / `else` on the next line ends the `if`
+    /// at the newline, leaving a bare `elseif` command — flagged
+    /// rather than passed through as a builtin.
+    #[test]
+    fn elseif_on_its_own_line_is_an_error() {
+        let src = "\
+proc f {x} unit {
+  if {$x} {
+    puts a
+  }
+  elseif {!$x} {
+    puts b
+  }
+  else {
+    puts c
+  }
+}
+";
+        let d = diags(src);
+        for kw in ["elseif", "else"] {
+            assert!(
+                d.iter().any(|e| e.severity == Severity::Error
+                    && e.message.starts_with(&format!(
+                        "`{kw}` outside `if`/`else` block"
+                    ))),
+                "expected `{kw}` error, got: {d:?}"
+            );
+        }
+        assert!(
+            d.iter().all(|e| !e.message.contains("undefined proc")),
+            "{d:?}"
+        );
     }
 
     #[test]

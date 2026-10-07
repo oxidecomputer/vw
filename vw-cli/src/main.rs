@@ -1762,6 +1762,12 @@ async fn main() {
                     }
                 }
             }
+            // htcl errors mean the IP config can't be trusted to
+            // generate: regenerating would run broken source through
+            // Vivado (and fail there, slowly, maybe remotely), and
+            // stale wrappers are an expected consequence of the edit
+            // being fixed, not a second problem to report.
+            let htcl_had_errors = had_errors;
             // VHDL static analysis (vhdl_ls) over the workspace's own
             // HDL — the same checks the editor surfaces live, run in
             // batch alongside the htcl check. Skipped entirely for a
@@ -1850,7 +1856,7 @@ async fn main() {
                     // check will still run and surface whatever it
                     // finds (including the staleness error if regen
                     // didn't take).
-                    if ip_generate {
+                    if ip_generate && !htcl_had_errors {
                         let stale = vw_lib::load_workspace_config(&ws)
                             .ok()
                             .and_then(|cfg| {
@@ -2039,6 +2045,18 @@ async fn main() {
                                 name,
                                 check_variant,
                             ) {
+                                Ok(true)
+                                    if project_dir.exists()
+                                        && htcl_had_errors =>
+                                {
+                                    println!(
+                                        "{} IP wrappers under `{ip_dir}/` are \
+                                         also stale; regenerate them with \
+                                         `vw check --ip-generate` once the \
+                                         htcl errors above are fixed.",
+                                        "note:".bright_yellow(),
+                                    );
+                                }
                                 Ok(true) if project_dir.exists() => {
                                     had_errors = true;
                                     eprintln!(
@@ -3058,6 +3076,7 @@ async fn check_htcl_with_mode(
             }
             None => (file.to_string(), 0, 0),
         };
+        let message = highlight_code_spans(message);
         eprintln!("{} {display_path}:{line}:{col}: {message}", level);
     };
 
@@ -3696,6 +3715,72 @@ fn overload_specialization_mangle(
         return None;
     };
     Some(vw_htcl::mangle_specialization(name, variant))
+}
+
+/// Render a diagnostic message's `` `code` `` spans for the terminal:
+/// each span is syntax-highlighted as htcl, with the backticks
+/// dropped. Messages carry backticks as markup because the same text
+/// goes to the editor, which has no colors to give it. With color
+/// off (`NO_COLOR`, piped output) the message is returned as-is so
+/// the code stays delimited.
+fn highlight_code_spans(message: &str) -> String {
+    if !colored::control::SHOULD_COLORIZE.should_colorize() {
+        return message.to_string();
+    }
+    let mut out = String::with_capacity(message.len());
+    let mut parts = message.split('`');
+    out.push_str(parts.next().unwrap_or_default());
+    let mut in_code = true;
+    let mut pending = parts.peekable();
+    while let Some(part) = pending.next() {
+        // An unpaired trailing backtick isn't markup; keep it.
+        if in_code && pending.peek().is_none() {
+            out.push('`');
+            out.push_str(part);
+            break;
+        }
+        if in_code {
+            out.push_str(&highlight_htcl_snippet(part));
+        } else {
+            out.push_str(part);
+        }
+        in_code = !in_code;
+    }
+    out
+}
+
+/// ANSI-styled `code`, colored by the REPL's htcl highlighter so
+/// code in a diagnostic looks like code in the REPL. Bytes the
+/// highlighter leaves uncolored (`}`, punctuation) are bolded so
+/// the whole snippet still reads apart from the prose around it.
+fn highlight_htcl_snippet(code: &str) -> String {
+    use ratatui::style::{Color, Modifier, Style};
+    let paint = |text: &str, style: Style| {
+        let mut c = match style.fg {
+            Some(Color::Rgb(r, g, b)) => text.truecolor(r, g, b),
+            _ => text.bold(),
+        };
+        if style.add_modifier.contains(Modifier::BOLD) {
+            c = c.bold();
+        }
+        if style.add_modifier.contains(Modifier::ITALIC) {
+            c = c.italic();
+        }
+        c.to_string()
+    };
+    let mut out = String::new();
+    let mut at = 0;
+    for tok in vw_repl::highlight_htcl::highlight_source(code) {
+        if tok.range.start > at {
+            out.push_str(&paint(&code[at..tok.range.start], Style::default()));
+        }
+        out.push_str(&paint(&code[tok.range.clone()], tok.style));
+        at = tok.range.end;
+    }
+    if at < code.len() {
+        out.push_str(&paint(&code[at..], Style::default()));
+    }
+    out
 }
 
 /// Upper bound on the Tcl text one [`DeclBatch`] eval carries. Keeps
