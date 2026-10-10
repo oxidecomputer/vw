@@ -4546,6 +4546,10 @@ pub fn check_vhdl(
 
     let severities = *config.severities();
     let mut project = vhdl_lang::Project::from_config(config, &mut messages);
+    // Match vhdl_ls, which enables these on startup: without them the
+    // unused-declaration and sensitivity-list warnings the editor shows
+    // never reach `vw check`.
+    project.enable_all_linters();
 
     // Restrict findings to the workspace's own *source* tree: not deps
     // under `~/.vw/deps`, not the bundled standard library, and not the
