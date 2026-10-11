@@ -84,9 +84,9 @@ vhdl_lang = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/e
 vhdl_ls = { git = "https://github.com/oxidecomputer/rust_hdl",  branch = "vw/embed-api" }
 
 
-[patch."https://github.com/oxidecomputer/rust_hdl"]
- vhdl_lang = { path = "/Users/ry/src/rust_hdl/vhdl_lang" }
- vhdl_ls = { path = "/Users/ry/src/rust_hdl/vhdl_ls" }
+# [patch."https://github.com/oxidecomputer/rust_hdl"]
+#  vhdl_lang = { path = "/Users/ry/src/rust_hdl/vhdl_lang" }
+#  vhdl_ls = { path = "/Users/ry/src/rust_hdl/vhdl_ls" }
 
 
 [patch."https://github.com/oxidecomputer/vw/"]
