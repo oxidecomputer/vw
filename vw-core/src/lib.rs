@@ -35,16 +35,38 @@ pub mod visitor;
 
 #[derive(Debug)]
 pub enum VwError {
-    Config { message: String },
-    Dependency { message: String },
-    Git { message: String },
-    FileSystem { message: String },
-    Testbench { message: String },
-    NvcSimulation { command: String },
-    NvcElab { command: String },
-    NvcAnalysis { library: String, command: String },
-    CodeGen { message: String },
-    Simulation { message: String },
+    Config {
+        message: String,
+    },
+    Dependency {
+        message: String,
+    },
+    Git {
+        message: String,
+    },
+    FileSystem {
+        message: String,
+    },
+    Testbench {
+        message: String,
+    },
+    NvcSimulation {
+        command: String,
+    },
+    NvcElab {
+        command: String,
+    },
+    NvcAnalysis {
+        library: String,
+        command: String,
+        output: String,
+    },
+    CodeGen {
+        message: String,
+    },
+    Simulation {
+        message: String,
+    },
     Io(std::io::Error),
     Serialization(toml::ser::Error),
     Deserialization(toml::de::Error),
@@ -93,8 +115,15 @@ impl fmt::Display for VwError {
                 writeln!(f, "{command}")?;
                 Ok(())
             }
-            VwError::NvcAnalysis { library, command } => {
+            VwError::NvcAnalysis {
+                library,
+                command,
+                output,
+            } => {
                 writeln!(f, "NVC analysis failed for library '{library}'")?;
+                if !output.is_empty() {
+                    writeln!(f, "{output}")?;
+                }
                 writeln!(f, "command:")?;
                 writeln!(f, "{command}")?;
                 Ok(())

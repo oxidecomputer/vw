@@ -5707,7 +5707,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhdl_lang"
 version = "0.87.1"
-source = "git+https://github.com/oxidecomputer/rust_hdl?branch=vw%2Fembed-api#941eae89ffcb09a8bdbfbd96eb59aa9827ac0dd2"
 dependencies = [
  "clap",
  "dirs 6.0.0",
@@ -5728,7 +5727,6 @@ dependencies = [
 [[package]]
 name = "vhdl_lang_macros"
 version = "0.87.1"
-source = "git+https://github.com/oxidecomputer/rust_hdl?branch=vw%2Fembed-api#941eae89ffcb09a8bdbfbd96eb59aa9827ac0dd2"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -5737,7 +5735,6 @@ dependencies = [
 [[package]]
 name = "vhdl_ls"
 version = "0.87.1"
-source = "git+https://github.com/oxidecomputer/rust_hdl?branch=vw%2Fembed-api#941eae89ffcb09a8bdbfbd96eb59aa9827ac0dd2"
 dependencies = [
  "clap",
  "env_logger",
