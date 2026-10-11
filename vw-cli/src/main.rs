@@ -92,8 +92,38 @@ impl From<CliLogLevel> for vw_vivado::LogLevel {
 /// outermost message is usually the least informative part — "generating
 /// anodizer structs" says which step, never what went wrong in it. The cause
 /// chain is where the answer is, so it is always printed.
+///
+/// Some causes carry a tool's own coloured output (nvc's diagnostics, for
+/// one), which is kept only when this process is colouring too.
 fn report(error: &dyn std::error::Error) {
-    eprintln!("{} {}", "error:".bright_red(), vw_remote::causes(error));
+    let message = vw_remote::causes(error);
+    let message = if colored::control::SHOULD_COLORIZE.should_colorize() {
+        message
+    } else {
+        strip_ansi(&message)
+    };
+    eprintln!("{} {message}", "error:".bright_red());
+}
+
+/// `text` without its ANSI CSI escape sequences (`ESC [ ... final`), which is
+/// all a terminal colour is.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            // Parameters and intermediates, up to the final byte.
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[derive(Parser)]
@@ -5495,5 +5525,29 @@ fn collect_files(dir: &std::path::Path, into: &mut Vec<std::path::PathBuf>) {
         } else {
             into.push(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::*;
+
+    /// nvc's diagnostics as they arrive with colour forced on.
+    #[test]
+    fn colour_is_removed_and_text_kept() {
+        assert_eq!(
+            strip_ansi("\u{1b}[31m** Error:\u{1b}[0m no visible declaration"),
+            "** Error: no visible declaration",
+        );
+        assert_eq!(
+            strip_ansi(" \u{1b}[1;34m  > \u{1b}[0mbad.vhd:2"),
+            "   > bad.vhd:2",
+        );
+    }
+
+    #[test]
+    fn plain_text_is_unchanged() {
+        let text = "missing choices for 'U'";
+        assert_eq!(strip_ansi(text), text);
     }
 }

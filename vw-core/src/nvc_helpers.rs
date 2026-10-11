@@ -82,7 +82,12 @@ pub async fn run_nvc_analysis(
     // on a remote instance an inherited stderr goes to the server's log, and
     // a failure that reports only the command line gives the developer
     // nothing to act on. The diagnostics have to travel inside the error.
-    let output = run_cmd_w_output(&args, None).await?;
+    //
+    // nvc only colours a terminal, and a pipe is not one, so colour is forced
+    // here. Whoever finally prints the error knows whether its own output is
+    // a terminal and strips the escapes if not.
+    let envs = vec![("NVC_COLORS".to_string(), "always".to_string())];
+    let output = run_cmd_w_output(&args, Some(&envs)).await?;
 
     if !output.status.success() {
         return Err(VwError::NvcAnalysis {
