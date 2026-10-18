@@ -35,10 +35,14 @@ use vw_api_types_versions::latest::S3Credentials;
 ///
 /// An `ltx` next to the image is the probes file for the debug cores in it;
 /// the Hardware Manager cannot show an ILA's signals without the one written
-/// from the same implementation as the `pdi`.
-const GATHERED: [(&str, &str); 7] = [
+/// from the same implementation as the `pdi`. `ila` holds the captures taken
+/// from those cores on a board, each as a CSV and as the `.ila` archive the
+/// Hardware Manager reopens as a waveform.
+const GATHERED: [(&str, &str); 9] = [
     ("image", "pdi"),
     ("image", "ltx"),
+    ("ila", "csv"),
+    ("ila", "ila"),
     ("reports", "rpt"),
     ("reports", "csv"),
     ("synth", "edif"),
@@ -822,6 +826,8 @@ mod test {
         let (_dir, root) = scratch();
         build_output(&root, "image/top.pdi", "image");
         build_output(&root, "image/top.ltx", "probes");
+        build_output(&root, "ila/capture-1.csv", "capture");
+        build_output(&root, "ila/capture-1.ila", "capture");
         build_output(&root, "reports/timing.rpt", "report");
         build_output(&root, "synth/design.edif", "netlist");
         // Neither small nor meaningful anywhere else.
@@ -838,6 +844,8 @@ mod test {
         assert_eq!(
             found,
             [
+                "ila/capture-1.csv",
+                "ila/capture-1.ila",
                 "image/top.ltx",
                 "image/top.pdi",
                 "reports/timing.rpt",
