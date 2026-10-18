@@ -32,8 +32,13 @@ use vw_api_types_versions::latest::S3Credentials;
 /// `synth`, `place` and `route` each produce an `edif` and they are different
 /// netlists, which is why what goes in the bucket is keyed by the directory
 /// too rather than by file name alone.
-const GATHERED: [(&str, &str); 6] = [
+///
+/// An `ltx` next to the image is the probes file for the debug cores in it;
+/// the Hardware Manager cannot show an ILA's signals without the one written
+/// from the same implementation as the `pdi`.
+const GATHERED: [(&str, &str); 7] = [
     ("image", "pdi"),
+    ("image", "ltx"),
     ("reports", "rpt"),
     ("reports", "csv"),
     ("synth", "edif"),
@@ -816,6 +821,7 @@ mod test {
     fn only_what_a_build_produced_counts_as_an_artifact() {
         let (_dir, root) = scratch();
         build_output(&root, "image/top.pdi", "image");
+        build_output(&root, "image/top.ltx", "probes");
         build_output(&root, "reports/timing.rpt", "report");
         build_output(&root, "synth/design.edif", "netlist");
         // Neither small nor meaningful anywhere else.
@@ -831,7 +837,12 @@ mod test {
 
         assert_eq!(
             found,
-            ["image/top.pdi", "reports/timing.rpt", "synth/design.edif",],
+            [
+                "image/top.ltx",
+                "image/top.pdi",
+                "reports/timing.rpt",
+                "synth/design.edif",
+            ],
         );
     }
 
