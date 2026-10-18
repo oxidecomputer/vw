@@ -465,6 +465,8 @@ pub enum CloudError {
     NoDriver(Utf8PathBuf),
     #[error("scanning {0}")]
     Scan(camino::Utf8PathBuf, #[source] vw_sync::ScanError),
+    #[error("finding the workspace's path dependencies")]
+    PathDependencies(#[source] vw_lib::VwError),
     #[error("reading {0}")]
     ReadSource(String, #[source] std::io::Error),
     #[error("watching the workspace for changes")]

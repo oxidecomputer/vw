@@ -88,7 +88,16 @@ pub async fn run(
         workspace.as_str().bright_black(),
     );
 
-    let mut changes = watcher(&workspace)?;
+    // Path dependencies travel with the workspace (see `Tree`), so an edit
+    // to one has to trigger a sync just as an edit to the workspace does.
+    let mut roots = vec![workspace.clone()];
+    roots.extend(
+        vw_lib::path_dependencies_to_sync(&workspace)
+            .map_err(CloudError::PathDependencies)?
+            .into_iter()
+            .map(|(_, root)| root),
+    );
+    let mut changes = watcher(&roots)?;
     loop {
         // Wait for something to happen, then let the rest of the burst land
         // before scanning. An editor writing a file is several events, and a
@@ -174,8 +183,8 @@ async fn sync_once(
     // same tree, and the scan is the expensive half of a pass — every source
     // file read and hashed — so scanning per instance would double the cost of
     // saying the same thing twice.
-    let manifest = vw_sync::scan(workspace)
-        .map_err(|e| CloudError::Scan(workspace.to_owned(), e))?;
+    let tree = Tree::scan(workspace)?;
+    let manifest = &tree.manifest;
 
     for kind in targets {
         let plan = vw_api_client::retrying(|| {
@@ -183,7 +192,7 @@ async fn sync_once(
                 &target.environment,
                 &target.workspace,
                 kind,
-                &manifest,
+                manifest,
             )
         })
         .await
@@ -200,11 +209,12 @@ async fn sync_once(
         // arrive in any order and are safe to send at once. The commit that
         // follows is what imposes an order, and it happens after all of this.
         let uploads = plan.missing.iter().map(|digest| {
-            let path = path_for(&manifest, digest)
+            let path = path_for(manifest, digest)
                 .expect("the plan only asks for content the manifest names");
+            let source = tree.source(path);
 
             async move {
-                let contents = std::fs::read(workspace.join(path))
+                let contents = std::fs::read(&source)
                     .map_err(|e| CloudError::ReadSource(path.to_owned(), e))?;
 
                 // Cloned per attempt because the body is consumed by the
@@ -238,17 +248,74 @@ async fn sync_once(
                 &target.environment,
                 &target.workspace,
                 kind,
-                &manifest,
+                manifest,
             )
         })
         .await
         .map_err(|e| session.error(e))?
         .into_inner();
 
-        report(*kind, &manifest, plan.missing.len(), &result, announce);
+        report(*kind, manifest, plan.missing.len(), &result, announce);
     }
 
     Ok(())
+}
+
+/// What one sync sends: the workspace, plus every path dependency it needs.
+///
+/// A `path = "..."` dependency names a directory on this machine — usually an
+/// absolute path under the developer's home directory — that no instance has.
+/// So each one, the whole closure of them, travels inside the workspace's own
+/// manifest under `.vw-path-deps/<name>/`, a location relative to the
+/// workspace and keyed by name rather than by where it lives here. Resolution
+/// on the instance looks there first (`vw_lib::SYNCED_PATH_DEPS_DIR`).
+/// Carrying them in the one manifest, rather than as trees of their own, keeps
+/// a pass a single commit, and a dependency that is dropped or renamed is
+/// removed from the instance by the same complete-manifest rule as any file.
+struct Tree {
+    manifest: types::TreeManifest,
+    workspace: Utf8PathBuf,
+    /// `(manifest prefix, local root)` for each path dependency.
+    dependencies: Vec<(String, Utf8PathBuf)>,
+}
+
+impl Tree {
+    fn scan(workspace: &Utf8Path) -> Result<Self, CloudError> {
+        let mut manifest = vw_sync::scan(workspace)
+            .map_err(|e| CloudError::Scan(workspace.to_owned(), e))?;
+        let mut dependencies = Vec::new();
+        for (name, root) in vw_lib::path_dependencies_to_sync(workspace)
+            .map_err(CloudError::PathDependencies)?
+        {
+            let prefix = format!("{}/{name}/", vw_lib::SYNCED_PATH_DEPS_DIR);
+            let scanned = vw_sync::scan(&root)
+                .map_err(|e| CloudError::Scan(root.clone(), e))?;
+            manifest.entries.extend(scanned.entries.into_iter().map(
+                |mut entry| {
+                    entry.path = format!("{prefix}{}", entry.path);
+                    entry
+                },
+            ));
+            dependencies.push((prefix, root));
+        }
+        // A scan's order, which consumers compare and hash by.
+        manifest.entries.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Self {
+            manifest,
+            workspace: workspace.to_owned(),
+            dependencies,
+        })
+    }
+
+    /// The local file behind a manifest path.
+    fn source(&self, path: &str) -> Utf8PathBuf {
+        for (prefix, root) in &self.dependencies {
+            if let Some(rest) = path.strip_prefix(prefix.as_str()) {
+                return root.join(rest);
+            }
+        }
+        self.workspace.join(path)
+    }
 }
 
 /// Find the file in `manifest` with this digest.
@@ -328,14 +395,14 @@ pub(crate) fn workspace_root() -> Result<Utf8PathBuf, CloudError> {
     }
 }
 
-/// A stream of "something under `root` changed".
+/// A stream of "something under one of `roots` changed".
 ///
 /// The events themselves are discarded. Working out what changed from them is
 /// a great deal of bookkeeping that a scan answers directly and correctly,
 /// including for the cases events are worst at — a branch switch, a file
 /// replaced by a directory, an editor writing through a temporary file.
 fn watcher(
-    root: &Utf8Path,
+    roots: &[Utf8PathBuf],
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<()>, CloudError> {
     use notify::Watcher;
 
@@ -351,9 +418,11 @@ fn watcher(
     })
     .map_err(CloudError::Watch)?;
 
-    watcher
-        .watch(root.as_std_path(), notify::RecursiveMode::Recursive)
-        .map_err(CloudError::Watch)?;
+    for root in roots {
+        watcher
+            .watch(root.as_std_path(), notify::RecursiveMode::Recursive)
+            .map_err(CloudError::Watch)?;
+    }
 
     // The watcher stops when it is dropped, and nothing else owns it.
     std::mem::forget(watcher);
@@ -436,6 +505,32 @@ mod test {
 
     fn paths(manifest: &types::TreeManifest) -> Vec<&str> {
         manifest.entries.iter().map(|e| e.path.as_str()).collect()
+    }
+
+    /// A path dependency outside the workspace rides along under
+    /// `.vw-path-deps/<name>/`, its files read from where they really are.
+    #[test]
+    fn path_dependencies_travel_under_their_name() {
+        let (_dir, root) = workspace(&["app/hdl/top.vhd", "lib/module.htcl"]);
+        let app = root.join("app");
+        std::fs::write(
+            app.join("vw.toml"),
+            "[workspace]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies.lib]\npath = \"../lib\"\n",
+        )
+        .unwrap();
+
+        let tree = Tree::scan(&app).unwrap();
+        assert_eq!(
+            paths(&tree.manifest),
+            [".vw-path-deps/lib/module.htcl", "hdl/top.vhd", "vw.toml"],
+        );
+        let canonical = root.canonicalize_utf8().unwrap();
+        assert_eq!(
+            tree.source(".vw-path-deps/lib/module.htcl"),
+            canonical.join("lib/module.htcl"),
+        );
+        assert_eq!(tree.source("hdl/top.vhd"), app.join("hdl/top.vhd"));
     }
 
     #[test]
