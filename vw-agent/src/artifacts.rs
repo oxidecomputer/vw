@@ -14,7 +14,7 @@
 //! poll has none of a watcher's trouble with a directory that does not exist
 //! yet, is deleted by `vw clean`, and then reappears.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -235,7 +235,9 @@ pub(crate) async fn synchronize(
     // What has already gone, by path, with the digest that went. Keyed by
     // digest rather than a timestamp so a rebuild that produces byte-identical
     // output is not uploaded twice, and one that produces different bytes
-    // under the same name is.
+    // under the same name is. Only ever a reason to look in the store before
+    // skipping a file, never the last word: the store can lose an object
+    // without this task hearing of it (`vw cloud artifacts --clear`, say).
     let mut uploaded: HashMap<Utf8PathBuf, String> = HashMap::new();
     // What each file looked like last time round, to tell a finished artifact
     // from one still being written.
@@ -365,6 +367,10 @@ async fn pass(
 ) -> Pass {
     let mut outcome = Pass::default();
     let mut currently = HashMap::new();
+    // What the store holds, asked for at most once a pass and only when
+    // memory says something has already gone: an outer `None` is not asked
+    // yet, an inner one is a listing that failed.
+    let mut stored: Option<Option<HashSet<String>>> = None;
 
     for Found {
         path: artifact,
@@ -400,7 +406,36 @@ async fn pass(
             }
         };
         if uploaded.get(&artifact) == Some(&digest) {
-            continue;
+            // Sent already, as far as this task knows. Whether it is still
+            // there is the store's to say: a store emptied behind our back
+            // would otherwise never again get a file that a rebuild produces
+            // byte-for-byte the same as the one that was removed.
+            if stored.is_none() {
+                stored = Some(match listing(credentials).await {
+                    Ok(keys) => Some(keys),
+                    Err(e) => {
+                        warn!(log, "cannot list the store";
+                            "bucket" => &credentials.bucket,
+                            "error" => %e,
+                        );
+                        // Counted, because a flush that could not check is
+                        // not one that knows everything arrived.
+                        outcome.failed += 1;
+                        None
+                    }
+                });
+            }
+            match stored.as_ref().and_then(Option::as_ref) {
+                // Not knowing is not a reason to send everything again to a
+                // store that is not answering.
+                None => continue,
+                Some(keys) if keys.contains(&key) => continue,
+                Some(_) => info!(log, "an artifact sent earlier is gone \
+                                       from the store; sending it again";
+                    "path" => %artifact,
+                    "key" => &key,
+                ),
+            }
         }
 
         match upload(credentials, &key, &artifact).await {
@@ -627,16 +662,10 @@ pub(crate) async fn upload_all(
     sent
 }
 
-/// Put one artifact in the bucket.
-///
-/// Streamed from disk rather than read first, for the same reason the digest
-/// is: the files this exists to move are large, and neither end of the wire
-/// needs a copy of one in memory for it to get across.
-async fn upload(
+/// The bucket `credentials` name.
+fn bucket(
     credentials: &S3Credentials,
-    key: &str,
-    path: &Utf8Path,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Box<s3::Bucket>, Box<dyn std::error::Error + Send + Sync>> {
     let region = s3::Region::Custom {
         region: credentials.region.clone(),
         endpoint: credentials.endpoint.clone(),
@@ -652,9 +681,35 @@ async fn upload(
     // Path style because the bucket is reached by address rather than by name:
     // there is no DNS inside the VPC that would resolve
     // `vivado-darmok.<instance>`.
-    let bucket =
-        s3::Bucket::new(&credentials.bucket, region, creds)?.with_path_style();
+    Ok(s3::Bucket::new(&credentials.bucket, region, creds)?.with_path_style())
+}
 
+/// The key of everything in the bucket.
+///
+/// One request for a store of the size a build fills, so cheap next to the
+/// hashing a pass already does.
+async fn listing(
+    credentials: &S3Credentials,
+) -> Result<HashSet<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let pages = bucket(credentials)?.list(String::new(), None).await?;
+    Ok(pages
+        .into_iter()
+        .flat_map(|page| page.contents)
+        .map(|object| object.key)
+        .collect())
+}
+
+/// Put one artifact in the bucket.
+///
+/// Streamed from disk rather than read first, for the same reason the digest
+/// is: the files this exists to move are large, and neither end of the wire
+/// needs a copy of one in memory for it to get across.
+async fn upload(
+    credentials: &S3Credentials,
+    key: &str,
+    path: &Utf8Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bucket = bucket(credentials)?;
     let mut file = tokio::fs::File::open(path).await?;
     let status = bucket
         .put_object_stream(&mut file, format!("/{key}"))
