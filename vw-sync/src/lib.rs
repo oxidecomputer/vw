@@ -27,7 +27,10 @@
 //! hierarchically and excludes build output outright, so neither end sends,
 //! receives, or deletes anything a build produced. Both ends apply the same
 //! rules — the receiver reads them from the tree it was handed, so they cannot
-//! drift apart.
+//! drift apart. And a receiver only ever deletes what an earlier commit put
+//! there, so a file generated on it among the sources, which no `.gitignore`
+//! happens to cover, is left alone too: a manifest that does not mention it is
+//! one whose sender never knew it was there.
 //!
 //! [`TreeManifest`]: vw_api_types_versions::latest::TreeManifest
 
