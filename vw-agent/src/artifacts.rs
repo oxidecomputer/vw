@@ -33,12 +33,19 @@ use vw_api_types_versions::latest::S3Credentials;
 /// netlists, which is why what goes in the bucket is keyed by the directory
 /// too rather than by file name alone.
 ///
+/// None of those netlists says where anything was placed, though, and the
+/// checkpoint that does is too big to keep. The `xdc` that `place` and `route`
+/// write next to theirs carries every placement constraint, the ones Vivado
+/// chose itself included: without it a build's package pins and sites are
+/// lost with the instance. `synth` writes one too, but before placement it is
+/// only the constraints the workspace already has.
+///
 /// An `ltx` next to the image is the probes file for the debug cores in it;
 /// the Hardware Manager cannot show an ILA's signals without the one written
 /// from the same implementation as the `pdi`. `ila` holds the captures taken
 /// from those cores on a board, each as a CSV and as the `.ila` archive the
 /// Hardware Manager reopens as a waveform.
-const GATHERED: [(&str, &str); 9] = [
+const GATHERED: [(&str, &str); 11] = [
     ("image", "pdi"),
     ("image", "ltx"),
     ("ila", "csv"),
@@ -48,6 +55,8 @@ const GATHERED: [(&str, &str); 9] = [
     ("synth", "edif"),
     ("place", "edif"),
     ("route", "edif"),
+    ("place", "xdc"),
+    ("route", "xdc"),
 ];
 
 /// Where a testbench leaves its results, and what to keep.
@@ -885,6 +894,7 @@ mod test {
         build_output(&root, "ila/capture-1.ila", "capture");
         build_output(&root, "reports/timing.rpt", "report");
         build_output(&root, "synth/design.edif", "netlist");
+        build_output(&root, "place/design-applied.xdc", "placement");
         // Neither small nor meaningful anywhere else.
         build_output(&root, "image/top.bit", "bitstream");
         build_output(&root, "synth/design.dcp", "checkpoint");
@@ -892,6 +902,8 @@ mod test {
         build_output(&root, "logs/vivado.log", "log");
         // A stage's working directory is not ours to send either.
         build_output(&root, "synth/runs/inner.edif", "scratch");
+        // Nothing has been placed yet, so nothing the workspace lacks.
+        build_output(&root, "synth/design-applied.xdc", "constraints");
 
         let found: Vec<String> =
             artifacts(&root).into_iter().map(|f| f.key).collect();
@@ -903,6 +915,7 @@ mod test {
                 "ila/capture-1.ila",
                 "image/top.ltx",
                 "image/top.pdi",
+                "place/design-applied.xdc",
                 "reports/timing.rpt",
                 "synth/design.edif",
             ],
