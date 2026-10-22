@@ -1040,9 +1040,9 @@ impl VivadoBackend {
         }
         if !outcome.absorbed {
             // Unclassified PTY output DURING an eval — the tail
-            // of a multi-line Vivado error (`[BD 41-758] … valid
-            // clock source:` followed by unindented `/pin` list),
-            // or arbitrary chatter the user's command triggered.
+            // of a multi-line Vivado message that arrived after
+            // the continuation window closed, or arbitrary
+            // chatter the user's command triggered.
             // Route as Stdout so the user can SEE it in the
             // scrollback without it inheriting the previous
             // warning/error's styling. Verbose-log too, for
@@ -1754,6 +1754,13 @@ struct PendingPtyMessage {
     kind: StreamKind,
     text: String,
     arrived_at: std::time::Instant,
+    /// The header line ended in `:`, announcing a list body (e.g.
+    /// `[BD 41-758] … not connected to a valid clock source:`
+    /// followed by one `/pin` per line). Vivado prints those list
+    /// lines *unindented*, so the usual leading-whitespace
+    /// continuation rule would split them off — see
+    /// [`PtyClassifier::handle`].
+    expects_list: bool,
 }
 
 /// Outcome of feeding one PTY line through [`PtyClassifier`].
@@ -1815,6 +1822,7 @@ impl PtyClassifier {
                 kind,
                 text: line.to_string(),
                 arrived_at: now,
+                expects_list: line.trim_end().ends_with(':'),
             });
             out.absorbed = true;
             return out;
@@ -1850,11 +1858,18 @@ impl PtyClassifier {
             // inherit its orange/red styling. Non-continuation
             // unclassified lines return `absorbed=false` — the
             // during-eval caller routes them to Stdout so they
-            // still surface (e.g. the `/pin` list following
-            // `[BD 41-758] … clock source:`), just without the
-            // pending's severity style.
+            // still surface, just without the pending's severity
+            // style.
+            //
+            // Exception: a header ending in `:` announces a list
+            // body, which Vivado prints unindented (the `/pin`
+            // list after `[BD 41-758] … clock source:`). Absorb
+            // any non-blank line for those, so the list stays
+            // attached to the diagnostic instead of degrading to
+            // Stdout — which terse log levels (`vw check`) elide.
             let looks_like_continuation =
-                line.chars().next().is_some_and(char::is_whitespace);
+                line.chars().next().is_some_and(char::is_whitespace)
+                    || (p.expects_list && !line.trim().is_empty());
             if merges
                 && looks_like_continuation
                 && now.duration_since(p.arrived_at) < self.window
@@ -2001,6 +2016,42 @@ mod tests {
             "WARNING: [X 1-1] header\n  /path/to/file.xci\n"
         );
         assert!(!out.absorbed, "unindented follow-up must not be absorbed");
+    }
+
+    /// Regression: `[BD 41-758]` ends its header with `:` and then
+    /// lists the offending pins *unindented*. Those lines must stay
+    /// attached to the error — split off as Stdout, terse log
+    /// levels (`vw check`'s IP pass) elide them and the user sees
+    /// a header promising a list with nothing under it.
+    #[test]
+    fn classifier_absorbs_unindented_list_after_colon_header() {
+        let mut c = classifier(20);
+        let t0 = Instant::now();
+        assert!(
+            c.handle(
+                "ERROR: [BD 41-758] The following clock pins are not \
+                 connected to a valid clock source: ",
+                t0,
+            )
+            .absorbed
+        );
+        let out = c.handle("/cips/pl0_ref_clk", t0 + Duration::from_millis(1));
+        assert!(out.chunks.is_empty(), "{:?}", out.chunks);
+        assert!(out.absorbed);
+        let out = c.handle("/dcmac/core_clk", t0 + Duration::from_millis(2));
+        assert!(out.chunks.is_empty(), "{:?}", out.chunks);
+        assert!(out.absorbed);
+        // A blank line still ends the list.
+        let out = c.handle("", t0 + Duration::from_millis(3));
+        assert_eq!(out.chunks.len(), 1, "{:?}", out.chunks);
+        assert!(!out.absorbed);
+        assert_eq!(out.chunks[0].0, StreamKind::Error);
+        assert_eq!(
+            out.chunks[0].1,
+            "ERROR: [BD 41-758] The following clock pins are not \
+             connected to a valid clock source: \n\
+             /cips/pl0_ref_clk\n/dcmac/core_clk\n"
+        );
     }
 
     /// Regression: a blank line between the warning body and the

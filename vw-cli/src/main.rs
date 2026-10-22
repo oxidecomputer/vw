@@ -92,8 +92,38 @@ impl From<CliLogLevel> for vw_vivado::LogLevel {
 /// outermost message is usually the least informative part — "generating
 /// anodizer structs" says which step, never what went wrong in it. The cause
 /// chain is where the answer is, so it is always printed.
+///
+/// Some causes carry a tool's own coloured output (nvc's diagnostics, for
+/// one), which is kept only when this process is colouring too.
 fn report(error: &dyn std::error::Error) {
-    eprintln!("{} {}", "error:".bright_red(), vw_remote::causes(error));
+    let message = vw_remote::causes(error);
+    let message = if colored::control::SHOULD_COLORIZE.should_colorize() {
+        message
+    } else {
+        strip_ansi(&message)
+    };
+    eprintln!("{} {message}", "error:".bright_red());
+}
+
+/// `text` without its ANSI CSI escape sequences (`ESC [ ... final`), which is
+/// all a terminal colour is.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            // Parameters and intermediates, up to the final byte.
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[derive(Parser)]
@@ -1762,6 +1792,12 @@ async fn main() {
                     }
                 }
             }
+            // htcl errors mean the IP config can't be trusted to
+            // generate: regenerating would run broken source through
+            // Vivado (and fail there, slowly, maybe remotely), and
+            // stale wrappers are an expected consequence of the edit
+            // being fixed, not a second problem to report.
+            let htcl_had_errors = had_errors;
             // VHDL static analysis (vhdl_ls) over the workspace's own
             // HDL — the same checks the editor surfaces live, run in
             // batch alongside the htcl check. Skipped entirely for a
@@ -1850,7 +1886,7 @@ async fn main() {
                     // check will still run and surface whatever it
                     // finds (including the staleness error if regen
                     // didn't take).
-                    if ip_generate {
+                    if ip_generate && !htcl_had_errors {
                         let stale = vw_lib::load_workspace_config(&ws)
                             .ok()
                             .and_then(|cfg| {
@@ -2039,6 +2075,18 @@ async fn main() {
                                 name,
                                 check_variant,
                             ) {
+                                Ok(true)
+                                    if project_dir.exists()
+                                        && htcl_had_errors =>
+                                {
+                                    println!(
+                                        "{} IP wrappers under `{ip_dir}/` are \
+                                         also stale; regenerate them with \
+                                         `vw check --ip-generate` once the \
+                                         htcl errors above are fixed.",
+                                        "note:".bright_yellow(),
+                                    );
+                                }
                                 Ok(true) if project_dir.exists() => {
                                     had_errors = true;
                                     eprintln!(
@@ -3058,6 +3106,7 @@ async fn check_htcl_with_mode(
             }
             None => (file.to_string(), 0, 0),
         };
+        let message = highlight_code_spans(message);
         eprintln!("{} {display_path}:{line}:{col}: {message}", level);
     };
 
@@ -3696,6 +3745,174 @@ fn overload_specialization_mangle(
         return None;
     };
     Some(vw_htcl::mangle_specialization(name, variant))
+}
+
+/// Render a diagnostic message's `` `code` `` spans for the terminal:
+/// each span is syntax-highlighted as htcl, with the backticks
+/// dropped. Messages carry backticks as markup because the same text
+/// goes to the editor, which has no colors to give it. With color
+/// off (`NO_COLOR`, piped output) the message is returned as-is so
+/// the code stays delimited.
+fn highlight_code_spans(message: &str) -> String {
+    if !colored::control::SHOULD_COLORIZE.should_colorize() {
+        return message.to_string();
+    }
+    let mut out = String::with_capacity(message.len());
+    let mut parts = message.split('`');
+    out.push_str(parts.next().unwrap_or_default());
+    let mut in_code = true;
+    let mut pending = parts.peekable();
+    while let Some(part) = pending.next() {
+        // An unpaired trailing backtick isn't markup; keep it.
+        if in_code && pending.peek().is_none() {
+            out.push('`');
+            out.push_str(part);
+            break;
+        }
+        if in_code {
+            out.push_str(&highlight_htcl_snippet(part));
+        } else {
+            out.push_str(part);
+        }
+        in_code = !in_code;
+    }
+    out
+}
+
+/// ANSI-styled `code`, colored by the REPL's htcl highlighter so
+/// code in a diagnostic looks like code in the REPL. Bytes the
+/// highlighter leaves uncolored (`}`, punctuation) are bolded so
+/// the whole snippet still reads apart from the prose around it.
+fn highlight_htcl_snippet(code: &str) -> String {
+    use ratatui::style::{Color, Modifier, Style};
+    let paint = |text: &str, style: Style| {
+        let mut c = match style.fg {
+            Some(Color::Rgb(r, g, b)) => text.truecolor(r, g, b),
+            _ => text.bold(),
+        };
+        if style.add_modifier.contains(Modifier::BOLD) {
+            c = c.bold();
+        }
+        if style.add_modifier.contains(Modifier::ITALIC) {
+            c = c.italic();
+        }
+        c.to_string()
+    };
+    let mut out = String::new();
+    let mut at = 0;
+    for tok in vw_repl::highlight_htcl::highlight_source(code) {
+        if tok.range.start > at {
+            out.push_str(&paint(&code[at..tok.range.start], Style::default()));
+        }
+        out.push_str(&paint(&code[tok.range.clone()], tok.style));
+        at = tok.range.end;
+    }
+    if at < code.len() {
+        out.push_str(&paint(&code[at..], Style::default()));
+    }
+    out
+}
+
+/// Upper bound on the Tcl text one [`DeclBatch`] eval carries. Keeps
+/// each request a modest WebSocket message on a remote session while
+/// still collapsing a ~20 MB program's ~20k declarations into a few
+/// dozen evals.
+const DECL_BATCH_BYTES: usize = 512 * 1024;
+
+/// True when `cmd` only *declares* — defining it runs nothing that can
+/// warn, print, or depend on what ran before it — so it can share an
+/// eval with its neighbours. Procs, newtype / enum declarations (which
+/// lower to nothing), and `namespace eval` blocks whose bodies hold
+/// only those. Anything else, including a `putr` rewrite target, keeps
+/// its own eval and origin marker.
+fn is_declaration_only(
+    cmd: &vw_htcl::Command,
+    putr_map: &vw_htcl::putr::RewriteMap,
+) -> bool {
+    if putr_map.contains_key(&cmd.span) {
+        return false;
+    }
+    match &cmd.kind {
+        vw_htcl::CommandKind::Proc(_)
+        | vw_htcl::CommandKind::TypeDecl(_)
+        | vw_htcl::CommandKind::EnumDecl(_) => true,
+        vw_htcl::CommandKind::NamespaceEval(ns) => {
+            ns.body.iter().all(|stmt| match stmt {
+                vw_htcl::Stmt::Command(c) => is_declaration_only(c, putr_map),
+                vw_htcl::Stmt::Comment(_) => true,
+                vw_htcl::Stmt::Error(_) => false,
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Lowered declarations waiting to be shipped together.
+///
+/// A loaded program is overwhelmingly declarations — redhawk's IP
+/// pre-pass is ~21.6k top-level statements, nearly all procs from the
+/// generated IP-wrapper libraries. One eval each is invisible locally
+/// but costs a network round trip per statement on a remote session,
+/// which turned `vw check --ip-generate` into a 5–10 minute wait.
+/// Declarations don't warn or produce output, so they lose nothing by
+/// sharing an eval (and the origin marker of the batch's first
+/// statement).
+#[derive(Default)]
+struct DeclBatch {
+    items: Vec<(String, vw_repl::Origin)>,
+    bytes: usize,
+}
+
+impl DeclBatch {
+    fn push(&mut self, tcl: String, origin: vw_repl::Origin) {
+        self.bytes += tcl.len() + 1;
+        self.items.push((tcl, origin));
+    }
+
+    /// Eval everything pending as one script. A failure stops Tcl at
+    /// the first bad declaration, leaving the rest undefined and the
+    /// error pointing at the batch's first statement, so on failure
+    /// replay each item on its own — redefining a proc is harmless —
+    /// to report the error against the declaration that caused it,
+    /// exactly as the one-eval-per-statement path did.
+    async fn flush(
+        &mut self,
+        backend: &mut dyn vw_eda::EdaBackend,
+        current_origin: &std::sync::Mutex<Option<vw_repl::Origin>>,
+    ) {
+        let items = std::mem::take(&mut self.items);
+        self.bytes = 0;
+        let Some((_, first_origin)) = items.first() else {
+            return;
+        };
+        let script = items
+            .iter()
+            .map(|(tcl, _)| tcl.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Ok(mut g) = current_origin.lock() {
+            *g = Some(first_origin.clone());
+        }
+        let tcl = vw_repl::wrap_tcl_with_origin_marker(&script, first_origin);
+        if backend.eval(&tcl).await.is_ok() {
+            return;
+        }
+        for (tcl, origin) in &items {
+            if let Ok(mut g) = current_origin.lock() {
+                *g = Some(origin.clone());
+            }
+            let tcl = vw_repl::wrap_tcl_with_origin_marker(tcl, origin);
+            match backend.eval(&tcl).await {
+                Ok(_) => {}
+                Err(vw_eda::BackendError::Tcl { message, .. }) => {
+                    eprintln!("{} {message}", "vivado:".bright_red());
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", "vivado:".bright_red());
+                }
+            }
+        }
+    }
 }
 
 /// Thin loader wrapper: resolve the entry's `src` imports into one
@@ -4524,6 +4741,9 @@ async fn run_loaded_program(
         usize,
         vw_htcl::LineIndex,
     > = std::collections::HashMap::new();
+    // Consecutive declarations (procs, decl-only `namespace eval`s) are
+    // shipped as one eval rather than one each — see [`DeclBatch`].
+    let mut decl_batch = DeclBatch::default();
     for stmt in &parsed.document.stmts {
         let vw_htcl::Stmt::Command(cmd) = stmt else {
             continue;
@@ -4569,16 +4789,12 @@ async fn run_loaded_program(
                     (None, lc.line + 1, snippet)
                 }
             };
-            let origin = vw_repl::Origin {
+            vw_repl::Origin {
                 file: file_path,
                 line,
                 snippet,
                 via: Vec::new(),
-            };
-            if let Ok(mut g) = current_origin.lock() {
-                *g = Some(origin.clone());
             }
-            origin
         };
         // Overload specializations lower under their mangled
         // names so the dispatcher's switch arms can find them.
@@ -4612,6 +4828,19 @@ async fn run_loaded_program(
         // body that forwards via `extern::` errors out at runtime
         // with `invalid command name "extern::create_project"`.
         let tcl = vw_htcl::rewrite_externs(&lowered).text;
+        if is_declaration_only(cmd, &putr_map) {
+            decl_batch.push(tcl, stmt_origin);
+            if decl_batch.bytes >= DECL_BATCH_BYTES {
+                decl_batch.flush(&mut *backend, &current_origin).await;
+            }
+            continue;
+        }
+        // Anything that executes runs after every declaration before
+        // it is in place.
+        decl_batch.flush(&mut *backend, &current_origin).await;
+        if let Ok(mut g) = current_origin.lock() {
+            *g = Some(stmt_origin.clone());
+        }
         // Wrap with a shim-side origin marker so any traceless
         // warning emitted during THIS eval stays anchored to
         // `stmt_origin` — see [`vw_repl::wrap_tcl_with_origin_marker`]
@@ -4671,6 +4900,7 @@ async fn run_loaded_program(
             }
         }
     }
+    decl_batch.flush(&mut *backend, &current_origin).await;
     let _ = backend.shutdown().await;
     // Flush any trailing NONE block the last chunk left in the
     // accumulator. Vivado's final write is often non-diagnostic
@@ -4934,6 +5164,148 @@ mod env_flag_tests {
 }
 
 #[cfg(test)]
+mod decl_batch_tests {
+    use super::*;
+
+    /// Records every eval; fails any whose script contains `BOOM`.
+    #[derive(Default)]
+    struct Recorder {
+        evals: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl vw_eda::EdaBackend for Recorder {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+
+        async fn eval(
+            &mut self,
+            tcl: &str,
+        ) -> Result<vw_eda::EvalOutput, vw_eda::BackendError> {
+            self.evals.push(tcl.to_string());
+            if tcl.contains("BOOM") {
+                return Err(vw_eda::BackendError::Tcl {
+                    message: "boom".into(),
+                    code: None,
+                    info: None,
+                    stdout: String::new(),
+                });
+            }
+            Ok(vw_eda::EvalOutput {
+                value: String::new(),
+                stdout: String::new(),
+            })
+        }
+
+        async fn send(
+            &mut self,
+            _request: vw_eda::Request,
+        ) -> Result<vw_eda::Response, vw_eda::BackendError> {
+            unimplemented!()
+        }
+
+        fn set_stdout_sink(&mut self, _sink: vw_eda::StdoutSink) {}
+
+        async fn shutdown(&mut self) -> Result<(), vw_eda::BackendError> {
+            Ok(())
+        }
+    }
+
+    fn origin(line: u32) -> vw_repl::Origin {
+        vw_repl::Origin {
+            file: None,
+            line,
+            snippet: String::new(),
+            via: Vec::new(),
+        }
+    }
+
+    /// Top-level commands of `src`, paired with whether each batches.
+    fn classify(src: &str) -> Vec<bool> {
+        let parsed = vw_htcl::parse(src);
+        let putr_map = vw_htcl::putr::rewrite(src, &parsed.document);
+        parsed
+            .document
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                vw_htcl::Stmt::Command(c) => {
+                    Some(is_declaration_only(c, &putr_map))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Procs and namespaces of procs batch; anything that executes —
+    /// including a namespace body that does — does not.
+    #[test]
+    fn only_pure_declarations_batch() {
+        let src = "\
+proc a {} unit { puts hi }
+namespace eval ns {
+  # comment
+  proc b {} unit { return }
+  namespace eval inner { proc c {} unit { return } }
+}
+namespace eval ns2 {
+  variable x 1
+  proc d {} unit { return }
+}
+set y 2
+puts hello
+";
+        assert_eq!(classify(src), vec![true, true, false, false, false]);
+    }
+
+    #[tokio::test]
+    async fn declarations_ship_as_one_eval() {
+        let mut backend = Recorder::default();
+        let current = std::sync::Mutex::new(None);
+        let mut batch = DeclBatch::default();
+        batch.push("proc a {} {}".into(), origin(1));
+        batch.push("proc b {} {}".into(), origin(2));
+        batch.push("proc c {} {}".into(), origin(3));
+        batch.flush(&mut backend, &current).await;
+        assert_eq!(backend.evals.len(), 1);
+        let script = &backend.evals[0];
+        let (a, b, c) = (
+            script.find("proc a").unwrap(),
+            script.find("proc b").unwrap(),
+            script.find("proc c").unwrap(),
+        );
+        assert!(a < b && b < c, "declaration order must be preserved");
+        assert_eq!(current.lock().unwrap().as_ref().unwrap().line, 1);
+        assert_eq!(batch.bytes, 0);
+
+        // Nothing pending: no eval at all.
+        batch.flush(&mut backend, &current).await;
+        assert_eq!(backend.evals.len(), 1);
+    }
+
+    /// A failing batch replays item by item, so the error is reported
+    /// against the declaration that caused it and the declarations
+    /// after it still get defined.
+    #[tokio::test]
+    async fn failed_batch_replays_each_declaration() {
+        let mut backend = Recorder::default();
+        let current = std::sync::Mutex::new(None);
+        let mut batch = DeclBatch::default();
+        batch.push("proc a {} {}".into(), origin(1));
+        batch.push("BOOM".into(), origin(2));
+        batch.push("proc c {} {}".into(), origin(3));
+        batch.flush(&mut backend, &current).await;
+        assert_eq!(backend.evals.len(), 4);
+        assert!(backend.evals[1].contains("proc a"));
+        assert!(backend.evals[2].contains("BOOM"));
+        assert!(backend.evals[3].contains("proc c"));
+        assert!(!backend.evals[3].contains("proc a"));
+        assert_eq!(current.lock().unwrap().as_ref().unwrap().line, 3);
+    }
+}
+
+#[cfg(test)]
 mod bunyan_tests {
     use super::*;
 
@@ -5153,5 +5525,29 @@ fn collect_files(dir: &std::path::Path, into: &mut Vec<std::path::PathBuf>) {
         } else {
             into.push(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::*;
+
+    /// nvc's diagnostics as they arrive with colour forced on.
+    #[test]
+    fn colour_is_removed_and_text_kept() {
+        assert_eq!(
+            strip_ansi("\u{1b}[31m** Error:\u{1b}[0m no visible declaration"),
+            "** Error: no visible declaration",
+        );
+        assert_eq!(
+            strip_ansi(" \u{1b}[1;34m  > \u{1b}[0mbad.vhd:2"),
+            "   > bad.vhd:2",
+        );
+    }
+
+    #[test]
+    fn plain_text_is_unchanged() {
+        let text = "missing choices for 'U'";
+        assert_eq!(strip_ansi(text), text);
     }
 }

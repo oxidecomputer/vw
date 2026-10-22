@@ -78,31 +78,47 @@ pub async fn run_nvc_analysis(
         args.push(file.clone());
     }
 
-    if capture_output {
-        let output = run_cmd_w_output(&args, None).await?;
+    // Always capture, even when the caller wants the output passed through:
+    // on a remote instance an inherited stderr goes to the server's log, and
+    // a failure that reports only the command line gives the developer
+    // nothing to act on. The diagnostics have to travel inside the error.
+    //
+    // nvc only colours a terminal, and a pipe is not one, so colour is forced
+    // here. Whoever finally prints the error knows whether its own output is
+    // a terminal and strips the escapes if not.
+    let envs = vec![("NVC_COLORS".to_string(), "always".to_string())];
+    let output = run_cmd_w_output(&args, Some(&envs)).await?;
 
-        if !output.status.success() {
-            let cmd_str = format!("nvc {}", args.join(" "));
-            std::io::stdout().write_all(&output.stdout)?;
-            std::io::stderr().write_all(&output.stderr)?;
-            return Err(VwError::NvcAnalysis {
-                library: lib_name.to_owned(),
-                command: cmd_str,
-            });
-        }
+    if !output.status.success() {
+        return Err(VwError::NvcAnalysis {
+            library: lib_name.to_owned(),
+            command: format!("nvc {}", args.join(" ")),
+            output: nvc_diagnostics(&output),
+        });
+    }
+
+    if capture_output {
         Ok(Some((output.stdout, output.stderr)))
     } else {
-        let status = run_cmd(&args, None).await?;
-
-        if !status.success() {
-            let cmd_str = format!("nvc {}", args.join(" "));
-            return Err(VwError::NvcAnalysis {
-                library: lib_name.to_owned(),
-                command: cmd_str,
-            });
-        }
+        // Warnings from a successful analysis still belong on the terminal.
+        std::io::stdout().write_all(&output.stdout)?;
+        std::io::stderr().write_all(&output.stderr)?;
         Ok(None)
     }
+}
+
+/// What nvc said, as text: stderr, where it writes its diagnostics, followed
+/// by anything it wrote to stdout.
+fn nvc_diagnostics(output: &Output) -> String {
+    let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&stdout);
+    }
+    text.trim_end().to_owned()
 }
 
 pub async fn run_nvc_elab(
@@ -322,5 +338,52 @@ pub async fn run_nvc_cosim(
             return Err(VwError::NvcSimulation { command: cmd_str });
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A failed analysis has to say why, not only which command failed: on a
+    /// remote instance nvc's own stderr never reaches the developer.
+    #[tokio::test]
+    async fn analysis_error_carries_nvc_diagnostics() {
+        if std::process::Command::new("nvc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("nvc not on PATH; skipping");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("bad.vhd");
+        std::fs::write(
+            &src,
+            "entity bad is end entity;\n\
+             architecture a of bad is\n\
+             begin\n  \
+               x <= '1';\n\
+             end architecture;\n",
+        )
+        .unwrap();
+
+        let err = run_nvc_analysis(
+            VhdlStandard::Vhdl2019,
+            dir.path().to_str().unwrap(),
+            "work",
+            &vec![src.to_string_lossy().into_owned()],
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("no visible declaration for X"),
+            "nvc's diagnostic is missing from the error:\n{message}"
+        );
     }
 }

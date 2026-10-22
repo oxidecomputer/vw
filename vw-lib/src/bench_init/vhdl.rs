@@ -18,7 +18,7 @@
 
 use camino::Utf8Path;
 
-use super::entity::{DesignTypes, EntityInterface, Interface};
+use super::entity::{DesignTypes, EntityInterface, Interface, PortMode};
 use super::{write_new_file, Created};
 use crate::{Result, VhdlStandard};
 
@@ -36,7 +36,7 @@ pub fn init(
     super::check_vhdl_identifier(&base)?;
     let entity = format!("{base}_tb");
 
-    let dut = dut
+    let mut dut = dut
         .map(|d| super::entity::load(workspace_dir, d, vhdl_std))
         .transpose()?;
     // A signal declared with the DUT's own subtype still needs a starting
@@ -46,6 +46,9 @@ pub fn init(
         Some(_) => super::entity::design_types(workspace_dir, vhdl_std)?,
         None => DesignTypes::default(),
     };
+    if let Some(dut) = &mut dut {
+        dut.resolve_views(&types);
+    }
 
     let path = workspace_dir.join("bench").join(format!("{entity}.vhd"));
     std::fs::create_dir_all(
@@ -208,12 +211,27 @@ fn signals_block(
     let width = dut.ports.iter().map(|p| p.name.len()).max().unwrap_or(0);
     let mut out = format!("  -- {}'s ports.\n", dut.name);
     for port in &dut.ports {
+        // A signal must be fully constrained, and a record with a bare
+        // `std_logic_vector` element is not — but the widths are the
+        // design's to choose, not something to guess here.
+        let open = unconstrained_elements(&port.subtype, types);
+        if !open.is_empty() {
+            out.push_str(&format!(
+                "  -- TODO: constrain {}'s unconstrained elements:\n",
+                port.subtype,
+            ));
+            for element in &open {
+                out.push_str(&format!("  --   {element}\n"));
+            }
+        }
         // Inputs start at a defined value so the design is not driven with
         // metavalues before the stimulus process gets to it; outputs are
-        // driven by the DUT and must not be initialized here.
+        // driven by the DUT and must not be initialized here. A view goes
+        // both ways, and since an initial value has to cover the whole
+        // record, it gets one for the sake of the elements the DUT reads.
         let init = if port.name == clock_name {
             Some("'0'".to_string())
-        } else if port.mode().is_driven() {
+        } else if port.mode().is_driven() || port.mode() == PortMode::View {
             initial_value(port, types)
         } else {
             None
@@ -315,6 +333,75 @@ fn stimulus(
 ///
 /// Resolved through the design's subtype declarations first: `Nibble` is a
 /// vector and takes `(others => '0')`, and nothing about the name says so.
+/// The elements of a record subtype, nested ones by their dotted path, that
+/// are vectors with no width: `read_channel.data` for a record declaring
+/// `data : std_logic_vector`.
+fn unconstrained_elements(subtype: &str, types: &DesignTypes) -> Vec<String> {
+    fn walk(
+        subtype: &str,
+        prefix: &str,
+        types: &DesignTypes,
+        depth: usize,
+        out: &mut Vec<String>,
+    ) {
+        let Some(fields) = types.record(subtype) else {
+            return;
+        };
+        if depth >= 4 {
+            return;
+        }
+        for field in fields {
+            let path = format!("{prefix}{}", field.name);
+            if is_unconstrained_vector(&field.subtype, types) {
+                out.push(path);
+            } else {
+                walk(
+                    &field.subtype,
+                    &format!("{path}."),
+                    types,
+                    depth + 1,
+                    out,
+                );
+            }
+        }
+    }
+
+    // A constraint on the port's own subtype — `T(data(7 downto 0))` — is
+    // taken to settle it.
+    let mut out = Vec::new();
+    if !subtype.contains('(') {
+        walk(subtype, "", types, 0, &mut out);
+    }
+    out
+}
+
+/// True for a vector subtype that leaves its range open. A subtype that is
+/// declared with one, `subtype Nibble is std_logic_vector(3 downto 0)`, is
+/// constrained however it is named.
+fn is_unconstrained_vector(subtype: &str, types: &DesignTypes) -> bool {
+    let mut current = subtype.to_string();
+    for _ in 0..8 {
+        if current.contains('(') {
+            return false;
+        }
+        let mark = super::entity::base_type_mark(&current);
+        match types.subtypes.get(&mark) {
+            Some(next) => current = next.clone(),
+            None => {
+                return matches!(
+                    mark.as_str(),
+                    "std_logic_vector"
+                        | "std_ulogic_vector"
+                        | "bit_vector"
+                        | "unsigned"
+                        | "signed"
+                )
+            }
+        }
+    }
+    false
+}
+
 fn initial_value(port: &Interface, types: &DesignTypes) -> Option<String> {
     super::zero_literal(&port.subtype, types)
 }
@@ -351,6 +438,7 @@ mod tests {
             mode: Some(mode),
             subtype: subtype.to_string(),
             default: None,
+            view: None,
         }
     }
 
@@ -367,6 +455,7 @@ mod tests {
                 mode: None,
                 subtype: "positive".to_string(),
                 default: Some("8".to_string()),
+                view: None,
             }],
             ports: vec![
                 port("clk", PortMode::In, "std_logic"),
@@ -389,6 +478,71 @@ mod tests {
         assert!(text.contains("signal rst_n  : std_logic := '0';"));
         // The DUT drives its own outputs — initializing one here would fight it.
         assert!(text.contains("unsigned(WIDTH - 1 downto 0);"));
+    }
+
+    /// A mode-view port is declared with the record the view is of and
+    /// mapped like any other — leaving it out is a port with no association,
+    /// which does not elaborate.
+    #[test]
+    fn view_ports_are_declared_and_mapped() {
+        let mut dut = dut();
+        dut.ports.push(Interface {
+            mode: Some(PortMode::View),
+            view: Some("ctlmanager".into()),
+            ..port("ax", PortMode::In, "ctl")
+        });
+        let text = render("counter_tb", Some(&dut), &types());
+        assert!(
+            text.contains(
+                "signal ax     : ctl := (go => '0', step => (others => '0'));"
+            ),
+            "{text}",
+        );
+        assert!(text.contains("      ax     => ax"), "{text}");
+    }
+
+    /// A record whose vectors have no width cannot be a signal as it stands,
+    /// and the widths are the design's to choose — so they are asked for by
+    /// name, nested ones included, rather than guessed.
+    #[test]
+    fn unconstrained_record_elements_are_called_out() {
+        let mut types = types();
+        types.records.insert(
+            "chan".into(),
+            vec![
+                crate::bench_init::entity::RecordField {
+                    name: "data".into(),
+                    subtype: "std_logic_vector".into(),
+                },
+                crate::bench_init::entity::RecordField {
+                    name: "ctl".into(),
+                    subtype: "ctl".into(),
+                },
+            ],
+        );
+        types.records.insert(
+            "txn".into(),
+            vec![crate::bench_init::entity::RecordField {
+                name: "rd".into(),
+                subtype: "chan".into(),
+            }],
+        );
+        assert_eq!(unconstrained_elements("txn", &types), ["rd.data"]);
+        assert!(unconstrained_elements("txn(rd(data(7 downto 0)))", &types)
+            .is_empty());
+        assert!(unconstrained_elements("ctl", &types).is_empty());
+
+        let mut dut = dut();
+        dut.ports.push(port("t", PortMode::In, "txn"));
+        let text = render("counter_tb", Some(&dut), &types);
+        assert!(
+            text.contains(
+                "  -- TODO: constrain txn's unconstrained elements:\n  \
+                 --   rd.data\n  \
+                 signal t "
+            ),
+            "{text}",
+        );
     }
 
     /// A subtype resolves to what it really is, and a record gets a named

@@ -46,7 +46,7 @@ pub fn init(
     // name, never a VHDL entity, so `tx-eq` is a perfectly good name for one.
     super::check_crate_name(name)?;
 
-    let dut = entity
+    let mut dut = entity
         .map(|e| super::entity::load(workspace_dir, e, vhdl_std))
         .transpose()?;
     // A design's analog-facing ports are very often subtypes — `Pam4Symbol`,
@@ -56,6 +56,9 @@ pub fn init(
         Some(_) => super::entity::design_types(workspace_dir, vhdl_std)?,
         None => DesignTypes::default(),
     };
+    if let Some(dut) = &mut dut {
+        dut.resolve_views(&types);
+    }
 
     let mut files = super::workspace::ensure_bench_workspace(workspace_dir)?;
 
@@ -429,6 +432,7 @@ mod tests {
             mode: Some(mode),
             subtype: subtype.to_string(),
             default: None,
+            view: None,
         }
     }
 
