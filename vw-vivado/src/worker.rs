@@ -98,7 +98,9 @@ fn vw_timing_log(event: &str, len: usize, preview: &str) {
 #[derive(Clone, Default)]
 pub struct VivadoConfig {
     /// Override the `vivado` executable path. If `None`, resolution
-    /// order is `$VW_VIVADO`, then a `vivado` lookup on `$PATH`.
+    /// order is `$VW_VIVADO`, then a `vivado` lookup on `$PATH`, then
+    /// a `vivado_lab` lookup on `$PATH` (lab machines carry only the
+    /// Lab Edition).
     pub vivado: Option<PathBuf>,
     /// Working directory for the spawned process. If `None`, a
     /// scratch tempdir is created so Vivado's incidental files don't
@@ -304,6 +306,10 @@ pub struct VivadoBackend {
     /// re-sourced shim connects again here.
     listener: Option<TcpListener>,
     _scratch_dir: Option<TempDir>,
+    /// `true` when the process on the other end is Vivado Lab
+    /// Edition (`vivado_lab`): hardware manager only, no synthesis
+    /// toolchain, so [`VivadoConfig::auto_project`] is ignored.
+    lab: bool,
 }
 
 impl VivadoBackend {
@@ -520,7 +526,26 @@ impl VivadoBackend {
             shim_dead: false,
             shim_path: shim_path.clone(),
             listener: Some(listener),
+            lab: false,
         };
+        // Vivado Lab Edition is the hardware manager without the
+        // implementation toolchain: no synthesis, and `create_project`
+        // takes no `-part`. Detect it by the toolchain being absent
+        // rather than by executable name, so `$VW_VIVADO` pointing at
+        // a symlink or wrapper still gets it right. `synth_design` is
+        // registered at startup in full Vivado (unlike the
+        // hardware-manager commands, which load on first use, so
+        // `info commands` can't be trusted for those).
+        {
+            use vw_eda::EdaBackend as _;
+            let probe = backend
+                .eval("llength [info commands ::synth_design]")
+                .await
+                .map_err(|e| {
+                    BackendError::Worker(format!("probing Vivado edition: {e}"))
+                })?;
+            backend.lab = probe.value.trim() == "0";
+        }
         // Auto-create (or reopen) the Vivado project if the caller
         // specified one. Runs BEFORE we return to the caller so the
         // first user eval sees an existing project — `ip::check` /
@@ -552,7 +577,19 @@ impl VivadoBackend {
         // VHDL-first, and the default Verilog would silently emit
         // `_wrapper.v` files that downstream tools looking for
         // `.vhd` fail on with an unhelpful "no wrapper found".
-        if let Some(ap) = &config.auto_project {
+        //
+        // Lab Edition gets no project at all: its work is JTAG
+        // through the hardware manager, which needs none, and it
+        // can't create one for a part anyway.
+        if backend.lab {
+            if let Some(ap) = &config.auto_project {
+                debug!(
+                    name = %ap.name,
+                    part = %ap.part,
+                    "vivado lab edition: not creating a project"
+                );
+            }
+        } else if let Some(ap) = &config.auto_project {
             use vw_eda::EdaBackend as _;
             let tcl = match &ap.persist_dir {
                 None => format!(
@@ -1920,17 +1957,21 @@ fn resolve_vivado(config: &VivadoConfig) -> Result<PathBuf, BackendError> {
             return Ok(PathBuf::from(env));
         }
     }
+    // Full Vivado first: a machine with both is a build machine,
+    // and the Lab Edition can't do what most scripts there ask of it.
     if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("vivado");
-            if candidate.is_file() {
-                return Ok(candidate);
+        for exe in ["vivado", "vivado_lab"] {
+            for dir in std::env::split_paths(&paths) {
+                let candidate = dir.join(exe);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
             }
         }
     }
     Err(BackendError::Worker(
-        "could not find `vivado` on PATH; set $VW_VIVADO or pass \
-         VivadoConfig::vivado"
+        "could not find `vivado` or `vivado_lab` on PATH; set $VW_VIVADO \
+         or pass VivadoConfig::vivado"
             .into(),
     ))
 }
