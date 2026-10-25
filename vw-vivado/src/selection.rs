@@ -14,6 +14,8 @@
 //! log and streams it back. Returning the notes instead of writing them lets
 //! both be true of the same code.
 
+use std::sync::Arc;
+
 use camino::Utf8Path;
 
 use crate::AutoProject;
@@ -76,6 +78,7 @@ pub fn resolve_workspace_selection(
                 notes,
             });
         };
+        let lock = lock_session(ws, Some(&v.name))?;
         let persist_dir =
             persist_dir(ws, &ws_info.name, Some(&v.name), &mut notes);
         Ok(Selection {
@@ -83,6 +86,7 @@ pub fn resolve_workspace_selection(
                 name: ws_info.name.clone(),
                 part: v.part.clone(),
                 persist_dir,
+                lock: Some(lock),
             }),
             active_variant: Some(v.name.clone()),
             notes,
@@ -91,17 +95,33 @@ pub fn resolve_workspace_selection(
         let selected = ws_info
             .select_target_part(part)
             .map_err(|e| e.to_string())?;
+        let lock = lock_session(ws, None)?;
         let persist_dir = persist_dir(ws, &ws_info.name, None, &mut notes);
         Ok(Selection {
             auto_project: selected.map(|p| AutoProject {
                 name: ws_info.name.clone(),
                 part: p.to_string(),
                 persist_dir: persist_dir.clone(),
+                lock: Some(lock),
             }),
             active_variant: None,
             notes,
         })
     }
+}
+
+/// Take the session's build directory before anything in it is touched:
+/// preparing the project dir below can wipe a project that another
+/// session's Vivado has open. Unlike a project dir that can't be
+/// prepared, this is fatal — falling back to an in-memory project
+/// would still leave the two sessions sharing every stage's cache.
+pub fn lock_session(
+    ws: &Utf8Path,
+    variant: Option<&str>,
+) -> Result<Arc<vw_lib::BuildLock>, String> {
+    vw_lib::lock_build_dir(ws, variant)
+        .map(Arc::new)
+        .map_err(|e| e.to_string())
 }
 
 /// The on-disk Vivado project directory, after the one-shot legacy IP-cache

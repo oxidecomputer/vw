@@ -27,6 +27,42 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
+use vw_eda::StreamKind;
+
+/// What a handler gets from the worker whose shim is calling it.
+///
+/// Most handlers just compute an answer. The ones that do real work while
+/// the caller waits — building IP checkpoints in worker Vivados — need to be
+/// seen doing it, and need to stop when the caller is interrupted.
+#[derive(Clone)]
+pub struct RpcContext {
+    /// Output for the session, as though the calling worker had produced
+    /// it: the worker feeds it to its own stream sink while the call is
+    /// outstanding, so it is classified, counted and rendered with
+    /// everything else (critical warnings included).
+    pub output: UnboundedSender<(StreamKind, String)>,
+    /// The calling worker's process. Interrupting it
+    /// ([`crate::interrupt_process_group`]) interrupts any worker a
+    /// handler registers under it too.
+    pub caller_pid: Option<u32>,
+}
+
+impl RpcContext {
+    /// A context whose output goes nowhere, for calls made outside an eval.
+    pub fn detached() -> Self {
+        let (output, _) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            output,
+            caller_pid: None,
+        }
+    }
+
+    /// Send `text` to the session as a `kind` message.
+    pub fn emit(&self, kind: StreamKind, text: impl Into<String>) {
+        let _ = self.output.send((kind, text.into()));
+    }
+}
 
 /// Trait implemented by anything that can service RPC calls from
 /// the shim. Registered via
@@ -36,7 +72,12 @@ use std::sync::Arc;
 /// the shim surfaces that verbatim to the caller.
 #[async_trait]
 pub trait RpcHandler: Send + Sync {
-    async fn call(&self, method: &str, args: Value) -> Result<Value, String>;
+    async fn call(
+        &self,
+        method: &str,
+        args: Value,
+        ctx: RpcContext,
+    ) -> Result<Value, String>;
 }
 
 /// Convenience impl so callers can wrap a closure without hand-
@@ -45,11 +86,16 @@ pub trait RpcHandler: Send + Sync {
 #[async_trait]
 impl<F, Fut> RpcHandler for FnHandler<F>
 where
-    F: Fn(String, Value) -> Fut + Send + Sync + 'static,
+    F: Fn(String, Value, RpcContext) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Value, String>> + Send,
 {
-    async fn call(&self, method: &str, args: Value) -> Result<Value, String> {
-        (self.f)(method.to_string(), args).await
+    async fn call(
+        &self,
+        method: &str,
+        args: Value,
+        ctx: RpcContext,
+    ) -> Result<Value, String> {
+        (self.f)(method.to_string(), args, ctx).await
     }
 }
 
@@ -64,7 +110,7 @@ impl<F> FnHandler<F> {
     #[allow(clippy::new_ret_no_self)] // returns a trait-object Arc, not Self
     pub fn new<Fut>(f: F) -> Arc<dyn RpcHandler>
     where
-        F: Fn(String, Value) -> Fut + Send + Sync + 'static,
+        F: Fn(String, Value, RpcContext) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Value, String>>
             + Send
             + 'static,

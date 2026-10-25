@@ -43,6 +43,7 @@ pub mod bench_init;
 pub mod cosim;
 pub mod depcache;
 pub mod parts;
+mod session_lock;
 pub mod sim;
 
 // The low-level VHDL-analysis + nvc primitives now live in `vw-core`.
@@ -54,6 +55,8 @@ pub use vw_core::{
     VhdlLsConfig, VhdlLsLibrary, VhdlStandard, VwError,
 };
 pub use vw_core::{mapping, nvc_helpers, visitor};
+
+pub use session_lock::{lock_build_dir, BuildLock};
 
 /// Start a `cargo` that resolves its own toolchain.
 ///
@@ -2940,6 +2943,29 @@ fn fingerprint_paths(workspace_dir: &Utf8Path, paths: &[PathBuf]) -> u64 {
         }
     }
     digest
+}
+
+/// Fingerprint over `paths` (contents and names relative to `root`)
+/// and `salt`, for a checkpoint kind that tracks its own inputs —
+/// an IP module's checkpoint, keyed on its `.bd` / `.xci`, the
+/// part, the Vivado install and the recipe that built it. Pair
+/// with [`checkpoint_status`] and [`write_checkpoint_fingerprint`].
+pub fn content_fingerprint(
+    root: &Utf8Path,
+    salt: &str,
+    paths: &[PathBuf],
+) -> u64 {
+    fnv1a_64_extend(fingerprint_paths(root, paths), salt.as_bytes())
+}
+
+/// Record `fingerprint` as what `checkpoint` was built from, in the
+/// same sidecar every stage checkpoint uses. Call only once the
+/// checkpoint is complete: [`checkpoint_status`] trusts it from then on.
+pub fn write_checkpoint_fingerprint(
+    checkpoint: &Path,
+    fingerprint: u64,
+) -> Result<()> {
+    write_checkpoint_manifest_with_fingerprint(checkpoint, fingerprint)
 }
 
 /// Combined fingerprint over the synth source set. Backs

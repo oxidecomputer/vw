@@ -98,7 +98,7 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use crate::rpc::{FnHandler, RpcHandler};
+use crate::rpc::{FnHandler, RpcContext, RpcHandler};
 
 /// Shared "already loaded in this Vivado session" map. Populated
 /// by the CLI / REPL after each successful htcl load with the
@@ -222,7 +222,7 @@ pub fn make_handler_reporting(
 ) -> Arc<dyn RpcHandler> {
     let workspace_root = workspace_root.map(Arc::new);
     let active_variant = active_variant.map(Arc::new);
-    FnHandler::new(move |method: String, args: Value| {
+    FnHandler::new(move |method: String, args: Value, ctx: RpcContext| {
         let ws = workspace_root.clone();
         let av = active_variant.clone();
         let pl = preloaded.clone();
@@ -237,6 +237,7 @@ pub fn make_handler_reporting(
                 &pl,
                 &cw,
                 report.as_ref(),
+                ctx,
             )
             .await
         }
@@ -252,6 +253,7 @@ async fn dispatch(
     preloaded: &SharedPreload,
     cw_count: &SharedCriticalWarningCount,
     reporter: Option<&Reporter>,
+    ctx: RpcContext,
 ) -> Result<Value, String> {
     match method {
         "workspace_root" => workspace_root
@@ -337,6 +339,15 @@ async fn dispatch(
         }
         "compile_htcl_module" => {
             compile_htcl_module(workspace_root, args, preloaded).await
+        }
+        "ip_checkpoints" => {
+            crate::ip_checkpoints::ip_checkpoints(
+                workspace_root,
+                active_variant,
+                args,
+                ctx,
+            )
+            .await
         }
         other => Err(format!("unknown RPC method: {other}")),
     }
@@ -1551,9 +1562,18 @@ mod variant_build_dir_tests {
     ) -> Value {
         let preloaded: SharedPreload = Arc::new(RwLock::new(HashMap::new()));
         let cw: SharedCriticalWarningCount = Arc::default();
-        dispatch(method, args, Some(ws), variant, &preloaded, &cw, None)
-            .await
-            .unwrap()
+        dispatch(
+            method,
+            args,
+            Some(ws),
+            variant,
+            &preloaded,
+            &cw,
+            None,
+            RpcContext::detached(),
+        )
+        .await
+        .unwrap()
     }
 
     fn two_variant_ws() -> (tempfile::TempDir, camino::Utf8PathBuf) {

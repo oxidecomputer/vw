@@ -194,6 +194,12 @@ pub struct AutoProject {
     /// `vw_lib::project_needs_wipe`) — the worker takes whatever
     /// state is on disk as-is.
     pub persist_dir: Option<PathBuf>,
+    /// The session's hold on its build directory (see
+    /// [`vw_lib::lock_build_dir`]). The backend keeps it until it is
+    /// dropped, so the directory stays this session's for as long as
+    /// its Vivado runs. `None` for projects nothing else can reach (the
+    /// in-memory ones `vw test` makes).
+    pub lock: Option<std::sync::Arc<vw_lib::BuildLock>>,
 }
 
 /// Vivado [`EdaBackend`] implementation.
@@ -310,6 +316,8 @@ pub struct VivadoBackend {
     /// Edition (`vivado_lab`): hardware manager only, no synthesis
     /// toolchain, so [`VivadoConfig::auto_project`] is ignored.
     lab: bool,
+    /// Held, never read: see [`AutoProject::lock`].
+    _lock: Option<std::sync::Arc<vw_lib::BuildLock>>,
 }
 
 impl VivadoBackend {
@@ -527,6 +535,7 @@ impl VivadoBackend {
             shim_path: shim_path.clone(),
             listener: Some(listener),
             lab: false,
+            _lock: config.auto_project.as_ref().and_then(|ap| ap.lock.clone()),
         };
         // Vivado Lab Edition is the hardware manager without the
         // implementation toolchain: no synthesis, and `create_project`
@@ -1014,17 +1023,45 @@ impl VivadoBackend {
 
     /// Handle one inbound [`RpcCall`], write the response back to
     /// the shim.
+    ///
+    /// While the handler runs, whatever it sends through its
+    /// [`crate::RpcContext`] goes to this worker's stream sink, as though
+    /// this worker had printed it.
     async fn dispatch_rpc_call(
         &mut self,
         call: vw_eda::protocol::RpcCall,
     ) -> Result<(), BackendError> {
-        let result = match &self.rpc_handler {
-            Some(handler) => handler.call(&call.method, call.args).await,
-            None => Err(format!(
-                "no RPC handler configured; can't answer '{}'",
-                call.method
-            )),
+        let (output, mut produced) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = crate::RpcContext {
+            output,
+            caller_pid: self.child_pid(),
         };
+        let handler = self.rpc_handler.clone();
+        let method = call.method.clone();
+        let answer = async move {
+            match handler {
+                Some(handler) => handler.call(&method, call.args, ctx).await,
+                None => Err(format!(
+                    "no RPC handler configured; can't answer '{method}'"
+                )),
+            }
+        };
+        tokio::pin!(answer);
+        let result = loop {
+            tokio::select! {
+                result = &mut answer => break result,
+                Some((kind, text)) = produced.recv() => {
+                    if let Some(sink) = self.stdout_sink.as_mut() {
+                        sink(kind, &text);
+                    }
+                }
+            }
+        };
+        while let Ok((kind, text)) = produced.try_recv() {
+            if let Some(sink) = self.stdout_sink.as_mut() {
+                sink(kind, &text);
+            }
+        }
         let resp = match result {
             Ok(value) => Response::ok(call.id, value),
             Err(msg) => Response::err(
@@ -1606,8 +1643,15 @@ impl Drop for VivadoBackend {
 ///
 /// Unix-only. Windows has no analogue that reliably reaches the child's Tcl
 /// signal handler, and every vw interactive user is on Unix.
+///
+/// Workers started on behalf of the one at `pid` (see [`register_helper`])
+/// are interrupted along with it: they are doing the work it is waiting on,
+/// so stopping it means stopping them.
 #[cfg(unix)]
 pub fn interrupt_process_group(pid: u32) {
+    for helper in helpers_of(pid) {
+        interrupt_process_group(helper);
+    }
     // SAFETY: `libc::kill(-pid, SIGINT)` on a process group we spawned.
     // Negative pid selects the pgid — necessary because vivado's on-disk
     // binary is a bash wrapper that forks loader+vivado as children without
@@ -1623,6 +1667,50 @@ pub fn interrupt_process_group(pid: u32) {
 /// Windows stub. See the unix variant.
 #[cfg(not(unix))]
 pub fn interrupt_process_group(_pid: u32) {}
+
+/// Workers each worker has started, by the starting worker's pid.
+static HELPERS: std::sync::Mutex<
+    std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Record the worker at `helper` as working for the one at `caller`, until
+/// the returned guard is dropped. Interrupting `caller` interrupts it too.
+pub(crate) fn register_helper(caller: u32, helper: u32) -> HelperGuard {
+    if let Ok(mut map) = HELPERS.lock() {
+        map.entry(caller).or_default().insert(helper);
+    }
+    HelperGuard { caller, helper }
+}
+
+fn helpers_of(caller: u32) -> Vec<u32> {
+    HELPERS
+        .lock()
+        .map(|map| {
+            map.get(&caller)
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// See [`register_helper`].
+pub(crate) struct HelperGuard {
+    caller: u32,
+    helper: u32,
+}
+
+impl Drop for HelperGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = HELPERS.lock() {
+            if let Some(set) = map.get_mut(&self.caller) {
+                set.remove(&self.helper);
+                if set.is_empty() {
+                    map.remove(&self.caller);
+                }
+            }
+        }
+    }
+}
 
 /// Pump Vivado's PTY output in the background.
 ///
@@ -1948,7 +2036,9 @@ fn with_trailing_newline(s: &str) -> String {
     }
 }
 
-fn resolve_vivado(config: &VivadoConfig) -> Result<PathBuf, BackendError> {
+pub(crate) fn resolve_vivado(
+    config: &VivadoConfig,
+) -> Result<PathBuf, BackendError> {
     if let Some(path) = &config.vivado {
         return Ok(path.clone());
     }

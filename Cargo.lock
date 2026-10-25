@@ -6225,6 +6225,7 @@ dependencies = [
  "colored",
  "libc",
  "portable-pty",
+ "regex",
  "serde",
  "serde_json",
  "similar",
