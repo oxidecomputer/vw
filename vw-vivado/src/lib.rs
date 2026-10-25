@@ -12,11 +12,11 @@
 //! land in phase 4.
 
 mod handlers;
-mod ip_checkpoints;
 mod raw_log;
 mod rpc;
 mod selection;
 pub mod stream;
+mod synth_ip;
 mod worker;
 
 pub use handlers::{

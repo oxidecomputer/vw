@@ -340,14 +340,9 @@ async fn dispatch(
         "compile_htcl_module" => {
             compile_htcl_module(workspace_root, args, preloaded).await
         }
-        "ip_checkpoints" => {
-            crate::ip_checkpoints::ip_checkpoints(
-                workspace_root,
-                active_variant,
-                args,
-                ctx,
-            )
-            .await
+        "synth_ip" => {
+            crate::synth_ip::synth_ip(workspace_root, active_variant, args, ctx)
+                .await
         }
         other => Err(format!("unknown RPC method: {other}")),
     }

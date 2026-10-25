@@ -77,13 +77,13 @@ struct Project {
     constraints: Vec<String>,
 }
 
-/// The `ip_checkpoints` RPC: build (or reuse) a checkpoint and a VHDL stub
+/// The `synth_ip` RPC: synthesize (or reuse) a checkpoint and a VHDL stub
 /// for every IP module of the session's project, and answer with where they
 /// are: `{<module>: {dcp, stub, kind, cached}}`.
 ///
 /// Optional args: `{"jobs": N}`, the most workers to run at once (absent or
 /// 0: one per module).
-pub(crate) async fn ip_checkpoints(
+pub(crate) async fn synth_ip(
     workspace_root: Option<&Path>,
     active_variant: Option<&str>,
     args: Value,
@@ -91,17 +91,16 @@ pub(crate) async fn ip_checkpoints(
 ) -> Result<Value, String> {
     let ws = workspace_root
         .and_then(Utf8Path::from_path)
-        .ok_or("ip_checkpoints: no workspace root")?;
+        .ok_or("synth_ip: no workspace root")?;
     let name = vw_lib::load_workspace_config(ws)
-        .map_err(|e| format!("ip_checkpoints: {e}"))?
+        .map_err(|e| format!("synth_ip: {e}"))?
         .workspace
         .name;
     let project_dir = vw_lib::vw_project_dir(ws, active_variant);
     let xpr = vw_lib::vw_project_xpr(project_dir.as_std_path(), &name);
     let srcs = xpr.with_extension("srcs");
-    let text = std::fs::read_to_string(&xpr).map_err(|e| {
-        format!("ip_checkpoints: reading {}: {e}", xpr.display())
-    })?;
+    let text = std::fs::read_to_string(&xpr)
+        .map_err(|e| format!("synth_ip: reading {}: {e}", xpr.display()))?;
     let project = parse_xpr(&text, &srcs)?;
 
     // A read-only project applies whatever constraints are registered in
@@ -109,7 +108,7 @@ pub(crate) async fn ip_checkpoints(
     // an IP's checkpoint: they would be applied to it and travel with it.
     if !project.constraints.is_empty() {
         return Err(format!(
-            "ip_checkpoints: {} has design constraints registered in \
+            "synth_ip: {} has design constraints registered in \
              constrs_1 ({}); remove them from the project before building \
              IP checkpoints",
             xpr.display(),
@@ -118,10 +117,10 @@ pub(crate) async fn ip_checkpoints(
     }
 
     let vivado = crate::worker::resolve_vivado(&VivadoConfig::default())
-        .map_err(|e| format!("ip_checkpoints: {e}"))?;
+        .map_err(|e| format!("synth_ip: {e}"))?;
     let out = vw_lib::build_dir(ws, active_variant).join(CHECKPOINT_DIR);
     std::fs::create_dir_all(out.as_std_path())
-        .map_err(|e| format!("ip_checkpoints: creating {out}: {e}"))?;
+        .map_err(|e| format!("synth_ip: creating {out}: {e}"))?;
     let root = project_dir.join(&name);
 
     let mut answer = Map::new();
@@ -215,8 +214,8 @@ pub(crate) async fn ip_checkpoints(
     // delivered, and the rest may have most of an hour left to run. Dropping
     // the set aborts the other jobs, and with them their Vivados.
     while let Some(joined) = running.join_next().await {
-        let (name, log, result) = joined
-            .map_err(|e| format!("ip_checkpoints: a job panicked: {e}"))?;
+        let (name, log, result) =
+            joined.map_err(|e| format!("synth_ip: a job panicked: {e}"))?;
         match result {
             Ok(seconds) => ctx.emit(
                 StreamKind::Info,
@@ -226,7 +225,7 @@ pub(crate) async fn ip_checkpoints(
             ),
             Err(e) => {
                 return Err(format!(
-                    "ip_checkpoints: synthesizing {name} failed: {e} (log: {})",
+                    "synth_ip: synthesizing {name} failed: {e} (log: {})",
                     log.display()
                 ));
             }
@@ -372,7 +371,7 @@ fn parse_xpr(text: &str, srcs: &Path) -> Result<Project, String> {
         .unwrap()
         .captures(text)
         .map(|c| c[1].to_string())
-        .ok_or("ip_checkpoints: the .xpr names no part")?;
+        .ok_or("synth_ip: the .xpr names no part")?;
     let fileset = |name: &str| -> &str {
         let open = format!("<FileSet Name=\"{name}\"");
         text.find(&open)
