@@ -23,6 +23,7 @@
 //! htcl side says which project, and this decides how it is built.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -286,7 +287,12 @@ impl Job {
         };
 
         // What reaches the session is what someone would act on. The full
-        // synthesis transcript is in the job's own log.
+        // synthesis transcript is in the job's own log. Nothing from opening
+        // the project is: it is the project the session already opened, and
+        // whatever Vivado says about it the session has already said once
+        // rather than once per worker.
+        let forwarding = Arc::new(AtomicBool::new(false));
+        let forward = forwarding.clone();
         let output = ctx.output.clone();
         let tag = format!(
             "  at IP synthesis of {} (log {})",
@@ -294,24 +300,31 @@ impl Job {
             self.log().display()
         );
         backend.set_stdout_sink(Box::new(move |kind, chunk: &str| {
-            if matches!(
-                kind,
-                StreamKind::Warning
-                    | StreamKind::CriticalWarning
-                    | StreamKind::Error
-            ) {
+            if forward.load(Ordering::Relaxed)
+                && matches!(
+                    kind,
+                    StreamKind::Warning
+                        | StreamKind::CriticalWarning
+                        | StreamKind::Error
+                )
+            {
                 let chunk = chunk.trim_end_matches('\n');
                 let _ = output.send((kind, format!("{chunk}\n{tag}\n")));
             }
         }));
 
-        for tcl in job_tcl(
+        let (open, build) = job_tcl(
             &self.module.name,
             &self.xpr,
             &self.part,
             &self.dcp,
             &self.stub,
-        ) {
+        );
+        for tcl in open {
+            backend.eval(&tcl).await.map_err(|e| format!("{e}"))?;
+        }
+        forwarding.store(true, Ordering::Relaxed);
+        for tcl in build {
             backend.eval(&tcl).await.map_err(|e| format!("{e}"))?;
         }
         let _ = backend.shutdown().await;
@@ -322,15 +335,16 @@ impl Job {
     }
 }
 
-/// What a module's worker evaluates, in order.
+/// What a module's worker evaluates, in order: opening the project, then
+/// building the module.
 fn job_tcl(
     module: &str,
     xpr: &Path,
     part: &str,
     dcp: &Path,
     stub: &Path,
-) -> Vec<String> {
-    vec![
+) -> (Vec<String>, Vec<String>) {
+    let open = vec![
         // Project-mode synthesis of one module still reads every IP's
         // scoped constraints, and reports each one whose module isn't under
         // the top it is synthesizing. In a job that synthesizes a single IP
@@ -340,11 +354,14 @@ fn job_tcl(
          set_msg_config -id {Designutils 20-1280} -new_severity INFO"
             .to_string(),
         format!("open_project -read_only {{{}}}", xpr.display()),
+    ];
+    let build = vec![
         format!("synth_design -top {module} -part {part} -mode out_of_context"),
         format!("write_checkpoint -force {{{}}}", dcp.display()),
         // Written last: a stub means the checkpoint before it is whole.
         format!("write_vhdl -force -mode synth_stub {{{}}}", stub.display()),
-    ]
+    ];
+    (open, build)
 }
 
 /// Read the part, the IP modules and the registered constraints out of a
@@ -472,15 +489,15 @@ mod test {
 
     #[test]
     fn the_job_writes_its_stub_last() {
-        let tcl = job_tcl(
+        let (open, build) = job_tcl(
             "cips",
             Path::new("/p/x.xpr"),
             "xcvp1202-vsva2785-3HP-e-S",
             Path::new("/o/cips.dcp"),
             Path::new("/o/cips_stub.vhdl"),
         );
-        assert!(tcl[1].starts_with("open_project -read_only"));
-        assert!(tcl[2].contains("-mode out_of_context"));
-        assert!(tcl.last().unwrap().contains("synth_stub"));
+        assert!(open.last().unwrap().starts_with("open_project -read_only"));
+        assert!(build[0].contains("-mode out_of_context"));
+        assert!(build.last().unwrap().contains("synth_stub"));
     }
 }

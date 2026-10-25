@@ -64,12 +64,8 @@ pub fn lock_build_dir(
         Ok(()) => {
             // Who holds it, for the next session's error message. Best
             // effort: the lock is what matters, not this note.
-            let since = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
             let _ = file.set_len(0).and_then(|()| {
-                writeln!(file, "pid {} since {since}", std::process::id())
+                writeln!(file, "{} {}", std::process::id(), now())
             });
             Ok(BuildLock { _file: file, path })
         }
@@ -78,10 +74,7 @@ pub fn lock_build_dir(
             let _ = file
                 .seek(SeekFrom::Start(0))
                 .and_then(|_| file.read_to_string(&mut holder));
-            let holder = match holder.trim() {
-                "" => String::new(),
-                h => format!(" ({h})"),
-            };
+            let holder = describe_holder(&holder, now());
             Err(VwError::FileSystem {
                 message: format!(
                     "{dir} is in use by another vw session{holder}; \
@@ -92,6 +85,31 @@ pub fn lock_build_dir(
         }
         Err(TryLockError::Error(e)) => Err(VwError::Io(e)),
     }
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `" (pid 123, started 12m ago)"` from the `<pid> <unix seconds>` a
+/// holder writes, or nothing if it wrote nothing readable.
+fn describe_holder(note: &str, now: u64) -> String {
+    let mut words = note.split_whitespace();
+    let (Some(pid), Some(Ok(started))) =
+        (words.next(), words.next().map(str::parse::<u64>))
+    else {
+        return String::new();
+    };
+    let minutes = now.saturating_sub(started) / 60;
+    let ago = match minutes {
+        0 => "under a minute ago".to_string(),
+        m if m < 120 => format!("{m}m ago"),
+        m => format!("{}h ago", m / 60),
+    };
+    format!(" (pid {pid}, started {ago})")
 }
 
 #[cfg(test)]
@@ -106,10 +124,27 @@ mod test {
         let err = lock_build_dir(ws, None).unwrap_err().to_string();
         assert!(err.contains("in use by another vw session"), "{err}");
         assert!(
-            err.contains(&format!("pid {}", std::process::id())),
+            err.contains(&format!("pid {}, started", std::process::id())),
             "{err}"
         );
         drop(first);
         lock_build_dir(ws, None).unwrap();
+    }
+
+    #[test]
+    fn describes_its_holder() {
+        assert_eq!(
+            describe_holder("42 1000", 1000),
+            " (pid 42, started under a minute ago)"
+        );
+        assert_eq!(
+            describe_holder("42 1000", 1000 + 12 * 60),
+            " (pid 42, started 12m ago)"
+        );
+        assert_eq!(
+            describe_holder("42 1000", 1000 + 3 * 3600),
+            " (pid 42, started 3h ago)"
+        );
+        assert_eq!(describe_holder("", 1000), "");
     }
 }
