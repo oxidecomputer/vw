@@ -340,6 +340,15 @@ async fn dispatch(
         "compile_htcl_module" => {
             compile_htcl_module(workspace_root, args, preloaded).await
         }
+        "synth_modular" => {
+            crate::synth_modular::synth_modular(
+                workspace_root,
+                active_variant,
+                args,
+                ctx,
+            )
+            .await
+        }
         "synth_ip" => {
             crate::synth_ip::synth_ip(workspace_root, active_variant, args, ctx)
                 .await
@@ -1123,7 +1132,7 @@ fn synth_needs_update(
 /// Grouped-by-library because the primary consumer is a Vivado
 /// `read_vhdl -library <lib> $files` loop — the tuple-per-file
 /// shape would force the caller to bucket, which we can do here.
-async fn vhdl_dependency_sources(
+pub(crate) async fn vhdl_dependency_sources(
     workspace_root: Option<&std::path::Path>,
     include_test: bool,
     exclude_sim_only: bool,
@@ -1178,7 +1187,7 @@ async fn vhdl_dependency_sources(
 /// `vhdl_design_sources` — return every VHDL file under
 /// `<workspace>/hdl/` as a JSON array of absolute-path strings.
 /// Empty array when the workspace has no `hdl/` dir yet.
-fn vhdl_design_sources(
+pub(crate) fn vhdl_design_sources(
     workspace_root: Option<&std::path::Path>,
     variant: Option<String>,
 ) -> Result<Value, String> {
@@ -1305,7 +1314,7 @@ fn top_value(
 /// JSON array of absolute-path strings. Variant resolution matches
 /// [`vhdl_design_sources`]. Empty array when nothing has been
 /// wrapped yet.
-fn vhdl_ip_sources(
+pub(crate) fn vhdl_ip_sources(
     workspace_root: Option<&std::path::Path>,
     variant: Option<String>,
 ) -> Result<Value, String> {
@@ -1352,13 +1361,13 @@ fn design_constraints(
 /// phase-specific accessors in `vw_lib`; kept as a small internal
 /// enum so the dispatch match up top can name each variant without
 /// duplicating the workspace-root plumbing three times.
-enum ConstraintPhase {
+pub(crate) enum ConstraintPhase {
     Synth,
     Place,
     Route,
 }
 
-fn design_phase_constraints(
+pub(crate) fn design_phase_constraints(
     workspace_root: Option<&std::path::Path>,
     phase: ConstraintPhase,
     variant: Option<String>,

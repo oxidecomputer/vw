@@ -23,18 +23,17 @@
 //! htcl side says which project, and this decides how it is built.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use camino::Utf8Path;
 use serde_json::{json, Map, Value};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use vw_eda::{EdaBackend, StreamKind};
+use vw_eda::StreamKind;
 
+use crate::job::{tcl_word, Job, Report};
 use crate::rpc::RpcContext;
-use crate::worker::{register_helper, VivadoBackend, VivadoConfig};
+use crate::worker::VivadoConfig;
 
 /// Bumped whenever [`job_tcl`] changes what a checkpoint contains, so
 /// checkpoints built the old way are not reused.
@@ -45,7 +44,7 @@ const CHECKPOINT_DIR: &str = "ip-checkpoints";
 
 /// What an IP module is in the project.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     BlockDesign,
     Xci,
 }
@@ -77,6 +76,25 @@ struct Project {
     constraints: Vec<String>,
 }
 
+/// One IP module's synthesized checkpoint and stub.
+pub(crate) struct Built {
+    pub name: String,
+    pub kind: Kind,
+    pub dcp: PathBuf,
+    pub stub: PathBuf,
+    /// Reused rather than synthesized this time.
+    pub cached: bool,
+}
+
+/// Every IP module of a session's project, synthesized.
+pub(crate) struct Synthesized {
+    /// The project's part.
+    pub part: String,
+    /// The Vivado that built them.
+    pub vivado: PathBuf,
+    pub modules: Vec<Built>,
+}
+
 /// The `synth_ip` RPC: synthesize (or reuse) a checkpoint and a VHDL stub
 /// for every IP module of the session's project, and answer with where they
 /// are: `{<module>: {dcp, stub, kind, cached}}`.
@@ -92,6 +110,39 @@ pub(crate) async fn synth_ip(
     let ws = workspace_root
         .and_then(Utf8Path::from_path)
         .ok_or("synth_ip: no workspace root")?;
+    let jobs = jobs_arg(&args);
+    let built = synthesize(ws, active_variant, jobs, &ctx).await?;
+    let mut answer = Map::new();
+    for m in built.modules {
+        answer.insert(
+            m.name,
+            json!({
+                "dcp": m.dcp.display().to_string(),
+                "stub": m.stub.display().to_string(),
+                "kind": m.kind.as_str(),
+                "cached": m.cached,
+            }),
+        );
+    }
+    Ok(Value::Object(answer))
+}
+
+/// `{"jobs": N}`: the most workers to run at once, `None` for one per job.
+pub(crate) fn jobs_arg(args: &Value) -> Option<usize> {
+    args.get("jobs")
+        .and_then(Value::as_u64)
+        .filter(|&n| n > 0)
+        .map(|n| n as usize)
+}
+
+/// Synthesize (or reuse) every IP module of the session's project, at most
+/// `jobs` at once.
+pub(crate) async fn synthesize(
+    ws: &Utf8Path,
+    active_variant: Option<&str>,
+    jobs: Option<usize>,
+    ctx: &RpcContext,
+) -> Result<Synthesized, String> {
     let name = vw_lib::load_workspace_config(ws)
         .map_err(|e| format!("synth_ip: {e}"))?
         .workspace
@@ -123,7 +174,7 @@ pub(crate) async fn synth_ip(
         .map_err(|e| format!("synth_ip: creating {out}: {e}"))?;
     let root = project_dir.join(&name);
 
-    let mut answer = Map::new();
+    let mut built = Vec::new();
     let mut todo = Vec::new();
     for module in project.modules {
         let dcp = out.join(format!("{}.dcp", module.name)).into_std_path_buf();
@@ -141,19 +192,10 @@ pub(crate) async fn synth_ip(
             &salt,
             std::slice::from_ref(&module.source),
         );
-        let fresh = stub.exists()
+        let cached = stub.exists()
             && vw_lib::checkpoint_status(&dcp, fingerprint)
                 == vw_lib::CheckpointStatus::Fresh;
-        answer.insert(
-            module.name.clone(),
-            json!({
-                "dcp": dcp.display().to_string(),
-                "stub": stub.display().to_string(),
-                "kind": module.kind.as_str(),
-                "cached": fresh,
-            }),
-        );
-        if fresh {
+        if cached {
             ctx.emit(
                 StreamKind::Info,
                 format!(
@@ -162,28 +204,49 @@ pub(crate) async fn synth_ip(
                 ),
             );
         } else {
-            todo.push(Job {
-                module,
-                dcp,
-                stub,
+            // Nothing of an earlier build survives a failed one: a
+            // checkpoint without its stub, or either without the mark, is
+            // rebuilt.
+            for stale in [&dcp, &stub] {
+                let _ = std::fs::remove_file(stale);
+            }
+            let (setup, steps) =
+                job_tcl(&module.name, &xpr, &project.part, &dcp, &stub);
+            todo.push((
+                module.name.clone(),
+                dcp.clone(),
                 fingerprint,
-                xpr: xpr.clone(),
-                part: project.part.clone(),
-                dir: out.join("jobs").into_std_path_buf(),
-                vivado: vivado.clone(),
-            });
+                Job {
+                    label: format!("IP synthesis of {}", module.name),
+                    vivado: vivado.clone(),
+                    dir: out
+                        .join("jobs")
+                        .join(&module.name)
+                        .into_std_path_buf(),
+                    setup,
+                    steps,
+                    report: Report::Problems,
+                },
+            ));
         }
+        built.push(Built {
+            name: module.name,
+            kind: module.kind,
+            dcp,
+            stub,
+            cached,
+        });
     }
+    let done = Synthesized {
+        part: project.part,
+        vivado,
+        modules: built,
+    };
     if todo.is_empty() {
-        return Ok(Value::Object(answer));
+        return Ok(done);
     }
 
-    let jobs = args
-        .get("jobs")
-        .and_then(Value::as_u64)
-        .filter(|&n| n > 0)
-        .map(|n| n as usize)
-        .unwrap_or(todo.len());
+    let jobs = jobs.unwrap_or(todo.len());
     ctx.emit(
         StreamKind::Info,
         format!(
@@ -191,7 +254,7 @@ pub(crate) async fn synth_ip(
             todo.len(),
             jobs.min(todo.len()),
             todo.iter()
-                .map(|j| j.module.name.as_str())
+                .map(|(name, ..)| name.as_str())
                 .collect::<Vec<_>>()
                 .join(" "),
         ),
@@ -199,15 +262,17 @@ pub(crate) async fn synth_ip(
 
     let permits = Arc::new(Semaphore::new(jobs));
     let mut running = JoinSet::new();
-    for job in todo {
+    for (name, dcp, fingerprint, job) in todo {
         let permits = permits.clone();
         let ctx = ctx.clone();
         running.spawn(async move {
             let _permit = permits.acquire_owned().await;
-            let name = job.module.name.clone();
-            let log = job.log();
-            let result = job.run(&ctx).await;
-            (name, log, result)
+            let result = job.run(&ctx).await.and_then(|seconds| {
+                vw_lib::write_checkpoint_fingerprint(&dcp, fingerprint)
+                    .map(|()| seconds)
+                    .map_err(|e| format!("marking {}: {e}", dcp.display()))
+            });
+            (name, job.log(), result)
         });
     }
     // The first failure ends the whole call: what was asked for can't be
@@ -231,107 +296,7 @@ pub(crate) async fn synth_ip(
             }
         }
     }
-    Ok(Value::Object(answer))
-}
-
-/// Building one module's checkpoint.
-struct Job {
-    module: Module,
-    dcp: PathBuf,
-    stub: PathBuf,
-    fingerprint: u64,
-    xpr: PathBuf,
-    part: String,
-    /// Where each job gets a working directory of its own.
-    dir: PathBuf,
-    vivado: PathBuf,
-}
-
-impl Job {
-    fn workdir(&self) -> PathBuf {
-        self.dir.join(&self.module.name)
-    }
-
-    fn log(&self) -> PathBuf {
-        self.workdir().join("vivado.log")
-    }
-
-    /// Build the checkpoint and stub, then mark the checkpoint with what it
-    /// was built from. Answers how long it took.
-    async fn run(&self, ctx: &RpcContext) -> Result<f64, String> {
-        let started = Instant::now();
-        let workdir = self.workdir();
-        let _ = std::fs::remove_dir_all(&workdir);
-        std::fs::create_dir_all(&workdir)
-            .map_err(|e| format!("creating {}: {e}", workdir.display()))?;
-        // Nothing of an earlier build survives a failed one: a checkpoint
-        // without its stub, or either without the mark, is rebuilt.
-        for stale in [&self.dcp, &self.stub] {
-            let _ = std::fs::remove_file(stale);
-        }
-
-        let mut backend = VivadoBackend::spawn(VivadoConfig {
-            vivado: Some(self.vivado.clone()),
-            working_dir: Some(workdir),
-            raw_log: Some(self.log()),
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| format!("starting Vivado: {e}"))?;
-        let _helper = match (ctx.caller_pid, backend.child_pid()) {
-            (Some(caller), Some(helper)) => {
-                Some(register_helper(caller, helper))
-            }
-            _ => None,
-        };
-
-        // What reaches the session is what someone would act on. The full
-        // synthesis transcript is in the job's own log. Nothing from opening
-        // the project is: it is the project the session already opened, and
-        // whatever Vivado says about it the session has already said once
-        // rather than once per worker.
-        let forwarding = Arc::new(AtomicBool::new(false));
-        let forward = forwarding.clone();
-        let output = ctx.output.clone();
-        let tag = format!(
-            "  at IP synthesis of {} (log {})",
-            self.module.name,
-            self.log().display()
-        );
-        backend.set_stdout_sink(Box::new(move |kind, chunk: &str| {
-            if forward.load(Ordering::Relaxed)
-                && matches!(
-                    kind,
-                    StreamKind::Warning
-                        | StreamKind::CriticalWarning
-                        | StreamKind::Error
-                )
-            {
-                let chunk = chunk.trim_end_matches('\n');
-                let _ = output.send((kind, format!("{chunk}\n{tag}\n")));
-            }
-        }));
-
-        let (open, build) = job_tcl(
-            &self.module.name,
-            &self.xpr,
-            &self.part,
-            &self.dcp,
-            &self.stub,
-        );
-        for tcl in open {
-            backend.eval(&tcl).await.map_err(|e| format!("{e}"))?;
-        }
-        forwarding.store(true, Ordering::Relaxed);
-        for tcl in build {
-            backend.eval(&tcl).await.map_err(|e| format!("{e}"))?;
-        }
-        let _ = backend.shutdown().await;
-
-        vw_lib::write_checkpoint_fingerprint(&self.dcp, self.fingerprint)
-            .map_err(|e| format!("marking {}: {e}", self.dcp.display()))?;
-        Ok(started.elapsed().as_secs_f64())
-    }
+    Ok(done)
 }
 
 /// What a module's worker evaluates, in order: opening the project, then
@@ -352,13 +317,13 @@ fn job_tcl(
         "set_msg_config -id {Constraints 18-5119} -new_severity INFO\n\
          set_msg_config -id {Designutils 20-1280} -new_severity INFO"
             .to_string(),
-        format!("open_project -read_only {{{}}}", xpr.display()),
+        format!("open_project -read_only {}", tcl_word(xpr)),
     ];
     let build = vec![
         format!("synth_design -top {module} -part {part} -mode out_of_context"),
-        format!("write_checkpoint -force {{{}}}", dcp.display()),
+        format!("write_checkpoint -force {}", tcl_word(dcp)),
         // Written last: a stub means the checkpoint before it is whole.
-        format!("write_vhdl -force -mode synth_stub {{{}}}", stub.display()),
+        format!("write_vhdl -force -mode synth_stub {}", tcl_word(stub)),
     ];
     (open, build)
 }
