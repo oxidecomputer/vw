@@ -343,3 +343,59 @@ See Also:
         "unannotated page should not synthesize a return type: {htcl}"
     );
 }
+
+/// `extra_args` in the constraints file adds flags a man page doesn't
+/// document, ahead of the positionals, and the documented arg wins
+/// when the page does list one.
+#[test]
+fn extra_args_add_undocumented_flags() {
+    let page = parse_man_page(
+        "build_thing",
+        "\nArguments:\n\n  -quiet - (Optional) Quietly.\n\n  \
+         <objects> - (Required) The things.\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cmd-constraints.toml");
+    std::fs::write(
+        &path,
+        r#"
+        [[build_thing.extra_args]]
+        flag = "no_iobuf"
+        description = "(Optional) Do not infer I/O buffers."
+
+        [[build_thing.extra_args]]
+        flag = "hidden"
+        value = true
+        description = "(Optional) A hidden value."
+
+        [[build_thing.extra_args]]
+        flag = "quiet"
+        description = "Shadowed by the documented flag."
+        "#,
+    )
+    .unwrap();
+    let opts = GenerateOptions {
+        constraints: vw_htcl_cmd::ConstraintsTable::load(&path).unwrap(),
+        ..GenerateOptions::default()
+    };
+    let htcl = generate(&page, &opts);
+
+    assert!(htcl.contains("@default(false) no_iobuf: bool"), "{htcl}");
+    assert!(
+        htcl.contains("if {$no_iobuf} { lappend flags -no_iobuf }"),
+        "{htcl}"
+    );
+    assert!(
+        htcl.contains("if {$hidden ne \"\"} { lappend flags -hidden $hidden }"),
+        "{htcl}"
+    );
+    assert_eq!(htcl.matches("quiet: bool").count(), 1, "{htcl}");
+    assert!(!htcl.contains("Shadowed"), "{htcl}");
+    let no_iobuf = htcl.find("lappend flags -no_iobuf").unwrap();
+    let objects = htcl.find("-objects $objects").unwrap();
+    assert!(no_iobuf < objects, "extras go before positionals: {htcl}");
+    let hidden_arg = htcl.find("@default(\"\") hidden").unwrap();
+    let objects_arg = htcl.find("  objects\n").unwrap();
+    assert!(hidden_arg < objects_arg, "{htcl}");
+    assert_reparses(&htcl);
+}
