@@ -137,6 +137,12 @@ fn persist_dir(
                      fingerprint changed or manifest missing)",
                 ));
             }
+            if let Some(wiped) = &prep.wiped_ip {
+                notes.push(format!(
+                    "removed IP wrappers at {wiped} along with the stale \
+                     project; IP configuration regenerates them",
+                ));
+            }
             Some(prep.project_dir.into_std_path_buf())
         }
         Err(e) => {

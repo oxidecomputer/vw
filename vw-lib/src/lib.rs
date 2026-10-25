@@ -3748,6 +3748,14 @@ pub struct PreparedProjectDir {
     /// sweeps any layout drift instead of leaving cross-version
     /// clutter behind.
     pub wiped_project: Option<Utf8PathBuf>,
+    /// `Some(path)` iff [`project_needs_wipe`] returned true and the
+    /// build dir's `ip/` existed, so we wiped it too. Everything in
+    /// it (the `vw::make_wrapper` outputs) comes from the
+    /// `ip::configure` run that configured the project, so it goes
+    /// stale with the project. Left behind, a wrapper for an IP the
+    /// new config no longer makes is still read into library `ip` by
+    /// [`vhdl_ip_sources`].
+    pub wiped_ip: Option<Utf8PathBuf>,
 }
 
 /// Bootstrap the on-disk Vivado project dir for a workspace and
@@ -3763,7 +3771,8 @@ pub struct PreparedProjectDir {
 ///    the manifest sidecar is missing, or the fingerprint is
 ///    stale, `remove_dir_all(<project_dir>/<name>)` so the worker
 ///    takes the fresh-create branch instead of `open_project` on
-///    stale bytes.
+///    stale bytes, and remove the build dir's `ip/` with it, since
+///    the fresh configure regenerates everything in it.
 /// 3. `create_dir_all(<project_dir>)` so Vivado's later
 ///    `create_project -dir` has a real parent.
 ///
@@ -3781,15 +3790,22 @@ pub fn prepare_vw_project_dir(
     let migrated = migrate_flat_build_output(workspace_dir);
     let project_dir = vw_project_dir(workspace_dir, active_variant);
     let mut wiped_project = None;
+    let mut wiped_ip = None;
     if project_needs_wipe(
         workspace_dir,
         project_dir.as_std_path(),
         name,
         active_variant,
-    )? && project_dir.exists()
-    {
-        fs::remove_dir_all(project_dir.as_std_path())?;
-        wiped_project = Some(project_dir.clone());
+    )? {
+        if project_dir.exists() {
+            fs::remove_dir_all(project_dir.as_std_path())?;
+            wiped_project = Some(project_dir.clone());
+        }
+        let ip_dir = build_dir(workspace_dir, active_variant).join("ip");
+        if ip_dir.exists() {
+            fs::remove_dir_all(ip_dir.as_std_path())?;
+            wiped_ip = Some(ip_dir);
+        }
     }
     fs::create_dir_all(project_dir.as_std_path())?;
     Ok(PreparedProjectDir {
@@ -3797,6 +3813,7 @@ pub fn prepare_vw_project_dir(
         legacy_cache_removed,
         migrated,
         wiped_project,
+        wiped_ip,
     })
 }
 
@@ -10059,6 +10076,49 @@ exclusive = ["hdl/top-beta.vhd"]
         // An IP config change still invalidates — per variant.
         write(&ws.join("ip/module.htcl"), "# changed");
         assert!(configure("alpha").wiped_project.is_some());
+    }
+
+    /// A stale project takes its `ip/` wrappers with it: a wrapper for
+    /// an IP the new config no longer makes must not outlive it.
+    #[test]
+    fn wiping_a_stale_project_wipes_its_ip_wrappers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        let configure = |variant: &str| {
+            let prep =
+                prepare_vw_project_dir(&ws, "twin", Some(variant)).unwrap();
+            let xpr = vw_project_xpr(prep.project_dir.as_std_path(), "twin");
+            if !xpr.exists() {
+                write(&Utf8PathBuf::from_path_buf(xpr).unwrap(), "");
+                write_project_manifest(
+                    &ws,
+                    prep.project_dir.as_std_path(),
+                    "twin",
+                    Some(variant),
+                )
+                .unwrap();
+            }
+            prep
+        };
+        configure("alpha");
+        configure("beta");
+        let old = ws.join("target/alpha/ip/old_bd/wrapper.vhd");
+        write(&old, "entity old_bd_wrapper is end;");
+        let beta = ws.join("target/beta/ip/old_bd/wrapper.vhd");
+        write(&beta, "entity old_bd_wrapper is end;");
+
+        // A fresh project keeps the wrappers its configure wrote.
+        assert!(configure("alpha").wiped_ip.is_none());
+        assert!(old.exists());
+
+        write(&ws.join("ip/module.htcl"), "# changed");
+        let prep = configure("alpha");
+        assert_eq!(prep.wiped_ip, Some(ws.join("target/alpha/ip")));
+        assert!(!old.exists());
+        // Per variant: beta's wrappers go when beta's project does.
+        assert!(beta.exists());
+        assert!(configure("beta").wiped_ip.is_some());
+        assert!(!beta.exists());
     }
 
     #[test]
