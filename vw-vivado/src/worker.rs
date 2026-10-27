@@ -98,7 +98,9 @@ fn vw_timing_log(event: &str, len: usize, preview: &str) {
 #[derive(Clone, Default)]
 pub struct VivadoConfig {
     /// Override the `vivado` executable path. If `None`, resolution
-    /// order is `$VW_VIVADO`, then a `vivado` lookup on `$PATH`.
+    /// order is `$VW_VIVADO`, then a `vivado` lookup on `$PATH`, then
+    /// a `vivado_lab` lookup on `$PATH` (lab machines carry only the
+    /// Lab Edition).
     pub vivado: Option<PathBuf>,
     /// Working directory for the spawned process. If `None`, a
     /// scratch tempdir is created so Vivado's incidental files don't
@@ -192,6 +194,12 @@ pub struct AutoProject {
     /// `vw_lib::project_needs_wipe`) — the worker takes whatever
     /// state is on disk as-is.
     pub persist_dir: Option<PathBuf>,
+    /// The session's hold on its build directory (see
+    /// [`vw_lib::lock_build_dir`]). The backend keeps it until it is
+    /// dropped, so the directory stays this session's for as long as
+    /// its Vivado runs. `None` for projects nothing else can reach (the
+    /// in-memory ones `vw test` makes).
+    pub lock: Option<std::sync::Arc<vw_lib::BuildLock>>,
 }
 
 /// Vivado [`EdaBackend`] implementation.
@@ -304,6 +312,12 @@ pub struct VivadoBackend {
     /// re-sourced shim connects again here.
     listener: Option<TcpListener>,
     _scratch_dir: Option<TempDir>,
+    /// `true` when the process on the other end is Vivado Lab
+    /// Edition (`vivado_lab`): hardware manager only, no synthesis
+    /// toolchain, so [`VivadoConfig::auto_project`] is ignored.
+    lab: bool,
+    /// Held, never read: see [`AutoProject::lock`].
+    _lock: Option<std::sync::Arc<vw_lib::BuildLock>>,
 }
 
 impl VivadoBackend {
@@ -520,7 +534,27 @@ impl VivadoBackend {
             shim_dead: false,
             shim_path: shim_path.clone(),
             listener: Some(listener),
+            lab: false,
+            _lock: config.auto_project.as_ref().and_then(|ap| ap.lock.clone()),
         };
+        // Vivado Lab Edition is the hardware manager without the
+        // implementation toolchain: no synthesis, and `create_project`
+        // takes no `-part`. Detect it by the toolchain being absent
+        // rather than by executable name, so `$VW_VIVADO` pointing at
+        // a symlink or wrapper still gets it right. `synth_design` is
+        // registered at startup in full Vivado (unlike the
+        // hardware-manager commands, which load on first use, so
+        // `info commands` can't be trusted for those).
+        {
+            use vw_eda::EdaBackend as _;
+            let probe = backend
+                .eval("llength [info commands ::synth_design]")
+                .await
+                .map_err(|e| {
+                    BackendError::Worker(format!("probing Vivado edition: {e}"))
+                })?;
+            backend.lab = probe.value.trim() == "0";
+        }
         // Auto-create (or reopen) the Vivado project if the caller
         // specified one. Runs BEFORE we return to the caller so the
         // first user eval sees an existing project — `ip::check` /
@@ -552,7 +586,19 @@ impl VivadoBackend {
         // VHDL-first, and the default Verilog would silently emit
         // `_wrapper.v` files that downstream tools looking for
         // `.vhd` fail on with an unhelpful "no wrapper found".
-        if let Some(ap) = &config.auto_project {
+        //
+        // Lab Edition gets no project at all: its work is JTAG
+        // through the hardware manager, which needs none, and it
+        // can't create one for a part anyway.
+        if backend.lab {
+            if let Some(ap) = &config.auto_project {
+                debug!(
+                    name = %ap.name,
+                    part = %ap.part,
+                    "vivado lab edition: not creating a project"
+                );
+            }
+        } else if let Some(ap) = &config.auto_project {
             use vw_eda::EdaBackend as _;
             let tcl = match &ap.persist_dir {
                 None => format!(
@@ -977,17 +1023,45 @@ impl VivadoBackend {
 
     /// Handle one inbound [`RpcCall`], write the response back to
     /// the shim.
+    ///
+    /// While the handler runs, whatever it sends through its
+    /// [`crate::RpcContext`] goes to this worker's stream sink, as though
+    /// this worker had printed it.
     async fn dispatch_rpc_call(
         &mut self,
         call: vw_eda::protocol::RpcCall,
     ) -> Result<(), BackendError> {
-        let result = match &self.rpc_handler {
-            Some(handler) => handler.call(&call.method, call.args).await,
-            None => Err(format!(
-                "no RPC handler configured; can't answer '{}'",
-                call.method
-            )),
+        let (output, mut produced) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = crate::RpcContext {
+            output,
+            caller_pid: self.child_pid(),
         };
+        let handler = self.rpc_handler.clone();
+        let method = call.method.clone();
+        let answer = async move {
+            match handler {
+                Some(handler) => handler.call(&method, call.args, ctx).await,
+                None => Err(format!(
+                    "no RPC handler configured; can't answer '{method}'"
+                )),
+            }
+        };
+        tokio::pin!(answer);
+        let result = loop {
+            tokio::select! {
+                result = &mut answer => break result,
+                Some((kind, text)) = produced.recv() => {
+                    if let Some(sink) = self.stdout_sink.as_mut() {
+                        sink(kind, &text);
+                    }
+                }
+            }
+        };
+        while let Ok((kind, text)) = produced.try_recv() {
+            if let Some(sink) = self.stdout_sink.as_mut() {
+                sink(kind, &text);
+            }
+        }
         let resp = match result {
             Ok(value) => Response::ok(call.id, value),
             Err(msg) => Response::err(
@@ -1040,9 +1114,9 @@ impl VivadoBackend {
         }
         if !outcome.absorbed {
             // Unclassified PTY output DURING an eval — the tail
-            // of a multi-line Vivado error (`[BD 41-758] … valid
-            // clock source:` followed by unindented `/pin` list),
-            // or arbitrary chatter the user's command triggered.
+            // of a multi-line Vivado message that arrived after
+            // the continuation window closed, or arbitrary
+            // chatter the user's command triggered.
             // Route as Stdout so the user can SEE it in the
             // scrollback without it inheriting the previous
             // warning/error's styling. Verbose-log too, for
@@ -1569,8 +1643,15 @@ impl Drop for VivadoBackend {
 ///
 /// Unix-only. Windows has no analogue that reliably reaches the child's Tcl
 /// signal handler, and every vw interactive user is on Unix.
+///
+/// Workers started on behalf of the one at `pid` (see [`register_helper`])
+/// are interrupted along with it: they are doing the work it is waiting on,
+/// so stopping it means stopping them.
 #[cfg(unix)]
 pub fn interrupt_process_group(pid: u32) {
+    for helper in helpers_of(pid) {
+        interrupt_process_group(helper);
+    }
     // SAFETY: `libc::kill(-pid, SIGINT)` on a process group we spawned.
     // Negative pid selects the pgid — necessary because vivado's on-disk
     // binary is a bash wrapper that forks loader+vivado as children without
@@ -1586,6 +1667,50 @@ pub fn interrupt_process_group(pid: u32) {
 /// Windows stub. See the unix variant.
 #[cfg(not(unix))]
 pub fn interrupt_process_group(_pid: u32) {}
+
+/// Workers each worker has started, by the starting worker's pid.
+static HELPERS: std::sync::Mutex<
+    std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Record the worker at `helper` as working for the one at `caller`, until
+/// the returned guard is dropped. Interrupting `caller` interrupts it too.
+pub(crate) fn register_helper(caller: u32, helper: u32) -> HelperGuard {
+    if let Ok(mut map) = HELPERS.lock() {
+        map.entry(caller).or_default().insert(helper);
+    }
+    HelperGuard { caller, helper }
+}
+
+fn helpers_of(caller: u32) -> Vec<u32> {
+    HELPERS
+        .lock()
+        .map(|map| {
+            map.get(&caller)
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// See [`register_helper`].
+pub(crate) struct HelperGuard {
+    caller: u32,
+    helper: u32,
+}
+
+impl Drop for HelperGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = HELPERS.lock() {
+            if let Some(set) = map.get_mut(&self.caller) {
+                set.remove(&self.helper);
+                if set.is_empty() {
+                    map.remove(&self.caller);
+                }
+            }
+        }
+    }
+}
 
 /// Pump Vivado's PTY output in the background.
 ///
@@ -1754,6 +1879,13 @@ struct PendingPtyMessage {
     kind: StreamKind,
     text: String,
     arrived_at: std::time::Instant,
+    /// The header line ended in `:`, announcing a list body (e.g.
+    /// `[BD 41-758] … not connected to a valid clock source:`
+    /// followed by one `/pin` per line). Vivado prints those list
+    /// lines *unindented*, so the usual leading-whitespace
+    /// continuation rule would split them off — see
+    /// [`PtyClassifier::handle`].
+    expects_list: bool,
 }
 
 /// Outcome of feeding one PTY line through [`PtyClassifier`].
@@ -1815,6 +1947,7 @@ impl PtyClassifier {
                 kind,
                 text: line.to_string(),
                 arrived_at: now,
+                expects_list: line.trim_end().ends_with(':'),
             });
             out.absorbed = true;
             return out;
@@ -1850,11 +1983,18 @@ impl PtyClassifier {
             // inherit its orange/red styling. Non-continuation
             // unclassified lines return `absorbed=false` — the
             // during-eval caller routes them to Stdout so they
-            // still surface (e.g. the `/pin` list following
-            // `[BD 41-758] … clock source:`), just without the
-            // pending's severity style.
+            // still surface, just without the pending's severity
+            // style.
+            //
+            // Exception: a header ending in `:` announces a list
+            // body, which Vivado prints unindented (the `/pin`
+            // list after `[BD 41-758] … clock source:`). Absorb
+            // any non-blank line for those, so the list stays
+            // attached to the diagnostic instead of degrading to
+            // Stdout — which terse log levels (`vw check`) elide.
             let looks_like_continuation =
-                line.chars().next().is_some_and(char::is_whitespace);
+                line.chars().next().is_some_and(char::is_whitespace)
+                    || (p.expects_list && !line.trim().is_empty());
             if merges
                 && looks_like_continuation
                 && now.duration_since(p.arrived_at) < self.window
@@ -1896,7 +2036,9 @@ fn with_trailing_newline(s: &str) -> String {
     }
 }
 
-fn resolve_vivado(config: &VivadoConfig) -> Result<PathBuf, BackendError> {
+pub(crate) fn resolve_vivado(
+    config: &VivadoConfig,
+) -> Result<PathBuf, BackendError> {
     if let Some(path) = &config.vivado {
         return Ok(path.clone());
     }
@@ -1905,17 +2047,21 @@ fn resolve_vivado(config: &VivadoConfig) -> Result<PathBuf, BackendError> {
             return Ok(PathBuf::from(env));
         }
     }
+    // Full Vivado first: a machine with both is a build machine,
+    // and the Lab Edition can't do what most scripts there ask of it.
     if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("vivado");
-            if candidate.is_file() {
-                return Ok(candidate);
+        for exe in ["vivado", "vivado_lab"] {
+            for dir in std::env::split_paths(&paths) {
+                let candidate = dir.join(exe);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
             }
         }
     }
     Err(BackendError::Worker(
-        "could not find `vivado` on PATH; set $VW_VIVADO or pass \
-         VivadoConfig::vivado"
+        "could not find `vivado` or `vivado_lab` on PATH; set $VW_VIVADO \
+         or pass VivadoConfig::vivado"
             .into(),
     ))
 }
@@ -2001,6 +2147,42 @@ mod tests {
             "WARNING: [X 1-1] header\n  /path/to/file.xci\n"
         );
         assert!(!out.absorbed, "unindented follow-up must not be absorbed");
+    }
+
+    /// Regression: `[BD 41-758]` ends its header with `:` and then
+    /// lists the offending pins *unindented*. Those lines must stay
+    /// attached to the error — split off as Stdout, terse log
+    /// levels (`vw check`'s IP pass) elide them and the user sees
+    /// a header promising a list with nothing under it.
+    #[test]
+    fn classifier_absorbs_unindented_list_after_colon_header() {
+        let mut c = classifier(20);
+        let t0 = Instant::now();
+        assert!(
+            c.handle(
+                "ERROR: [BD 41-758] The following clock pins are not \
+                 connected to a valid clock source: ",
+                t0,
+            )
+            .absorbed
+        );
+        let out = c.handle("/cips/pl0_ref_clk", t0 + Duration::from_millis(1));
+        assert!(out.chunks.is_empty(), "{:?}", out.chunks);
+        assert!(out.absorbed);
+        let out = c.handle("/dcmac/core_clk", t0 + Duration::from_millis(2));
+        assert!(out.chunks.is_empty(), "{:?}", out.chunks);
+        assert!(out.absorbed);
+        // A blank line still ends the list.
+        let out = c.handle("", t0 + Duration::from_millis(3));
+        assert_eq!(out.chunks.len(), 1, "{:?}", out.chunks);
+        assert!(!out.absorbed);
+        assert_eq!(out.chunks[0].0, StreamKind::Error);
+        assert_eq!(
+            out.chunks[0].1,
+            "ERROR: [BD 41-758] The following clock pins are not \
+             connected to a valid clock source: \n\
+             /cips/pl0_ref_clk\n/dcmac/core_clk\n"
+        );
     }
 
     /// Regression: a blank line between the warning body and the

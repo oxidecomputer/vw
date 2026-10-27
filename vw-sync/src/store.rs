@@ -1,7 +1,17 @@
 //! Where delivered content waits between arriving and being put in place.
 
+use std::collections::BTreeSet;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use vw_api_types_versions::latest::Digest;
+
+/// Where a store records which paths synchronization put in its tree.
+///
+/// In the store because it describes the store's own deliveries, and because
+/// emptying the store is exactly when it should be forgotten. Content is kept
+/// under two-character shard directories, so a name like this cannot collide
+/// with it.
+const APPLIED: &str = "applied";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -97,6 +107,56 @@ impl Store {
         }
         let (shard, rest) = digest.0.split_at(2);
         Ok(self.root.join(shard).join(rest))
+    }
+
+    /// The paths synchronization has put in the tree behind this store, or
+    /// `None` if it has never said.
+    ///
+    /// `None` is a store from before this was kept, or one that was just
+    /// emptied, and it is not the same answer as an empty set: an empty set
+    /// is a tree that was told to hold nothing, while `None` is a tree nobody
+    /// can account for.
+    pub fn applied(&self) -> Result<Option<BTreeSet<String>>, StoreError> {
+        let path = self.root.join(APPLIED);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(
+                text.split('\0')
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::Read(path, e)),
+        }
+    }
+
+    /// Record the paths synchronization has put in the tree.
+    ///
+    /// Written aside and renamed into place, so an agent that dies part way
+    /// through leaves the previous record rather than half of this one — half
+    /// a record is a list of files that will never be removed.
+    pub fn remember_applied<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), StoreError> {
+        std::fs::create_dir_all(&self.root)
+            .map_err(|e| StoreError::CreateDir(self.root.clone(), e))?;
+
+        // Separated by NUL, the one byte a path can never contain.
+        let mut text = String::new();
+        for path in paths {
+            text.push_str(path);
+            text.push('\0');
+        }
+
+        let path = self.root.join(APPLIED);
+        let staged = self.root.join(format!("{APPLIED}.new"));
+        std::fs::write(&staged, text)
+            .map_err(|e| StoreError::Write(staged.clone(), e))?;
+        std::fs::rename(&staged, &path)
+            .map_err(|e| StoreError::Write(path, e))?;
+
+        Ok(())
     }
 
     /// Where this store keeps its content.

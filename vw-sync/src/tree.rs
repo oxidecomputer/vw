@@ -1,6 +1,6 @@
 //! Making a directory match a manifest.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use vw_api_types_versions::latest::{
@@ -61,10 +61,22 @@ pub fn missing(
 /// That order is what makes a rename work: the content of the old path is
 /// still there to be copied to the new one when it is needed.
 ///
-/// Only files the scan can see are candidates for removal, so anything a build
-/// produced — everything under a `target` directory, anything a `.gitignore`
-/// covers — is left alone. The receiver reads those rules from the tree it was
-/// handed, which is why they cannot disagree with the sender's.
+/// Only files an earlier commit put here are candidates for removal. Anything
+/// else in the tree was made on this machine — a build's output, or a file a
+/// tool generated among the sources, like a cosim crate's `build.rs` — and a
+/// sender has no way to know it is there, so not mentioning it is not asking
+/// for it to go. Deleting it anyway is worse than untidy: several jobs push
+/// the same workspace at once, and every one of their syncs would remove the
+/// file from under whichever build had just written it.
+///
+/// A store that has no record of what it applied — one from before records
+/// were kept, or one just emptied by [`clear`] — falls back to treating
+/// everything the scan can see as its own. That is the answer for a tree
+/// nobody can account for, and the record written here means it is only ever
+/// given once.
+///
+/// Either way only files the scan can see are removed, so everything under a
+/// `target` directory and anything a `.gitignore` covers is always left alone.
 pub fn apply(
     root: &Utf8Path,
     store: &Store,
@@ -82,6 +94,22 @@ pub fn apply(
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect();
+
+    let applied = store.applied()?;
+    let ours: BTreeSet<&str> = match &applied {
+        Some(applied) => applied.iter().map(String::as_str).collect(),
+        None => current.keys().copied().collect(),
+    };
+
+    // Before anything is written, everything this commit might leave behind
+    // is put on the record. A commit that fails part way has still written
+    // some of the new manifest's files, and if only the old record survived,
+    // a later manifest dropping one of those would leave it here for good.
+    store.remember_applied(
+        ours.iter()
+            .copied()
+            .chain(manifest.entries.iter().map(|entry| entry.path.as_str())),
+    )?;
 
     let mut result = CommitResult::default();
 
@@ -104,17 +132,18 @@ pub fn apply(
         write_file(&path, &contents, entry.executable)?;
     }
 
-    // Everything the manifest does not ask for.
-    let wanted: BTreeMap<&str, ()> = manifest
+    // Everything of ours the manifest no longer asks for.
+    let wanted: BTreeSet<&str> = manifest
         .entries
         .iter()
-        .map(|entry| (entry.path.as_str(), ()))
+        .map(|entry| entry.path.as_str())
         .collect();
     for entry in &existing.entries {
-        if wanted.contains_key(entry.path.as_str()) {
+        let path = entry.path.as_str();
+        if wanted.contains(path) || !ours.contains(path) {
             continue;
         }
-        let path = root.join(&entry.path);
+        let path = root.join(path);
         std::fs::remove_file(&path).map_err(|e| ApplyError::Remove(path, e))?;
         result.deleted += 1;
     }
@@ -122,6 +151,8 @@ pub fn apply(
     if result.deleted > 0 {
         prune_empty_dirs(root)?;
     }
+
+    store.remember_applied(wanted.iter().copied())?;
 
     Ok(result)
 }
@@ -139,6 +170,12 @@ pub fn apply(
 /// itself is the thing in doubt: with nothing held and nothing in the tree,
 /// there is no account left to be wrong, and the sync that follows sends the
 /// whole tree because it genuinely is all missing.
+///
+/// The store goes first, and with it the record of what was applied, so the
+/// commit that follows has no account of the tree to go by and removes
+/// everything the scan can see — files generated on this machine included.
+/// That is what asking for a clean slate means, and anything a tool generated
+/// it will generate again.
 pub fn clear(
     root: &Utf8Path,
     store: &Store,

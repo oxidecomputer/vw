@@ -43,6 +43,7 @@ pub mod bench_init;
 pub mod cosim;
 pub mod depcache;
 pub mod parts;
+mod session_lock;
 pub mod sim;
 
 // The low-level VHDL-analysis + nvc primitives now live in `vw-core`.
@@ -54,6 +55,8 @@ pub use vw_core::{
     VhdlLsConfig, VhdlLsLibrary, VhdlStandard, VwError,
 };
 pub use vw_core::{mapping, nvc_helpers, visitor};
+
+pub use session_lock::{lock_build_dir, BuildLock};
 
 /// Start a `cargo` that resolves its own toolchain.
 ///
@@ -1459,7 +1462,7 @@ async fn build_dependency_graph(
                     let Some(p) = dep.local_path() else {
                         continue;
                     };
-                    let root = resolve_local_dep_path(&ws, p);
+                    let root = resolve_local_dep_path(&ws, &name, p);
                     let root =
                         Utf8PathBuf::from_path_buf(root).map_err(|p| {
                             VwError::FileSystem {
@@ -2124,6 +2127,9 @@ fn resolve_dep_source_path(
     dep: &Dependency,
 ) -> Result<Option<PathBuf>> {
     if let Some(p) = dep.local_path() {
+        if let Some(synced) = synced_path_dep(parent_workspace_dir, name) {
+            return Ok(Some(synced));
+        }
         // Relative path deps resolve against the workspace that
         // DECLARES them (same rule Cargo uses). Absolute paths
         // pass through unchanged. This lets a workspace ship a
@@ -2939,6 +2945,29 @@ fn fingerprint_paths(workspace_dir: &Utf8Path, paths: &[PathBuf]) -> u64 {
     digest
 }
 
+/// Fingerprint over `paths` (contents and names relative to `root`)
+/// and `salt`, for a checkpoint kind that tracks its own inputs —
+/// an IP module's checkpoint, keyed on its `.bd` / `.xci`, the
+/// part, the Vivado install and the recipe that built it. Pair
+/// with [`checkpoint_status`] and [`write_checkpoint_fingerprint`].
+pub fn content_fingerprint(
+    root: &Utf8Path,
+    salt: &str,
+    paths: &[PathBuf],
+) -> u64 {
+    fnv1a_64_extend(fingerprint_paths(root, paths), salt.as_bytes())
+}
+
+/// Record `fingerprint` as what `checkpoint` was built from, in the
+/// same sidecar every stage checkpoint uses. Call only once the
+/// checkpoint is complete: [`checkpoint_status`] trusts it from then on.
+pub fn write_checkpoint_fingerprint(
+    checkpoint: &Path,
+    fingerprint: u64,
+) -> Result<()> {
+    write_checkpoint_manifest_with_fingerprint(checkpoint, fingerprint)
+}
+
 /// Combined fingerprint over the synth source set. Backs
 /// [`synth_needs_update`] and [`write_synth_checkpoint_manifest`].
 pub fn synth_source_fingerprint(
@@ -3745,6 +3774,14 @@ pub struct PreparedProjectDir {
     /// sweeps any layout drift instead of leaving cross-version
     /// clutter behind.
     pub wiped_project: Option<Utf8PathBuf>,
+    /// `Some(path)` iff [`project_needs_wipe`] returned true and the
+    /// build dir's `ip/` existed, so we wiped it too. Everything in
+    /// it (the `vw::make_wrapper` outputs) comes from the
+    /// `ip::configure` run that configured the project, so it goes
+    /// stale with the project. Left behind, a wrapper for an IP the
+    /// new config no longer makes is still read into library `ip` by
+    /// [`vhdl_ip_sources`].
+    pub wiped_ip: Option<Utf8PathBuf>,
 }
 
 /// Bootstrap the on-disk Vivado project dir for a workspace and
@@ -3760,7 +3797,8 @@ pub struct PreparedProjectDir {
 ///    the manifest sidecar is missing, or the fingerprint is
 ///    stale, `remove_dir_all(<project_dir>/<name>)` so the worker
 ///    takes the fresh-create branch instead of `open_project` on
-///    stale bytes.
+///    stale bytes, and remove the build dir's `ip/` with it, since
+///    the fresh configure regenerates everything in it.
 /// 3. `create_dir_all(<project_dir>)` so Vivado's later
 ///    `create_project -dir` has a real parent.
 ///
@@ -3778,15 +3816,22 @@ pub fn prepare_vw_project_dir(
     let migrated = migrate_flat_build_output(workspace_dir);
     let project_dir = vw_project_dir(workspace_dir, active_variant);
     let mut wiped_project = None;
+    let mut wiped_ip = None;
     if project_needs_wipe(
         workspace_dir,
         project_dir.as_std_path(),
         name,
         active_variant,
-    )? && project_dir.exists()
-    {
-        fs::remove_dir_all(project_dir.as_std_path())?;
-        wiped_project = Some(project_dir.clone());
+    )? {
+        if project_dir.exists() {
+            fs::remove_dir_all(project_dir.as_std_path())?;
+            wiped_project = Some(project_dir.clone());
+        }
+        let ip_dir = build_dir(workspace_dir, active_variant).join("ip");
+        if ip_dir.exists() {
+            fs::remove_dir_all(ip_dir.as_std_path())?;
+            wiped_ip = Some(ip_dir);
+        }
     }
     fs::create_dir_all(project_dir.as_std_path())?;
     Ok(PreparedProjectDir {
@@ -3794,6 +3839,7 @@ pub fn prepare_vw_project_dir(
         legacy_cache_removed,
         migrated,
         wiped_project,
+        wiped_ip,
     })
 }
 
@@ -4546,6 +4592,10 @@ pub fn check_vhdl(
 
     let severities = *config.severities();
     let mut project = vhdl_lang::Project::from_config(config, &mut messages);
+    // Match vhdl_ls, which enables these on startup: without them the
+    // unused-declaration and sensitivity-list warnings the editor shows
+    // never reach `vw check`.
+    project.enable_all_linters();
 
     // Restrict findings to the workspace's own *source* tree: not deps
     // under `~/.vw/deps`, not the bundled standard library, and not the
@@ -5361,16 +5411,16 @@ pub fn dep_cache_paths_with_test(
     if let Ok(config) = load_workspace_config(workspace_dir) {
         for (name, dep) in config.dependencies {
             if let Some(path) = dep.local_path() {
-                out.insert(name, resolve_local_dep_path(workspace_dir, path));
+                let root = resolve_local_dep_path(workspace_dir, &name, path);
+                out.insert(name, root);
             }
         }
         if include_test {
             for (name, dep) in config.test_dependencies {
                 if let Some(path) = dep.local_path() {
-                    out.insert(
-                        name,
-                        resolve_local_dep_path(workspace_dir, path),
-                    );
+                    let root =
+                        resolve_local_dep_path(workspace_dir, &name, path);
+                    out.insert(name, root);
                 }
             }
         }
@@ -5458,21 +5508,156 @@ fn resolve_dep_path(path: &Path) -> Result<PathBuf> {
     Ok(deps_dir.join(path))
 }
 
+/// Where a remote sync puts the path dependencies a workspace needs:
+/// `<workspace>/.vw-path-deps/<name>/`.
+///
+/// A `path = "..."` dependency names a directory on the developer's
+/// machine — often an absolute path under their home directory — that
+/// does not exist on a build instance. So the sender carries each one
+/// inside the workspace's own manifest under this directory, keyed by
+/// dependency name, and resolution on the instance looks here first (see
+/// [`synced_path_dep`]). Only the synchronized copy has it; a local
+/// checkout never does, so local resolution is unaffected.
+pub const SYNCED_PATH_DEPS_DIR: &str = ".vw-path-deps";
+
+/// The synchronized copy of path dependency `name`, if this is a synced
+/// tree that has one.
+///
+/// Checked from the workspace that declares the dependency. That is the
+/// entry workspace (`<ws>/.vw-path-deps/<name>`) or, for a path dependency
+/// of a path dependency, one of the synced copies itself, whose siblings
+/// are the other synced dependencies (`<ws>/.vw-path-deps/<other>`, looked
+/// up as `../<name>`): the sender flattens the whole closure into the
+/// entry's directory by name, the same first-seen-wins rule resolution
+/// uses.
+fn synced_path_dep(declaring_ws: &Utf8Path, name: &str) -> Option<PathBuf> {
+    let own = declaring_ws.join(SYNCED_PATH_DEPS_DIR).join(name);
+    let sibling = declaring_ws
+        .parent()
+        .filter(|p| p.file_name() == Some(SYNCED_PATH_DEPS_DIR))
+        .map(|p| p.join(name));
+    [Some(own), sibling]
+        .into_iter()
+        .flatten()
+        .find(|p| p.is_dir())
+        .map(|p| p.into_std_path_buf())
+}
+
 /// Resolve a `path = "..."` dependency to an absolute, canonicalized
-/// root. Relative paths resolve against the workspace that DECLARES
-/// them (the same Cargo rule [`resolve_dep_source_path`] uses), so a
+/// root. A synchronized copy wins when there is one (see
+/// [`SYNCED_PATH_DEPS_DIR`]). Otherwise relative paths resolve against
+/// the workspace that DECLARES them (the same Cargo rule
+/// [`resolve_dep_source_path`] uses), so a
 /// dep buried in a transitive workspace — e.g. an in-tree `testlib`
 /// that declares `vw = ".."` — points at the real directory instead of
 /// leaking its literal `..` into the import resolver. Canonicalizing
 /// also lets the transitive walk dedup a circular dep (vw → testlib →
 /// vw) by real path rather than looping on `<vw>/testlib/..`.
-fn resolve_local_dep_path(workspace_dir: &Utf8Path, path: &Path) -> PathBuf {
+fn resolve_local_dep_path(
+    workspace_dir: &Utf8Path,
+    name: &str,
+    path: &Path,
+) -> PathBuf {
+    if let Some(synced) = synced_path_dep(workspace_dir, name) {
+        return synced.canonicalize().unwrap_or(synced);
+    }
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         workspace_dir.as_std_path().join(path)
     };
     abs.canonicalize().unwrap_or(abs)
+}
+
+/// The path dependencies a remote sync of `entry_workspace_dir` has to
+/// carry, as `(name, local root)` pairs sorted by name.
+///
+/// The transitive closure over path dependencies — a path dependency's
+/// own path dependencies included — with the entry's
+/// `[test-dependencies]` too, flattened by name, first seen wins: the
+/// same rule [`transitive_dep_cache_paths`] resolves by, so each name
+/// lands where resolution on the instance will look for it. Git
+/// dependencies are left out; the instance fetches those itself from
+/// the entry's `vw.lock`, which pins the whole graph. So are roots
+/// inside the entry workspace, which travel with it at their own
+/// relative paths.
+pub fn path_dependencies_to_sync(
+    entry_workspace_dir: &Utf8Path,
+) -> Result<Vec<(String, Utf8PathBuf)>> {
+    let entry = entry_workspace_dir
+        .canonicalize_utf8()
+        .unwrap_or_else(|_| entry_workspace_dir.to_owned());
+    let mut seen: std::collections::BTreeMap<String, Utf8PathBuf> =
+        std::collections::BTreeMap::new();
+    let mut visited: std::collections::HashSet<Utf8PathBuf> =
+        std::collections::HashSet::new();
+    let mut queue = vec![(entry.clone(), true)];
+    while let Some((ws, is_entry)) = queue.pop() {
+        if !visited.insert(ws.clone()) {
+            continue;
+        }
+        let Ok(config) = load_workspace_config(&ws) else {
+            continue;
+        };
+        let tests = if is_entry {
+            Some(config.test_dependencies.iter())
+        } else {
+            None
+        };
+        let deps = config
+            .dependencies
+            .iter()
+            .chain(tests.into_iter().flatten());
+        for (name, dep) in deps {
+            let Some(path) = dep.local_path() else {
+                continue;
+            };
+            let abs = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                ws.as_std_path().join(path)
+            };
+            // Lexically when it can't be canonicalized (it doesn't exist),
+            // so a leftover `..` can't make `../nowhere` look like it is
+            // inside the workspace below.
+            let abs = abs.canonicalize().unwrap_or_else(|_| {
+                let mut out = PathBuf::new();
+                for c in abs.components() {
+                    match c {
+                        std::path::Component::ParentDir => {
+                            out.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        c => out.push(c),
+                    }
+                }
+                out
+            });
+            let root = Utf8PathBuf::from_path_buf(abs).map_err(|p| {
+                VwError::FileSystem {
+                    message: format!(
+                        "path dependency `{name}` is not UTF-8: {}",
+                        p.display()
+                    ),
+                }
+            })?;
+            if root.starts_with(&entry) || seen.contains_key(name) {
+                continue;
+            }
+            if !root.is_dir() {
+                return Err(VwError::FileSystem {
+                    message: format!(
+                        "path dependency `{name}` ({root}) does not exist"
+                    ),
+                });
+            }
+            seen.insert(name.clone(), root.clone());
+            if root.join("vw.toml").exists() {
+                queue.push((root, false));
+            }
+        }
+    }
+    Ok(seen.into_iter().collect())
 }
 
 /// Like [`dep_cache_paths`], but walks the dependency graph
@@ -9919,6 +10104,49 @@ exclusive = ["hdl/top-beta.vhd"]
         assert!(configure("alpha").wiped_project.is_some());
     }
 
+    /// A stale project takes its `ip/` wrappers with it: a wrapper for
+    /// an IP the new config no longer makes must not outlive it.
+    #[test]
+    fn wiping_a_stale_project_wipes_its_ip_wrappers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = two_variant_ws(&tmp);
+        let configure = |variant: &str| {
+            let prep =
+                prepare_vw_project_dir(&ws, "twin", Some(variant)).unwrap();
+            let xpr = vw_project_xpr(prep.project_dir.as_std_path(), "twin");
+            if !xpr.exists() {
+                write(&Utf8PathBuf::from_path_buf(xpr).unwrap(), "");
+                write_project_manifest(
+                    &ws,
+                    prep.project_dir.as_std_path(),
+                    "twin",
+                    Some(variant),
+                )
+                .unwrap();
+            }
+            prep
+        };
+        configure("alpha");
+        configure("beta");
+        let old = ws.join("target/alpha/ip/old_bd/wrapper.vhd");
+        write(&old, "entity old_bd_wrapper is end;");
+        let beta = ws.join("target/beta/ip/old_bd/wrapper.vhd");
+        write(&beta, "entity old_bd_wrapper is end;");
+
+        // A fresh project keeps the wrappers its configure wrote.
+        assert!(configure("alpha").wiped_ip.is_none());
+        assert!(old.exists());
+
+        write(&ws.join("ip/module.htcl"), "# changed");
+        let prep = configure("alpha");
+        assert_eq!(prep.wiped_ip, Some(ws.join("target/alpha/ip")));
+        assert!(!old.exists());
+        // Per variant: beta's wrappers go when beta's project does.
+        assert!(beta.exists());
+        assert!(configure("beta").wiped_ip.is_some());
+        assert!(!beta.exists());
+    }
+
     #[test]
     fn a_checkpoint_only_depends_on_its_own_variants_ip() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10071,5 +10299,127 @@ exclusive = ["hdl/top-beta.vhd"]
         // Legacy caches are removed before the move, not carried along.
         assert_eq!(prep.legacy_cache_removed, 1);
         assert!(!ws.join("target/alpha/ip/bd").exists());
+    }
+}
+
+#[cfg(test)]
+mod synced_path_dep_tests {
+    use super::*;
+
+    fn write(path: &Utf8Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn manifest(name: &str, deps: &str) -> String {
+        format!("[workspace]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n{deps}")
+    }
+
+    fn scratch() -> (tempfile::TempDir, Utf8PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root =
+            Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap())
+                .unwrap();
+        (tmp, root)
+    }
+
+    /// On an instance, a path dependency names a directory that only
+    /// existed on the developer's machine. The synced copy, by name, is
+    /// what resolves — for the entry's own dependency and for a path
+    /// dependency of that dependency (a sibling in the synced directory).
+    #[test]
+    fn synced_copies_resolve_by_name_on_an_instance() {
+        let (_tmp, ws) = scratch();
+        write(
+            &ws.join("vw.toml"),
+            &manifest(
+                "app",
+                "[dependencies.lib]\npath = \"/Users/someone/src/lib\"\n",
+            ),
+        );
+        let synced = ws.join(SYNCED_PATH_DEPS_DIR);
+        write(
+            &synced.join("lib/vw.toml"),
+            &manifest(
+                "lib",
+                "[dependencies.inner]\npath = \"/Users/someone/src/inner\"\n",
+            ),
+        );
+        write(&synced.join("inner/module.htcl"), "");
+
+        let paths = transitive_dep_cache_paths(&ws).unwrap();
+        assert_eq!(paths["lib"], synced.join("lib").into_std_path_buf());
+        assert_eq!(paths["inner"], synced.join("inner").into_std_path_buf());
+    }
+
+    /// Locally there is no synced copy, so resolution is what it was.
+    #[test]
+    fn without_a_synced_copy_the_declared_path_resolves() {
+        let (_tmp, root) = scratch();
+        let ws = root.join("app");
+        write(
+            &ws.join("vw.toml"),
+            &manifest("app", "[dependencies.lib]\npath = \"../lib\"\n"),
+        );
+        write(&root.join("lib/vw.toml"), &manifest("lib", ""));
+
+        let paths = transitive_dep_cache_paths(&ws).unwrap();
+        assert_eq!(paths["lib"], root.join("lib").into_std_path_buf());
+    }
+
+    /// The closure the sender carries: path dependencies of path
+    /// dependencies, the entry's test dependencies, first seen wins by
+    /// name, and nothing that already travels inside the workspace.
+    #[test]
+    fn the_closure_to_sync_is_flattened_by_name() {
+        let (_tmp, root) = scratch();
+        let ws = root.join("app");
+        write(
+            &ws.join("vw.toml"),
+            &manifest(
+                "app",
+                "[dependencies.lib]\npath = \"../lib\"\n\n\
+                 [dependencies.intree]\npath = \"fixtures/intree\"\n\n\
+                 [test-dependencies.testy]\npath = \"../testy\"\n",
+            ),
+        );
+        write(&ws.join("fixtures/intree/vw.toml"), &manifest("intree", ""));
+        write(
+            &root.join("lib/vw.toml"),
+            &manifest(
+                "lib",
+                "[dependencies.inner]\npath = \"../inner\"\n\n\
+                 [dependencies.testy]\npath = \"../other-testy\"\n\n\
+                 [test-dependencies.libtest]\npath = \"../libtest\"\n",
+            ),
+        );
+        write(&root.join("inner/module.htcl"), "");
+        write(&root.join("testy/module.htcl"), "");
+        write(&root.join("other-testy/module.htcl"), "");
+        write(&root.join("libtest/module.htcl"), "");
+
+        let got = path_dependencies_to_sync(&ws).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("inner".to_owned(), root.join("inner")),
+                ("lib".to_owned(), root.join("lib")),
+                ("testy".to_owned(), root.join("testy")),
+            ]
+        );
+    }
+
+    /// A path dependency that does not exist is an error at sync time,
+    /// not a confusing failure on the instance later.
+    #[test]
+    fn a_missing_path_dependency_is_an_error() {
+        let (_tmp, root) = scratch();
+        let ws = root.join("app");
+        write(
+            &ws.join("vw.toml"),
+            &manifest("app", "[dependencies.lib]\npath = \"../nowhere\"\n"),
+        );
+        let err = path_dependencies_to_sync(&ws).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 }

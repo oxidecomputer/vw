@@ -51,7 +51,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 
-use super::entity::{DesignTypes, EntityInterface, Instance, Interface, Reach};
+use super::entity::{
+    DesignTypes, EntityInterface, Instance, PortMode, Reach, ViewElement,
+};
 use super::{write_file, write_new_file, Created};
 use crate::{Result, VhdlStandard, VwError};
 
@@ -260,15 +262,23 @@ fn resolve(
         });
     }
 
-    let dut = super::entity::load(workspace_dir, &config.entity, vhdl_std)?;
+    let mut dut = super::entity::load(workspace_dir, &config.entity, vhdl_std)?;
     // Only worth reading the design's type declarations when there is an
     // entity whose ports might use them.
     let types = super::entity::design_types(workspace_dir, vhdl_std)?;
+    dut.resolve_views(&types);
     let components = config
         .rust_components
         .iter()
         .map(|label| {
-            super::entity::find_instance(workspace_dir, &dut, label, vhdl_std)
+            let mut instance = super::entity::find_instance(
+                workspace_dir,
+                &dut,
+                label,
+                vhdl_std,
+            )?;
+            instance.interface.resolve_views(&types);
+            Ok(instance)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -502,10 +512,13 @@ enum Side {
 }
 
 impl Side {
-    fn drives(self, port: &Interface) -> bool {
-        match self {
-            Side::Consumer => port.mode().is_driven(),
-            Side::Implementer => !port.mode().is_driven(),
+    fn drives(self, mode: PortMode) -> bool {
+        match (self, mode) {
+            // Neither way as a whole: each element goes the way the view
+            // says, and that is settled element by element in `expand`.
+            (_, PortMode::View) => false,
+            (Side::Consumer, mode) => mode.is_driven(),
+            (Side::Implementer, mode) => !mode.is_driven(),
         }
     }
 }
@@ -515,7 +528,9 @@ impl Side {
 /// A record port contributes one handle per element rather than one for
 /// itself: the aggregate is not a value, and reading it crashes the GPI
 /// layer. Nested records are followed down, to a depth no real design reaches
-/// but a self-referential one cannot exceed.
+/// but a self-referential one cannot exceed. A mode-view port is a record
+/// whose elements each go their own way, so which of them the driver owns is
+/// read off the view as it is expanded.
 fn plan_handles(
     entity: &EntityInterface,
     side: Side,
@@ -524,7 +539,9 @@ fn plan_handles(
     let mut handles = Vec::new();
     for port in &entity.ports {
         expand(
-            side.drives(port),
+            side,
+            side.drives(port.mode()),
+            port.view.as_deref(),
             &port.name,
             &port.subtype,
             vec![port.name.clone()],
@@ -555,8 +572,11 @@ fn struct_name(label: &str) -> String {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand(
+    side: Side,
     driven: bool,
+    view: Option<&str>,
     signal: &str,
     subtype: &str,
     path: Vec<String>,
@@ -569,11 +589,23 @@ fn expand(
     // this either.
     if depth < 4 {
         if let Some(fields) = types.record(subtype) {
+            let view = view.and_then(|v| types.views.get(v));
             for field in fields {
                 let mut path = path.clone();
                 path.push(field.name.clone());
+                let (driven, view) = match view
+                    .and_then(|v| v.element(&field.name))
+                {
+                    Some(ViewElement::Mode(mode)) => (side.drives(*mode), None),
+                    Some(ViewElement::View(inner)) => {
+                        (side.drives(PortMode::View), Some(inner.as_str()))
+                    }
+                    None => (driven, None),
+                };
                 expand(
+                    side,
                     driven,
+                    view,
                     &format!("{signal}.{}", field.name),
                     &field.subtype,
                     path,
@@ -1292,7 +1324,7 @@ fn helper_fns() -> TokenStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench_init::entity::{PortMode, RecordField};
+    use crate::bench_init::entity::{Interface, RecordField};
 
     fn port(name: &str, mode: PortMode, subtype: &str) -> Interface {
         Interface {
@@ -1300,6 +1332,7 @@ mod tests {
             mode: Some(mode),
             subtype: subtype.to_string(),
             default: None,
+            view: None,
         }
     }
 
@@ -1314,12 +1347,14 @@ mod tests {
                     mode: None,
                     subtype: "positive".to_string(),
                     default: Some("32".to_string()),
+                    view: None,
                 },
                 Interface {
                     name: "FAST_READ".to_string(),
                     mode: None,
                     subtype: "boolean".to_string(),
                     default: None,
+                    view: None,
                 },
             ],
             ports: vec![
@@ -1407,6 +1442,87 @@ mod tests {
         );
         // And never the aggregate on its own.
         assert!(!text.contains("pub bus_in: SimHandle"));
+    }
+
+    /// A mode-view port's elements go the way the view says, nested views
+    /// included, and from the implementing side every one of them flips.
+    #[test]
+    fn view_elements_take_their_direction_from_the_view() {
+        use crate::bench_init::entity::{ModeView, ViewElement};
+
+        let field = |name: &str, subtype: &str| RecordField {
+            name: name.to_string(),
+            subtype: subtype.to_string(),
+        };
+        let view = |record: &str, elements: &[(&str, ViewElement)]| ModeView {
+            record: record.to_string(),
+            elements: elements
+                .iter()
+                .map(|(n, m)| (n.to_string(), m.clone()))
+                .collect(),
+        };
+        let mut types = DesignTypes::default();
+        types.records.insert(
+            "req".into(),
+            vec![field("valid", "std_logic"), field("ready", "std_logic")],
+        );
+        types.records.insert(
+            "bus".into(),
+            vec![field("req", "Req"), field("done", "std_logic")],
+        );
+        types.views.insert(
+            "reqmanager".into(),
+            view(
+                "Req",
+                &[
+                    ("valid", ViewElement::Mode(PortMode::Out)),
+                    ("ready", ViewElement::Mode(PortMode::In)),
+                ],
+            ),
+        );
+        types.views.insert(
+            "busmanager".into(),
+            view(
+                "Bus",
+                &[
+                    ("req", ViewElement::View("reqmanager".into())),
+                    ("done", ViewElement::Mode(PortMode::In)),
+                ],
+            ),
+        );
+        let entity = EntityInterface {
+            name: "mover".into(),
+            file: "hdl/mover.vhd".into(),
+            context: Vec::new(),
+            generics: Vec::new(),
+            ports: vec![Interface {
+                view: Some("busmanager".into()),
+                ..port("ax", PortMode::View, "Bus")
+            }],
+        };
+
+        let driven = |side| -> Vec<(String, bool)> {
+            plan_handles(&entity, side, &types)
+                .into_iter()
+                .map(|h| (h.signal, h.driven))
+                .collect()
+        };
+        assert_eq!(
+            driven(Side::Consumer),
+            [
+                ("ax.req.valid".to_string(), false),
+                ("ax.req.ready".to_string(), true),
+                ("ax.done".to_string(), true),
+            ],
+        );
+        assert_eq!(
+            driven(Side::Implementer),
+            [
+                ("ax.req.valid".to_string(), true),
+                ("ax.req.ready".to_string(), false),
+                ("ax.done".to_string(), false),
+            ],
+        );
     }
 
     /// A subtype needs no special handling as long as nothing assumes a

@@ -59,4 +59,5 @@ notify = "6"
 toml.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true

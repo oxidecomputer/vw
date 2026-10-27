@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use camino::Utf8Path;
 use vhdl_lang::ast::{
     AnyDesignUnit, AnyPrimaryUnit, AnySecondaryUnit, ConcurrentStatement,
-    InstantiatedUnit, InterfaceDeclaration, InterfaceList, Mode,
-    ModeIndication, TypeDeclaration, TypeDefinition,
+    Declaration, ElementMode, InstantiatedUnit, InterfaceDeclaration,
+    InterfaceList, Mode, ModeIndication, TypeDeclaration, TypeDefinition,
 };
 use vhdl_lang::VHDLParser;
 use vw_core::visitor::{walk_design_file, Visitor, VisitorResult};
@@ -41,6 +41,9 @@ pub enum PortMode {
     Out,
     InOut,
     Buffer,
+    /// A VHDL-2019 mode view: a record port whose elements each have their
+    /// own direction, given by the view rather than the port.
+    View,
 }
 
 impl PortMode {
@@ -50,10 +53,14 @@ impl PortMode {
             PortMode::Out => "out",
             PortMode::InOut => "inout",
             PortMode::Buffer => "buffer",
+            PortMode::View => "view",
         }
     }
 
     /// True when a harness has to drive this port rather than read it.
+    ///
+    /// False for a view, which is neither as a whole: which of its elements
+    /// a harness drives is up to the view's own element modes.
     pub fn is_driven(self) -> bool {
         matches!(self, PortMode::In | PortMode::InOut)
     }
@@ -70,6 +77,9 @@ pub struct Interface {
     pub subtype: String,
     /// The declared default, if there was one.
     pub default: Option<String>,
+    /// For a mode-view port, the view's name, lowercased and unqualified —
+    /// `aximanager` for `view work.axi.AxiManager`.
+    pub view: Option<String>,
 }
 
 impl Interface {
@@ -143,6 +153,27 @@ impl EntityInterface {
     pub fn reset(&self) -> Option<&Interface> {
         self.ports.iter().find(|p| p.is_reset())
     }
+
+    /// Give each mode-view port the record type its view is of.
+    ///
+    /// `ax : view AxiManager` names no type, and a harness has to declare a
+    /// signal to map it to. The view's declaration — usually in a package in
+    /// another file, which is why this cannot happen while the entity is
+    /// read — says which record it is a view of. A view that is not found
+    /// keeps its name in place of a type, which will not compile but says
+    /// what is missing.
+    pub fn resolve_views(&mut self, types: &DesignTypes) {
+        for port in &mut self.ports {
+            let Some(view) = &port.view else { continue };
+            if !port.subtype.is_empty() {
+                continue; // `view V of T` already named the type
+            }
+            port.subtype = match types.views.get(view) {
+                Some(v) => v.record.clone(),
+                None => view.clone(),
+            };
+        }
+    }
 }
 
 // ===========================================================================
@@ -178,6 +209,36 @@ pub struct DesignTypes {
     /// Array type names, keyed by lowercased name. Not usable as a whole from
     /// a driver, and tracked so that saying so is possible.
     pub arrays: HashSet<String>,
+    /// Mode view declarations, keyed by lowercased view name.
+    pub views: HashMap<String, ModeView>,
+}
+
+/// A VHDL-2019 mode view: which record it is a view of, and the direction of
+/// each of that record's elements from the entity's side.
+#[derive(Clone, Debug)]
+pub struct ModeView {
+    /// The record's subtype indication, rendered back to VHDL.
+    pub record: String,
+    /// Element modes, keyed by lowercased element name.
+    pub elements: HashMap<String, ViewElement>,
+}
+
+/// One element's mode in a [`ModeView`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewElement {
+    /// `in`, `out`, ... — the element as a whole goes one way.
+    Mode(PortMode),
+    /// `view Other` (or `view (Other)` for an array of records): the
+    /// element's own elements take their directions from that view,
+    /// lowercased and unqualified.
+    View(String),
+}
+
+impl ModeView {
+    /// How element `name` of this view points, if the view says.
+    pub fn element(&self, name: &str) -> Option<&ViewElement> {
+        self.elements.get(&name.to_lowercase())
+    }
 }
 
 impl DesignTypes {
@@ -301,6 +362,39 @@ struct TypeCollector<'a> {
 }
 
 impl Visitor for TypeCollector<'_> {
+    fn visit_declaration(
+        &mut self,
+        decl: &Declaration,
+        _unit: &AnyDesignUnit,
+    ) -> VisitorResult {
+        let Declaration::View(view) = decl else {
+            return VisitorResult::Continue;
+        };
+        let mut elements = HashMap::new();
+        for element in &view.elements {
+            let mode = match &element.mode {
+                ElementMode::Simple(m) => ViewElement::Mode(port_mode(m.item)),
+                ElementMode::Record(name) | ElementMode::Array(name) => {
+                    ViewElement::View(base_type_mark(&name.to_string()))
+                }
+            };
+            for ident in &element.names {
+                elements.insert(
+                    ident.tree.item.name_utf8().to_lowercase(),
+                    mode.clone(),
+                );
+            }
+        }
+        self.types.views.insert(
+            view.ident.tree.item.name_utf8().to_lowercase(),
+            ModeView {
+                record: view.typ.to_string(),
+                elements,
+            },
+        );
+        VisitorResult::Continue
+    }
+
     fn visit_type_declaration(
         &mut self,
         decl: &TypeDeclaration,
@@ -465,8 +559,6 @@ fn component_interface(
     name: &str,
     file: &Path,
 ) -> Option<EntityInterface> {
-    use vhdl_lang::ast::Declaration;
-
     for (_, unit) in &design_file.design_units {
         let AnyDesignUnit::Secondary(AnySecondaryUnit::Architecture(arch)) =
             unit
@@ -658,21 +750,27 @@ fn interfaces(list: Option<&InterfaceList>) -> Vec<Interface> {
             // rare enough to hand back to the developer.
             continue;
         };
-        let ModeIndication::Simple(simple) = &object.mode else {
-            // A mode view — `port (p : view bar)`. The view names a record,
-            // so this lands in the same place a record port would.
-            continue;
+        let (mode, subtype, default, view) = match &object.mode {
+            ModeIndication::Simple(simple) => (
+                simple.mode.as_ref().map(|m| port_mode(m.item)),
+                simple.subtype_indication.to_string(),
+                simple.expression.as_ref().map(|e| e.to_string()),
+                None,
+            ),
+            // `p : view V` names no type of its own; the record it is a view
+            // of is filled in by [`EntityInterface::resolve_views`] unless
+            // the port spells it out with `view V of T`. An array of views,
+            // `view (V) of T`, must say its type, and comes out as `T`.
+            ModeIndication::View(view) => (
+                Some(PortMode::View),
+                view.subtype_indication
+                    .as_ref()
+                    .map(|(_, s)| s.to_string())
+                    .unwrap_or_default(),
+                None,
+                Some(base_type_mark(&view.name.to_string())),
+            ),
         };
-        let mode = simple.mode.as_ref().map(|m| match m.item {
-            Mode::In => PortMode::In,
-            Mode::Out => PortMode::Out,
-            Mode::InOut => PortMode::InOut,
-            // `linkage` is vestigial; nothing generated here can use it, and
-            // treating it as a buffer at least keeps the port visible.
-            Mode::Buffer | Mode::Linkage => PortMode::Buffer,
-        });
-        let subtype = simple.subtype_indication.to_string();
-        let default = simple.expression.as_ref().map(|e| e.to_string());
 
         for ident in &object.idents {
             out.push(Interface {
@@ -680,10 +778,22 @@ fn interfaces(list: Option<&InterfaceList>) -> Vec<Interface> {
                 mode,
                 subtype: subtype.clone(),
                 default: default.clone(),
+                view: view.clone(),
             });
         }
     }
     out
+}
+
+fn port_mode(mode: Mode) -> PortMode {
+    match mode {
+        Mode::In => PortMode::In,
+        Mode::Out => PortMode::Out,
+        Mode::InOut => PortMode::InOut,
+        // `linkage` is vestigial; nothing generated here can use it, and
+        // treating it as a buffer at least keeps the port visible.
+        Mode::Buffer | Mode::Linkage => PortMode::Buffer,
+    }
 }
 
 /// The `library` / `use` lines a file opens with, up to the entity.
@@ -849,6 +959,81 @@ end entity flit_fifo;
             "a declaration naming two elements is two elements",
         );
         assert_eq!(fields[2].subtype, "Nibble");
+    }
+
+    const VIEW_SOURCE: &str = "\
+library ieee;
+use ieee.std_logic_1164.all;
+
+package link is
+  type Req is record
+    valid : std_logic;
+    ready : std_logic;
+  end record;
+  view ReqManager of Req is
+    valid : out;
+    ready : in;
+  end view;
+
+  type Link is record
+    req  : Req;
+    done : std_logic;
+  end record;
+  view LinkManager of Link is
+    req  : view ReqManager;
+    done : in;
+  end view;
+end package;
+
+library ieee;
+use ieee.std_logic_1164.all;
+use work.link.all;
+
+entity mover is
+  port (
+    clk  : in std_logic;
+    ax   : view work.link.LinkManager;
+    side : view ReqManager of Req
+  );
+end entity;
+";
+
+    /// A mode-view port is a port: it comes back rather than being dropped,
+    /// and a harness can declare a signal for it once the view is resolved
+    /// to the record it is a view of.
+    #[test]
+    fn view_ports_resolve_to_their_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mover.vhd");
+        std::fs::write(&file, VIEW_SOURCE).unwrap();
+        let mut entity =
+            read_entity(&file, "mover", VhdlStandard::Vhdl2019).unwrap();
+        let types = design_types_of(&file);
+
+        let names: Vec<&str> =
+            entity.ports.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["clk", "ax", "side"]);
+        assert_eq!(entity.ports[1].mode(), PortMode::View);
+        assert_eq!(entity.ports[1].view.as_deref(), Some("linkmanager"));
+        assert_eq!(entity.ports[1].subtype, "", "the view names no type");
+
+        entity.resolve_views(&types);
+        assert_eq!(entity.ports[1].subtype, "Link");
+        assert_eq!(
+            entity.ports[2].subtype, "Req",
+            "`view V of T` keeps the type it spelled out",
+        );
+
+        let link = &types.views["linkmanager"];
+        assert_eq!(
+            link.element("req"),
+            Some(&ViewElement::View("reqmanager".into())),
+        );
+        assert_eq!(
+            link.element("DONE"),
+            Some(&ViewElement::Mode(PortMode::In)),
+            "element names are matched without regard to case",
+        );
     }
 
     /// Parse the one file directly, since `design_types` walks a workspace.

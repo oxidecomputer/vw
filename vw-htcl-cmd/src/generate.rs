@@ -349,8 +349,32 @@ fn effective_args(
     page: &ManPage,
     overrides: Option<&crate::constraints::CommandOverride>,
 ) -> Vec<EffectiveArg> {
-    page.arguments
+    let mut args = page.arguments.clone();
+    // Undocumented args go ahead of the positionals, which the body
+    // emits last.
+    let at = args
         .iter()
+        .position(|a| a.kind == ArgKind::Positional)
+        .unwrap_or(args.len());
+    let extras = overrides
+        .into_iter()
+        .flat_map(|o| &o.extra_args)
+        .filter(|x| !page.arguments.iter().any(|a| a.ident == x.flag))
+        .map(|x| Argument {
+            kind: if x.value {
+                ArgKind::Value
+            } else {
+                ArgKind::Boolean
+            },
+            ident: x.flag.clone(),
+            flag: Some(x.flag.clone()),
+            required: false,
+            synthesized: false,
+            description: vec![x.description.clone()],
+        })
+        .collect::<Vec<_>>();
+    args.splice(at..at, extras);
+    args.iter()
         .map(|arg| {
             effective_arg(arg, overrides.and_then(|o| o.args.get(&arg.ident)))
         })

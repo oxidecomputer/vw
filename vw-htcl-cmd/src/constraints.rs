@@ -24,6 +24,11 @@
 //! one_of = ["other"]      # adds @one_of(other)
 //! requires = ["a", "b"]   # adds @requires(a, b)
 //! conflicts = ["a"]       # adds @conflicts(a)
+//!
+//! [[<command>.extra_args]]
+//! flag = "no_iobuf"       # an arg the man page doesn't document
+//! value = false           # true for `-flag <value>`; default is a toggle
+//! description = "..."     # its doc comment
 //! ```
 //!
 //! The generator applies overrides during signature emission. The
@@ -113,6 +118,26 @@ pub struct ArgOverride {
     pub positional: bool,
 }
 
+/// An argument the command accepts but its man page doesn't document
+/// (`synth_design -no_iobuf`, for one). The generator adds it to the
+/// wrapper as though the page had listed it, ahead of any positional,
+/// and `[<command>.args.<flag>]` overrides apply to it like any other
+/// arg. If a later man page does document the flag, the documented arg
+/// wins and this entry is ignored.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExtraArg {
+    /// The Vivado flag without its leading dash. Also the htcl
+    /// proc-arg identifier.
+    pub flag: String,
+    /// `true` for a value-taking `-flag <value>`; `false` (the
+    /// default) for a boolean toggle.
+    #[serde(default)]
+    pub value: bool,
+    /// The arg's doc comment.
+    pub description: String,
+}
+
 /// All overrides for one command, indexed by arg ident.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct CommandOverride {
@@ -120,6 +145,9 @@ pub struct CommandOverride {
     /// (matches `Argument::ident`).
     #[serde(default)]
     pub args: HashMap<String, ArgOverride>,
+    /// Arguments to add that the man page doesn't document.
+    #[serde(default)]
+    pub extra_args: Vec<ExtraArg>,
     /// Override the command's return type. The string is taken
     /// verbatim and emitted as the proc's 4th-word annotation
     /// (`proc NAME { args } <returns> { body }`), so any valid
@@ -208,6 +236,26 @@ mod tests {
             name.requires,
             vec!["value".to_string(), "objects".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_extra_args() {
+        let toml = r#"
+            [[synth_design.extra_args]]
+            flag = "no_iobuf"
+            description = "Do not infer I/O buffers."
+
+            [[synth_design.extra_args]]
+            flag = "hidden_value"
+            value = true
+            description = "A value."
+        "#;
+        let t: ConstraintsTable = toml::from_str(toml).unwrap();
+        let extra = &t.for_command("synth_design").unwrap().extra_args;
+        assert_eq!(extra.len(), 2);
+        assert_eq!(extra[0].flag, "no_iobuf");
+        assert!(!extra[0].value);
+        assert!(extra[1].value);
     }
 
     #[test]

@@ -7,14 +7,18 @@
 //! Spawns `vivado -mode tcl` as a long-lived worker, sources the
 //! embedded shim TCL file at startup, and exchanges newline-delimited
 //! JSON with it over stdio. Resolution order for the `vivado`
-//! executable is: `VW_VIVADO` env var, then `PATH` lookup. v0 supports
-//! the `eval` op only; structured ops land in phase 4.
+//! executable is: `VW_VIVADO` env var, then `PATH` lookup for `vivado`,
+//! then for `vivado_lab`. v0 supports the `eval` op only; structured ops
+//! land in phase 4.
 
 mod handlers;
+mod job;
 mod raw_log;
 mod rpc;
 mod selection;
 pub mod stream;
+mod synth_ip;
+mod synth_modular;
 mod worker;
 
 pub use handlers::{
@@ -23,8 +27,8 @@ pub use handlers::{
     Reporter, SharedCriticalWarningCount, SharedPreload,
 };
 pub use raw_log::raw_log_path_for_workspace;
-pub use rpc::{FnHandler, RpcHandler};
-pub use selection::{resolve_workspace_selection, Selection};
+pub use rpc::{FnHandler, RpcContext, RpcHandler};
+pub use selection::{lock_session, resolve_workspace_selection, Selection};
 pub use stream::{
     severity_of, stream_kind_for, Block, BlockAccumulator, LogLevel, Severity,
 };

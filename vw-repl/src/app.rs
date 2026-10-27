@@ -4251,6 +4251,7 @@ fn resolve_worker_selection(
         else {
             return Ok((None, None));
         };
+        let lock = vw_vivado::lock_session(ws, Some(&v.name))?;
         let persist_dir =
             prepare_repl_persist_dir(ws, &ws_info.name, Some(&v.name));
         return Ok((
@@ -4258,6 +4259,7 @@ fn resolve_worker_selection(
                 name: ws_info.name.clone(),
                 part: v.part.clone(),
                 persist_dir,
+                lock: Some(lock),
             }),
             Some(v.name.clone()),
         ));
@@ -4265,12 +4267,14 @@ fn resolve_worker_selection(
     let selected = ws_info
         .select_target_part(part)
         .map_err(|e| e.to_string())?;
+    let lock = vw_vivado::lock_session(ws, None)?;
     let persist_dir = prepare_repl_persist_dir(ws, &ws_info.name, None);
     Ok((
         selected.map(|p| vw_vivado::AutoProject {
             name: ws_info.name.clone(),
             part: p.to_string(),
             persist_dir: persist_dir.clone(),
+            lock: Some(lock),
         }),
         None,
     ))
@@ -4311,6 +4315,12 @@ fn prepare_repl_persist_dir(
                 tracing::info!(
                     "wiped stale Vivado project at {wiped} \
                      (source fingerprint changed or manifest missing)"
+                );
+            }
+            if let Some(wiped) = &prep.wiped_ip {
+                tracing::info!(
+                    "removed IP wrappers at {wiped} along with the stale \
+                     project; IP configuration regenerates them"
                 );
             }
             Some(prep.project_dir.into_std_path_buf())

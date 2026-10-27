@@ -30,7 +30,7 @@ pub mod model;
 pub mod parse;
 
 pub use constraints::{
-    ArgOverride, CommandOverride, ConstraintsError, ConstraintsTable,
+    ArgOverride, CommandOverride, ConstraintsError, ConstraintsTable, ExtraArg,
 };
 pub use generate::{generate, GenerateOptions};
 pub use model::{ArgKind, Argument, ManPage};

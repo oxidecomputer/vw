@@ -453,6 +453,7 @@ async fn run_dedicated_bucket(
                 // workers would trip over a shared on-disk project, and
                 // test scratch has no business dirtying `<ws>/target/`.
                 persist_dir: None,
+                lock: None,
             })
         } else if let Some(p) = &test.target_part_override {
             Some(vw_vivado::AutoProject {
@@ -462,6 +463,7 @@ async fn run_dedicated_bucket(
                     .unwrap_or_else(|| "vw_test".to_string()),
                 part: p.clone(),
                 persist_dir: None,
+                lock: None,
             })
         } else {
             ws_default.clone()
@@ -654,6 +656,7 @@ fn workspace_auto_project(
             // See sibling site above: `vw test` intentionally never
             // persists the Vivado project.
             persist_dir: None,
+            lock: None,
         }));
     }
     if variant.is_some() {
@@ -672,6 +675,7 @@ fn workspace_auto_project(
         name: cfg.workspace.name.clone(),
         part: p.to_string(),
         persist_dir: None,
+        lock: None,
     }))
 }
 

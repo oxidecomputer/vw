@@ -12,6 +12,7 @@
 // straight away and the artifact is not there yet, ask for a flush first and
 // it is. The first one is the bug, the second is the reason `--flush` exists.
 
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
@@ -47,12 +48,14 @@ const ARTIFACT: &str = "reports/worst-paths.csv";
 
 /// A stand-in for the object store.
 ///
-/// Answers a `PUT` of anything with `200` and remembers what it was called.
-/// What the real store does with an artifact is not in question here; whether
-/// the agent has sent it yet is the whole question.
+/// Answers a `PUT` of anything with `200` and remembers what it was called,
+/// and a listing with what it holds. What the real store does with an
+/// artifact is not in question here; whether the agent has sent it yet is the
+/// whole question.
 struct Store {
     address: SocketAddr,
-    received: Arc<Mutex<Vec<String>>>,
+    /// What it holds, by request path: `/<bucket>/<key>`.
+    received: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl Store {
@@ -61,7 +64,7 @@ impl Store {
             .await
             .expect("bind a store");
         let address = listener.local_addr().expect("read the store's address");
-        let received = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::new(Mutex::new(BTreeSet::new()));
 
         let keys = Arc::clone(&received);
         tokio::spawn(async move {
@@ -82,9 +85,20 @@ impl Store {
             .contains(&wanted)
     }
 
-    /// Everything that has arrived, for a failure message worth reading.
+    /// Everything it holds, for a failure message worth reading.
     fn contents(&self) -> Vec<String> {
-        self.received.lock().expect("the store's record").clone()
+        self.received
+            .lock()
+            .expect("the store's record")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Empty it from outside the agent, as `vw cloud artifacts --clear`
+    /// does.
+    fn clear(&self) {
+        self.received.lock().expect("the store's record").clear();
     }
 
     /// Wait for an artifact to turn up on its own.
@@ -112,14 +126,15 @@ impl Store {
     }
 }
 
-/// Answer one upload and record the name it was sent under.
+/// Answer one request: record the name an upload was sent under, or list
+/// what the store holds.
 ///
 /// An artifact small enough to fit in one chunk is a plain `PUT`, which is
 /// what every artifact in these tests is, so there is no multipart handshake
 /// to imitate.
 async fn take_object(
     mut stream: tokio::net::TcpStream,
-    received: Arc<Mutex<Vec<String>>>,
+    received: Arc<Mutex<BTreeSet<String>>>,
 ) {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -158,21 +173,53 @@ async fn take_object(
     }
 
     // `PUT /bucket/key HTTP/1.1`, path style, because the store is reached by
-    // address rather than by name.
+    // address rather than by name; a listing is a `GET` of the bucket.
     let mut parts = request.split_whitespace();
-    if let (Some("PUT"), Some(path)) = (parts.next(), parts.next()) {
-        received
-            .lock()
-            .expect("the store's record")
-            .push(path.to_owned());
-    }
+    let body = match (parts.next(), parts.next()) {
+        (Some("PUT"), Some(path)) => {
+            received
+                .lock()
+                .expect("the store's record")
+                .insert(path.to_owned());
+            String::new()
+        }
+        (Some("GET"), Some(_)) => listing(&received),
+        _ => String::new(),
+    };
 
     let _ = stream
         .write_all(
-            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .as_bytes(),
         )
         .await;
     let _ = stream.shutdown().await;
+}
+
+/// What the store holds, as the one page of a `ListObjectsV2` answer.
+fn listing(received: &Mutex<BTreeSet<String>>) -> String {
+    let prefix = format!("/{BUCKET}/");
+    let contents: String = received
+        .lock()
+        .expect("the store's record")
+        .iter()
+        .filter_map(|path| path.strip_prefix(&prefix))
+        .map(|key| {
+            format!(
+                "<Contents><Key>{key}</Key>\
+                 <LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+                 <Size>0</Size></Contents>"
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult><Name>{BUCKET}</Name>\
+         <IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+    )
 }
 
 /// Start an agent on `port`, with everything it needs under `base`.
@@ -456,5 +503,34 @@ async fn flushing_twice_sends_nothing_the_second_time() {
     assert_eq!(
         again.uploaded, 0,
         "nothing changed, so the second flush had nothing to send",
+    );
+}
+
+/// A store emptied from outside the agent — `vw cloud artifacts --clear` —
+/// gets back a file the next build writes byte-for-byte the same as before.
+///
+/// The agent remembers the digest of everything it has sent and skips a file
+/// whose digest has not moved, which a deterministic rebuild guarantees for
+/// anything without a timestamp in it: a probes file, a route status report.
+/// Going by memory alone, those never reached the store again after a clear.
+#[tokio::test]
+async fn a_cleared_store_gets_an_unchanged_artifact_again() {
+    let store = Store::start().await;
+    let agent = Agent::start().await;
+    agent.upload_to(&store).await;
+
+    agent.build_wrote(ARTIFACT, "the same every build");
+    assert_eq!(agent.flush().await.uploaded, 1);
+
+    store.clear();
+    agent.build_wrote(ARTIFACT, "the same every build");
+    let flushed = agent.flush().await;
+
+    assert!(flushed.settled);
+    assert_eq!(flushed.uploaded, 1, "the cleared artifact went again");
+    assert!(
+        store.holds(ARTIFACT),
+        "the store is still missing {ARTIFACT}; it holds {:?}",
+        store.contents(),
     );
 }

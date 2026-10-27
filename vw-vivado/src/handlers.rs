@@ -98,7 +98,7 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use crate::rpc::{FnHandler, RpcHandler};
+use crate::rpc::{FnHandler, RpcContext, RpcHandler};
 
 /// Shared "already loaded in this Vivado session" map. Populated
 /// by the CLI / REPL after each successful htcl load with the
@@ -222,7 +222,7 @@ pub fn make_handler_reporting(
 ) -> Arc<dyn RpcHandler> {
     let workspace_root = workspace_root.map(Arc::new);
     let active_variant = active_variant.map(Arc::new);
-    FnHandler::new(move |method: String, args: Value| {
+    FnHandler::new(move |method: String, args: Value, ctx: RpcContext| {
         let ws = workspace_root.clone();
         let av = active_variant.clone();
         let pl = preloaded.clone();
@@ -237,6 +237,7 @@ pub fn make_handler_reporting(
                 &pl,
                 &cw,
                 report.as_ref(),
+                ctx,
             )
             .await
         }
@@ -252,6 +253,7 @@ async fn dispatch(
     preloaded: &SharedPreload,
     cw_count: &SharedCriticalWarningCount,
     reporter: Option<&Reporter>,
+    ctx: RpcContext,
 ) -> Result<Value, String> {
     match method {
         "workspace_root" => workspace_root
@@ -337,6 +339,19 @@ async fn dispatch(
         }
         "compile_htcl_module" => {
             compile_htcl_module(workspace_root, args, preloaded).await
+        }
+        "synth_modular" => {
+            crate::synth_modular::synth_modular(
+                workspace_root,
+                active_variant,
+                args,
+                ctx,
+            )
+            .await
+        }
+        "synth_ip" => {
+            crate::synth_ip::synth_ip(workspace_root, active_variant, args, ctx)
+                .await
         }
         other => Err(format!("unknown RPC method: {other}")),
     }
@@ -442,23 +457,12 @@ fn compile_htcl_module_blocking(
     let cache_manifest_name = format!("{dbg_name}.manifest");
     let cache_manifest = target_dir.join(&cache_manifest_name);
 
-    // Cache hit path: manifest exists AND every listed file's
-    // current mtime matches. The manifest also embeds a hash of
-    // the preload snapshot's paths (sorted) — if the caller now
-    // has a different set of files preloaded, the compile output
-    // would differ, so we invalidate on that too.
-    if let Some(cached) = try_load_cached_compile(
-        cache_manifest.as_std_path(),
-        cache_tcl.as_std_path(),
-        &preloaded_snapshot,
-    ) {
-        return Ok(Value::String(cached));
-    }
     // Build the resolver with the workspace's transitive deps plus
     // the Cargo-parity self-injection. Mirrors vw-cli's
     // `load_htcl_program_with_mode` at a minimum — we don't need
     // test deps here (the auto-load path never fires from inside
-    // a test).
+    // a test). Built before the cache check: the dependency map
+    // is part of the cache key (see `deps_fingerprint`).
     let mut resolver = vw_htcl::Resolver::new();
     let paths = vw_lib::transitive_dep_cache_paths(&ws).map_err(|e| {
         tracing::error!(%ws, %path, error = %e, "compile_htcl_module: resolving deps");
@@ -472,6 +476,24 @@ fn compile_htcl_module_blocking(
             cfg.workspace.name.clone(),
             ws.as_std_path().to_path_buf(),
         );
+    }
+    let deps_hash = deps_fingerprint(&resolver);
+
+    // Cache hit path: manifest exists AND every listed file's
+    // current mtime matches. The manifest also embeds a hash of
+    // the preload snapshot's paths (sorted) — if the caller now
+    // has a different set of files preloaded, the compile output
+    // would differ, so we invalidate on that too — and a hash of
+    // the dependency map, so a dependency bump (which points
+    // `@name` at a new cache dir while the old one stays on disk,
+    // unchanged) invalidates as well.
+    if let Some(cached) = try_load_cached_compile(
+        cache_manifest.as_std_path(),
+        cache_tcl.as_std_path(),
+        &preloaded_snapshot,
+        deps_hash,
+    ) {
+        return Ok(Value::String(cached));
     }
 
     // Resolve the import path against the workspace root (that's
@@ -640,6 +662,7 @@ fn compile_htcl_module_blocking(
         cache_manifest.as_std_path(),
         &program,
         &preloaded_snapshot,
+        deps_hash,
     );
 
     Ok(Value::String(out))
@@ -648,13 +671,16 @@ fn compile_htcl_module_blocking(
 /// Manifest file format (plain text):
 /// ```text
 /// preload-hash <u64>
+/// deps-hash <u64>
 /// <mtime-ns> <path>
 /// <mtime-ns> <path>
 /// ...
 /// ```
 /// One line per loaded file. `preload-hash` is FNV-1a over the
 /// sorted list of preload paths so a caller-side change to
-/// what's already-loaded invalidates the cache too.
+/// what's already-loaded invalidates the cache too. `deps-hash`
+/// is [`deps_fingerprint`] of the resolver the compile used, so
+/// a change to where `@name` imports resolve invalidates it.
 fn write_compile_manifest(
     manifest_path: &std::path::Path,
     program: &vw_htcl::LoadedProgram,
@@ -662,11 +688,13 @@ fn write_compile_manifest(
         std::path::PathBuf,
         std::time::SystemTime,
     >,
+    deps_hash: u64,
 ) -> std::io::Result<()> {
     use std::fmt::Write;
     let mut body = String::new();
     let ph = preload_fingerprint(preloaded);
     writeln!(body, "preload-hash {ph}").ok();
+    writeln!(body, "deps-hash {deps_hash}").ok();
     for f in &program.files {
         let Some(mtime) = f.mtime else { continue };
         let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) else {
@@ -680,10 +708,13 @@ fn write_compile_manifest(
 /// Try to serve a compile from the cache. Returns `Some(tcl)` iff
 /// - the manifest exists,
 /// - every listed file's current mtime matches the recorded one,
-/// - AND the recorded preload-hash matches the current one.
+/// - the recorded preload-hash matches the current one,
+/// - AND the recorded deps-hash matches the current one.
 ///
 /// Any mismatch (or missing file, or unreadable cache) → `None`,
-/// and the caller falls through to a fresh compile.
+/// and the caller falls through to a fresh compile. A manifest
+/// from before `deps-hash` existed has no such line, so it misses
+/// once and is rewritten.
 fn try_load_cached_compile(
     manifest_path: &std::path::Path,
     cache_path: &std::path::Path,
@@ -691,6 +722,7 @@ fn try_load_cached_compile(
         std::path::PathBuf,
         std::time::SystemTime,
     >,
+    deps_hash: u64,
 ) -> Option<String> {
     let manifest = std::fs::read_to_string(manifest_path).ok()?;
     let mut lines = manifest.lines();
@@ -698,6 +730,11 @@ fn try_load_cached_compile(
     let ph_str = ph_line.strip_prefix("preload-hash ")?;
     let stored_ph: u64 = ph_str.parse().ok()?;
     if stored_ph != preload_fingerprint(preloaded) {
+        return None;
+    }
+    let dh_str = lines.next()?.strip_prefix("deps-hash ")?;
+    let stored_dh: u64 = dh_str.parse().ok()?;
+    if stored_dh != deps_hash {
         return None;
     }
     for line in lines {
@@ -738,6 +775,31 @@ fn preload_fingerprint(
         // Separator so `/a/b` + `/c` doesn't collide with `/a` + `/b/c`.
         h ^= 0xff;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// FNV-1a over the resolver's `@name` → root map, sorted by name.
+/// The mtime check only covers files a cached compile loaded; when
+/// a dependency moves to a new commit, `@name` resolves to a new
+/// cache dir while the old one stays on disk untouched, so without
+/// this the stale compile (and the old procs in it) would keep
+/// being served.
+fn deps_fingerprint(resolver: &vw_htcl::Resolver) -> u64 {
+    let mut deps: Vec<(&str, &std::path::Path)> = resolver.deps().collect();
+    deps.sort();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (name, root) in deps {
+        for b in name
+            .as_bytes()
+            .iter()
+            .chain([0xffu8].iter())
+            .chain(root.to_string_lossy().as_bytes())
+            .chain([0xfeu8].iter())
+        {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
     h
 }
@@ -1070,7 +1132,7 @@ fn synth_needs_update(
 /// Grouped-by-library because the primary consumer is a Vivado
 /// `read_vhdl -library <lib> $files` loop — the tuple-per-file
 /// shape would force the caller to bucket, which we can do here.
-async fn vhdl_dependency_sources(
+pub(crate) async fn vhdl_dependency_sources(
     workspace_root: Option<&std::path::Path>,
     include_test: bool,
     exclude_sim_only: bool,
@@ -1125,7 +1187,7 @@ async fn vhdl_dependency_sources(
 /// `vhdl_design_sources` — return every VHDL file under
 /// `<workspace>/hdl/` as a JSON array of absolute-path strings.
 /// Empty array when the workspace has no `hdl/` dir yet.
-fn vhdl_design_sources(
+pub(crate) fn vhdl_design_sources(
     workspace_root: Option<&std::path::Path>,
     variant: Option<String>,
 ) -> Result<Value, String> {
@@ -1252,7 +1314,7 @@ fn top_value(
 /// JSON array of absolute-path strings. Variant resolution matches
 /// [`vhdl_design_sources`]. Empty array when nothing has been
 /// wrapped yet.
-fn vhdl_ip_sources(
+pub(crate) fn vhdl_ip_sources(
     workspace_root: Option<&std::path::Path>,
     variant: Option<String>,
 ) -> Result<Value, String> {
@@ -1299,13 +1361,13 @@ fn design_constraints(
 /// phase-specific accessors in `vw_lib`; kept as a small internal
 /// enum so the dispatch match up top can name each variant without
 /// duplicating the workspace-root plumbing three times.
-enum ConstraintPhase {
+pub(crate) enum ConstraintPhase {
     Synth,
     Place,
     Route,
 }
 
-fn design_phase_constraints(
+pub(crate) fn design_phase_constraints(
     workspace_root: Option<&std::path::Path>,
     phase: ConstraintPhase,
     variant: Option<String>,
@@ -1504,9 +1566,18 @@ mod variant_build_dir_tests {
     ) -> Value {
         let preloaded: SharedPreload = Arc::new(RwLock::new(HashMap::new()));
         let cw: SharedCriticalWarningCount = Arc::default();
-        dispatch(method, args, Some(ws), variant, &preloaded, &cw, None)
-            .await
-            .unwrap()
+        dispatch(
+            method,
+            args,
+            Some(ws),
+            variant,
+            &preloaded,
+            &cw,
+            None,
+            RpcContext::detached(),
+        )
+        .await
+        .unwrap()
     }
 
     fn two_variant_ws() -> (tempfile::TempDir, camino::Utf8PathBuf) {
@@ -1575,6 +1646,56 @@ mod variant_build_dir_tests {
 #[cfg(test)]
 mod compile_cache_tests {
     use super::*;
+
+    /// A dependency bump points `@name` at a different directory while
+    /// the old one stays on disk, unchanged. Every file the cached
+    /// compile loaded still has its recorded mtime, so only the
+    /// dependency map in the cache key can tell the compile is stale.
+    #[test]
+    fn dependency_bump_invalidates_cached_compile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .unwrap();
+        for v in ["v1", "v2"] {
+            let dir = ws.join(format!("lib_{v}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("module.htcl"),
+                format!("proc which {{}} string {{\n  return {v}\n}}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(ws.join("main.htcl"), "src @lib\n").unwrap();
+        let manifest = |v: &str| {
+            format!(
+                "[workspace]\nname = \"cache\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies.lib]\npath = \"lib_{v}\"\n"
+            )
+        };
+        let compile = || {
+            let Value::String(tcl) = compile_htcl_module_blocking(
+                ws.clone(),
+                "main.htcl".into(),
+                Default::default(),
+            )
+            .unwrap() else {
+                panic!("compile returned a non-string");
+            };
+            tcl
+        };
+
+        std::fs::write(ws.join("vw.toml"), manifest("v1")).unwrap();
+        let first = compile();
+        assert!(first.contains("return v1"), "{first}");
+
+        std::fs::write(ws.join("vw.toml"), manifest("v2")).unwrap();
+        let second = compile();
+        assert!(
+            second.contains("return v2"),
+            "stale compile served: {second}"
+        );
+        assert!(!second.contains("return v1"), "{second}");
+    }
 
     /// Concurrent sessions on one cloud instance share the workspace's
     /// compile cache. Many compiles of one module at once — cache misses

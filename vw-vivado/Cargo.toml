@@ -20,6 +20,7 @@ tempfile.workspace = true
 tracing.workspace = true
 portable-pty.workspace = true
 similar.workspace = true
+regex.workspace = true
 colored = "2.0"
 
 # Unix-only. Used for `libc::kill(pid, SIGINT)` in
