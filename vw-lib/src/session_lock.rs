@@ -87,6 +87,25 @@ pub fn lock_build_dir(
     }
 }
 
+/// Whether another session holds the build directory for `variant` right now.
+///
+/// For a caller that would rather wait than be refused — an instance whose
+/// previous session is still tearing its Vivado down when the next one
+/// arrives. Takes and drops the lock to find out, so it holds nothing
+/// afterwards, and anything short of a definite "held" reads as free: the
+/// [`lock_build_dir`] that follows is what decides, and says why if it can't.
+pub fn build_dir_in_use(
+    workspace_dir: &Utf8Path,
+    variant: Option<&str>,
+) -> bool {
+    let path = build_dir(workspace_dir, variant).join(".vw-session.lock");
+    let Ok(file) = OpenOptions::new().read(true).open(path.as_std_path())
+    else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(TryLockError::WouldBlock))
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -128,6 +147,22 @@ mod test {
             "{err}"
         );
         drop(first);
+        lock_build_dir(ws, None).unwrap();
+    }
+
+    #[test]
+    fn says_whether_a_build_dir_is_held_without_holding_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Utf8Path::from_path(tmp.path()).unwrap();
+        assert!(!build_dir_in_use(ws, None), "never locked");
+
+        let held = lock_build_dir(ws, None).unwrap();
+        assert!(build_dir_in_use(ws, None));
+        assert!(build_dir_in_use(ws, None), "asking did not take it");
+        drop(held);
+
+        assert!(!build_dir_in_use(ws, None));
+        // And asking left nothing behind that would refuse a session.
         lock_build_dir(ws, None).unwrap();
     }
 

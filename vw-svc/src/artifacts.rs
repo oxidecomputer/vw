@@ -165,15 +165,12 @@ impl From<ArtifactError> for dropshot::HttpError {
         let message = value.to_string();
         match value {
             ArtifactError::NoSuchArtifact(_) => {
-                dropshot::HttpError::for_not_found(None, message)
+                crate::error::not_found(message)
             }
-            ArtifactError::NoStore => dropshot::HttpError::for_unavail(
-                None,
-                String::from(
-                    "this environment has no object store yet; its artifact \
+            ArtifactError::NoStore => crate::error::unavailable(String::from(
+                "this environment has no object store yet; its artifact \
                      instance may still be coming up",
-                ),
-            ),
+            )),
             _ => dropshot::HttpError::for_internal_error(message),
         }
     }

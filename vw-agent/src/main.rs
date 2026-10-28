@@ -384,13 +384,10 @@ impl VwSyncApi for Agent {
         let current = ws.artifact_target.borrow().clone();
         let Some(current) = current else {
             slog::debug!(log, "no artifact target has been set");
-            return Err(HttpError::for_not_found(
-                None,
-                String::from(
-                    "this instance has not been told where its \
+            return Err(error::not_found(String::from(
+                "this instance has not been told where its \
                               artifacts go",
-                ),
-            ));
+            )));
         };
 
         Ok(HttpResponseOk(current))
@@ -414,13 +411,10 @@ impl VwSyncApi for Agent {
         // answer with a cheerful nothing, which would read as "flushed" to
         // whoever is about to collect.
         let Some(flushes) = ws.flushes.as_ref() else {
-            return Err(HttpError::for_not_found(
-                None,
-                String::from(
-                    "this instance does not produce artifacts, so it has \
+            return Err(error::not_found(String::from(
+                "this instance does not produce artifacts, so it has \
                      nothing to flush",
-                ),
-            ));
+            )));
         };
 
         // Checked here rather than left to the uploader so the answer says
@@ -428,12 +422,9 @@ impl VwSyncApi for Agent {
         // artifacts has not failed to flush them — it has never been told
         // where they go, and that is what somebody needs to hear.
         if ws.artifact_target.borrow().is_none() {
-            return Err(HttpError::for_not_found(
-                None,
-                String::from(
-                    "this instance has not been told where its artifacts go",
-                ),
-            ));
+            return Err(error::not_found(String::from(
+                "this instance has not been told where its artifacts go",
+            )));
         }
 
         let (reply, answer) = tokio::sync::oneshot::channel();
@@ -523,13 +514,10 @@ impl VwSyncApi for Agent {
                 "asked for an object store this instance \
                                     does not run"
             );
-            return Err(HttpError::for_not_found(
-                None,
-                String::from(
-                    "this instance does not run an object store; the artifact \
+            return Err(error::not_found(String::from(
+                "this instance does not run an object store; the artifact \
                      instance does",
-                ),
-            ));
+            )));
         };
 
         let kind = query
@@ -638,15 +626,17 @@ impl VwSyncApi for Agent {
         )
         .await;
 
-        // Where the artifacts go is settled before the build starts, so the
-        // upload can happen the moment cargo is done rather than after the
-        // developer's command has already returned.
-        let target = ws.artifact_target.borrow().clone();
+        // Where the artifacts go is read when cargo is done, not when it
+        // starts. The service may only get round to saying so while the
+        // build is running — a new environment's store is often still coming
+        // up — and a build that took a minute should not be lost to a
+        // question answered thirty seconds into it.
+        let target = ws.artifact_target.subscribe();
         let root = driver.clone();
         let upload_log = log.clone();
         let upload: vw_remote::driver::Uploader =
             Box::new(move |produced: Vec<camino::Utf8PathBuf>| {
-                let target = target.clone();
+                let target = target.borrow().clone();
                 let root = root.clone();
                 let log = upload_log.clone();
                 Box::pin(async move {
@@ -666,7 +656,13 @@ impl VwSyncApi for Agent {
                                 "nowhere to put the driver's artifacts; this \
                                  instance has not been told where its store is"
                             );
-                            0
+                            vw_remote::driver::Stored {
+                                count: 0,
+                                problems: vec![String::from(
+                                    "the instance has not been told where \
+                                     its artifact store is",
+                                )],
+                            }
                         }
                     }
                 })
@@ -991,13 +987,10 @@ impl Context {
             "wanted" => environment,
             "serving" => &self.environment,
         );
-        Err(HttpError::for_not_found(
-            None,
-            format!(
-                "this agent serves '{}', not '{environment}'",
-                self.environment
-            ),
-        ))
+        Err(error::not_found(format!(
+            "this agent serves '{}', not '{environment}'",
+            self.environment
+        )))
     }
 }
 

@@ -42,9 +42,19 @@ pub const DIRECTORY: &str = "driver";
 /// finished, so a developer whose command has returned can go and fetch what
 /// it made.
 pub type Uploader = Box<
-    dyn Fn(Vec<Utf8PathBuf>) -> futures::future::BoxFuture<'static, usize>
+    dyn Fn(Vec<Utf8PathBuf>) -> futures::future::BoxFuture<'static, Stored>
         + Send,
 >;
+
+/// What became of storing a build's artifacts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stored {
+    /// How many made it to the store.
+    pub count: usize,
+    /// Why the rest did not, one line each. The developer cannot see this
+    /// instance's log, so the reason has to travel with the result.
+    pub problems: Vec<String>,
+}
 
 /// What the instance sends back while a build runs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +85,10 @@ pub enum DriverEvent {
     Produced {
         artifacts: Vec<String>,
         stored: usize,
+        /// Why anything in `artifacts` was not stored. Defaulted so a client
+        /// and an instance one version apart still understand each other.
+        #[serde(default)]
+        problems: Vec<String>,
     },
     /// The build could not be run at all.
     Fatal { message: String },
@@ -413,7 +427,8 @@ async fn build(
         let stored = upload(produced.clone()).await;
         let _ = events.send(DriverEvent::Produced {
             artifacts: produced.iter().map(ToString::to_string).collect(),
-            stored,
+            stored: stored.count,
+            problems: stored.problems,
         });
     }
 

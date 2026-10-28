@@ -413,6 +413,20 @@ impl VwUserApi for UserApi {
             .await
             .inspect_err(|e| log_relay_failure(&log, &target, e))?;
 
+        // And where its artifacts go, for the same reason a sync does it: the
+        // build uploads the moment cargo is done, and an instance nobody has
+        // told yet would build the driver and keep it to itself.
+        crate::wiring::ensure(
+            &caller.name,
+            &name,
+            &workspace,
+            vw_api_types_versions::latest::TargetKind::Helios,
+            &args,
+            &agent,
+            &log,
+        )
+        .await;
+
         info!(log, "building the driver";
             "environment" => &name,
             "user" => &caller.name,

@@ -16,6 +16,15 @@ use vw_sync::{ApplyError, StoreError};
 
 use crate::workspace::WorkspaceError;
 
+/// A 404 that says what was not found.
+///
+/// Dropshot's own `for_not_found` sends the caller the bare words "Not Found"
+/// and keeps the reason for this instance's log, which nobody calling it can
+/// read. Every 404 here is written to be read by the caller.
+pub(crate) fn not_found(message: String) -> HttpError {
+    HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
+}
+
 pub(crate) fn apply_error(value: ApplyError) -> HttpError {
     let message = value.to_string();
     match value {
@@ -74,9 +83,7 @@ pub(crate) fn generated_error(
         crate::generated::GeneratedError::UnsafePath(_) => {
             HttpError::for_bad_request(None, message)
         }
-        crate::generated::GeneratedError::NotFound(_) => {
-            HttpError::for_not_found(None, message)
-        }
+        crate::generated::GeneratedError::NotFound(_) => not_found(message),
         crate::generated::GeneratedError::Read(..) => {
             HttpError::for_internal_error(message)
         }

@@ -288,6 +288,56 @@ where
     }
 }
 
+/// How long a session waits for the one before it to let go of the build
+/// directory.
+///
+/// On a developer's machine a held directory means a REPL they left open, and
+/// the right answer is to say so at once. Here it far more often means the
+/// previous command's session is still tearing its Vivado down — one CI job
+/// following another onto the same variant — and refusing would fail a build
+/// over a few seconds' overlap. Bounded, because a session that really is
+/// still running is not going to finish for anyone's patience.
+const BUILD_DIR_PATIENCE: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+/// Wait, within [`BUILD_DIR_PATIENCE`], for no other session to hold the
+/// build directory this one is about to take.
+///
+/// Only waits; taking it is still selection's job, and if the time runs out
+/// that is where the refusal comes from, naming the holder.
+async fn wait_for_build_dir(
+    root: &Utf8Path,
+    variant: Option<&str>,
+    note: &impl Fn(String),
+) {
+    // The directory a session locks is its variant's, and with no variant
+    // asked for that is the workspace's default — so the name is worked out
+    // the same way selection will work it out. A config that cannot be read
+    // or a variant that does not exist is selection's to report.
+    let variant = vw_lib::load_workspace_config(root).ok().and_then(|cfg| {
+        cfg.workspace
+            .select_variant(variant)
+            .ok()
+            .flatten()
+            .map(|v| v.name.clone())
+    });
+
+    let deadline = tokio::time::Instant::now() + BUILD_DIR_PATIENCE;
+    let mut said = false;
+    while vw_lib::build_dir_in_use(root, variant.as_deref())
+        && tokio::time::Instant::now() < deadline
+    {
+        if !said {
+            note(String::from(
+                "another session still holds this build directory; waiting \
+                 for it to finish",
+            ));
+            said = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 /// Bring up Vivado for this session.
 async fn start(
     events: &UnboundedSender<SessionEvent>,
@@ -303,6 +353,8 @@ async fn start(
     // exactly what the developer's machine would — using the credentials the
     // sync that preceded this put in place.
     fetch_dependencies(root, &note).await;
+
+    wait_for_build_dir(root, params.variant.as_deref(), &note).await;
 
     let selection = vw_vivado::resolve_workspace_selection(
         root,
