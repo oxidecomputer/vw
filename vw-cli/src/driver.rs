@@ -48,6 +48,12 @@ pub async fn build(
     )
     .await;
 
+    // Whether everything cargo produced made it to the store. A build whose
+    // artifacts went nowhere has not done what it was asked: whoever runs it
+    // is about to go and collect them, and finding nothing there is a much
+    // worse place to learn about it than here.
+    let mut unstored = 0;
+
     while let Some(message) = socket.next().await {
         let text =
             match message.map_err(|e| CloudError::Transport(e.to_string()))? {
@@ -70,7 +76,11 @@ pub async fn build(
             vw_remote::DriverEvent::Line { text } => println!("{text}"),
             // Named so a developer knows what to look for in the store
             // without having to guess at target directory layout.
-            vw_remote::DriverEvent::Produced { artifacts, stored } => {
+            vw_remote::DriverEvent::Produced {
+                artifacts,
+                stored,
+                problems,
+            } => {
                 for artifact in &artifacts {
                     println!(
                         "{:>12} {artifact}",
@@ -84,6 +94,10 @@ pub async fn build(
                         "Stored".bright_green().bold(),
                     );
                 }
+                for problem in &problems {
+                    eprintln!("{} {problem}", "warning:".yellow());
+                }
+                unstored = artifacts.len().saturating_sub(stored);
             }
             vw_remote::DriverEvent::Done { success, code } => {
                 if !success {
@@ -95,8 +109,16 @@ pub async fn build(
                             None => String::from(" (killed)"),
                         },
                     );
+                    return Ok(false);
                 }
-                return Ok(success);
+                if unstored > 0 {
+                    eprintln!(
+                        "{} {unstored} artifact(s) built but not stored",
+                        "error:".bright_red(),
+                    );
+                    return Ok(false);
+                }
+                return Ok(true);
             }
             vw_remote::DriverEvent::Fatal { message } => {
                 return Err(CloudError::Transport(message));

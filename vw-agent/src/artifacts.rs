@@ -632,16 +632,16 @@ fn digest_of(path: &Utf8Path) -> std::io::Result<String> {
 /// announces it. A cargo build does announce it — cargo names every file it
 /// produced — so there is nothing to discover and nothing to wait for.
 ///
-/// Returns how many went. A failure is logged and skipped rather than
-/// abandoning the rest: one unreachable moment should not cost the other
-/// artifacts of the same build.
+/// Returns how many went, and why any did not. A failure is logged and
+/// skipped rather than abandoning the rest: one unreachable moment should not
+/// cost the other artifacts of the same build.
 pub(crate) async fn upload_all(
     root: &Utf8Path,
     credentials: &S3Credentials,
     artifacts: &[Utf8PathBuf],
     log: &Logger,
-) -> usize {
-    let mut sent = 0;
+) -> vw_remote::driver::Stored {
+    let mut stored = vw_remote::driver::Stored::default();
     for artifact in artifacts {
         // Keyed by its path under `target`, so a debug and a release build of
         // the same name stay two objects, as do the same name built for two
@@ -660,15 +660,18 @@ pub(crate) async fn upload_all(
                     "bucket" => &credentials.bucket,
                     "key" => &key,
                 );
-                sent += 1;
+                stored.count += 1;
             }
-            Err(e) => warn!(log, "cannot upload a build artifact";
-                "path" => %artifact,
-                "error" => %e,
-            ),
+            Err(e) => {
+                warn!(log, "cannot upload a build artifact";
+                    "path" => %artifact,
+                    "error" => %e,
+                );
+                stored.problems.push(format!("cannot upload {key}: {e}"));
+            }
         }
     }
-    sent
+    stored
 }
 
 /// The bucket `credentials` name.

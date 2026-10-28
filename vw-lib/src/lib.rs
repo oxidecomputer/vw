@@ -56,7 +56,7 @@ pub use vw_core::{
 };
 pub use vw_core::{mapping, nvc_helpers, visitor};
 
-pub use session_lock::{lock_build_dir, BuildLock};
+pub use session_lock::{build_dir_in_use, lock_build_dir, BuildLock};
 
 /// Start a `cargo` that resolves its own toolchain.
 ///

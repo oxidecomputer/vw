@@ -796,6 +796,13 @@ impl VivadoBackend {
     ) -> Result<(Response, String), BackendError> {
         let mut accumulated = String::new();
         let mut line = String::new();
+        // Whether the PTY pump is still running. Once it has gone, its
+        // channel answers every poll at once with `None`; left in a
+        // `biased` select that branch would win forever and the protocol
+        // socket would never be read again — a loop that spins without end,
+        // holding the session's build directory, waiting for an answer it
+        // has stopped listening for.
+        let mut pty_open = true;
         loop {
             line.clear();
             // Race the protocol socket against the PTY channel. The
@@ -804,13 +811,14 @@ impl VivadoBackend {
             // best-effort context until then.
             tokio::select! {
                 biased;
-                pty = self.pty_rx.recv() => {
+                pty = self.pty_rx.recv(), if pty_open => {
                     let Some(pty_line) = pty else {
                         // Pump exited: Vivado's PTY closed.
                         // Stop trying to drain it but keep waiting
                         // for a Response on the protocol socket —
                         // most teardown sequences send the
                         // shutdown ack before the PTY EOFs.
+                        pty_open = false;
                         continue;
                     };
                     vw_timing_log(
@@ -1589,8 +1597,16 @@ impl EdaBackend for VivadoBackend {
             op: RequestOp::Shutdown,
         };
         let _ = self.write_request(&req).await;
-        let _ = self.read_response_for(id).await;
+        // Bounded, like the wait below. A Vivado that has already gone —
+        // because the shutdown it was sent was not the first — answers
+        // nothing, and nothing after this is worth holding the session for.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.read_response_for(id),
+        )
+        .await;
         if let Some(mut child) = self.child.take() {
+            let pid = child.process_id();
             // Vivado's tear-down is slow; bound it.
             let waited = tokio::task::spawn_blocking(move || {
                 let deadline =
@@ -1600,6 +1616,14 @@ impl EdaBackend for VivadoBackend {
                         Ok(Some(status)) => return Ok(status),
                         Ok(None) => {
                             if std::time::Instant::now() >= deadline {
+                                // The whole group, not just the child: the
+                                // child is vivado's bash wrapper, and the
+                                // vivado under it would outlive a kill aimed
+                                // at the wrapper alone — keeping the PTY open
+                                // and the pump below from ever finishing.
+                                if let Some(pid) = pid {
+                                    kill_process_group(pid);
+                                }
                                 let _ = child.kill();
                                 return child.wait();
                             }
@@ -1626,6 +1650,11 @@ impl EdaBackend for VivadoBackend {
 impl Drop for VivadoBackend {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
+            // The group for the same reason as in `shutdown`: killing the
+            // wrapper alone leaves the vivado under it running.
+            if let Some(pid) = child.process_id() {
+                kill_process_group(pid);
+            }
             let _ = child.kill();
         }
         // The pump thread will exit on its own when the PTY master is
@@ -1667,6 +1696,24 @@ pub fn interrupt_process_group(pid: u32) {
 /// Windows stub. See the unix variant.
 #[cfg(not(unix))]
 pub fn interrupt_process_group(_pid: u32) {}
+
+/// Kill the vivado at `pid` and everything in its process group.
+///
+/// For teardown, where `interrupt_process_group`'s politeness is no longer the
+/// point. Signalled by group for the same reason: the pid is a bash wrapper,
+/// and the vivado doing the work is its child.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // SAFETY: as in `interrupt_process_group` — a process group we spawned,
+    // whose only documented failures (EPERM, ESRCH) are harmless here.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+/// Windows stub. See the unix variant.
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 /// Workers each worker has started, by the starting worker's pid.
 static HELPERS: std::sync::Mutex<
