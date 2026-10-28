@@ -488,7 +488,13 @@ impl VwSyncApi for Agent {
         );
 
         // Waking the uploader, which will send anything already built.
-        let _ = ws.artifact_target.send(Some(credentials));
+        //
+        // `send_replace` rather than `send`: a watch channel's `send` keeps
+        // nothing when nobody is subscribed, and on an instance with no
+        // uploader — helios, whose driver build reads this when cargo is
+        // done — nobody is. The target would be on disk and nowhere else
+        // until the agent next restarted.
+        ws.artifact_target.send_replace(Some(credentials));
 
         Ok(HttpResponseUpdatedNoContent())
     }

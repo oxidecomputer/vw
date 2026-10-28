@@ -36,14 +36,20 @@ fn spawn_agent(
     root: &Utf8Path,
     netrc: &Utf8Path,
     port: u16,
+    kind: &str,
 ) -> Child {
     Command::new(env!("CARGO_BIN_EXE_vw-agent"))
         .arg("serve")
         .args(["--address", "127.0.0.1"])
         .args(["--port", &port.to_string()])
         .args(["--environment", ENVIRONMENT])
+        .args(["--kind", kind])
         .args(["--root", root.as_str()])
         .args(["--store", base.join("store").as_str()])
+        .args([
+            "--artifact-target",
+            base.join("artifact-target.json").as_str(),
+        ])
         .args(["--netrc", netrc.as_str()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -134,6 +140,11 @@ struct Agent {
 
 impl Agent {
     async fn start() -> Agent {
+        Self::start_as("vivado").await
+    }
+
+    /// An agent playing one particular instance of an environment.
+    async fn start_as(kind: &str) -> Agent {
         let dir = TempDir::new().expect("scratch directory");
         let base = Utf8Path::from_path(dir.path())
             .expect("utf8 temp dir")
@@ -149,7 +160,7 @@ impl Agent {
         // and there is nothing to do about it but pick another.
         for _ in 0..STARTUP_ATTEMPTS {
             let port = free_port();
-            let mut child = spawn_agent(&base, &trees, &netrc, port);
+            let mut child = spawn_agent(&base, &trees, &netrc, port, kind);
             let base_url = format!("http://127.0.0.1:{port}");
 
             if listening(&client, &base_url, &mut child).await {
@@ -522,6 +533,42 @@ async fn flushing_before_anyone_said_where_artifacts_go_is_refused() {
         .expect("send");
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// An instance with no uploader of its own still keeps what it is told.
+///
+/// Helios builds the driver and reads where its artifacts go once cargo is
+/// done, but runs no uploader watching for changes. Being told and then
+/// asked straight back must give the same answer — not the "never told"
+/// that held until the agent next restarted and read it off the disk.
+#[tokio::test]
+async fn an_instance_that_runs_no_uploader_remembers_where_artifacts_go() {
+    let agent = Agent::start_as("helios").await;
+    let url = format!(
+        "{}/environment/{ENVIRONMENT}/workspace/{WORKSPACE}/artifact-target",
+        agent.base_url
+    );
+
+    let told = agent
+        .client
+        .put(&url)
+        .json(&serde_json::json!({
+            "endpoint": "http://127.0.0.1:3900",
+            "port": 3900,
+            "region": "garage",
+            "bucket": "helios-redhawk",
+            "access_key_id": "key",
+            "secret_access_key": "secret",
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert!(told.status().is_success(), "{}", told.status());
+
+    let asked = agent.client.get(&url).send().await.expect("send");
+    assert_eq!(asked.status(), StatusCode::OK);
+    let target: serde_json::Value = asked.json().await.expect("decode");
+    assert_eq!(target["bucket"], "helios-redhawk");
 }
 
 #[tokio::test]
