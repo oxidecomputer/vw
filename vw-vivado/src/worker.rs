@@ -424,6 +424,17 @@ impl VivadoBackend {
         if let Ok(v) = std::env::var("VW_TRACE_STACK_CAPTURE") {
             cmd.env("VW_TRACE_STACK_CAPTURE", v);
         }
+        // Keep Vivado out of the per-user Tcl Store data under
+        // `~/.Xilinx`. Vivados starting together on a fresh home all
+        // create it at once, and the losers fail to load bundled Tcl
+        // apps (Common 17-685 on `xilinx::questa` during
+        // `create_project`). A session starts several — one per IP
+        // job, and one per variant when variants build side by side.
+        // AMD's workaround for exactly this is AR 63253. An explicit
+        // setting in the caller's environment wins.
+        if std::env::var_os("XILINX_LOCAL_USER_DATA").is_none() {
+            cmd.env("XILINX_LOCAL_USER_DATA", "no");
+        }
         cmd.cwd(&cwd);
 
         let child = pair.slave.spawn_command(cmd).map_err(|e| {
