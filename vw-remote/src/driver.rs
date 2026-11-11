@@ -46,6 +46,28 @@ pub type Uploader = Box<
         + Send,
 >;
 
+/// What a build needs from elsewhere in the environment before cargo runs.
+///
+/// Passed in for the same reason [`Uploader`] is: fetching things is the
+/// agent's business. Answers with what to add to cargo's environment and
+/// anything worth telling the developer about where it came from — or, when
+/// something the build needs cannot be had, why, which is reported in place of
+/// a build that could only fail further in.
+pub type Preparer = Box<
+    dyn FnOnce()
+            -> futures::future::BoxFuture<'static, Result<Prepared, String>>
+        + Send,
+>;
+
+/// What [`Preparer`] came back with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prepared {
+    /// Variables to set for every cargo invocation.
+    pub env: Vec<(String, String)>,
+    /// Lines for the developer, said before the build starts.
+    pub notes: Vec<String>,
+}
+
 /// What became of storing a build's artifacts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stored {
@@ -165,6 +187,7 @@ pub async fn serve<S>(
     socket: WebSocketStream<S>,
     root: &Utf8Path,
     params: BuildParams,
+    prepare: Option<Preparer>,
     upload: Uploader,
 ) -> Result<Vec<Utf8PathBuf>, crate::SessionError>
 where
@@ -196,7 +219,7 @@ where
         }
     });
 
-    let building = build(root, &params, events.clone(), upload);
+    let building = build(root, &params, prepare, events.clone(), upload);
     tokio::pin!(building);
 
     // A build that finishes after the developer has gone still produced
@@ -371,6 +394,7 @@ fn contradiction(root: &Utf8Path) -> Option<String> {
 async fn build(
     root: &Utf8Path,
     params: &BuildParams,
+    prepare: Option<Preparer>,
     events: tokio::sync::mpsc::UnboundedSender<DriverEvent>,
     upload: Uploader,
 ) -> Vec<Utf8PathBuf> {
@@ -399,6 +423,24 @@ async fn build(
         return Vec::new();
     }
 
+    // Before cargo, so a missing input is reported as itself rather than as a
+    // compile error naming a file the developer never wrote.
+    let mut env = Vec::new();
+    if let Some(prepare) = prepare {
+        match prepare().await {
+            Ok(prepared) => {
+                for text in prepared.notes {
+                    let _ = events.send(DriverEvent::Line { text });
+                }
+                env = prepared.env;
+            }
+            Err(message) => {
+                let _ = events.send(DriverEvent::Fatal { message });
+                return Vec::new();
+            }
+        }
+    }
+
     // Cargo is asked which of its members are the workspace's, so a
     // dependency's artifacts are not mistaken for the driver's.
     let members: std::collections::HashSet<String> = metadata(root)
@@ -411,7 +453,8 @@ async fn build(
             unit: unit.name.clone(),
         });
 
-        match build_one(&unit.directory, params, &events, &members).await {
+        match build_one(&unit.directory, params, &env, &events, &members).await
+        {
             Some((true, mut artifacts)) => produced.append(&mut artifacts),
             // Reported already; there is no sense building the kernel module
             // against a userland that did not compile.
@@ -447,6 +490,7 @@ async fn build(
 async fn build_one(
     root: &Utf8Path,
     params: &BuildParams,
+    env: &[(String, String)],
     events: &tokio::sync::mpsc::UnboundedSender<DriverEvent>,
     members: &std::collections::HashSet<String>,
 ) -> Option<(bool, Vec<Utf8PathBuf>)> {
@@ -465,6 +509,7 @@ async fn build_one(
     // sees changes.
     command.args(["--message-format", "json-diagnostic-rendered-ansi"]);
     command.args(&params.args);
+    command.envs(env.iter().map(|(k, v)| (k, v)));
 
     let child = command
         .current_dir(root.as_std_path())

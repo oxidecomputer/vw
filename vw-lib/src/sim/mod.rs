@@ -175,10 +175,9 @@ async fn build_bridge_library(
     let bench_dir_owned = bench_dir.to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        let output = crate::cargo_command()
+        let output = crate::bench_cargo_command(&bench_dir_owned)
             .arg("build")
             .arg("--release")
-            .current_dir(&bench_dir_owned)
             .output()
             .map_err(|e| VwError::Simulation {
                 message: format!("Failed to run cargo build: {e}"),

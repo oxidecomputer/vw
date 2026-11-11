@@ -19,6 +19,7 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (6, ANODIZE_PHASE),
     (5, WORKSPACES),
     (4, ANODIZE),
     (3, ARTIFACT_FLUSH),
@@ -323,7 +324,7 @@ pub trait VwUserApi {
     #[channel {
         protocol = WEBSOCKETS,
         path = "/environment/{name}/workspace/{workspace}/driver/build",
-        versions = VERSION_WORKSPACES..,
+        versions = VERSION_ANODIZE_PHASE..,
     }]
     async fn driver_build(
         rqctx: RequestContext<Self::Context>,
@@ -331,6 +332,27 @@ pub trait VwUserApi {
         query: Query<latest::DriverBuildQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
+
+    /// Build the driver on an environment's helios instance.
+    ///
+    /// Relayed frame for frame. The driver's target is native there and its
+    /// pinned toolchain is installed there, which is the whole reason the
+    /// build does not happen on a developer's machine.
+    #[channel {
+        operation_id = "driver_build",
+        protocol = WEBSOCKETS,
+        path = "/environment/{name}/workspace/{workspace}/driver/build",
+        versions = VERSION_WORKSPACES..VERSION_ANODIZE_PHASE,
+    }]
+    async fn driver_build_v5(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::WorkspacePathParam>,
+        query: Query<v1::DriverBuildQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult {
+        Self::driver_build(rqctx, path_params, query.map(Into::into), websock)
+            .await
+    }
 
     /// Build the driver on an environment's helios instance.
     ///
@@ -357,7 +379,7 @@ pub trait VwUserApi {
                     latest::LEGACY_WORKSPACE,
                 )
             }),
-            query,
+            query.map(Into::into),
             websock,
         )
         .await
@@ -373,7 +395,7 @@ pub trait VwUserApi {
     #[channel {
         protocol = WEBSOCKETS,
         path = "/environment/{name}/workspace/{workspace}/anodize",
-        versions = VERSION_WORKSPACES..,
+        versions = VERSION_ANODIZE_PHASE..,
     }]
     async fn anodize(
         rqctx: RequestContext<Self::Context>,
@@ -381,6 +403,28 @@ pub trait VwUserApi {
         query: Query<latest::AnodizeQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
+
+    /// Run the anodizer on an environment's vivado instance.
+    ///
+    /// Relayed frame for frame. Anodization already happens on its own before
+    /// every bench run, cached and silent; this is the same generator with
+    /// the cache off and the answers reported, for working on the generator
+    /// itself. It runs there rather than here because it is an nvc pass over
+    /// the workspace's VHDL, and the workspace is there.
+    #[channel {
+        operation_id = "anodize",
+        protocol = WEBSOCKETS,
+        path = "/environment/{name}/workspace/{workspace}/anodize",
+        versions = VERSION_WORKSPACES..VERSION_ANODIZE_PHASE,
+    }]
+    async fn anodize_v5(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::WorkspacePathParam>,
+        query: Query<v4::AnodizeQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult {
+        Self::anodize(rqctx, path_params, query.map(Into::into), websock).await
+    }
 
     /// Run the anodizer on an environment's vivado instance.
     ///
@@ -409,7 +453,7 @@ pub trait VwUserApi {
                     latest::LEGACY_WORKSPACE,
                 )
             }),
-            query,
+            query.map(Into::into),
             websock,
         )
         .await

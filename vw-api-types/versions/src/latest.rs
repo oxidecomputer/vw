@@ -5,7 +5,6 @@ pub use crate::v1::CleanResult;
 pub use crate::v1::CommitResult;
 pub use crate::v1::Credentials;
 pub use crate::v1::Digest;
-pub use crate::v1::DriverBuildQuery;
 pub use crate::v1::Environment;
 pub use crate::v1::EnvironmentCreate;
 pub use crate::v1::EnvironmentImages;
@@ -31,8 +30,6 @@ pub use crate::v2::RecycledImage;
 
 pub use crate::v3::ArtifactFlush;
 
-pub use crate::v4::AnodizeQuery;
-
 pub use crate::v5::ArtifactPathParam;
 pub use crate::v5::TargetBlobPathParam;
 pub use crate::v5::TargetPathParam;
@@ -41,3 +38,7 @@ pub use crate::v5::WorkspaceForgotten;
 pub use crate::v5::WorkspaceListQuery;
 pub use crate::v5::WorkspacePathParam;
 pub use crate::v5::LEGACY_WORKSPACE;
+
+pub use crate::v6::AgentDriverBuildQuery;
+pub use crate::v6::AnodizeQuery;
+pub use crate::v6::DriverBuildQuery;

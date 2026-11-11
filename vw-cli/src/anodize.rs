@@ -46,6 +46,18 @@ pub enum AnodizeError {
     Abandoned,
 }
 
+/// What to anodize, and how.
+#[derive(Clone, Debug)]
+pub struct Options<'a> {
+    /// A bench to compile against the result, for `vw cosim anodize`.
+    pub bench: Option<&'a str>,
+    pub standard: vw_lib::VhdlStandard,
+    /// The variant to anodize for; the workspace's default when absent.
+    pub variant: Option<&'a str>,
+    /// Regenerate even output that is already current.
+    pub force: bool,
+}
+
 /// Anodize on an environment's vivado instance.
 ///
 /// Returns whether it worked, so the caller can decide the exit code; an
@@ -53,16 +65,17 @@ pub enum AnodizeError {
 pub async fn run(
     session: &Session,
     target: &crate::cloud::Target,
-    bench: Option<&str>,
-    standard: vw_lib::VhdlStandard,
+    options: &Options<'_>,
 ) -> Result<bool, AnodizeError> {
-    let standard = standard.to_string();
+    let standard = options.standard.to_string();
     let upgraded = vw_api_client::retrying(|| {
         session.client.anodize(
             &target.environment,
             &target.workspace,
-            bench,
+            options.bench,
+            Some(options.force),
             Some(standard.as_str()),
+            options.variant,
         )
     })
     .await
@@ -101,12 +114,13 @@ pub async fn run(
 /// through a network to use them.
 pub async fn run_locally(
     workspace: &Utf8Path,
-    bench: Option<&str>,
-    standard: vw_lib::VhdlStandard,
+    options: &Options<'_>,
 ) -> Result<bool, AnodizeError> {
     let request = vw_remote::AnodizeRequest {
-        bench: bench.map(str::to_owned),
-        standard: standard.to_string(),
+        bench: options.bench.map(str::to_owned),
+        standard: options.standard.to_string(),
+        variant: options.variant.map(str::to_owned),
+        force: options.force,
     };
 
     // The same channel the socket would carry, ending at this terminal
@@ -117,7 +131,9 @@ pub async fn run_locally(
     let working = tokio::spawn({
         let workspace = workspace.to_owned();
         async move {
-            vw_remote::anodize::run(&workspace, &request, events).await;
+            // Nothing is published from here: the store belongs to a cloud
+            // environment, and what is generated on this machine stays on it.
+            vw_remote::anodize::run(&workspace, &request, None, events).await;
         }
     });
 
@@ -153,12 +169,20 @@ fn show(event: AnodizeEvent) -> Option<bool> {
                 if sources == 1 { "" } else { "s" },
             );
         }
-        AnodizeEvent::Generated { path, lines } => {
+        AnodizeEvent::Generated {
+            path,
+            lines,
+            regenerated,
+        } => {
+            let verb = if regenerated { "Generated" } else { "Current" };
             println!(
                 "{:>12} {path} ({lines} line{})",
-                "Generated".bright_green().bold(),
+                verb.bright_green().bold(),
                 if lines == 1 { "" } else { "s" },
             );
+        }
+        AnodizeEvent::Published { key } => {
+            println!("{:>12} {key}", "Published".bright_green().bold());
         }
         // Not a failure, and worth saying plainly: a developer who has just
         // written `attribute serialize_rust` and sees this has learnt that
@@ -178,8 +202,9 @@ fn show(event: AnodizeEvent) -> Option<bool> {
         AnodizeEvent::NotExercised { bench } => {
             println!(
                 "{:>12} {bench} builds, but nothing in it names \
-                 `generated_structs` — the generated Rust was not compiled",
+                 `{}` — the generated Rust was not compiled",
                 "Note".yellow().bold(),
+                vw_lib::ANODIZED_ENV,
             );
         }
         // Printed as cargo wrote it: cargo already says these things better

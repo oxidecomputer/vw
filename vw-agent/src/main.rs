@@ -34,6 +34,7 @@ use vw_sync_api::{
     EnvironmentPathParam, VwSyncApi, WorkspaceBlobPathParam, WorkspacePathParam,
 };
 
+mod anodized;
 mod artifacts;
 mod error;
 mod garage;
@@ -597,7 +598,9 @@ impl VwSyncApi for Agent {
     async fn driver_build(
         rqctx: RequestContext<Self::Context>,
         path_params: dropshot::Path<WorkspacePathParam>,
-        query: dropshot::Query<vw_api_types_versions::latest::DriverBuildQuery>,
+        query: dropshot::Query<
+            vw_api_types_versions::latest::AgentDriverBuildQuery,
+        >,
         websock: dropshot::WebsocketConnection,
     ) -> dropshot::WebsocketChannelResult {
         let ctx = rqctx.context();
@@ -610,6 +613,29 @@ impl VwSyncApi for Agent {
         let params = vw_remote::BuildParams {
             release: query.release,
             args: query.arguments(),
+        };
+
+        // The anodizer output the driver may be built against, fetched from
+        // where the vivado instance published it and checked against the
+        // sources this instance holds.
+        let prepare: vw_remote::Preparer = {
+            let root = ws.root.clone();
+            let variant = query.variant.clone();
+            let bucket = query.anodized_bucket.clone();
+            let credentials = ws.artifact_target.borrow().clone();
+            let log = log.clone();
+            Box::new(move || {
+                Box::pin(async move {
+                    anodized::prepare(
+                        &root,
+                        variant.as_deref(),
+                        credentials,
+                        bucket,
+                        &log,
+                    )
+                    .await
+                })
+            })
         };
 
         // This instance holds the whole workspace, the same as the other one
@@ -674,8 +700,14 @@ impl VwSyncApi for Agent {
                 })
             });
 
-        let result =
-            vw_remote::driver::serve(socket, &driver, params, upload).await;
+        let result = vw_remote::driver::serve(
+            socket,
+            &driver,
+            params,
+            Some(prepare),
+            upload,
+        )
+        .await;
 
         match &result {
             Ok(produced) => info!(log, "driver build finished";
@@ -708,12 +740,48 @@ impl VwSyncApi for Agent {
                 .standard
                 .clone()
                 .unwrap_or_else(|| "2019".to_owned()),
+            variant: query.variant.clone(),
+            force: query.force,
         };
 
         info!(log, "anodizing";
             "root" => %ws.root,
             "bench" => request.bench.as_deref().unwrap_or("-"),
+            "variant" => request.variant.as_deref().unwrap_or("-"),
+            "force" => request.force,
         );
+
+        // The output goes to this workspace's bucket as soon as it is current,
+        // which is how the helios instance comes to have it. Read when the
+        // generator is done rather than now, for the reason the driver build
+        // gives: the service may only just have said where the store is.
+        let target = ws.artifact_target.subscribe();
+        let root = ws.root.clone();
+        let publish_log = log.clone();
+        let publish: vw_remote::Publisher =
+            Box::new(move |generated: camino::Utf8PathBuf| {
+                let target = target.borrow().clone();
+                Box::pin(async move {
+                    let Some(credentials) = target else {
+                        return Err(String::from(
+                            "this instance has not been told where its \
+                             artifact store is",
+                        ));
+                    };
+                    let stored = artifacts::upload_all(
+                        &root,
+                        &credentials,
+                        std::slice::from_ref(&generated),
+                        &publish_log,
+                    )
+                    .await;
+                    if stored.count == 1 {
+                        Ok(artifacts::key_for(&root, &generated))
+                    } else {
+                        Err(stored.problems.join("; "))
+                    }
+                })
+            });
 
         let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
             websock.into_inner(),
@@ -722,7 +790,9 @@ impl VwSyncApi for Agent {
         )
         .await;
 
-        let result = vw_remote::anodize::serve(socket, &ws.root, request).await;
+        let result =
+            vw_remote::anodize::serve(socket, &ws.root, request, Some(publish))
+                .await;
 
         match &result {
             Ok(()) => info!(log, "anodization finished"),
