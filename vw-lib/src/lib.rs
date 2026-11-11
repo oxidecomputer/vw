@@ -78,8 +78,8 @@ pub fn cargo_command() -> std::process::Command {
 
 /// Workspace-relative directory for vw's own testbench simulation build (the
 /// nvc `work` + dependency libraries). Kept under `target/` so all generated
-/// output lives there. (anodizer's separate build is under each variant's
-/// build directory — see [`anodized_dir`].)
+/// output lives there. (anodizer's separate build is `target/anodizer` —
+/// see [`anodized_dir`].)
 pub const BUILD_DIR: &str = "target/sim";
 
 // ============================================================================
@@ -3855,10 +3855,9 @@ pub fn bench_output_dir(workspace_dir: &Utf8Path, name: &str) -> Utf8PathBuf {
 ///
 /// A crate pulls the generated types in with
 /// `include!(concat!(env!("VW_ANODIZED_DIR"), "/hdl.rs"))`. Named rather than
-/// reached by a relative path into `target/` because the output is per
-/// variant, which no path written into a source file can choose, and because
-/// a crate built outside vw then fails by naming the variable — which points
-/// at vw — rather than with a missing file nobody wrote.
+/// reached by a relative path into `target/` so a crate built outside vw fails
+/// by naming the variable — which points at vw — rather than with a missing
+/// file nobody wrote.
 pub const ANODIZED_ENV: &str = "VW_ANODIZED_DIR";
 
 /// The file anodizer's output is written to, inside [`anodized_dir`].
@@ -3875,71 +3874,92 @@ const ANODIZED_FINGERPRINT_PREFIX: &str = "// vw-anodized-fingerprint: ";
 /// Mixed into every fingerprint, so output written in an older shape is
 /// regenerated rather than trusted. Bump when what anodizer emits changes in
 /// a way a consumer can see.
-const ANODIZED_FORMAT: &[u8] = b"anodized/2: module per package";
+const ANODIZED_FORMAT: &[u8] = b"anodized/3: one for every variant";
 
-/// The variant anodization is done for: the one named, or the workspace's
-/// default. `None` in a workspace without variants.
-fn anodize_variant(
-    workspace_dir: &Utf8Path,
-    variant: Option<&str>,
-) -> Option<String> {
-    resolve_active_variant(workspace_dir, variant)
+/// Where anodization keeps everything: the nvc scratch build and the
+/// generated Rust. `target/anodizer`, whatever variants the workspace has.
+///
+/// One for the workspace, not one per variant, because a workspace has one
+/// driver. The HDL is built per board; the driver that talks to every board
+/// is built once, against one set of types. A board whose hardware differs
+/// enough to need different types gives them different names (a
+/// `versal_pci_desc` package beside a `kintex_pci_desc`), and both land here.
+/// `anodizer` is a reserved target name, so no variant's build directory can
+/// be this.
+fn anodizer_dir(workspace_dir: &Utf8Path) -> Utf8PathBuf {
+    workspace_dir.join("target").join("anodizer")
 }
 
-/// Where anodization keeps everything for one variant: the nvc scratch build
-/// and the generated Rust. `target/<variant>/anodizer`, or `target/anodizer`
-/// without variants.
-fn anodizer_dir(
-    workspace_dir: &Utf8Path,
-    variant: Option<&str>,
-) -> Utf8PathBuf {
-    let variant = anodize_variant(workspace_dir, variant);
-    build_dir(workspace_dir, variant.as_deref()).join("anodizer")
+/// The directory [`ANODIZED_ENV`] names.
+pub fn anodized_dir(workspace_dir: &Utf8Path) -> Utf8PathBuf {
+    anodizer_dir(workspace_dir).join("gen")
 }
 
-/// The directory [`ANODIZED_ENV`] names for a variant.
-pub fn anodized_dir(
-    workspace_dir: &Utf8Path,
-    variant: Option<&str>,
-) -> Utf8PathBuf {
-    anodizer_dir(workspace_dir, variant).join("gen")
+/// The generated Rust.
+pub fn anodized_path(workspace_dir: &Utf8Path) -> Utf8PathBuf {
+    anodized_dir(workspace_dir).join(ANODIZED_FILE)
 }
 
-/// The generated Rust for a variant.
-pub fn anodized_path(
-    workspace_dir: &Utf8Path,
-    variant: Option<&str>,
-) -> Utf8PathBuf {
-    anodized_dir(workspace_dir, variant).join(ANODIZED_FILE)
-}
-
-/// What the generated Rust is made from: the variant's design sources, in a
+/// What the generated Rust is made from: every variant's design sources, in a
 /// fixed order, and the workspace manifest and lockfile that pin the
 /// dependencies those sources are analysed against.
 ///
-/// Deliberately cheap and local — no dependency fetch, no generated IP — so
-/// any instance holding the workspace can work it out. The helios instance
-/// checks the output it was handed against this before building with it.
-fn anodize_inputs(
-    workspace_dir: &Utf8Path,
-    variant: Option<&str>,
-) -> Result<Vec<PathBuf>> {
-    let variant = anodize_variant(workspace_dir, variant);
-    let mut files =
-        vhdl_design_sources_for_variant(workspace_dir, variant.as_deref())?;
+/// Every variant's, because the output is the one set of types the driver is
+/// built against — see [`anodizer_dir`]. Deliberately cheap and local — no
+/// dependency fetch, no generated IP — so any instance holding the workspace
+/// can work it out. The helios instance checks the output it was handed
+/// against this before building with it.
+fn anodize_inputs(workspace_dir: &Utf8Path) -> Result<Vec<PathBuf>> {
+    let mut files = vhdl_design_sources_all_variants(workspace_dir)?;
     files.sort();
     files.dedup();
     Ok(files)
 }
 
-/// The fingerprint anodizer's output for this variant has to carry to be
-/// current, or `None` when nothing in the design is tagged and there is
-/// nothing to generate.
-pub fn anodize_fingerprint(
-    workspace_dir: &Utf8Path,
-    variant: Option<&str>,
-) -> Result<Option<u64>> {
-    let files = anodize_inputs(workspace_dir, variant)?;
+/// What the anodizer analyses: every variant's design sources as one library,
+/// and the dependencies'.
+///
+/// Not [`render_vhdl_ls_config`], which is one variant's view and includes
+/// the IP Vivado generated for it. Generated IP is per board and only exists
+/// once Vivado has run, and the types a driver is built against can depend on
+/// neither. The anodizer starts from the tagged files and follows what they
+/// use, so another board's top level costs nothing; a package defined once
+/// per board, and used by a tagged type, is refused rather than guessed at.
+fn anodize_config(workspace_dir: &Utf8Path) -> Result<VhdlLsConfig> {
+    let mut libraries: HashMap<String, VhdlLsLibrary> = HashMap::new();
+    let design = anodize_inputs(workspace_dir)?;
+    if !design.is_empty() {
+        libraries.insert(
+            "defaultlib".to_string(),
+            VhdlLsLibrary {
+                files: design,
+                exclude: None,
+                is_third_party: None,
+            },
+        );
+    }
+    for src in vhdl_dependency_sources_ext(workspace_dir, true, false)? {
+        libraries
+            .entry(src.library)
+            .or_insert_with(|| VhdlLsLibrary {
+                files: Vec::new(),
+                exclude: None,
+                is_third_party: Some(true),
+            })
+            .files
+            .push(src.path);
+    }
+    Ok(VhdlLsConfig {
+        standard: Some("2019".to_string()),
+        libraries,
+        lint: None,
+    })
+}
+
+/// The fingerprint anodizer's output has to carry to be current, or `None`
+/// when nothing in the design is tagged and there is nothing to generate.
+pub fn anodize_fingerprint(workspace_dir: &Utf8Path) -> Result<Option<u64>> {
+    let files = anodize_inputs(workspace_dir)?;
     if tagged_sources(&files) == 0 {
         return Ok(None);
     }
@@ -3981,16 +4001,12 @@ pub enum Anodized {
     },
 }
 
-/// Check, without generating anything, whether anodizer's output for this
-/// variant is current.
-pub fn anodized_status(
-    workspace_dir: &Utf8Path,
-    variant: Option<&str>,
-) -> Result<Anodized> {
-    let Some(expected) = anodize_fingerprint(workspace_dir, variant)? else {
+/// Check, without generating anything, whether anodizer's output is current.
+pub fn anodized_status(workspace_dir: &Utf8Path) -> Result<Anodized> {
+    let Some(expected) = anodize_fingerprint(workspace_dir)? else {
         return Ok(Anodized::Untagged);
     };
-    let path = anodized_path(workspace_dir, variant);
+    let path = anodized_path(workspace_dir);
     let found = fs::read_to_string(&path)
         .ok()
         .and_then(|text| anodized_fingerprint_of(&text));
@@ -4019,7 +4035,7 @@ pub fn bench_cargo_command(crate_dir: &Path) -> std::process::Command {
     let mut command = cargo_command();
     command.current_dir(crate_dir);
     if let Some(workspace) = find_workspace_dir(crate_dir) {
-        command.env(ANODIZED_ENV, anodized_dir(&workspace, None));
+        command.env(ANODIZED_ENV, anodized_dir(&workspace));
     }
     command
 }
@@ -4144,13 +4160,12 @@ pub fn uses_anodized(crate_dirs: &[Utf8PathBuf]) -> bool {
 /// Detection is two-stage: (1) skip entirely when no design source carries the
 /// `serialize_rust` attribute; (2) otherwise regenerate only when the
 /// fingerprint the output carries differs from the sources'. Everything lands
-/// under the variant's build directory (see [`anodized_dir`]).
+/// in `target/anodizer` (see [`anodized_dir`]).
 pub async fn ensure_anodized(
     workspace_dir: &Utf8Path,
     vhdl_std: VhdlStandard,
-    active_variant: Option<&str>,
 ) -> Result<()> {
-    anodize(workspace_dir, vhdl_std, active_variant, Freshness::IfStale)
+    anodize(workspace_dir, vhdl_std, Freshness::IfStale)
         .await
         .map(|_| ())
 }
@@ -4198,11 +4213,8 @@ pub struct AnodizeReport {
 /// itself on — and worth having separately so a caller can say what is about
 /// to happen *before* it happens. A pass that fails is exactly when knowing
 /// how much it was looking at matters most.
-pub fn anodize_scope(
-    workspace_dir: &Utf8Path,
-    active_variant: Option<&str>,
-) -> Result<(usize, usize)> {
-    let files = anodize_inputs(workspace_dir, active_variant)?;
+pub fn anodize_scope(workspace_dir: &Utf8Path) -> Result<(usize, usize)> {
+    let files = anodize_inputs(workspace_dir)?;
     let tagged = tagged_sources(&files);
     Ok((files.len(), tagged))
 }
@@ -4228,13 +4240,9 @@ fn tagged_sources(files: &[PathBuf]) -> usize {
 pub async fn anodize(
     workspace_dir: &Utf8Path,
     vhdl_std: VhdlStandard,
-    active_variant: Option<&str>,
     freshness: Freshness,
 ) -> Result<AnodizeReport> {
-    let variant = anodize_variant(workspace_dir, active_variant);
-    let variant = variant.as_deref();
-
-    let (sources, tagged) = anodize_scope(workspace_dir, variant)?;
+    let (sources, tagged) = anodize_scope(workspace_dir)?;
     let mut report = AnodizeReport {
         sources,
         tagged,
@@ -4242,7 +4250,7 @@ pub async fn anodize(
     };
 
     // Stage 1: cheap gate — is anything tagged for serialization at all?
-    let status = anodized_status(workspace_dir, variant)?;
+    let status = anodized_status(workspace_dir)?;
     let (path, fingerprint) = match status {
         Anodized::Untagged => return Ok(report),
         // Stage 2: regenerate only when the design sources changed.
@@ -4260,8 +4268,8 @@ pub async fn anodize(
         Anodized::Stale { path, expected, .. } => (path, expected),
     };
 
-    let config = render_vhdl_ls_config(workspace_dir, variant, false)?;
-    let build_dir = anodizer_dir(workspace_dir, variant).join("build");
+    let config = anodize_config(workspace_dir)?;
+    let build_dir = anodizer_dir(workspace_dir).join("build");
     let rust = anodizer::anodize(&config, &build_dir, vhdl_std).await?;
     let stamped = stamp_anodized(fingerprint, &rust);
 
@@ -10752,19 +10760,14 @@ exclusive = ["hdl/top-beta.vhd"]
         std::fs::write(path, contents).unwrap();
     }
 
+    /// One output for the workspace, whatever variants it has: there is one
+    /// driver.
     #[test]
-    fn output_lives_under_each_variants_build_dir() {
+    fn output_is_one_for_the_workspace() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ws = ws(&tmp);
-        assert_eq!(
-            anodized_path(&ws, Some("beta")),
-            ws.join("target/beta/anodizer/gen/hdl.rs")
-        );
-        // No variant named means the default one, not a shared location.
-        assert_eq!(
-            anodized_dir(&ws, None),
-            ws.join("target/alpha/anodizer/gen")
-        );
+        assert_eq!(anodized_path(&ws), ws.join("target/anodizer/gen/hdl.rs"));
+        assert!(RESERVED_TARGET_NAMES.contains(&"anodizer"));
     }
 
     #[test]
@@ -10773,36 +10776,49 @@ exclusive = ["hdl/top-beta.vhd"]
         let ws = ws(&tmp);
         std::fs::write(ws.join("hdl/ring.vhd"), "package ring is end;\n")
             .unwrap();
-        assert_eq!(anodize_fingerprint(&ws, None).unwrap(), None);
-        assert_eq!(anodized_status(&ws, None).unwrap(), Anodized::Untagged);
+        assert_eq!(anodize_fingerprint(&ws).unwrap(), None);
+        assert_eq!(anodized_status(&ws).unwrap(), Anodized::Untagged);
+    }
+
+    /// A record tagged only in one variant's exclusive file is still
+    /// generated: the driver serves that board too.
+    #[test]
+    fn a_tag_in_one_variants_file_counts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = ws(&tmp);
+        std::fs::write(ws.join("hdl/ring.vhd"), "package ring is end;\n")
+            .unwrap();
+        std::fs::write(
+            ws.join("hdl/top-beta.vhd"),
+            "package beta_desc is\n  attribute serialize_rust : boolean;\n\
+             end package;\n",
+        )
+        .unwrap();
+        assert_eq!(anodize_scope(&ws).unwrap(), (3, 1));
+        assert!(anodize_fingerprint(&ws).unwrap().is_some());
     }
 
     /// The fingerprint is what lets the helios instance trust output it did
-    /// not generate, so it has to follow the variant's sources and nothing
-    /// else.
+    /// not generate, so it has to follow every variant's sources.
     #[test]
-    fn the_fingerprint_follows_the_variants_sources() {
+    fn the_fingerprint_follows_every_variants_sources() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ws = ws(&tmp);
-        let alpha = anodize_fingerprint(&ws, Some("alpha")).unwrap().unwrap();
-        let beta = anodize_fingerprint(&ws, Some("beta")).unwrap().unwrap();
-        assert_ne!(alpha, beta, "each variant has its own top");
+        let before = anodize_fingerprint(&ws).unwrap().unwrap();
 
-        // Another variant's exclusive file is not an input.
         std::fs::write(ws.join("hdl/top-beta.vhd"), "-- beta, changed\n")
             .unwrap();
-        assert_eq!(
-            anodize_fingerprint(&ws, Some("alpha")).unwrap(),
-            Some(alpha)
-        );
-        assert_ne!(anodize_fingerprint(&ws, Some("beta")).unwrap(), Some(beta));
+        let after_beta = anodize_fingerprint(&ws).unwrap().unwrap();
+        assert_ne!(before, after_beta);
 
-        // The dependency pins are.
+        std::fs::write(ws.join("hdl/top-alpha.vhd"), "-- alpha, changed\n")
+            .unwrap();
+        let after_alpha = anodize_fingerprint(&ws).unwrap().unwrap();
+        assert_ne!(after_beta, after_alpha);
+
+        // The dependency pins are inputs too.
         std::fs::write(ws.join("vw.lock"), "# changed\n").unwrap();
-        assert_ne!(
-            anodize_fingerprint(&ws, Some("alpha")).unwrap(),
-            Some(alpha)
-        );
+        assert_ne!(anodize_fingerprint(&ws).unwrap(), Some(after_alpha));
     }
 
     /// Two copies of the same workspace — one per instance — agree.
@@ -10811,20 +10827,37 @@ exclusive = ["hdl/top-beta.vhd"]
         let one = tempfile::TempDir::new().unwrap();
         let two = tempfile::TempDir::new().unwrap();
         assert_eq!(
-            anodize_fingerprint(&ws(&one), Some("beta")).unwrap(),
-            anodize_fingerprint(&ws(&two), Some("beta")).unwrap(),
+            anodize_fingerprint(&ws(&one)).unwrap(),
+            anodize_fingerprint(&ws(&two)).unwrap(),
         );
+    }
+
+    /// Generated IP is per board and only exists once Vivado has run; the
+    /// driver's types can depend on neither.
+    #[test]
+    fn the_anodizer_sees_every_variant_and_no_generated_ip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = ws(&tmp);
+        write(&ws.join("target/alpha/ip/wrapper.vhd"), "-- ip\n");
+        let config = anodize_config(&ws).unwrap();
+        let mut names: Vec<_> = config.libraries.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, vec!["defaultlib".to_string()]);
+        let files = &config.libraries["defaultlib"].files;
+        for top in ["top-alpha.vhd", "top-beta.vhd", "ring.vhd"] {
+            assert!(files.iter().any(|f| f.ends_with(top)), "{top}");
+        }
     }
 
     #[test]
     fn output_is_current_only_when_its_stamp_matches() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ws = ws(&tmp);
-        let path = anodized_path(&ws, Some("beta"));
-        let expected = anodize_fingerprint(&ws, Some("beta")).unwrap().unwrap();
+        let path = anodized_path(&ws);
+        let expected = anodize_fingerprint(&ws).unwrap().unwrap();
 
         assert_eq!(
-            anodized_status(&ws, Some("beta")).unwrap(),
+            anodized_status(&ws).unwrap(),
             Anodized::Stale {
                 path: path.clone(),
                 expected,
@@ -10834,7 +10867,7 @@ exclusive = ["hdl/top-beta.vhd"]
 
         write(&path, &stamp_anodized(expected ^ 1, "pub mod ring {}\n"));
         assert_eq!(
-            anodized_status(&ws, Some("beta")).unwrap(),
+            anodized_status(&ws).unwrap(),
             Anodized::Stale {
                 path: path.clone(),
                 expected,
@@ -10844,17 +10877,12 @@ exclusive = ["hdl/top-beta.vhd"]
 
         write(&path, &stamp_anodized(expected, "pub mod ring {}\n"));
         assert_eq!(
-            anodized_status(&ws, Some("beta")).unwrap(),
+            anodized_status(&ws).unwrap(),
             Anodized::Current {
                 path: path.clone(),
                 fingerprint: expected
             }
         );
-        // And only for its own variant.
-        assert!(matches!(
-            anodized_status(&ws, Some("alpha")).unwrap(),
-            Anodized::Stale { .. }
-        ));
     }
 
     #[test]

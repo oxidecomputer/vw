@@ -241,15 +241,6 @@
               "nullable": true,
               "type": "string"
             }
-          },
-          {
-            "in": "query",
-            "name": "variant",
-            "description": "The variant to anodize for. Absent means the workspace's default.",
-            "schema": {
-              "nullable": true,
-              "type": "string"
-            }
           }
         ],
         "responses": {
@@ -566,7 +557,7 @@
           {
             "in": "query",
             "name": "args",
-            "description": "Anything else to put on cargo's command line, separated by spaces.\n\nSplit on whitespace at the far end; see [`v1::DriverBuildQuery`].",
+            "description": "Anything else to put on cargo's command line, separated by spaces.\n\nOne string because a query parameter has to be scalar. Split on whitespace at the far end, so a value containing a space cannot be expressed — no flag the driver build needs has one, and the alternative is reimplementing half a shell's quoting rules.",
             "schema": {
               "nullable": true,
               "type": "string"
@@ -578,15 +569,6 @@
             "description": "Build with optimizations.",
             "schema": {
               "type": "boolean"
-            }
-          },
-          {
-            "in": "query",
-            "name": "variant",
-            "description": "The variant whose anodizer output the driver builds against. Absent means the workspace's default.",
-            "schema": {
-              "nullable": true,
-              "type": "string"
             }
           }
         ],

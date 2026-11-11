@@ -35,7 +35,7 @@ dependencies = [
 [[package]]
 name = "anodizer"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/anodizer?branch=ry%2Fanodize-phase#1454a6a22e2af041eda4d71c7d85f242b527cd8e"
+source = "git+https://github.com/oxidecomputer/anodizer?branch=ry%2Fanodize-phase#829d38b42e78af460fd845571fddcd4b729cd921"
 dependencies = [
  "camino",
  "clap",

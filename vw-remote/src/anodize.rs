@@ -40,9 +40,6 @@ pub struct AnodizeRequest {
     pub bench: Option<String>,
     /// The VHDL standard, as `nvc` spells it.
     pub standard: String,
-    /// The variant to anodize for. Absent means the workspace's default.
-    #[serde(default)]
-    pub variant: Option<String>,
     /// Regenerate even when the output is already current.
     ///
     /// What working on the anodizer wants. A build — `vw anodize`, or the
@@ -205,8 +202,7 @@ pub async fn run(
     // Said before the generator runs, not after: a pass that fails is exactly
     // when knowing how much it was looking at matters, and a report that only
     // arrives on success cannot say it then.
-    let variant = request.variant.as_deref();
-    let (sources, tagged) = match vw_lib::anodize_scope(root, variant) {
+    let (sources, tagged) = match vw_lib::anodize_scope(root) {
         Ok(scope) => scope,
         Err(e) => {
             let _ = events.send(AnodizeEvent::Fatal {
@@ -227,8 +223,7 @@ pub async fn run(
     } else {
         vw_lib::Freshness::IfStale
     };
-    let report = match vw_lib::anodize(root, standard, variant, freshness).await
-    {
+    let report = match vw_lib::anodize(root, standard, freshness).await {
         Ok(report) => report,
         Err(e) => {
             let _ = events.send(AnodizeEvent::Fatal {
@@ -274,7 +269,7 @@ pub async fn run(
         return;
     };
 
-    let success = build_bench(root, bench, variant, &events).await;
+    let success = build_bench(root, bench, &events).await;
     if success && !refers_to_generated(root, bench) {
         let _ = events.send(AnodizeEvent::NotExercised {
             bench: bench.to_string(),
@@ -357,7 +352,6 @@ fn mentions_generated(crate_dir: &Utf8Path) -> bool {
 async fn build_bench(
     root: &Utf8Path,
     bench: &str,
-    variant: Option<&str>,
     events: &tokio::sync::mpsc::UnboundedSender<AnodizeEvent>,
 ) -> bool {
     let crate_dir = root.join("bench").join(bench);
@@ -378,9 +372,7 @@ async fn build_bench(
     command
         .arg("build")
         .current_dir(crate_dir.as_std_path())
-        // The variant just anodized, which is not necessarily the default
-        // one `vw_lib::bench_cargo_command` would choose.
-        .env(vw_lib::ANODIZED_ENV, vw_lib::anodized_dir(root, variant))
+        .env(vw_lib::ANODIZED_ENV, vw_lib::anodized_dir(root))
         // Cargo colours its output when it believes it is talking to a
         // terminal, and over a socket it does not. Asking for it anyway is
         // what makes a remote build read like a local one.

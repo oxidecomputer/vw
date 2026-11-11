@@ -52,8 +52,6 @@ pub struct Options<'a> {
     /// A bench to compile against the result, for `vw cosim anodize`.
     pub bench: Option<&'a str>,
     pub standard: vw_lib::VhdlStandard,
-    /// The variant to anodize for; the workspace's default when absent.
-    pub variant: Option<&'a str>,
     /// Regenerate even output that is already current.
     pub force: bool,
 }
@@ -75,7 +73,6 @@ pub async fn run(
             options.bench,
             Some(options.force),
             Some(standard.as_str()),
-            options.variant,
         )
     })
     .await
@@ -119,7 +116,6 @@ pub async fn run_locally(
     let request = vw_remote::AnodizeRequest {
         bench: options.bench.map(str::to_owned),
         standard: options.standard.to_string(),
-        variant: options.variant.map(str::to_owned),
         force: options.force,
     };
 

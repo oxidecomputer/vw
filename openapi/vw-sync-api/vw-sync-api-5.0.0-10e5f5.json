@@ -134,15 +134,6 @@
               "nullable": true,
               "type": "string"
             }
-          },
-          {
-            "in": "query",
-            "name": "variant",
-            "description": "The variant to anodize for. Absent means the workspace's default.",
-            "schema": {
-              "nullable": true,
-              "type": "string"
-            }
           }
         ],
         "responses": {
@@ -453,15 +444,6 @@
             "description": "Build with optimizations.",
             "schema": {
               "type": "boolean"
-            }
-          },
-          {
-            "in": "query",
-            "name": "variant",
-            "description": "The variant whose anodizer output the driver builds against. Absent means the workspace's default.",
-            "schema": {
-              "nullable": true,
-              "type": "string"
             }
           }
         ],

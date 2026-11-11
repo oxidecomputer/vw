@@ -409,7 +409,6 @@ impl Agent {
                 query.anodized_bucket.as_deref(),
                 query.args.as_deref(),
                 Some(query.release),
-                query.variant.as_deref(),
             )
             .await
             .map_err(|e| self.failed(e))?
@@ -434,7 +433,6 @@ impl Agent {
                 query.bench.as_deref(),
                 Some(query.force),
                 query.standard.as_deref(),
-                query.variant.as_deref(),
             )
             .await
             .map_err(|e| self.failed(e))?

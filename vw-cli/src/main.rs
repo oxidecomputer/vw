@@ -161,14 +161,6 @@ enum DriverCommand {
         #[arg(long, help = "Build with optimizations")]
         release: bool,
         #[arg(
-            long,
-            value_name = "NAME",
-            help = "The `[[workspace.variants]]` entry whose anodizer output \
-                    the driver is built against. Defaults to the workspace's \
-                    default variant."
-        )]
-        variant: Option<String>,
-        #[arg(
             trailing_var_arg = true,
             help = "Further arguments for cargo, e.g. `-p module`"
         )]
@@ -511,9 +503,13 @@ enum Commands {
         about = "Generate Rust for the design's `serialize_rust` types, and \
                  publish it to the cloud environment",
         long_about = "Run the anodizer over the design's \
-                      `serialize_rust`-tagged VHDL for one variant, on the \
-                      environment's vivado instance, and publish what it \
-                      generates to the environment's artifact store.\n\n\
+                      `serialize_rust`-tagged VHDL, on the environment's \
+                      vivado instance, and publish what it generates to the \
+                      environment's artifact store.\n\n\
+                      One output for the whole workspace, from every \
+                      variant's sources: a workspace builds many variants of \
+                      the HDL but one driver. Types that differ between \
+                      boards belong in differently named packages.\n\n\
                       Skipped when the published output is already current. \
                       `vw driver build` and `vw bench run` do this themselves \
                       when they need to; this is the same step on its own, \
@@ -524,13 +520,6 @@ enum Commands {
                       `include!(concat!(env!(\"VW_ANODIZED_DIR\"), \"/hdl.rs\"))`."
     )]
     Anodize {
-        #[arg(
-            long,
-            value_name = "NAME",
-            help = "The `[[workspace.variants]]` entry to anodize for. \
-                    Defaults to the workspace's default variant."
-        )]
-        variant: Option<String>,
         #[arg(
             long,
             help = "Regenerate even when the output is already current"
@@ -1191,7 +1180,6 @@ async fn main() {
             }
         }
         Commands::Anodize {
-            variant,
             force,
             local,
             env,
@@ -1202,7 +1190,6 @@ async fn main() {
             let options = anodize::Options {
                 bench: None,
                 standard: std.into(),
-                variant: variant.as_deref(),
                 force,
             };
             match anodize(&cwd, &options, local, env.as_deref(), insecure).await
@@ -1221,7 +1208,6 @@ async fn main() {
                 env,
                 insecure,
                 release,
-                variant,
                 args,
             } = command;
             match driver_build(
@@ -1230,7 +1216,6 @@ async fn main() {
                 env.as_deref(),
                 insecure,
                 release,
-                variant.as_deref(),
                 &args,
             )
             .await
@@ -1536,7 +1521,6 @@ async fn main() {
             let options = anodize::Options {
                 bench: bench.as_deref(),
                 standard: std.into(),
-                variant: None,
                 force: true,
             };
             match anodize(&cwd, &options, local, env.as_deref(), insecure).await
@@ -4259,18 +4243,18 @@ async fn driver_build(
     named: Option<&str>,
     insecure: bool,
     release: bool,
-    variant: Option<&str>,
     args: &[String],
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let workspace = vw_lib::find_workspace_dir(cwd.as_std_path())
         .ok_or("no vw workspace here; run this from one, or from a directory inside it")?;
 
-    // A driver that includes anodizer's output is built against the output
-    // for one variant, which has to be current first. Anodizing is its own
+    // A driver that includes anodizer's output is built against it, so it
+    // has to be current first. One output for every variant: there is one
+    // driver. Anodizing is its own
     // phase — `vw anodize` — and this runs it when the driver needs it rather
     // than leaving a developer to remember; it costs a fingerprint when
     // nothing has changed.
-    let anodized = driver::needs_anodized(&workspace, variant)?;
+    let anodized = driver::needs_anodized(&workspace)?;
     if anodized {
         ensure_workspace_deps(cwd).await;
     }
@@ -4291,7 +4275,6 @@ async fn driver_build(
             let options = anodize::Options {
                 bench: None,
                 standard: vw_lib::VhdlStandard::Vhdl2019,
-                variant,
                 force: false,
             };
             if !anodize::run(&session, &target, &options).await? {
@@ -4299,20 +4282,14 @@ async fn driver_build(
             }
         }
 
-        return Ok(
-            driver::build(&session, &target, release, variant, args).await?
-        );
+        return Ok(driver::build(&session, &target, release, args).await?);
     }
 
     if anodized {
-        vw_lib::ensure_anodized(
-            &workspace,
-            vw_lib::VhdlStandard::Vhdl2019,
-            variant,
-        )
-        .await?;
+        vw_lib::ensure_anodized(&workspace, vw_lib::VhdlStandard::Vhdl2019)
+            .await?;
     }
-    Ok(driver::build_locally(&workspace, release, variant, args).await?)
+    Ok(driver::build_locally(&workspace, release, args).await?)
 }
 
 /// Remove build output, wherever this workspace builds.
@@ -5276,8 +5253,8 @@ mod env_flag_tests {
             vec!["vw", "repl"],
             vec!["vw", "driver", "build"],
             vec!["vw", "anodize"],
-            vec!["vw", "anodize", "--variant", "metro"],
-            vec!["vw", "driver", "build", "--variant", "metro", "--release"],
+            vec!["vw", "anodize", "--force"],
+            vec!["vw", "driver", "build", "--release"],
         ] {
             let cli = Cli::try_parse_from(&argv).expect("should parse");
             assert_eq!(

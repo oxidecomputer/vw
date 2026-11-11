@@ -45,14 +45,7 @@ use vw_api_types_versions::latest::S3Credentials;
 /// from the same implementation as the `pdi`. `ila` holds the captures taken
 /// from those cores on a board, each as a CSV and as the `.ila` archive the
 /// Hardware Manager reopens as a waveform.
-///
-/// `anodizer/gen` holds the Rust anodizer generates from the design's
-/// `serialize_rust` types — small, but the helios instance builds the driver
-/// against it, and the store is how it gets there. Kept here as well as being
-/// published by `vw anodize` so that output a bench run regenerated reaches
-/// the store too, rather than only output somebody asked to publish.
-const GATHERED: [(&str, &str); 12] = [
-    ("anodizer/gen", "rs"),
+const GATHERED: [(&str, &str); 11] = [
     ("image", "pdi"),
     ("image", "ltx"),
     ("ila", "csv"),
@@ -65,6 +58,17 @@ const GATHERED: [(&str, &str); 12] = [
     ("place", "xdc"),
     ("route", "xdc"),
 ];
+
+/// The Rust anodizer generates from the design's `serialize_rust` types, and
+/// its extension.
+///
+/// Small, but the helios instance builds the driver against it, and the store
+/// is how it gets there. One for the workspace rather than one per variant —
+/// a workspace has one driver — so it sits beside the variants' build
+/// directories, not in them. Kept here as well as being published by
+/// `vw anodize` so that output a bench run regenerated reaches the store too,
+/// rather than only output somebody asked to publish.
+const GATHERED_ANODIZED: (&str, &str) = ("anodizer/gen", "rs");
 
 /// Where a testbench leaves its results, and what to keep.
 ///
@@ -523,11 +527,15 @@ fn artifacts(root: &Utf8Path) -> Vec<Found> {
     // Every variant's build, keyed by its path under `target` — so each
     // variant's image and reports are their own objects (`vpk120/image/…`)
     // rather than overwriting another variant's of the same name.
-    let gathered = vw_lib::build_dirs(root).into_iter().flat_map(|build| {
-        GATHERED.iter().map(move |(directory, extension)| {
-            (build.join(directory), *extension)
+    let (anodized, anodized_extension) = GATHERED_ANODIZED;
+    let gathered = vw_lib::build_dirs(root)
+        .into_iter()
+        .flat_map(|build| {
+            GATHERED.iter().map(move |(directory, extension)| {
+                (build.join(directory), *extension)
+            })
         })
-    });
+        .chain(std::iter::once((output.join(anodized), anodized_extension)));
     for (source, extension) in gathered {
         let Some(prefix) =
             source.strip_prefix(&output).ok().map(Utf8Path::to_owned)

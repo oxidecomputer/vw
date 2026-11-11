@@ -457,13 +457,11 @@ impl VwUserApi for UserApi {
             "environment" => &name,
             "user" => &caller.name,
             "release" => query.release,
-            "variant" => query.variant.as_deref().unwrap_or("-"),
         );
 
         let query = vw_api_types_versions::latest::AgentDriverBuildQuery {
             release: query.release,
             args: query.args,
-            variant: query.variant,
             anodized_bucket,
         };
         let result = agent.join_driver_build(websock, &query).await;
@@ -536,7 +534,6 @@ impl VwUserApi for UserApi {
             "environment" => &name,
             "user" => &caller.name,
             "bench" => query.bench.as_deref().unwrap_or("-"),
-            "variant" => query.variant.as_deref().unwrap_or("-"),
             "force" => query.force,
         );
 

@@ -24,16 +24,15 @@ use vw_remote::Prepared;
 
 use crate::artifacts;
 
-/// Make anodizer's output for `variant` available to the driver build, if the
-/// driver uses it, and say how cargo finds it.
+/// Make anodizer's output available to the driver build, if the driver uses
+/// it, and say how cargo finds it.
 pub(crate) async fn prepare(
     root: &Utf8Path,
-    variant: Option<&str>,
     credentials: Option<S3Credentials>,
     bucket: Option<String>,
     log: &Logger,
 ) -> Result<Prepared, String> {
-    let dir = vw_lib::anodized_dir(root, variant);
+    let dir = vw_lib::anodized_dir(root);
     let env = vec![(vw_lib::ANODIZED_ENV.to_owned(), dir.to_string())];
 
     // Only a driver that includes the output needs it. Asking every driver to
@@ -50,16 +49,14 @@ pub(crate) async fn prepare(
         });
     }
 
-    let which = describe(variant);
-    let rerun = rerun(variant);
-
-    let status = vw_lib::anodized_status(root, variant)
-        .map_err(|e| format!("cannot work out what {which} needs: {e}"))?;
+    let status = vw_lib::anodized_status(root).map_err(|e| {
+        format!("cannot work out what anodizer output the driver needs: {e}")
+    })?;
     let path = match status {
         Anodized::Untagged => {
             return Err(format!(
                 "the driver includes anodizer's output (it names \
-                 `{}`), but nothing in the design for {which} is tagged \
+                 `{}`), but nothing in the design is tagged \
                  `serialize_rust`, so there is nothing to include",
                 vw_lib::ANODIZED_ENV
             ))
@@ -68,7 +65,7 @@ pub(crate) async fn prepare(
             return Ok(Prepared {
                 env,
                 notes: vec![format!(
-                    "anodizer output for {which}: current ({fingerprint:016x})"
+                    "anodizer output: current ({fingerprint:016x})"
                 )],
             })
         }
@@ -76,10 +73,9 @@ pub(crate) async fn prepare(
     };
 
     let (Some(mut credentials), Some(bucket)) = (credentials, bucket) else {
-        return Err(format!(
-            "the driver needs anodizer output for {which}, and this instance \
-             has not been told where the environment's artifact store is to \
-             fetch it from"
+        return Err(String::from(
+            "the driver needs anodizer output, and this instance has not been \
+             told where the environment's artifact store is to fetch it from",
         ));
     };
     credentials.bucket = bucket;
@@ -88,24 +84,24 @@ pub(crate) async fn prepare(
     match artifacts::download(&credentials, &key, &path).await {
         Ok(true) => {}
         Ok(false) => {
-            return Err(format!(
-                "the driver needs anodizer output for {which}, and none has \
-                 been published. `{rerun}` publishes it; `vw driver build` \
-                 runs that first on its own, so if this came from there, the \
-                 anodize step was skipped or failed."
+            return Err(String::from(
+                "the driver needs anodizer output, and none has been \
+                 published. `vw anodize` publishes it; `vw driver build` runs \
+                 that first on its own, so if this came from there, the \
+                 anodize step was skipped or failed.",
             ))
         }
         Err(e) => {
             return Err(format!(
-                "cannot fetch anodizer output for {which} ({key}) from the \
+                "cannot fetch anodizer output ({key}) from the \
                  artifact store: {e}"
             ))
         }
     }
 
-    match vw_lib::anodized_status(root, variant)
-        .map_err(|e| format!("cannot work out what {which} needs: {e}"))?
-    {
+    match vw_lib::anodized_status(root).map_err(|e| {
+        format!("cannot work out what anodizer output the driver needs: {e}")
+    })? {
         Anodized::Current { fingerprint, .. } => {
             info!(log, "fetched anodizer output";
                 "key" => &key,
@@ -114,7 +110,7 @@ pub(crate) async fn prepare(
             Ok(Prepared {
                 env,
                 notes: vec![format!(
-                    "anodizer output for {which}: fetched {key} \
+                    "anodizer output: fetched {key} \
                      ({fingerprint:016x})"
                 )],
             })
@@ -122,29 +118,13 @@ pub(crate) async fn prepare(
         Anodized::Stale {
             expected, found, ..
         } => Err(format!(
-            "the published anodizer output for {which} was made from \
-             different sources than this instance holds (it is {}, the \
-             sources here need {expected:016x}). Sync, then run `{rerun}`.",
+            "the published anodizer output was made from different sources \
+             than this instance holds (it is {}, the sources here need \
+             {expected:016x}). Sync, then run `vw anodize`.",
             found
                 .map(|f| format!("{f:016x}"))
                 .unwrap_or_else(|| String::from("unstamped")),
         )),
         Anodized::Untagged => unreachable!("checked above"),
-    }
-}
-
-/// A variant as a developer would read it in a sentence.
-fn describe(variant: Option<&str>) -> String {
-    match variant {
-        Some(variant) => format!("variant `{variant}`"),
-        None => String::from("the default variant"),
-    }
-}
-
-/// The command that produces the output for `variant`.
-fn rerun(variant: Option<&str>) -> String {
-    match variant {
-        Some(variant) => format!("vw anodize --variant {variant}"),
-        None => String::from("vw anodize"),
     }
 }

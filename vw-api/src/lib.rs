@@ -324,7 +324,7 @@ pub trait VwUserApi {
     #[channel {
         protocol = WEBSOCKETS,
         path = "/environment/{name}/workspace/{workspace}/driver/build",
-        versions = VERSION_ANODIZE_PHASE..,
+        versions = VERSION_WORKSPACES..,
     }]
     async fn driver_build(
         rqctx: RequestContext<Self::Context>,
@@ -332,27 +332,6 @@ pub trait VwUserApi {
         query: Query<latest::DriverBuildQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
-
-    /// Build the driver on an environment's helios instance.
-    ///
-    /// Relayed frame for frame. The driver's target is native there and its
-    /// pinned toolchain is installed there, which is the whole reason the
-    /// build does not happen on a developer's machine.
-    #[channel {
-        operation_id = "driver_build",
-        protocol = WEBSOCKETS,
-        path = "/environment/{name}/workspace/{workspace}/driver/build",
-        versions = VERSION_WORKSPACES..VERSION_ANODIZE_PHASE,
-    }]
-    async fn driver_build_v5(
-        rqctx: RequestContext<Self::Context>,
-        path_params: Path<latest::WorkspacePathParam>,
-        query: Query<v1::DriverBuildQuery>,
-        websock: WebsocketConnection,
-    ) -> WebsocketChannelResult {
-        Self::driver_build(rqctx, path_params, query.map(Into::into), websock)
-            .await
-    }
 
     /// Build the driver on an environment's helios instance.
     ///

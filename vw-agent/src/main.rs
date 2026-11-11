@@ -620,20 +620,12 @@ impl VwSyncApi for Agent {
         // sources this instance holds.
         let prepare: vw_remote::Preparer = {
             let root = ws.root.clone();
-            let variant = query.variant.clone();
             let bucket = query.anodized_bucket.clone();
             let credentials = ws.artifact_target.borrow().clone();
             let log = log.clone();
             Box::new(move || {
                 Box::pin(async move {
-                    anodized::prepare(
-                        &root,
-                        variant.as_deref(),
-                        credentials,
-                        bucket,
-                        &log,
-                    )
-                    .await
+                    anodized::prepare(&root, credentials, bucket, &log).await
                 })
             })
         };
@@ -740,14 +732,12 @@ impl VwSyncApi for Agent {
                 .standard
                 .clone()
                 .unwrap_or_else(|| "2019".to_owned()),
-            variant: query.variant.clone(),
             force: query.force,
         };
 
         info!(log, "anodizing";
             "root" => %ws.root,
             "bench" => request.bench.as_deref().unwrap_or("-"),
-            "variant" => request.variant.as_deref().unwrap_or("-"),
             "force" => request.force,
         );
 

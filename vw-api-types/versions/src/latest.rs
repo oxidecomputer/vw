@@ -39,6 +39,6 @@ pub use crate::v5::WorkspaceListQuery;
 pub use crate::v5::WorkspacePathParam;
 pub use crate::v5::LEGACY_WORKSPACE;
 
+pub use crate::v1::DriverBuildQuery;
 pub use crate::v6::AgentDriverBuildQuery;
 pub use crate::v6::AnodizeQuery;
-pub use crate::v6::DriverBuildQuery;

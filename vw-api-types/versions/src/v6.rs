@@ -1,18 +1,18 @@
 //! Version `ANODIZE_PHASE` of the vw APIs.
 //!
 //! Anodization used to be something that happened on the way to running the
-//! benches, for whichever variant was the default, and the generated Rust
-//! stayed on the instance that ran it. The driver now builds against it too,
-//! on a different instance — so anodization became a phase of its own: done
-//! for a named variant, skipped when its output is already current, and
-//! published to the environment's artifact store for the helios instance to
-//! build with.
+//! benches, and the generated Rust stayed on the instance that ran it. The
+//! driver now builds against it too, on a different instance — so
+//! anodization became a phase of its own: skipped when its output is already
+//! current, and published to the environment's artifact store for the helios
+//! instance to build with.
 //!
-//! Two things changed shape. Anodizing takes a variant and says whether to
-//! regenerate output that is already current; building the driver takes the
-//! variant it is built against. The service tells the helios instance where
-//! the vivado instance's output is kept, which no client gets a say in, so
-//! the instance's own query differs from the developer's.
+//! The output is one for the workspace, not one per variant: a workspace has
+//! many HDL variants but one driver. Anodizing now says whether to regenerate
+//! output that is already current. The service tells the helios instance
+//! where the vivado instance's output is kept, which no client gets a say in,
+//! so the instance's own driver query differs from the developer's, which is
+//! unchanged.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -31,9 +31,6 @@ pub struct AnodizeQuery {
     /// its own default.
     #[serde(default)]
     pub standard: Option<String>,
-    /// The variant to anodize for. Absent means the workspace's default.
-    #[serde(default)]
-    pub variant: Option<String>,
     /// Regenerate even when the output is already current.
     ///
     /// Off for a build, which only needs the output to be current. On for
@@ -44,58 +41,19 @@ pub struct AnodizeQuery {
 
 impl From<v4::AnodizeQuery> for AnodizeQuery {
     /// What a client from before this version asked for: `vw cosim anodize`,
-    /// which always regenerated, for the default variant.
+    /// which always regenerated.
     fn from(old: v4::AnodizeQuery) -> Self {
         AnodizeQuery {
             bench: old.bench,
             standard: old.standard,
-            variant: None,
             force: true,
-        }
-    }
-}
-
-/// How to build the driver.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
-pub struct DriverBuildQuery {
-    /// Build with optimizations.
-    #[serde(default)]
-    pub release: bool,
-    /// Anything else to put on cargo's command line, separated by spaces.
-    ///
-    /// Split on whitespace at the far end; see [`v1::DriverBuildQuery`].
-    #[serde(default)]
-    pub args: Option<String>,
-    /// The variant whose anodizer output the driver builds against. Absent
-    /// means the workspace's default.
-    #[serde(default)]
-    pub variant: Option<String>,
-}
-
-impl DriverBuildQuery {
-    /// The extra arguments, as cargo will receive them.
-    pub fn arguments(&self) -> Vec<String> {
-        v1::DriverBuildQuery {
-            release: self.release,
-            args: self.args.clone(),
-        }
-        .arguments()
-    }
-}
-
-impl From<v1::DriverBuildQuery> for DriverBuildQuery {
-    fn from(old: v1::DriverBuildQuery) -> Self {
-        DriverBuildQuery {
-            release: old.release,
-            args: old.args,
-            variant: None,
         }
     }
 }
 
 /// How the service asks a helios instance to build the driver.
 ///
-/// The developer's [`DriverBuildQuery`], plus what only the service knows.
+/// The developer's [`v1::DriverBuildQuery`], plus what only the service knows.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AgentDriverBuildQuery {
     /// Build with optimizations.
@@ -104,10 +62,6 @@ pub struct AgentDriverBuildQuery {
     /// Anything else to put on cargo's command line, separated by spaces.
     #[serde(default)]
     pub args: Option<String>,
-    /// The variant whose anodizer output the driver builds against. Absent
-    /// means the workspace's default.
-    #[serde(default)]
-    pub variant: Option<String>,
     /// The bucket the vivado instance publishes this workspace's anodizer
     /// output to.
     ///
@@ -136,7 +90,6 @@ impl From<v1::DriverBuildQuery> for AgentDriverBuildQuery {
         AgentDriverBuildQuery {
             release: old.release,
             args: old.args,
-            variant: None,
             anodized_bucket: None,
         }
     }

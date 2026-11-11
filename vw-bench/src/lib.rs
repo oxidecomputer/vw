@@ -158,7 +158,7 @@ pub async fn prepare(
     workspace: &Utf8Path,
     standard: vw_lib::VhdlStandard,
 ) -> Result<(), BenchError> {
-    vw_lib::ensure_anodized(workspace, standard, None)
+    vw_lib::ensure_anodized(workspace, standard)
         .await
         .map_err(BenchError::Anodize)?;
 
