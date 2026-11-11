@@ -162,6 +162,9 @@ pub async fn run_locally(
 /// having gone wrong with vw would bury the message that says what.
 fn show(event: AnodizeEvent) -> Option<bool> {
     match event {
+        AnodizeEvent::Note { message } => {
+            println!("{:>12} {message}", "Note".yellow().bold());
+        }
         AnodizeEvent::Anodizing { sources, tagged } => {
             println!(
                 "{:>12} {tagged} tagged of {sources} design source{}",

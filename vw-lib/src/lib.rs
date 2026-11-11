@@ -6656,7 +6656,7 @@ fn find_vhdl_files_impl(
     recursive: bool,
 ) -> Result<()> {
     for entry in fs::read_dir(dir).map_err(|e| VwError::FileSystem {
-        message: format!("Failed to read directory: {e}"),
+        message: format!("Failed to read directory {}: {e}", dir.display()),
     })? {
         let entry = entry.map_err(|e| VwError::FileSystem {
             message: format!("Failed to read directory entry: {e}"),

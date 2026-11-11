@@ -69,6 +69,9 @@ pub type Publisher = Box<
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnodizeEvent {
+    /// Something worth knowing that is neither progress nor a verdict, such
+    /// as dependencies being fetched first.
+    Note { message: String },
     /// The generator is about to run, over this much.
     Anodizing { sources: usize, tagged: usize },
     /// It finished and wrote this — or found it already current, and left
@@ -150,6 +153,17 @@ where
             }
         }
     });
+
+    // The anodizer analyses the design with nvc, and the design uses packages
+    // from dependency repositories, so they have to be here first. Done here
+    // rather than in `run` because `run` is also `vw anodize --local`, where
+    // fetching dependencies is `vw update`'s business. An environment where
+    // anodizing is the first thing ever asked of the vivado instance has never
+    // fetched them.
+    let note = |message: String| {
+        let _ = events.send(AnodizeEvent::Note { message });
+    };
+    crate::session::fetch_dependencies(root, &note).await;
 
     let running = run(root, &request, publish, events.clone());
     tokio::pin!(running);
