@@ -448,8 +448,12 @@ enum SourceSet {
     /// Everything the hardware flow reads: VHDL, constraints, htcl, and the
     /// workspace's dependency pins.
     Design,
-    /// Everything the driver build reads.
+    /// Everything the driver build reads: the driver's cargo workspace, any
+    /// crate outside it that it reaches by path, and — when one of those
+    /// includes anodizer's output — everything that output is made from.
     Driver,
+    /// Everything anodizer's output is made from.
+    Anodize,
 }
 
 #[derive(Subcommand)]
@@ -495,6 +499,56 @@ enum Commands {
     },
     #[command(about = "Clear all cached repositories")]
     Clear,
+    #[command(
+        about = "Generate Rust for the design's `serialize_rust` types, and \
+                 publish it to the cloud environment",
+        long_about = "Run the anodizer over the design's \
+                      `serialize_rust`-tagged VHDL, on the environment's \
+                      vivado instance, and publish what it generates to the \
+                      environment's artifact store.\n\n\
+                      One output for the whole workspace, from every \
+                      variant's sources: a workspace builds many variants of \
+                      the HDL but one driver. Types that differ between \
+                      boards belong in differently named packages.\n\n\
+                      Skipped when the published output is already current. \
+                      `vw driver build` and `vw bench run` do this themselves \
+                      when they need to; this is the same step on its own, \
+                      for a pipeline that wants it as a phase with its own \
+                      result.\n\n\
+                      Rust reaches the output through the `VW_ANODIZED_DIR` \
+                      variable vw sets for every cargo it runs: \
+                      `include!(concat!(env!(\"VW_ANODIZED_DIR\"), \"/hdl.rs\"))`."
+    )]
+    Anodize {
+        #[arg(
+            long,
+            help = "Regenerate even when the output is already current"
+        )]
+        force: bool,
+        #[arg(
+            long,
+            help = "Anodize on this machine instead of in a cloud environment. \
+                    Nothing is published."
+        )]
+        local: bool,
+        #[arg(
+            long,
+            env = "VW_ENV",
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to anodize in. Defaults to $VW_ENV, and \
+                    is only needed when that is unset and you have more than \
+                    one."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+        #[arg(long, help = "VHDL standard", default_value_t = CliVhdlStandard::Vhdl2019)]
+        std: CliVhdlStandard,
+    },
     #[command(about = "Work with the workspace's driver")]
     Driver {
         #[command(subcommand)]
@@ -1125,6 +1179,29 @@ async fn main() {
                 }
             }
         }
+        Commands::Anodize {
+            force,
+            local,
+            env,
+            insecure,
+            std,
+        } => {
+            ensure_workspace_deps(&cwd).await;
+            let options = anodize::Options {
+                bench: None,
+                standard: std.into(),
+                force,
+            };
+            match anodize(&cwd, &options, local, env.as_deref(), insecure).await
+            {
+                Ok(true) => {}
+                Ok(false) => process::exit(1),
+                Err(e) => {
+                    report(&*e);
+                    process::exit(1);
+                }
+            }
+        }
         Commands::Driver { command } => {
             let DriverCommand::Build {
                 local,
@@ -1440,15 +1517,13 @@ async fn main() {
             // anodizer reads the design's `src @dep` imports like any other
             // consumer of the source set.
             ensure_workspace_deps(&cwd).await;
-            match anodize(
-                &cwd,
-                bench.as_deref(),
-                local,
-                env.as_deref(),
-                insecure,
-                std.into(),
-            )
-            .await
+            // Forced: this command exists to watch the generator run.
+            let options = anodize::Options {
+                bench: bench.as_deref(),
+                standard: std.into(),
+                force: true,
+            };
+            match anodize(&cwd, &options, local, env.as_deref(), insecure).await
             {
                 Ok(true) => {}
                 // A failed anodization is the answer, not a vw failure; what
@@ -1944,9 +2019,11 @@ async fn main() {
                     // and re-analyze. That pass is skip-gated and
                     // `generate_target`-only, so it's cheap; and we only
                     // reach it on a real resolution failure, never
-                    // speculatively. A generation that doesn't complete
-                    // cleanly isn't fatal — the re-analysis reports the
-                    // true remaining state.
+                    // speculatively. A generation that fails fails the
+                    // check: everything the analyzer says afterwards about
+                    // `ip`/`xil_defaultlib` is a consequence, and a page of
+                    // "no such library" buries the one line that says why.
+                    let mut ip_failure: Option<String> = None;
                     if matches!(&vhdl_result, Ok(diags)
                         if diagnostics_need_ip_generation(diags))
                     {
@@ -1970,10 +2047,11 @@ async fn main() {
                         .await
                         {
                             eprintln!(
-                                "{} IP generation did not complete \
-                                 cleanly: {e}",
-                                "warning:".yellow(),
+                                "{} IP generation failed: {e}",
+                                "error:".bright_red(),
                             );
+                            had_errors = true;
+                            ip_failure = Some(e.to_string());
                         }
                         vhdl_result = vw_lib::check_vhdl(
                             &ws,
@@ -2014,6 +2092,18 @@ async fn main() {
                             );
                             if errs > 0 {
                                 had_errors = true;
+                            }
+                            // Said again under the count, where somebody
+                            // scrolling to the end of a long check looks.
+                            if let Some(cause) = &ip_failure {
+                                eprintln!(
+                                    "{} IP generation failed{scope}, so \
+                                     errors about the `ip` and \
+                                     `xil_defaultlib` libraries above are a \
+                                     consequence of that, not of the design: \
+                                     {cause}",
+                                    "error:".bright_red(),
+                                );
                             }
                         }
                         Ok(_) => {} // no VHDL, or no findings
@@ -3923,16 +4013,15 @@ impl DeclBatch {
 /// an nvc pass over the design, and the design is on the instance.
 async fn anodize(
     cwd: &Utf8Path,
-    bench: Option<&str>,
+    options: &anodize::Options<'_>,
     local: bool,
     named: Option<&str>,
     insecure: bool,
-    std: vw_lib::VhdlStandard,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let workspace = workspace_or_exit(cwd);
 
     if local {
-        return Ok(anodize::run_locally(&workspace, bench, std).await?);
+        return Ok(anodize::run_locally(&workspace, options).await?);
     }
 
     let session = cloud::Session::from_env(insecure)?;
@@ -3947,7 +4036,7 @@ async fn anodize(
     )
     .await?;
 
-    Ok(anodize::run(&session, &target, bench, std).await?)
+    Ok(anodize::run(&session, &target, options).await?)
 }
 
 /// The workspace `cwd` is in, or a message saying it is not in one.
@@ -4159,20 +4248,47 @@ async fn driver_build(
     let workspace = vw_lib::find_workspace_dir(cwd.as_std_path())
         .ok_or("no vw workspace here; run this from one, or from a directory inside it")?;
 
+    // A driver that includes anodizer's output is built against it, so it
+    // has to be current first. One output for every variant: there is one
+    // driver. Anodizing is its own
+    // phase — `vw anodize` — and this runs it when the driver needs it rather
+    // than leaving a developer to remember; it costs a fingerprint when
+    // nothing has changed.
+    let anodized = driver::needs_anodized(&workspace)?;
+    if anodized {
+        ensure_workspace_deps(cwd).await;
+    }
+
     if !local {
         let session = cloud::Session::from_env(insecure)?;
         let target = cloud::resolve_target(&session, named).await?;
 
-        // The instance builds what it was last given.
-        cloud::sync_for_build(
-            &session,
-            &target,
-            Some(vw_api_types_versions::latest::TargetKind::Helios),
-        )
-        .await?;
+        // The instances build what they were last given. Both of them when
+        // the driver needs anodizing: the vivado instance generates the
+        // output from the design, and the helios instance checks what it
+        // fetches against the same sources.
+        let only = (!anodized)
+            .then_some(vw_api_types_versions::latest::TargetKind::Helios);
+        cloud::sync_for_build(&session, &target, only).await?;
+
+        if anodized {
+            let options = anodize::Options {
+                bench: None,
+                standard: vw_lib::VhdlStandard::Vhdl2019,
+                force: false,
+            };
+            if !anodize::run(&session, &target, &options).await? {
+                return Ok(false);
+            }
+        }
+
         return Ok(driver::build(&session, &target, release, args).await?);
     }
 
+    if anodized {
+        vw_lib::ensure_anodized(&workspace, vw_lib::VhdlStandard::Vhdl2019)
+            .await?;
+    }
     Ok(driver::build_locally(&workspace, release, args).await?)
 }
 
@@ -5103,7 +5219,8 @@ mod env_flag_tests {
             Commands::Run { env, .. }
             | Commands::Check { env, .. }
             | Commands::Clean { env, .. }
-            | Commands::Repl { env, .. } => env,
+            | Commands::Repl { env, .. }
+            | Commands::Anodize { env, .. } => env,
             Commands::Bench {
                 command: BenchCommand::Run { env, .. },
             } => env,
@@ -5135,6 +5252,9 @@ mod env_flag_tests {
             vec!["vw", "clean"],
             vec!["vw", "repl"],
             vec!["vw", "driver", "build"],
+            vec!["vw", "anodize"],
+            vec!["vw", "anodize", "--force"],
+            vec!["vw", "driver", "build", "--release"],
         ] {
             let cli = Cli::try_parse_from(&argv).expect("should parse");
             assert_eq!(
@@ -5465,6 +5585,17 @@ mod bunyan_tests {
 /// build output, not input, and nothing tracks them. Dependency sources live
 /// outside the workspace entirely, so no diff of this repository can mention
 /// them — a change to one arrives as a change to `vw.lock`, which is listed.
+/// What anodizer's output is made from, for every variant: a pipeline asking
+/// whether to anodize cannot know which variant a later job will want.
+fn anodize_sources(
+    ws: &camino::Utf8Path,
+) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    let mut paths = vw_lib::vhdl_design_sources_all_variants(ws)?;
+    paths.push(ws.join("vw.toml").into_std_path_buf());
+    paths.push(ws.join("vw.lock").into_std_path_buf());
+    Ok(paths)
+}
+
 fn list_sources(
     ws: &camino::Utf8Path,
     set: SourceSet,
@@ -5490,8 +5621,23 @@ fn list_sources(
             let root = ws.join(vw_remote::driver::DIRECTORY);
             if root.exists() {
                 collect_files(root.as_std_path(), &mut paths);
+
+                // And so is every crate outside it that it reaches by path,
+                // which the build compiles exactly as if it were inside.
+                let mut crates = vec![root.clone()];
+                for dir in vw_lib::path_dependency_dirs(&root) {
+                    collect_files(dir.as_std_path(), &mut paths);
+                    crates.push(dir);
+                }
+
+                // A driver that includes anodizer's output changes whenever
+                // that output would.
+                if vw_lib::uses_anodized(&crates) {
+                    paths.extend(anodize_sources(ws)?);
+                }
             }
         }
+        SourceSet::Anodize => paths.extend(anodize_sources(ws)?),
     }
 
     let mut relative: Vec<String> = paths

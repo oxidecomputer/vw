@@ -292,9 +292,8 @@ async fn build_driver_library(
     let dir = crate_dir.to_owned();
     let package_name = crate_name.clone();
     tokio::task::spawn_blocking(move || {
-        let output = crate::cargo_command()
+        let output = crate::bench_cargo_command(dir.as_std_path())
             .args(["build", "-p", &package_name])
-            .current_dir(dir.as_std_path())
             .output()
             .map_err(|e| VwError::Testbench {
                 message: format!("running cargo build: {e}"),

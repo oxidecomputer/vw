@@ -59,6 +59,17 @@ const GATHERED: [(&str, &str); 11] = [
     ("route", "xdc"),
 ];
 
+/// The Rust anodizer generates from the design's `serialize_rust` types, and
+/// its extension.
+///
+/// Small, but the helios instance builds the driver against it, and the store
+/// is how it gets there. One for the workspace rather than one per variant —
+/// a workspace has one driver — so it sits beside the variants' build
+/// directories, not in them. Kept here as well as being published by
+/// `vw anodize` so that output a bench run regenerated reaches the store too,
+/// rather than only output somebody asked to publish.
+const GATHERED_ANODIZED: (&str, &str) = ("anodizer/gen", "rs");
+
 /// Where a testbench leaves its results, and what to keep.
 ///
 /// Kept apart from [`GATHERED`] because the shape is different: each bench
@@ -516,11 +527,15 @@ fn artifacts(root: &Utf8Path) -> Vec<Found> {
     // Every variant's build, keyed by its path under `target` — so each
     // variant's image and reports are their own objects (`vpk120/image/…`)
     // rather than overwriting another variant's of the same name.
-    let gathered = vw_lib::build_dirs(root).into_iter().flat_map(|build| {
-        GATHERED.iter().map(move |(directory, extension)| {
-            (build.join(directory), *extension)
+    let (anodized, anodized_extension) = GATHERED_ANODIZED;
+    let gathered = vw_lib::build_dirs(root)
+        .into_iter()
+        .flat_map(|build| {
+            GATHERED.iter().map(move |(directory, extension)| {
+                (build.join(directory), *extension)
+            })
         })
-    });
+        .chain(std::iter::once((output.join(anodized), anodized_extension)));
     for (source, extension) in gathered {
         let Some(prefix) =
             source.strip_prefix(&output).ok().map(Utf8Path::to_owned)
@@ -643,15 +658,7 @@ pub(crate) async fn upload_all(
 ) -> vw_remote::driver::Stored {
     let mut stored = vw_remote::driver::Stored::default();
     for artifact in artifacts {
-        // Keyed by its path under `target`, so a debug and a release build of
-        // the same name stay two objects, as do the same name built for two
-        // different targets.
-        let key = artifact
-            .strip_prefix(root.join(BUILD_OUTPUT))
-            .map(Utf8Path::to_string)
-            .unwrap_or_else(|_| {
-                artifact.file_name().unwrap_or("artifact").to_owned()
-            });
+        let key = key_for(root, artifact);
 
         match upload(credentials, &key, artifact).await {
             Ok(()) => {
@@ -672,6 +679,21 @@ pub(crate) async fn upload_all(
         }
     }
     stored
+}
+
+/// What a file under `root`'s build output is called in the store.
+///
+/// Its path under `target`, so a debug and a release build of the same name
+/// stay two objects, as do the same name built for two different targets or
+/// two variants. Both ends of a transfer compute it, which is what lets the
+/// helios instance find what the vivado instance published.
+pub(crate) fn key_for(root: &Utf8Path, artifact: &Utf8Path) -> String {
+    artifact
+        .strip_prefix(root.join(BUILD_OUTPUT))
+        .map(Utf8Path::to_string)
+        .unwrap_or_else(|_| {
+            artifact.file_name().unwrap_or("artifact").to_owned()
+        })
 }
 
 /// The bucket `credentials` name.
@@ -709,6 +731,41 @@ async fn listing(
         .flat_map(|page| page.contents)
         .map(|object| object.key)
         .collect())
+}
+
+/// Fetch one object from the bucket into `destination`, if it is there.
+///
+/// Answers `Ok(false)` for an object that does not exist, which is an answer
+/// rather than a failure: the caller knows what was expected and can say what
+/// to do about its absence far better than "404" can.
+pub(crate) async fn download(
+    credentials: &S3Credentials,
+    key: &str,
+    destination: &Utf8Path,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let bucket = bucket(credentials)?;
+    let response = match bucket.get_object(format!("/{key}")).await {
+        Ok(response) => response,
+        Err(s3::error::S3Error::HttpFailWithBody(404, _)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    match response.status_code() {
+        404 => return Ok(false),
+        status if status >= 300 => {
+            return Err(format!("the object store answered {status}").into())
+        }
+        _ => {}
+    }
+
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    // Into place whole, so a build that starts while this is being written
+    // never reads half of it.
+    let partial = destination.with_extension("partial");
+    tokio::fs::write(&partial, response.as_slice()).await?;
+    tokio::fs::rename(&partial, destination).await?;
+    Ok(true)
 }
 
 /// Put one artifact in the bucket.

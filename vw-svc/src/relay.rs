@@ -399,13 +399,14 @@ impl Agent {
     pub(crate) async fn join_driver_build(
         &self,
         client: dropshot::WebsocketConnection,
-        query: &vw_api_types_versions::latest::DriverBuildQuery,
+        query: &vw_api_types_versions::latest::AgentDriverBuildQuery,
     ) -> Result<(), RelayError> {
         let upgraded = self
             .client
             .driver_build(
                 &self.environment,
                 &self.workspace,
+                query.anodized_bucket.as_deref(),
                 query.args.as_deref(),
                 Some(query.release),
             )
@@ -430,6 +431,7 @@ impl Agent {
                 &self.environment,
                 &self.workspace,
                 query.bench.as_deref(),
+                Some(query.force),
                 query.standard.as_deref(),
             )
             .await

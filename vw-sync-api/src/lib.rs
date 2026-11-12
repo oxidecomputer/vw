@@ -36,6 +36,7 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (5, ANODIZE_PHASE),
     (4, WORKSPACES),
     (3, ANODIZE),
     (2, ARTIFACT_FLUSH),
@@ -627,14 +628,40 @@ pub trait VwSyncApi {
     #[channel {
         protocol = WEBSOCKETS,
         path = "/environment/{environment}/workspace/{workspace}/driver/build",
-        versions = VERSION_WORKSPACES..,
+        versions = VERSION_ANODIZE_PHASE..,
     }]
     async fn driver_build(
         rqctx: RequestContext<Self::Context>,
         path_params: Path<WorkspacePathParam>,
-        query: Query<latest::DriverBuildQuery>,
+        query: Query<latest::AgentDriverBuildQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
+
+    /// Build the driver on this instance.
+    ///
+    /// A websocket because a build takes minutes and produces output the whole
+    /// time, and because a developer who interrupts one should not leave cargo
+    /// running on a machine nobody is watching.
+    ///
+    /// Cargo is spawned rather than linked: the driver pins its toolchain in
+    /// `rust-toolchain.toml`, which the rustup shim honours and a linked cargo
+    /// would not, so linking it would quietly build a kernel module with the
+    /// wrong compiler.
+    #[channel {
+        operation_id = "driver_build",
+        protocol = WEBSOCKETS,
+        path = "/environment/{environment}/workspace/{workspace}/driver/build",
+        versions = VERSION_WORKSPACES..VERSION_ANODIZE_PHASE,
+    }]
+    async fn driver_build_v5(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<WorkspacePathParam>,
+        query: Query<v1::DriverBuildQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult {
+        Self::driver_build(rqctx, path_params, query.map(Into::into), websock)
+            .await
+    }
 
     /// Build the driver on this instance.
     ///
@@ -661,7 +688,7 @@ pub trait VwSyncApi {
         Self::driver_build(
             rqctx,
             path_params.map(WorkspacePathParam::legacy),
-            query,
+            query.map(Into::into),
             websock,
         )
         .await
@@ -675,7 +702,7 @@ pub trait VwSyncApi {
     #[channel {
         protocol = WEBSOCKETS,
         path = "/environment/{environment}/workspace/{workspace}/anodize",
-        versions = VERSION_WORKSPACES..,
+        versions = VERSION_ANODIZE_PHASE..,
     }]
     async fn anodize(
         rqctx: RequestContext<Self::Context>,
@@ -683,6 +710,26 @@ pub trait VwSyncApi {
         query: Query<latest::AnodizeQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
+
+    /// Run the anodizer over this workspace, on purpose.
+    ///
+    /// A websocket because the interesting half is a cargo build of a bench
+    /// against what was just generated, and a build's output is worth seeing
+    /// as it happens.
+    #[channel {
+        operation_id = "anodize",
+        protocol = WEBSOCKETS,
+        path = "/environment/{environment}/workspace/{workspace}/anodize",
+        versions = VERSION_WORKSPACES..VERSION_ANODIZE_PHASE,
+    }]
+    async fn anodize_v5(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<WorkspacePathParam>,
+        query: Query<v4::AnodizeQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult {
+        Self::anodize(rqctx, path_params, query.map(Into::into), websock).await
+    }
 
     /// Run the anodizer over this workspace, on purpose.
     ///
@@ -704,7 +751,7 @@ pub trait VwSyncApi {
         Self::anodize(
             rqctx,
             path_params.map(WorkspacePathParam::legacy),
-            query,
+            query.map(Into::into),
             websock,
         )
         .await

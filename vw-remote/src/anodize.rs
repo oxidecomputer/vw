@@ -40,16 +40,50 @@ pub struct AnodizeRequest {
     pub bench: Option<String>,
     /// The VHDL standard, as `nvc` spells it.
     pub standard: String,
+    /// Regenerate even when the output is already current.
+    ///
+    /// What working on the anodizer wants. A build — `vw anodize`, or the
+    /// step `vw driver build` takes first — leaves it off, so an unchanged
+    /// design costs a fingerprint and nothing else.
+    #[serde(default)]
+    pub force: bool,
 }
+
+/// How the instance hands what it generated to the rest of the environment.
+///
+/// Passed in because where things are kept is the agent's business, not this
+/// module's. Called with the generated file once it is known to be current;
+/// answers with the key it was stored under, or why it could not be.
+pub type Publisher = Box<
+    dyn FnOnce(
+            camino::Utf8PathBuf,
+        )
+            -> futures::future::BoxFuture<'static, Result<String, String>>
+        + Send,
+>;
 
 /// What the instance sends back while anodizing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnodizeEvent {
+    /// Something worth knowing that is neither progress nor a verdict, such
+    /// as dependencies being fetched first.
+    Note { message: String },
     /// The generator is about to run, over this much.
     Anodizing { sources: usize, tagged: usize },
-    /// It finished and wrote this.
-    Generated { path: String, lines: usize },
+    /// It finished and wrote this — or found it already current, and left
+    /// it alone.
+    Generated {
+        path: String,
+        lines: usize,
+        /// Whether the generator ran. Defaulted for an instance that predates
+        /// the question, which always ran it.
+        #[serde(default = "ran")]
+        regenerated: bool,
+    },
+    /// What was generated is in the environment's artifact store, under this
+    /// key, for the other instance to build with.
+    Published { key: String },
     /// Nothing was tagged, so there was nothing to generate.
     ///
     /// Distinct from a failure and from success: a developer who has just
@@ -74,11 +108,17 @@ pub enum AnodizeEvent {
     Fatal { message: String },
 }
 
-/// Anodize `root`, then build `request.bench` against the result.
+/// What an instance that never said whether it regenerated did.
+fn ran() -> bool {
+    true
+}
+
+/// Anodize `root`, publish the result, then build `request.bench` against it.
 pub async fn serve<S>(
     socket: WebSocketStream<S>,
     root: &Utf8Path,
     request: AnodizeRequest,
+    publish: Option<Publisher>,
 ) -> Result<(), crate::SessionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -111,7 +151,18 @@ where
         }
     });
 
-    let running = run(root, &request, events.clone());
+    // The anodizer analyses the design with nvc, and the design uses packages
+    // from dependency repositories, so they have to be here first. Done here
+    // rather than in `run` because `run` is also `vw anodize --local`, where
+    // fetching dependencies is `vw update`'s business. An environment where
+    // anodizing is the first thing ever asked of the vivado instance has never
+    // fetched them.
+    let note = |message: String| {
+        let _ = events.send(AnodizeEvent::Note { message });
+    };
+    crate::session::fetch_dependencies(root, &note).await;
+
+    let running = run(root, &request, publish, events.clone());
     tokio::pin!(running);
 
     tokio::select! {
@@ -135,6 +186,7 @@ where
 pub async fn run(
     root: &Utf8Path,
     request: &AnodizeRequest,
+    publish: Option<Publisher>,
     events: tokio::sync::mpsc::UnboundedSender<AnodizeEvent>,
 ) {
     let standard = match request.standard.parse::<vw_lib::VhdlStandard>() {
@@ -150,7 +202,7 @@ pub async fn run(
     // Said before the generator runs, not after: a pass that fails is exactly
     // when knowing how much it was looking at matters, and a report that only
     // arrives on success cannot say it then.
-    let (sources, tagged) = match vw_lib::anodize_scope(root, None) {
+    let (sources, tagged) = match vw_lib::anodize_scope(root) {
         Ok(scope) => scope,
         Err(e) => {
             let _ = events.send(AnodizeEvent::Fatal {
@@ -166,24 +218,50 @@ pub async fn run(
     }
     let _ = events.send(AnodizeEvent::Anodizing { sources, tagged });
 
-    let report =
-        match vw_lib::anodize(root, standard, None, vw_lib::Freshness::Always)
-            .await
-        {
-            Ok(report) => report,
-            Err(e) => {
-                let _ = events.send(AnodizeEvent::Fatal {
-                    message: causes(&e),
-                });
-                return;
-            }
-        };
+    let freshness = if request.force {
+        vw_lib::Freshness::Always
+    } else {
+        vw_lib::Freshness::IfStale
+    };
+    let report = match vw_lib::anodize(root, standard, freshness).await {
+        Ok(report) => report,
+        Err(e) => {
+            let _ = events.send(AnodizeEvent::Fatal {
+                message: causes(&e),
+            });
+            return;
+        }
+    };
 
     if let Some(generated) = &report.generated {
         let _ = events.send(AnodizeEvent::Generated {
             path: relative(root, generated),
             lines: report.lines,
+            regenerated: report.regenerated,
         });
+
+        // Published whether or not this pass regenerated it: the store is
+        // what the driver build reads, and output that was already current
+        // here may never have reached it — generated by a bench run, say,
+        // before anything asked for it to be kept.
+        if let Some(publish) = publish {
+            match publish(generated.clone()).await {
+                Ok(key) => {
+                    let _ = events.send(AnodizeEvent::Published { key });
+                }
+                Err(message) => {
+                    let _ = events.send(AnodizeEvent::Fatal {
+                        message: format!(
+                            "generated {}, but could not put it in the \
+                             environment's artifact store: {message}",
+                            relative(root, generated)
+                        ),
+                    });
+                    let _ = events.send(AnodizeEvent::Done { success: false });
+                    return;
+                }
+            }
+        }
     }
 
     let Some(bench) = request.bench.as_deref() else {
@@ -200,11 +278,11 @@ pub async fn run(
     let _ = events.send(AnodizeEvent::Done { success });
 }
 
-/// The module name a crate reaches the generated structs through.
+/// What a crate that uses anodizer's output names somewhere in its sources.
 ///
-/// Anodizer's output is included with a `#[path]` module rather than linked,
-/// so a crate that uses it names this somewhere in its sources.
-const GENERATED_MODULE: &str = "generated_structs";
+/// The output is pulled in with `include!` through this variable rather than
+/// linked, so naming it is the one thing every such crate has in common.
+const GENERATED_MODULE: &str = vw_lib::ANODIZED_ENV;
 
 /// Whether building `bench` would actually compile the generated file.
 ///
@@ -294,6 +372,7 @@ async fn build_bench(
     command
         .arg("build")
         .current_dir(crate_dir.as_std_path())
+        .env(vw_lib::ANODIZED_ENV, vw_lib::anodized_dir(root))
         // Cargo colours its output when it believes it is talking to a
         // terminal, and over a socket it does not. Asking for it anyway is
         // what makes a remote build read like a local one.

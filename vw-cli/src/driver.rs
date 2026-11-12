@@ -152,6 +152,7 @@ pub async fn build_locally(
         command.arg("--release");
     }
     command.args(args);
+    command.env(vw_lib::ANODIZED_ENV, vw_lib::anodized_dir(workspace));
 
     let status = command
         .current_dir(driver.as_std_path())
@@ -160,4 +161,21 @@ pub async fn build_locally(
         .map_err(|e| CloudError::Transport(format!("running cargo: {e}")))?;
 
     Ok(status.success())
+}
+
+/// Whether the driver includes anodizer's output, and so needs it to be
+/// current before it is built.
+///
+/// Asked of the driver's sources and the crates outside `driver/` it reaches
+/// by path, then of the design: a driver that includes the output from a
+/// design with nothing tagged is left to fail on its own terms, which are
+/// clearer than anything that could be said here.
+pub fn needs_anodized(workspace: &Utf8Path) -> Result<bool, vw_lib::VwError> {
+    let driver = workspace.join(vw_remote::driver::DIRECTORY);
+    let mut crates = vec![driver.clone()];
+    crates.extend(vw_lib::path_dependency_dirs(&driver));
+    if !vw_lib::uses_anodized(&crates) {
+        return Ok(false);
+    }
+    Ok(vw_lib::anodize_fingerprint(workspace)?.is_some())
 }

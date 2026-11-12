@@ -24,10 +24,10 @@ pub mod driver;
 pub mod protocol;
 mod session;
 
-pub use anodize::{AnodizeEvent, AnodizeRequest};
+pub use anodize::{AnodizeEvent, AnodizeRequest, Publisher};
 pub use backend::{InterruptHandle, NoteSink, RemoteBackend};
 pub use bench::BenchEvent;
-pub use driver::{BuildParams, DriverEvent};
+pub use driver::{BuildParams, DriverEvent, Prepared, Preparer};
 pub use protocol::{SessionEvent, SessionParams, SessionRequest};
 pub use session::{serve, workspace_root, SessionError};
 

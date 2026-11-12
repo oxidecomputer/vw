@@ -19,6 +19,7 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (6, ANODIZE_PHASE),
     (5, WORKSPACES),
     (4, ANODIZE),
     (3, ARTIFACT_FLUSH),
@@ -357,7 +358,7 @@ pub trait VwUserApi {
                     latest::LEGACY_WORKSPACE,
                 )
             }),
-            query,
+            query.map(Into::into),
             websock,
         )
         .await
@@ -373,7 +374,7 @@ pub trait VwUserApi {
     #[channel {
         protocol = WEBSOCKETS,
         path = "/environment/{name}/workspace/{workspace}/anodize",
-        versions = VERSION_WORKSPACES..,
+        versions = VERSION_ANODIZE_PHASE..,
     }]
     async fn anodize(
         rqctx: RequestContext<Self::Context>,
@@ -381,6 +382,28 @@ pub trait VwUserApi {
         query: Query<latest::AnodizeQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult;
+
+    /// Run the anodizer on an environment's vivado instance.
+    ///
+    /// Relayed frame for frame. Anodization already happens on its own before
+    /// every bench run, cached and silent; this is the same generator with
+    /// the cache off and the answers reported, for working on the generator
+    /// itself. It runs there rather than here because it is an nvc pass over
+    /// the workspace's VHDL, and the workspace is there.
+    #[channel {
+        operation_id = "anodize",
+        protocol = WEBSOCKETS,
+        path = "/environment/{name}/workspace/{workspace}/anodize",
+        versions = VERSION_WORKSPACES..VERSION_ANODIZE_PHASE,
+    }]
+    async fn anodize_v5(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::WorkspacePathParam>,
+        query: Query<v4::AnodizeQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult {
+        Self::anodize(rqctx, path_params, query.map(Into::into), websock).await
+    }
 
     /// Run the anodizer on an environment's vivado instance.
     ///
@@ -409,7 +432,7 @@ pub trait VwUserApi {
                     latest::LEGACY_WORKSPACE,
                 )
             }),
-            query,
+            query.map(Into::into),
             websock,
         )
         .await

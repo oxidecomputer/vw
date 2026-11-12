@@ -427,12 +427,43 @@ impl VwUserApi for UserApi {
         )
         .await;
 
+        // Where the vivado instance publishes its anodizer output, which the
+        // driver may be built against. Named rather than handed over as a
+        // credential: it is a bucket in the same store, opened by the same
+        // key the instance was just given for its own. Missing only when the
+        // store cannot be reached, in which case a driver that needs the
+        // output is told so by the instance, and one that does not is built
+        // regardless.
+        let anodized_bucket = match crate::wiring::store_for(
+            &caller.name,
+            &name,
+            &workspace,
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            &args,
+        )
+        .await
+        {
+            Ok(store) => Some(store.bucket),
+            Err(e) => {
+                info!(log, "no store to read anodizer output from";
+                    "environment" => &name,
+                    "detail" => %e,
+                );
+                None
+            }
+        };
+
         info!(log, "building the driver";
             "environment" => &name,
             "user" => &caller.name,
             "release" => query.release,
         );
 
+        let query = vw_api_types_versions::latest::AgentDriverBuildQuery {
+            release: query.release,
+            args: query.args,
+            anodized_bucket,
+        };
         let result = agent.join_driver_build(websock, &query).await;
 
         match &result {
@@ -485,10 +516,25 @@ impl VwUserApi for UserApi {
             .await
             .inspect_err(|e| log_relay_failure(&log, &target, e))?;
 
+        // Told where its artifacts go before it runs, as a sync does: the
+        // output is published as soon as it is current, and an instance that
+        // had never been told would have nowhere to publish it.
+        crate::wiring::ensure(
+            &caller.name,
+            &name,
+            &workspace,
+            vw_api_types_versions::latest::TargetKind::Vivado,
+            &args,
+            &agent,
+            &log,
+        )
+        .await;
+
         info!(log, "anodizing";
             "environment" => &name,
             "user" => &caller.name,
             "bench" => query.bench.as_deref().unwrap_or("-"),
+            "force" => query.force,
         );
 
         let result = agent.join_anodize(websock, &query).await;
