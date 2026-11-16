@@ -135,37 +135,132 @@ struct Cli {
 }
 
 /// What can be done with the workspace's driver.
+///
+/// The cargo commands a driver is developed with, run where the driver can
+/// actually be compiled: the helios instance, against the anodizer output the
+/// environment holds. Each is the cargo command of the same name.
 #[derive(Subcommand)]
 enum DriverCommand {
     #[command(about = "Build the driver on the helios instance")]
     Build {
-        #[arg(
-            long,
-            help = "Build on this machine instead of in a cloud environment"
-        )]
-        local: bool,
-        #[arg(
-            long,
-            env = "VW_ENV",
-            value_name = "NAME",
-            conflicts_with = "local",
-            help = "Cloud environment to build in. Defaults to $VW_ENV, and is only \
-                    needed when that is unset and you have more than one."
-        )]
-        env: Option<String>,
-        #[arg(
-            long,
-            help = "Accept the service's TLS certificate without verifying it"
-        )]
-        insecure: bool,
+        #[command(flatten)]
+        run: DriverRun,
         #[arg(long, help = "Build with optimizations")]
         release: bool,
-        #[arg(
-            trailing_var_arg = true,
-            help = "Further arguments for cargo, e.g. `-p module`"
-        )]
-        args: Vec<String>,
     },
+    #[command(about = "Type-check the driver on the helios instance")]
+    Check {
+        #[command(flatten)]
+        run: DriverRun,
+        #[arg(long, help = "Check with the release profile")]
+        release: bool,
+    },
+    #[command(about = "Lint the driver with clippy on the helios instance")]
+    Clippy {
+        #[command(flatten)]
+        run: DriverRun,
+        #[arg(long, help = "Lint with the release profile")]
+        release: bool,
+    },
+    #[command(
+        about = "Run the driver's tests on the helios instance",
+        long_about = "Run the driver's tests on the helios instance.\n\n\
+                      Members whose own .cargo/config.toml selects a build \
+                      target — a kernel module — are compiled for somewhere \
+                      tests cannot run, so only the workspace's default \
+                      members are tested."
+    )]
+    Test {
+        #[command(flatten)]
+        run: DriverRun,
+        #[arg(long, help = "Test with the release profile")]
+        release: bool,
+    },
+    #[command(
+        about = "Format the driver with the toolchain it pins",
+        long_about = "Format the driver with the toolchain it pins.\n\n\
+                      rustfmt runs on the helios instance and every file it \
+                      changes is written back here. A file edited here since \
+                      it was synchronized is left alone and named, so nothing \
+                      typed while this ran is lost. With --check, nothing is \
+                      rewritten: the diff is printed and the command fails if \
+                      there is one."
+    )]
+    Fmt {
+        #[command(flatten)]
+        run: DriverRun,
+        #[arg(
+            long,
+            help = "Report what would change without rewriting anything"
+        )]
+        check: bool,
+    },
+}
+
+impl DriverCommand {
+    /// What every driver command shares, the command as the service names
+    /// it, and whether to compile with optimizations.
+    fn parts(
+        self,
+    ) -> (
+        DriverRun,
+        vw_api_types_versions::latest::DriverCommand,
+        bool,
+    ) {
+        use vw_api_types_versions::latest::DriverCommand as C;
+        match self {
+            DriverCommand::Build { run, release } => (run, C::Build, release),
+            DriverCommand::Check { run, release } => (run, C::Check, release),
+            DriverCommand::Clippy { run, release } => (run, C::Clippy, release),
+            DriverCommand::Test { run, release } => (run, C::Test, release),
+            DriverCommand::Fmt { run, check: false } => (run, C::Fmt, false),
+            DriverCommand::Fmt { run, check: true } => {
+                (run, C::FmtCheck, false)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn env(&self) -> &Option<String> {
+        match self {
+            DriverCommand::Build { run, .. }
+            | DriverCommand::Check { run, .. }
+            | DriverCommand::Clippy { run, .. }
+            | DriverCommand::Test { run, .. }
+            | DriverCommand::Fmt { run, .. } => &run.env,
+        }
+    }
+}
+
+/// Where a driver command runs, and what else to tell cargo.
+#[derive(clap::Args)]
+struct DriverRun {
+    #[arg(
+        long,
+        help = "Run on this machine instead of in a cloud environment"
+    )]
+    local: bool,
+    #[arg(
+        long,
+        env = "VW_ENV",
+        value_name = "NAME",
+        conflicts_with = "local",
+        help = "Cloud environment to run in. Defaults to $VW_ENV, and is only \
+                needed when that is unset and you have more than one."
+    )]
+    env: Option<String>,
+    #[arg(
+        long,
+        help = "Accept the service's TLS certificate without verifying it"
+    )]
+    insecure: bool,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Further arguments for cargo, e.g. `-p module` or \
+                `--all-targets -- -D warnings`"
+    )]
+    args: Vec<String>,
 }
 
 // What can be done with the workspace's testbenches.
@@ -1203,26 +1298,21 @@ async fn main() {
             }
         }
         Commands::Driver { command } => {
-            let DriverCommand::Build {
-                local,
-                env,
-                insecure,
-                release,
-                args,
-            } = command;
-            match driver_build(
+            let (run, command, release) = command.parts();
+            match driver_cargo(
                 &cwd,
-                local,
-                env.as_deref(),
-                insecure,
+                command,
+                run.local,
+                run.env.as_deref(),
+                run.insecure,
                 release,
-                &args,
+                &run.args,
             )
             .await
             {
                 Ok(true) => {}
-                // A build that failed is not a vw failure; the message came
-                // from cargo and has already been printed.
+                // A build or lint that failed is not a vw failure; the
+                // message came from cargo and has already been printed.
                 Ok(false) => process::exit(1),
                 Err(e) => {
                     report(&*e);
@@ -4232,13 +4322,16 @@ async fn remote_worker(
     })
 }
 
-/// Build the driver, wherever this workspace builds it.
+/// Run a cargo command over the driver, wherever this workspace builds it.
 ///
 /// Cloud first, like everything else that needs a toolchain the developer's
 /// machine may not have: the driver targets illumos and pins its own compiler,
-/// and the helios instance is where both of those are true.
-async fn driver_build(
+/// and the helios instance is where both of those are true. Linting and
+/// testing are no different from building in that respect — clippy has to
+/// compile what it lints.
+async fn driver_cargo(
     cwd: &Utf8Path,
+    command: vw_api_types_versions::latest::DriverCommand,
     local: bool,
     named: Option<&str>,
     insecure: bool,
@@ -4254,7 +4347,12 @@ async fn driver_build(
     // phase — `vw anodize` — and this runs it when the driver needs it rather
     // than leaving a developer to remember; it costs a fingerprint when
     // nothing has changed.
-    let anodized = driver::needs_anodized(&workspace)?;
+    // Formatting compiles nothing, so it needs nothing generated.
+    let anodized = !matches!(
+        command,
+        vw_api_types_versions::latest::DriverCommand::Fmt
+            | vw_api_types_versions::latest::DriverCommand::FmtCheck
+    ) && driver::needs_anodized(&workspace)?;
     if anodized {
         ensure_workspace_deps(cwd).await;
     }
@@ -4282,14 +4380,17 @@ async fn driver_build(
             }
         }
 
-        return Ok(driver::build(&session, &target, release, args).await?);
+        return Ok(driver::run(
+            &session, &target, &workspace, command, release, args,
+        )
+        .await?);
     }
 
     if anodized {
         vw_lib::ensure_anodized(&workspace, vw_lib::VhdlStandard::Vhdl2019)
             .await?;
     }
-    Ok(driver::build_locally(&workspace, release, args).await?)
+    Ok(driver::run_locally(&workspace, command, release, args).await?)
 }
 
 /// Remove build output, wherever this workspace builds.
@@ -5227,10 +5328,53 @@ mod env_flag_tests {
             Commands::Cosim {
                 command: CosimCommand::Anodize { env, .. },
             } => env,
-            Commands::Driver { command } => match command {
-                DriverCommand::Build { env, .. } => env,
-            },
+            Commands::Driver { command } => command.env().clone(),
             _ => panic!("not a command that takes --env"),
+        }
+    }
+
+    /// What a developer would type after `cargo clippy` reaches cargo
+    /// unchanged, `--` and all, while vw's own flags are still vw's.
+    #[test]
+    fn a_lint_passes_cargo_its_arguments_verbatim() {
+        let cli = Cli::try_parse_from([
+            "vw",
+            "driver",
+            "clippy",
+            "--env",
+            "e",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .expect("should parse");
+        let Commands::Driver { command } = cli.command else {
+            panic!("not a driver command");
+        };
+        let (run, command, release) = command.parts();
+
+        assert_eq!(
+            command,
+            vw_api_types_versions::latest::DriverCommand::Clippy
+        );
+        assert!(!release);
+        assert_eq!(run.env.as_deref(), Some("e"));
+        assert_eq!(run.args, ["--all-targets", "--", "-D", "warnings"]);
+    }
+
+    #[test]
+    fn formatting_rewrites_unless_asked_only_to_check() {
+        use vw_api_types_versions::latest::DriverCommand as C;
+        for (argv, expected) in [
+            (vec!["vw", "driver", "fmt"], C::Fmt),
+            (vec!["vw", "driver", "fmt", "--check"], C::FmtCheck),
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("should parse");
+            let Commands::Driver { command } = cli.command else {
+                panic!("not a driver command");
+            };
+            assert_eq!(command.parts().1, expected, "{argv:?}");
         }
     }
 
@@ -5255,6 +5399,9 @@ mod env_flag_tests {
             vec!["vw", "anodize"],
             vec!["vw", "anodize", "--force"],
             vec!["vw", "driver", "build", "--release"],
+            vec!["vw", "driver", "clippy"],
+            vec!["vw", "driver", "fmt"],
+            vec!["vw", "driver", "fmt", "--check"],
         ] {
             let cli = Cli::try_parse_from(&argv).expect("should parse");
             assert_eq!(

@@ -6121,6 +6121,7 @@ dependencies = [
  "vw-bench",
  "vw-eda",
  "vw-lib",
+ "vw-sync",
  "vw-vivado",
 ]
 

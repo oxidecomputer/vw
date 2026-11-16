@@ -22,7 +22,7 @@ use dropshot::{
 use dropshot_api_manager_types::api_versions;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use vw_api_types_versions::{latest, v1, v3, v4};
+use vw_api_types_versions::{latest, v1, v3, v4, v6};
 
 api_versions!([
     // WHEN CHANGING THE API (part 1 of 2):
@@ -36,6 +36,7 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (6, DRIVER_CARGO),
     (5, ANODIZE_PHASE),
     (4, WORKSPACES),
     (3, ANODIZE),
@@ -615,6 +616,28 @@ pub trait VwSyncApi {
         .await
     }
 
+    /// Run a cargo command over the driver on this instance.
+    ///
+    /// A websocket because a build or a lint takes minutes and produces output
+    /// the whole time, and because a developer who interrupts one should not
+    /// leave cargo running on a machine nobody is watching.
+    ///
+    /// Cargo is spawned rather than linked: the driver pins its toolchain in
+    /// `rust-toolchain.toml`, which the rustup shim honours and a linked cargo
+    /// would not, so linking it would quietly build a kernel module with the
+    /// wrong compiler.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{environment}/workspace/{workspace}/driver/cargo",
+        versions = VERSION_DRIVER_CARGO..,
+    }]
+    async fn driver_cargo(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<WorkspacePathParam>,
+        query: Query<latest::AgentDriverQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
+
     /// Build the driver on this instance.
     ///
     /// A websocket because a build takes minutes and produces output the whole
@@ -628,14 +651,17 @@ pub trait VwSyncApi {
     #[channel {
         protocol = WEBSOCKETS,
         path = "/environment/{environment}/workspace/{workspace}/driver/build",
-        versions = VERSION_ANODIZE_PHASE..,
+        versions = VERSION_ANODIZE_PHASE..VERSION_DRIVER_CARGO,
     }]
     async fn driver_build(
         rqctx: RequestContext<Self::Context>,
         path_params: Path<WorkspacePathParam>,
-        query: Query<latest::AgentDriverBuildQuery>,
+        query: Query<v6::AgentDriverBuildQuery>,
         websock: WebsocketConnection,
-    ) -> WebsocketChannelResult;
+    ) -> WebsocketChannelResult {
+        Self::driver_cargo(rqctx, path_params, query.map(Into::into), websock)
+            .await
+    }
 
     /// Build the driver on this instance.
     ///
@@ -659,7 +685,7 @@ pub trait VwSyncApi {
         query: Query<v1::DriverBuildQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult {
-        Self::driver_build(rqctx, path_params, query.map(Into::into), websock)
+        Self::driver_cargo(rqctx, path_params, query.map(Into::into), websock)
             .await
     }
 
@@ -685,7 +711,7 @@ pub trait VwSyncApi {
         query: Query<v1::DriverBuildQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult {
-        Self::driver_build(
+        Self::driver_cargo(
             rqctx,
             path_params.map(WorkspacePathParam::legacy),
             query.map(Into::into),

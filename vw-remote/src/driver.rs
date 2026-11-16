@@ -114,6 +114,21 @@ pub enum DriverEvent {
     },
     /// The build could not be run at all.
     Fatal { message: String },
+    /// A file formatting changed, as it now reads.
+    ///
+    /// Sent whole rather than as a diff, for the reason synchronization sends
+    /// whole files: source is small, and applying a diff is one more thing to
+    /// get wrong. `before` is the digest of what the instance formatted, so
+    /// the client can tell whether its own copy is still that — a developer
+    /// who kept editing while this ran must not have the edit overwritten
+    /// with a formatting of what was there before it.
+    Formatted {
+        /// Relative to the driver's directory, `/`-separated.
+        path: String,
+        /// Hex blake3, as synchronization spells a digest.
+        before: String,
+        contents: String,
+    },
 }
 
 /// What cargo says about something it built.
@@ -169,10 +184,97 @@ fn is_deliverable(path: &Utf8Path) -> bool {
     !matches!(path.extension(), Some("rlib" | "rmeta" | "d"))
 }
 
-/// What to build.
+/// Which cargo command to run over the driver.
+///
+/// The commands a driver is developed with. They differ in what they need and
+/// what they leave behind, which is why this is a closed set rather than any
+/// cargo subcommand: each answer below is one the instance has to get right
+/// on a machine nobody is looking at.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Command {
+    #[default]
+    Build,
+    Check,
+    Clippy,
+    Test,
+    /// Format, and send back every file that changed.
+    ///
+    /// The instance's copy is a mirror, so formatting it alone would change
+    /// nothing a developer keeps: what matters is the content that comes back
+    /// as [`DriverEvent::Formatted`], for the client to write into the tree
+    /// it actually works in. The instance's copy is left formatted, which is
+    /// harmless — the next sync makes it match the developer's either way.
+    Fmt,
+    /// `cargo fmt --check`: report, rewrite nothing.
+    FmtCheck,
+}
+
+impl Command {
+    /// Whether this compiles the driver, and so needs everything compiling
+    /// it needs: anodizer output, and members built for their own targets
+    /// built from their own directories.
+    ///
+    /// Formatting reads source and nothing else — rustfmt does not expand
+    /// `include!`, so it neither needs anodizer output nor has an opinion
+    /// about targets.
+    pub fn compiles(self) -> bool {
+        !matches!(self, Command::Fmt | Command::FmtCheck)
+    }
+
+    /// Whether what this produces is worth keeping. Only a build's is: a lint
+    /// or a check makes metadata, and a test binary has done its job by the
+    /// time it exits.
+    pub fn stores(self) -> bool {
+        matches!(self, Command::Build)
+    }
+
+    /// Whether a member compiled for its own target takes part.
+    ///
+    /// It does for anything that only compiles. It cannot for `test`, which
+    /// has to run what it compiles, and such a member is by vw's definition
+    /// compiled for somewhere other than here — a kernel module has no test
+    /// harness to run.
+    fn includes_separately_targeted(self) -> bool {
+        !matches!(self, Command::Test | Command::Fmt | Command::FmtCheck)
+    }
+
+    /// The arguments that start cargo's command line.
+    fn subcommand(self) -> &'static [&'static str] {
+        match self {
+            Command::Build => &["build"],
+            Command::Check => &["check"],
+            Command::Clippy => &["clippy"],
+            Command::Test => &["test"],
+            Command::Fmt => &["fmt"],
+            Command::FmtCheck => &["fmt", "--check"],
+        }
+    }
+}
+
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Command::Build => "build",
+            Command::Check => "check",
+            Command::Clippy => "clippy",
+            Command::Test => "test",
+            Command::Fmt => "fmt",
+            Command::FmtCheck => "fmt --check",
+        })
+    }
+}
+
+/// What to run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BuildParams {
-    /// Build with optimizations.
+    /// The cargo command. Defaulted so a request from before there was a
+    /// choice still means what it meant: a build.
+    #[serde(default)]
+    pub command: Command,
+    /// Compile with optimizations. Ignored by `fmt`, which compiles nothing.
     pub release: bool,
     /// Anything else to put on cargo's command line.
     ///
@@ -327,11 +429,18 @@ fn metadata(root: &Utf8Path) -> Option<Metadata> {
 /// Deriving it from a file the project already needs means there is nothing
 /// extra to declare, and nothing that can disagree with how the project
 /// actually builds.
-fn units(root: &Utf8Path) -> Vec<Unit> {
+fn units(root: &Utf8Path, command: Command) -> Vec<Unit> {
     let mut units = vec![Unit {
         directory: root.to_owned(),
         name: "workspace".to_owned(),
     }];
+
+    // Formatting from the root covers every member, whatever it targets, so
+    // there is nothing to split. Testing cannot include a member built for
+    // somewhere else. Either way the workspace invocation is the whole of it.
+    if !command.includes_separately_targeted() {
+        return units;
+    }
 
     let Some(metadata) = metadata(root) else {
         return units;
@@ -415,8 +524,14 @@ async fn build(
     }
 
     // Said before anything is built, because the alternative is a compiler
-    // error several minutes from now that names none of this.
-    if let Some(contradiction) = contradiction(root) {
+    // error several minutes from now that names none of this. Only for what
+    // compiles: formatting does not care which target a member is for.
+    if let Some(contradiction) = params
+        .command
+        .compiles()
+        .then(|| contradiction(root))
+        .flatten()
+    {
         let _ = events.send(DriverEvent::Fatal {
             message: contradiction,
         });
@@ -426,7 +541,7 @@ async fn build(
     // Before cargo, so a missing input is reported as itself rather than as a
     // compile error naming a file the developer never wrote.
     let mut env = Vec::new();
-    if let Some(prepare) = prepare {
+    if let Some(prepare) = prepare.filter(|_| params.command.compiles()) {
         match prepare().await {
             Ok(prepared) => {
                 for text in prepared.notes {
@@ -447,8 +562,17 @@ async fn build(
         .map(|metadata| metadata.workspace_members.into_iter().collect())
         .unwrap_or_default();
 
+    if params.command == Command::Fmt {
+        let _ = events.send(DriverEvent::Building {
+            unit: "workspace".to_owned(),
+        });
+        let (success, code) = format(root, params, &events).await;
+        let _ = events.send(DriverEvent::Done { success, code });
+        return Vec::new();
+    }
+
     let mut produced = Vec::new();
-    for unit in units(root) {
+    for unit in units(root, params.command) {
         let _ = events.send(DriverEvent::Building {
             unit: unit.name.clone(),
         });
@@ -457,12 +581,13 @@ async fn build(
         {
             Some((true, mut artifacts)) => produced.append(&mut artifacts),
             // Reported already; there is no sense building the kernel module
-            // against a userland that did not compile.
+            // against a userland that did not compile, and a lint that has
+            // already failed has already said what a developer needs.
             Some((false, _)) | None => return Vec::new(),
         }
     }
 
-    if !produced.is_empty() {
+    if params.command.stores() && !produced.is_empty() {
         // Stored before the build is called finished. Otherwise a developer
         // whose command has just returned successfully would go looking for
         // the artifacts and find nothing, which is a race they have no way to
@@ -483,6 +608,214 @@ async fn build(
     produced
 }
 
+/// Format the driver and send back everything that changed.
+///
+/// Two passes: `--check` with rustfmt's `-l` first, which names the files that
+/// would change without changing them, so what they held before can be
+/// recorded; then the formatting itself. Returns whether it worked and cargo's
+/// exit status, for [`DriverEvent::Done`].
+async fn format(
+    root: &Utf8Path,
+    params: &BuildParams,
+    events: &tokio::sync::mpsc::UnboundedSender<DriverEvent>,
+) -> (bool, Option<i32>) {
+    // rustfmt's own flags go after cargo's `--`. A developer who already
+    // wrote one gets theirs extended rather than a second, which cargo would
+    // hand rustfmt as a file name.
+    let rustfmt_list = |mut args: Vec<String>| {
+        if !args.iter().any(|arg| arg == "--") {
+            args.push("--".to_owned());
+        }
+        args.push("-l".to_owned());
+        args
+    };
+
+    let mut check = vec!["fmt".to_owned(), "--check".to_owned()];
+    check.extend(params.args.iter().cloned());
+    let listed = match run_quietly(root, &rustfmt_list(check), events).await {
+        Ok(listed) => listed,
+        Err(code) => return (false, code),
+    };
+
+    // rustfmt names files as cargo handed them over, which is absolute; the
+    // client needs them relative to the driver, since that is the one
+    // directory both ends agree on.
+    let base = std::fs::canonicalize(root)
+        .ok()
+        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+        .unwrap_or_else(|| root.to_owned());
+    let mut before = Vec::new();
+    for line in &listed.lines {
+        let path = Utf8PathBuf::from(line.trim());
+        let absolute = std::fs::canonicalize(root.join(&path))
+            .ok()
+            .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+            .unwrap_or(path);
+        let Ok(relative) = absolute.strip_prefix(&base) else {
+            // A member outside the driver's directory. Formatted on the
+            // instance like the rest, but there is nowhere on the client this
+            // could be said to belong, so it is said rather than sent.
+            let _ = events.send(DriverEvent::Line {
+                text: format!(
+                    "warning: {absolute} needs formatting but is outside \
+                     `{DIRECTORY}`; format it locally"
+                ),
+            });
+            continue;
+        };
+        match std::fs::read(&absolute) {
+            Ok(bytes) => before.push((
+                absolute.clone(),
+                relative.to_owned(),
+                vw_sync::digest_bytes(&bytes).0,
+            )),
+            Err(e) => {
+                let _ = events.send(DriverEvent::Fatal {
+                    message: format!("reading {absolute}: {e}"),
+                });
+                return (false, None);
+            }
+        }
+    }
+
+    if !listed.success && before.is_empty() && listed.lines.is_empty() {
+        // `--check` failed without naming anything, which means it failed for
+        // a reason of its own — a file that does not parse, a module that
+        // does not exist. rustfmt has already said which.
+        return (false, listed.code);
+    }
+    if listed.lines.is_empty() {
+        return (true, Some(0));
+    }
+
+    let mut write = vec!["fmt".to_owned()];
+    write.extend(params.args.iter().cloned());
+    match run_quietly(root, &write, events).await {
+        Ok(ran) if ran.success => {}
+        Ok(ran) => return (false, ran.code),
+        Err(code) => return (false, code),
+    }
+
+    for (absolute, relative, digest) in before {
+        match std::fs::read_to_string(&absolute) {
+            Ok(contents) => {
+                let _ = events.send(DriverEvent::Formatted {
+                    path: relative.as_str().replace('\\', "/"),
+                    before: digest,
+                    contents,
+                });
+            }
+            Err(e) => {
+                let _ = events.send(DriverEvent::Fatal {
+                    message: format!("reading {absolute}: {e}"),
+                });
+                return (false, None);
+            }
+        }
+    }
+
+    (true, Some(0))
+}
+
+/// What a cargo run that kept its stdout came to.
+struct Quiet {
+    success: bool,
+    code: Option<i32>,
+    lines: Vec<String>,
+}
+
+/// Run cargo, keeping stdout and forwarding stderr.
+///
+/// For `cargo fmt -l`, whose stdout is a list of files for this module to act
+/// on rather than anything a developer should read. `Err` when cargo could not
+/// be run at all, which has already been reported.
+async fn run_quietly(
+    root: &Utf8Path,
+    args: &[String],
+    events: &tokio::sync::mpsc::UnboundedSender<DriverEvent>,
+) -> Result<Quiet, Option<i32>> {
+    let child = tokio::process::Command::new("cargo")
+        .args(args)
+        .current_dir(root.as_std_path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = events.send(DriverEvent::Fatal {
+                message: format!("cannot run cargo on this instance: {e}"),
+            });
+            return Err(None);
+        }
+    };
+
+    let plain = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(forward(stderr, events.clone())));
+    let mut lines = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+        }
+    }
+    let status = child.wait().await;
+    if let Some(plain) = plain {
+        let _ = plain.await;
+    }
+
+    match status {
+        Ok(status) => Ok(Quiet {
+            success: status.success(),
+            code: status.code(),
+            lines,
+        }),
+        Err(e) => {
+            let _ = events.send(DriverEvent::Fatal {
+                message: format!("waiting for cargo: {e}"),
+            });
+            Err(None)
+        }
+    }
+}
+
+/// Cargo's command line for `params`, after the program name.
+fn arguments(params: &BuildParams) -> Vec<String> {
+    let mut args: Vec<String> = params
+        .command
+        .subcommand()
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect();
+
+    if params.command.compiles() {
+        if params.release {
+            args.push("--release".to_owned());
+        }
+        // Forced on: cargo turns colour off when its output is not a
+        // terminal, and here it never is — but there is a terminal at the far
+        // end of this, and it is the one that matters.
+        args.extend(["--color", "always"].map(str::to_owned));
+        // Structured, so the exact set of files this produced comes from
+        // cargo rather than from guessing at target directory layout.
+        // Diagnostics still arrive pre-rendered, colour and all, so nothing
+        // about what a developer sees changes. `cargo fmt` has neither flag:
+        // it is rustfmt with a cargo-shaped front, and its diff is the output.
+        args.extend(
+            ["--message-format", "json-diagnostic-rendered-ansi"]
+                .map(str::to_owned),
+        );
+    }
+
+    args.extend(params.args.iter().cloned());
+    args
+}
+
 /// Spawn cargo in one directory and forward everything it says.
 ///
 /// Returns whether it succeeded, or `None` if it could not be run at all — in
@@ -495,20 +828,7 @@ async fn build_one(
     members: &std::collections::HashSet<String>,
 ) -> Option<(bool, Vec<Utf8PathBuf>)> {
     let mut command = tokio::process::Command::new("cargo");
-    command.arg("build");
-    if params.release {
-        command.arg("--release");
-    }
-    // Forced on: cargo turns colour off when its output is not a terminal, and
-    // here it never is — but there is a terminal at the far end of this, and
-    // it is the one that matters.
-    command.args(["--color", "always"]);
-    // Structured, so the exact set of files this produced comes from cargo
-    // rather than from guessing at target directory layout. Diagnostics still
-    // arrive pre-rendered, colour and all, so nothing about what a developer
-    // sees changes.
-    command.args(["--message-format", "json-diagnostic-rendered-ansi"]);
-    command.args(&params.args);
+    command.args(arguments(params));
     command.envs(env.iter().map(|(k, v)| (k, v)));
 
     let child = command
@@ -648,6 +968,7 @@ mod test {
     #[test]
     fn a_release_build_says_so() {
         let params = BuildParams {
+            command: Command::Build,
             release: true,
             args: vec!["-p".to_owned(), "module".to_owned()],
         };
@@ -655,13 +976,62 @@ mod test {
         // The shape the agent will hand cargo, checked here because getting it
         // wrong means building the wrong thing on a machine nobody is looking
         // at.
-        let mut expected = vec!["build", "--release", "--color", "always"];
-        expected.extend(params.args.iter().map(String::as_str));
+        assert_eq!(
+            arguments(&params),
+            [
+                "build",
+                "--release",
+                "--color",
+                "always",
+                "--message-format",
+                "json-diagnostic-rendered-ansi",
+                "-p",
+                "module",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_lint_is_clippy_with_what_the_developer_added() {
+        let params = BuildParams {
+            command: Command::Clippy,
+            release: false,
+            args: vec!["--all-targets".to_owned()],
+        };
 
         assert_eq!(
-            expected,
-            ["build", "--release", "--color", "always", "-p", "module"],
+            arguments(&params),
+            [
+                "clippy",
+                "--color",
+                "always",
+                "--message-format",
+                "json-diagnostic-rendered-ansi",
+                "--all-targets",
+            ],
         );
+    }
+
+    #[test]
+    fn checking_formatting_passes_nothing_meant_for_a_compiler() {
+        // `--release` means nothing to rustfmt, and `--message-format` means
+        // something else entirely, so neither is passed.
+        let params = BuildParams {
+            command: Command::FmtCheck,
+            release: true,
+            args: Vec::new(),
+        };
+
+        assert_eq!(arguments(&params), ["fmt", "--check"]);
+    }
+
+    #[test]
+    fn a_request_that_names_no_command_is_a_build() {
+        // What an instance hears from a service that predates the choice.
+        let params: BuildParams =
+            serde_json::from_str(r#"{"release":false,"args":[]}"#)
+                .expect("deserialize");
+        assert_eq!(params.command, Command::Build);
     }
 
     /// A driver workspace with `userland` and, optionally, a member built for
@@ -721,8 +1091,10 @@ mod test {
         // cargo runs from its directory, so that is where it is run from.
         let (_dir, root) = workspace(true, false);
 
-        let names: Vec<String> =
-            units(&root).into_iter().map(|unit| unit.name).collect();
+        let names: Vec<String> = units(&root, Command::Build)
+            .into_iter()
+            .map(|unit| unit.name)
+            .collect();
 
         assert_eq!(names, ["workspace", "kmod"]);
     }
@@ -733,8 +1105,10 @@ mod test {
         // different target, so one invocation covers it.
         let (_dir, root) = workspace(false, false);
 
-        let names: Vec<String> =
-            units(&root).into_iter().map(|unit| unit.name).collect();
+        let names: Vec<String> = units(&root, Command::Build)
+            .into_iter()
+            .map(|unit| unit.name)
+            .collect();
 
         assert_eq!(names, ["workspace"]);
     }
@@ -750,6 +1124,143 @@ mod test {
 
         assert!(complaint.contains("kmod"), "{complaint}");
         assert!(complaint.contains("default-members"), "{complaint}");
+    }
+
+    #[test]
+    fn only_compiling_splits_off_a_member_with_its_own_target() {
+        // Formatting from the root already covers it, and testing cannot run
+        // what a kernel module compiles to.
+        let (_dir, root) = workspace(true, false);
+
+        for command in [Command::Fmt, Command::FmtCheck, Command::Test] {
+            let names: Vec<String> = units(&root, command)
+                .into_iter()
+                .map(|unit| unit.name)
+                .collect();
+            assert_eq!(names, ["workspace"], "{command}");
+        }
+
+        for command in [Command::Check, Command::Clippy] {
+            let names: Vec<String> = units(&root, command)
+                .into_iter()
+                .map(|unit| unit.name)
+                .collect();
+            assert_eq!(names, ["workspace", "kmod"], "{command}");
+        }
+    }
+
+    /// Run `command` over a workspace whose `userland` member is badly
+    /// formatted, collecting everything the instance would have sent.
+    async fn run_over_unformatted(command: Command) -> Vec<DriverEvent> {
+        let (_dir, root) = workspace(false, false);
+        std::fs::write(
+            root.join("userland/src/lib.rs"),
+            "mod m;\nfn  f( ){}\n",
+        )
+        .expect("write");
+        std::fs::write(root.join("userland/src/m.rs"), "pub fn g() {}\n")
+            .expect("write");
+        // Already formatted, so only `userland` has anything to change.
+        std::fs::write(root.join("kmod/src/lib.rs"), "\n").expect("write");
+
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let params = BuildParams {
+            command,
+            ..BuildParams::default()
+        };
+        let upload: Uploader =
+            Box::new(|_| Box::pin(async { Stored::default() }));
+        build(&root, &params, None, events, upload).await;
+
+        let mut all = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            all.push(event);
+        }
+        all
+    }
+
+    #[tokio::test]
+    async fn formatting_sends_back_exactly_what_changed() {
+        let events = run_over_unformatted(Command::Fmt).await;
+
+        let formatted: Vec<(&str, &str, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                DriverEvent::Formatted {
+                    path,
+                    before,
+                    contents,
+                } => Some((path.as_str(), before.as_str(), contents.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        // Only the file that needed it, named relative to the driver, with
+        // the digest of what it held so the client can tell it is unchanged.
+        assert_eq!(formatted.len(), 1, "{events:?}");
+        let (path, before, contents) = formatted[0];
+        assert_eq!(path, "userland/src/lib.rs");
+        assert_eq!(before, vw_sync::digest_bytes(b"mod m;\nfn  f( ){}\n").0);
+        assert_eq!(contents, "mod m;\nfn f() {}\n");
+        assert!(
+            matches!(
+                events.last(),
+                Some(DriverEvent::Done { success: true, .. })
+            ),
+            "{events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn checking_formatting_sends_nothing_back_and_fails() {
+        let events = run_over_unformatted(Command::FmtCheck).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, DriverEvent::Formatted { .. })),
+            "{events:?}",
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(DriverEvent::Done { success: false, .. })
+            ),
+            "{events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_does_not_parse_fails_formatting_and_sends_nothing() {
+        let (_dir, root) = workspace(false, false);
+        std::fs::write(root.join("userland/src/lib.rs"), "fn f( {\n")
+            .expect("write");
+
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let params = BuildParams {
+            command: Command::Fmt,
+            ..BuildParams::default()
+        };
+        let upload: Uploader =
+            Box::new(|_| Box::pin(async { Stored::default() }));
+        build(&root, &params, None, events, upload).await;
+
+        let mut all = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            all.push(event);
+        }
+        assert!(
+            !all.iter()
+                .any(|event| matches!(event, DriverEvent::Formatted { .. })),
+            "{all:?}",
+        );
+        assert!(
+            matches!(
+                all.last(),
+                Some(DriverEvent::Done { success: false, .. })
+            ),
+            "{all:?}",
+        );
     }
 
     #[test]

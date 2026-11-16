@@ -19,6 +19,7 @@ api_versions!([
     // |  example for the next person.
     // v
     // (next_int, IDENT),
+    (7, DRIVER_CARGO),
     (6, ANODIZE_PHASE),
     (5, WORKSPACES),
     (4, ANODIZE),
@@ -316,6 +317,25 @@ pub trait VwUserApi {
         .await
     }
 
+    /// Run a cargo command over the driver on an environment's helios
+    /// instance.
+    ///
+    /// Relayed frame for frame. The driver's target is native there, its
+    /// pinned toolchain is installed there, and the anodizer output it
+    /// includes is fetched there — which is the whole reason building,
+    /// linting and testing it do not happen on a developer's machine.
+    #[channel {
+        protocol = WEBSOCKETS,
+        path = "/environment/{name}/workspace/{workspace}/driver/cargo",
+        versions = VERSION_DRIVER_CARGO..,
+    }]
+    async fn driver_cargo(
+        rqctx: RequestContext<Self::Context>,
+        path_params: Path<latest::WorkspacePathParam>,
+        query: Query<latest::DriverQuery>,
+        websock: WebsocketConnection,
+    ) -> WebsocketChannelResult;
+
     /// Build the driver on an environment's helios instance.
     ///
     /// Relayed frame for frame. The driver's target is native there and its
@@ -324,14 +344,17 @@ pub trait VwUserApi {
     #[channel {
         protocol = WEBSOCKETS,
         path = "/environment/{name}/workspace/{workspace}/driver/build",
-        versions = VERSION_WORKSPACES..,
+        versions = VERSION_WORKSPACES..VERSION_DRIVER_CARGO,
     }]
     async fn driver_build(
         rqctx: RequestContext<Self::Context>,
         path_params: Path<latest::WorkspacePathParam>,
-        query: Query<latest::DriverBuildQuery>,
+        query: Query<v1::DriverBuildQuery>,
         websock: WebsocketConnection,
-    ) -> WebsocketChannelResult;
+    ) -> WebsocketChannelResult {
+        Self::driver_cargo(rqctx, path_params, query.map(Into::into), websock)
+            .await
+    }
 
     /// Build the driver on an environment's helios instance.
     ///
@@ -350,7 +373,7 @@ pub trait VwUserApi {
         query: Query<v1::DriverBuildQuery>,
         websock: WebsocketConnection,
     ) -> WebsocketChannelResult {
-        Self::driver_build(
+        Self::driver_cargo(
             rqctx,
             path_params.map(|params| {
                 latest::WorkspacePathParam::from_v1(

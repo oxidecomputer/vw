@@ -32,6 +32,8 @@ vw check                          # parse and analyze the design
 vw run                            # build the FPGA image
 vw bench run                      # run testbenches
 vw driver build --release         # build the kernel driver
+vw driver clippy --all-targets    # lint it (also check, test)
+vw driver fmt                     # format it; --check only reports
 
 vw cloud artifacts --all          # download build output
 vw cloud delete my-env            # release the instances
@@ -44,6 +46,15 @@ it has to name one. `$VW_ENV` and an explicit `--env` still win, in that order.
 workspace to the environment before they run, and stream output back as it
 happens. Pass `--local` to any of them to run on this machine instead, which
 needs the toolchains installed locally.
+
+The other `vw driver` commands — `check`, `clippy`, `test` and `fmt` — run on
+the helios instance for the same reason the build does: the kernel module
+targets illumos, the driver pins its own toolchain, and it includes anodizer
+output that only the environment has. Anything after the command goes to cargo
+verbatim (`vw driver clippy --all-targets -- -D warnings`). `vw driver fmt`
+writes every file rustfmt changed back into this checkout, leaving alone any
+file edited since it was sent; `vw driver fmt --check` rewrites nothing and
+fails if anything would change.
 
 ### One environment, several workspaces
 
