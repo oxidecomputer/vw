@@ -374,12 +374,12 @@ impl VwUserApi for UserApi {
         Ok(dropshot::HttpResponseOk(cleaned))
     }
 
-    async fn driver_build(
+    async fn driver_cargo(
         rqctx: dropshot::RequestContext<Self::Context>,
         path_params: dropshot::Path<
             vw_api_types_versions::latest::WorkspacePathParam,
         >,
-        query: dropshot::Query<vw_api_types_versions::latest::DriverBuildQuery>,
+        query: dropshot::Query<vw_api_types_versions::latest::DriverQuery>,
         websock: dropshot::WebsocketConnection,
     ) -> dropshot::WebsocketChannelResult {
         let log = rqctx.log.clone();
@@ -453,21 +453,24 @@ impl VwUserApi for UserApi {
             }
         };
 
-        info!(log, "building the driver";
+        info!(log, "running cargo over the driver";
             "environment" => &name,
             "user" => &caller.name,
+            "command" => %query.command,
             "release" => query.release,
         );
 
-        let query = vw_api_types_versions::latest::AgentDriverBuildQuery {
+        let query = vw_api_types_versions::latest::AgentDriverQuery {
+            command: query.command,
+            diagnostics: query.diagnostics,
             release: query.release,
             args: query.args,
             anodized_bucket,
         };
-        let result = agent.join_driver_build(websock, &query).await;
+        let result = agent.join_driver_cargo(websock, &query).await;
 
         match &result {
-            Ok(()) => info!(log, "driver build ended";
+            Ok(()) => info!(log, "driver cargo ended";
                 "environment" => &name,
             ),
             Err(e) => log_relay_failure(&log, &target, e),

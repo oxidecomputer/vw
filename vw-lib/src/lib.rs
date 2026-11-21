@@ -1880,20 +1880,71 @@ pub fn list_testbenches(
     list_testbenches_impl(bench_dir, ignore_dirs, recurse, &mut entities_cache)
 }
 
+/// Whether a directory under `bench/` is build output rather than bench
+/// sources, and so must not be walked when looking for testbenches.
+///
+/// `bench/target` is the cargo target directory for the Rust cosim benches.
+/// Benches run concurrently, so while one bench walks `bench/` another may be
+/// running cargo there, and rustc creates and deletes scratch directories
+/// under it as it goes. Walking into it races those deletions.
+fn is_bench_build_dir(name: &str) -> bool {
+    name == "target" || name.starts_with('.')
+}
+
+/// The entries of a directory in the bench tree.
+///
+/// `bench_dir` itself must exist. A subdirectory that vanished between being
+/// listed by its parent and being read here is treated as empty: something
+/// else in the tree removed it, and a directory that is gone holds no
+/// testbenches.
+fn read_bench_dir(dir: &Utf8Path, is_root: bool) -> Result<Vec<fs::DirEntry>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if !is_root && e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new())
+        }
+        Err(e) => {
+            return Err(VwError::FileSystem {
+                message: format!("Failed to read bench directory {dir}: {e}"),
+            })
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => out.push(entry),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(VwError::FileSystem {
+                    message: format!(
+                        "Failed to read directory entry in {dir}: {e}"
+                    ),
+                })
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn list_testbenches_impl(
     bench_dir: &Utf8Path,
     ignore_dirs: &HashSet<String>,
     recurse: bool,
     entities_cache: &mut HashMap<PathBuf, Vec<String>>,
 ) -> Result<Vec<TestbenchInfo>> {
+    list_testbenches_walk(bench_dir, true, ignore_dirs, recurse, entities_cache)
+}
+
+fn list_testbenches_walk(
+    bench_dir: &Utf8Path,
+    is_root: bool,
+    ignore_dirs: &HashSet<String>,
+    recurse: bool,
+    entities_cache: &mut HashMap<PathBuf, Vec<String>>,
+) -> Result<Vec<TestbenchInfo>> {
     let mut testbenches = Vec::new();
 
-    for entry in fs::read_dir(bench_dir).map_err(|e| VwError::FileSystem {
-        message: format!("Failed to read bench directory: {e}"),
-    })? {
-        let entry = entry.map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read directory entry: {e}"),
-        })?;
+    for entry in read_bench_dir(bench_dir, is_root)? {
         let path = entry.path();
 
         if path.is_file() {
@@ -1914,9 +1965,12 @@ fn list_testbenches_impl(
                     message: format!("Failed to get dir path: {e}"),
                 })?;
             if let Some(file_name) = dir_path.file_name() {
-                if !ignore_dirs.contains(file_name) {
-                    let mut lower_testbenches = list_testbenches_impl(
+                if !ignore_dirs.contains(file_name)
+                    && !is_bench_build_dir(file_name)
+                {
+                    let mut lower_testbenches = list_testbenches_walk(
                         &dir_path,
+                        false,
                         ignore_dirs,
                         recurse,
                         entities_cache,
@@ -4323,9 +4377,20 @@ pub fn ensure_bench_scaffolds(workspace_dir: &Utf8Path) -> Result<()> {
     // ways — see `bench_init::heal_cosim_scaffolds`.
     bench_init::heal_cosim_scaffolds(workspace_dir)?;
 
+    for (bench, config) in mist_benches(workspace_dir)? {
+        sim::scaffold(&bench, &config)?;
+    }
+    Ok(())
+}
+
+/// Every mixed-signal bench in the workspace, with its parsed `mist.toml`.
+fn mist_benches(
+    workspace_dir: &Utf8Path,
+) -> Result<Vec<(Utf8PathBuf, MistConfig)>> {
+    let mut benches = Vec::new();
     let bench_dir = workspace_dir.join("bench");
     let Ok(entries) = fs::read_dir(bench_dir.as_std_path()) else {
-        return Ok(()); // no bench dir → nothing to scaffold
+        return Ok(benches); // no bench dir → nothing to scaffold
     };
     let mut ws_config: Option<WorkspaceConfig> = None;
     for entry in entries.flatten() {
@@ -4359,9 +4424,59 @@ pub fn ensure_bench_scaffolds(workspace_dir: &Utf8Path) -> Result<()> {
                     ),
                 }
             })?;
-        sim::scaffold(&bench_test_dir, &mist_config)?;
+        benches.push((bench_test_dir, mist_config));
     }
-    Ok(())
+    benches.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(benches)
+}
+
+/// What [`ensure_editor_scaffolds`] did, bench by bench.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EditorScaffolds {
+    /// Benches whose derived files are now in place.
+    pub written: Vec<String>,
+    /// Benches left alone because their `.gitignore` does not cover what
+    /// would be written, so synchronization would carry it to the cloud.
+    pub skipped: Vec<String>,
+}
+
+/// Generate the mixed-signal benches' derived files for an editor on this
+/// machine, and nothing synchronization would see.
+///
+/// [`ensure_bench_scaffolds`] is for the machine that builds the benches and
+/// may write anything a build needs: it rewrites a bench's `.gitignore`,
+/// creates a missing `src/lib.rs`, and heals cosim crates' `build.rs`. On a
+/// developer's machine those are files in their checkout, and the next sync
+/// would carry them to the cloud — generated locally and fed into a build,
+/// which is exactly what must not happen. So this writes only the files
+/// derived from `mist.toml`, and only for a bench whose own `.gitignore`
+/// already lists every one of them; anything else is reported, not written.
+pub fn ensure_editor_scaffolds(
+    workspace_dir: &Utf8Path,
+) -> Result<EditorScaffolds> {
+    let mut done = EditorScaffolds::default();
+    for (bench, config) in mist_benches(workspace_dir)? {
+        let name = bench.file_name().unwrap_or_default().to_owned();
+        let ignored: std::collections::BTreeSet<String> =
+            fs::read_to_string(bench.join(".gitignore"))
+                .map(|text| {
+                    text.lines()
+                        .map(|line| line.trim().trim_start_matches('/'))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+        if sim::bridge::DERIVED
+            .iter()
+            .all(|file| ignored.contains(*file))
+        {
+            sim::scaffold_derived(&bench, &config)?;
+            done.written.push(name);
+        } else {
+            done.skipped.push(name);
+        }
+    }
+    Ok(done)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5308,17 +5423,13 @@ pub fn write_ip_stubs_from_templates(
 fn find_testbench_file_recurse(
     testbench_name: &str,
     bench_dir: &Utf8Path,
+    is_root: bool,
     recurse: bool,
     entities_cache: &mut HashMap<PathBuf, Vec<String>>,
 ) -> Result<Vec<PathBuf>> {
     let mut found_files = Vec::new();
 
-    for entry in fs::read_dir(bench_dir).map_err(|e| VwError::FileSystem {
-        message: format!("Failed to read bench directory: {e}"),
-    })? {
-        let entry = entry.map_err(|e| VwError::FileSystem {
-            message: format!("Failed to read directory entry: {e}"),
-        })?;
+    for entry in read_bench_dir(bench_dir, is_root)? {
         let path = entry.path();
 
         if path.is_file() {
@@ -5339,9 +5450,13 @@ fn find_testbench_file_recurse(
                 path.try_into().map_err(|e| VwError::FileSystem {
                     message: format!("Failed to get dir path: {e}"),
                 })?;
+            if dir_path.file_name().is_some_and(is_bench_build_dir) {
+                continue;
+            }
             let mut lower_testbenches = find_testbench_file_recurse(
                 testbench_name,
                 &dir_path,
+                false,
                 recurse,
                 entities_cache,
             )?;
@@ -5360,6 +5475,7 @@ fn find_testbench_file(
     let found_files = find_testbench_file_recurse(
         testbench_name,
         bench_dir,
+        true,
         recurse,
         entities_cache,
     )?;
@@ -10942,5 +11058,129 @@ exclusive = ["hdl/top-beta.vhd"]
             "pub mod hdl {\n    include!(concat!(env!(\"VW_ANODIZED_DIR\"), \"/hdl.rs\"));\n}\n",
         );
         assert!(uses_anodized(&found));
+    }
+}
+
+#[cfg(test)]
+mod bench_walk_tests {
+    use super::*;
+
+    fn bench(tmp: &tempfile::TempDir) -> Utf8PathBuf {
+        let bench =
+            Utf8PathBuf::from_path_buf(tmp.path().join("bench")).unwrap();
+        fs::create_dir_all(bench.join("foo_test")).unwrap();
+        fs::write(
+            bench.join("foo_test").join("foo_tb.vhd"),
+            "entity foo_tb is\nend entity;\n",
+        )
+        .unwrap();
+        bench
+    }
+
+    /// `bench/target` is cargo's, and rustc creates and deletes directories
+    /// there while other benches walk the tree. Neither walk may enter it —
+    /// here a stray copy of a testbench under it would otherwise be found.
+    #[test]
+    fn the_cargo_target_dir_is_not_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bench = bench(&tmp);
+        let stray = bench.join("target").join("debug").join("build");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join("foo_tb.vhd"), "entity foo_tb is\nend entity;\n")
+            .unwrap();
+
+        let mut cache = HashMap::new();
+        let found =
+            find_testbench_file("foo_tb", &bench, true, &mut cache).unwrap();
+        assert_eq!(found, bench.join("foo_test").join("foo_tb.vhd"));
+
+        let listed = list_testbenches(&bench, &HashSet::new(), true).unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    /// A subdirectory removed between its parent being listed and it being
+    /// read holds no testbenches; it is not an error. The bench root
+    /// missing still is.
+    #[test]
+    fn a_vanished_subdirectory_reads_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = Utf8PathBuf::from_path_buf(tmp.path().join("gone")).unwrap();
+        assert!(read_bench_dir(&gone, false).unwrap().is_empty());
+        assert!(read_bench_dir(&gone, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod editor_scaffold_test {
+    use super::*;
+
+    const MIST: &str = "\
+netlist = \"analog/model.cir\"
+entity = \"TxEq\"
+clock = 26.5625e9
+prime-cycles = 4
+
+[ports]
+\"main_eq\" = { dac = \"dac_sym_main\", encoding = \"pam4\" }
+";
+
+    fn bench(ws: &Utf8Path, name: &str, gitignore: Option<&str>) {
+        let dir = ws.join("bench").join(name);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("mist.toml"), MIST).unwrap();
+        fs::write(dir.join("src/lib.rs"), "// mine\n").unwrap();
+        if let Some(text) = gitignore {
+            fs::write(dir.join(".gitignore"), text).unwrap();
+        }
+    }
+
+    #[test]
+    fn only_what_sync_would_ignore_is_written() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = Utf8Path::from_path(dir.path()).unwrap().to_owned();
+        fs::write(
+            ws.join("vw.toml"),
+            "[workspace]\nname = \"t\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        // An older header, but every derived file listed: fine to write, and
+        // the header is the developer's to update, not this.
+        let old = "# Auto-generated by `vw test --scaffold`\n\
+                   Cargo.toml\nbuild.rs\nxyce_cinterface.cpp\n\
+                   src/xyce.rs\nsrc/generated.rs\n";
+        bench(&ws, "covered", Some(old));
+        // Nothing ignored: every file written here would be synchronized.
+        bench(&ws, "uncovered", None);
+        // A cosim crate without its build script, which a build heals and
+        // an editor must not.
+        let cosim = ws.join("bench/cosim_crate");
+        fs::create_dir_all(cosim.join("src")).unwrap();
+        fs::write(
+            cosim.join("Cargo.toml"),
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n\n[lib]\n\
+             crate-type = [\"cdylib\"]\n\n[dependencies]\nrust-cosim = \"*\"\n",
+        )
+        .unwrap();
+
+        let done = ensure_editor_scaffolds(&ws).unwrap();
+
+        assert_eq!(done.written, ["covered"]);
+        assert_eq!(done.skipped, ["uncovered"]);
+        let covered = ws.join("bench/covered");
+        for file in sim::bridge::DERIVED {
+            assert!(covered.join(file).is_file(), "{file}");
+        }
+        assert_eq!(
+            fs::read_to_string(covered.join(".gitignore")).unwrap(),
+            old
+        );
+        assert_eq!(
+            fs::read_to_string(covered.join("src/lib.rs")).unwrap(),
+            "// mine\n"
+        );
+        assert!(!ws.join("bench/uncovered/Cargo.toml").exists());
+        assert!(!ws.join("bench/uncovered/.gitignore").exists());
+        assert!(!cosim.join("build.rs").exists());
     }
 }

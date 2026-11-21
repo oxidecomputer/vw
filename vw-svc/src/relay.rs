@@ -395,19 +395,22 @@ impl Agent {
         Ok(())
     }
 
-    /// Build the driver on the instance, joined to `client`.
-    pub(crate) async fn join_driver_build(
+    /// Run a cargo command over the driver on the instance, joined to
+    /// `client`.
+    pub(crate) async fn join_driver_cargo(
         &self,
         client: dropshot::WebsocketConnection,
-        query: &vw_api_types_versions::latest::AgentDriverBuildQuery,
+        query: &vw_api_types_versions::latest::AgentDriverQuery,
     ) -> Result<(), RelayError> {
         let upgraded = self
             .client
-            .driver_build(
+            .driver_cargo(
                 &self.environment,
                 &self.workspace,
                 query.anodized_bucket.as_deref(),
                 query.args.as_deref(),
+                &query.command,
+                Some(query.diagnostics),
                 Some(query.release),
             )
             .await
