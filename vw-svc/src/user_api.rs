@@ -462,6 +462,7 @@ impl VwUserApi for UserApi {
 
         let query = vw_api_types_versions::latest::AgentDriverQuery {
             command: query.command,
+            diagnostics: query.diagnostics,
             release: query.release,
             args: query.args,
             anodized_bucket,

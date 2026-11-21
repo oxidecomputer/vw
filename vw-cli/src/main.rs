@@ -23,6 +23,7 @@ mod cloud;
 mod cloud_config;
 mod cloud_sync;
 mod driver;
+mod editor;
 mod htcl_test;
 mod parallel_load;
 mod part_picker;
@@ -230,6 +231,82 @@ impl DriverCommand {
             | DriverCommand::Fmt { run, .. } => &run.env,
         }
     }
+}
+
+/// What an editor on this machine needs from vw.
+#[derive(Subcommand)]
+enum EditorCommand {
+    #[command(
+        about = "Put generated Rust inputs where rust-analyzer can read them",
+        long_about = "Put generated Rust inputs where rust-analyzer can read \
+                      them.\n\n\
+                      Generates the mixed-signal benches' crates from their \
+                      mist.toml, and fetches the anodizer output the \
+                      environment published (anodizing first if it is not \
+                      current). Both stay out of synchronization: the \
+                      scaffolds are gitignored and the output is under \
+                      target/. Then says what, if anything, in the project's \
+                      own files still keeps rust-analyzer from reading it."
+    )]
+    Prepare {
+        #[arg(
+            long,
+            help = "Anodize on this machine instead of fetching from the cloud"
+        )]
+        local: bool,
+        #[arg(
+            long,
+            env = "VW_ENV",
+            value_name = "NAME",
+            conflicts_with = "local",
+            help = "Cloud environment to fetch from. Defaults to $VW_ENV."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+        #[arg(
+            long,
+            help = "Write a one-line JSON summary to stdout, and everything \
+                    else to stderr — for a program running this, such as \
+                    the vw analyzer"
+        )]
+        json: bool,
+    },
+    #[command(
+        about = "Check the driver on the helios instance, for rust-analyzer",
+        long_about = "Check the driver on the helios instance, for \
+                      rust-analyzer.\n\n\
+                      Meant as rust-analyzer's check.overrideCommand. Writes \
+                      cargo's JSON diagnostics, naming this machine's files, \
+                      to stdout, and everything else to stderr. Run from \
+                      anywhere that is not the driver or a crate it depends \
+                      on by path, it checks nothing."
+    )]
+    Check {
+        #[arg(
+            long,
+            env = "VW_ENV",
+            value_name = "NAME",
+            help = "Cloud environment to check in. Defaults to $VW_ENV."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+        #[arg(long, help = "Lint with clippy instead of `cargo check`")]
+        clippy: bool,
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            help = "Further arguments for cargo, e.g. `--all-targets`"
+        )]
+        args: Vec<String>,
+    },
 }
 
 /// Where a driver command runs, and what else to tell cargo.
@@ -648,6 +725,11 @@ enum Commands {
     Driver {
         #[command(subcommand)]
         command: DriverCommand,
+    },
+    #[command(about = "Make the workspace's Rust legible to an editor")]
+    Editor {
+        #[command(subcommand)]
+        command: EditorCommand,
     },
     #[command(
         about = "Remove build output, on the cloud environment if there is one"
@@ -1307,12 +1389,95 @@ async fn main() {
                 run.insecure,
                 release,
                 &run.args,
+                None,
             )
             .await
             {
                 Ok(true) => {}
                 // A build or lint that failed is not a vw failure; the
                 // message came from cargo and has already been printed.
+                Ok(false) => process::exit(1),
+                Err(e) => {
+                    report(&*e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Editor {
+            command:
+                EditorCommand::Prepare {
+                    local,
+                    env,
+                    insecure,
+                    json,
+                },
+        } => {
+            // As for `editor check`: claimed before anything can print, so
+            // the summary is the only thing on stdout.
+            let out = if json {
+                match editor::claim_stdout() {
+                    Ok(out) => Some(out),
+                    Err(e) => {
+                        eprintln!(
+                            "cannot set aside stdout for the summary: {e}"
+                        );
+                        process::exit(1);
+                    }
+                }
+            } else {
+                None
+            };
+            match editor::prepare(&cwd, local, env.as_deref(), insecure).await {
+                Ok(summary) => {
+                    let ready = summary.ready();
+                    match out {
+                        Some(mut out) => {
+                            use std::io::Write;
+                            let line = serde_json::to_string(&summary)
+                                .unwrap_or_default();
+                            let _ = writeln!(out, "{line}");
+                        }
+                        None => editor::print_check_hint(),
+                    }
+                    if !ready {
+                        process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    report(&*e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Editor {
+            command:
+                EditorCommand::Check {
+                    env,
+                    insecure,
+                    clippy,
+                    args,
+                },
+        } => {
+            // Before anything can print: from here on stdout is cargo's JSON
+            // and nothing else.
+            let mut out = match editor::claim_stdout() {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("cannot set aside stdout for diagnostics: {e}");
+                    process::exit(1);
+                }
+            };
+            match editor::check(
+                &cwd,
+                env.as_deref(),
+                insecure,
+                clippy,
+                &args,
+                &mut out,
+            )
+            .await
+            {
+                Ok(true) => {}
                 Ok(false) => process::exit(1),
                 Err(e) => {
                     report(&*e);
@@ -1746,7 +1911,11 @@ async fn main() {
         }
         Commands::Analyzer => {
             init_analyzer_logging();
-            vw_analyzer::run_stdio().await;
+            // Itself, so what prepares the editor's workspaces is exactly
+            // this version of vw rather than whichever is on the path.
+            let vw = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("vw"));
+            vw_analyzer::run_stdio_with(vw).await;
         }
         Commands::Repl {
             local,
@@ -4329,6 +4498,7 @@ async fn remote_worker(
 /// and the helios instance is where both of those are true. Linting and
 /// testing are no different from building in that respect — clippy has to
 /// compile what it lints.
+#[allow(clippy::too_many_arguments)]
 async fn driver_cargo(
     cwd: &Utf8Path,
     command: vw_api_types_versions::latest::DriverCommand,
@@ -4337,9 +4507,16 @@ async fn driver_cargo(
     insecure: bool,
     release: bool,
     args: &[String],
+    diagnostics: Option<&mut dyn std::io::Write>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let workspace = vw_lib::find_workspace_dir(cwd.as_std_path())
         .ok_or("no vw workspace here; run this from one, or from a directory inside it")?;
+
+    if local && diagnostics.is_some() {
+        return Err("diagnostics for an editor come from the cloud; locally, \
+                    point the editor at cargo itself"
+            .into());
+    }
 
     // A driver that includes anodizer's output is built against it, so it
     // has to be current first. One output for every variant: there is one
@@ -4381,7 +4558,13 @@ async fn driver_cargo(
         }
 
         return Ok(driver::run(
-            &session, &target, &workspace, command, release, args,
+            &session,
+            &target,
+            &workspace,
+            command,
+            release,
+            args,
+            diagnostics,
         )
         .await?);
     }

@@ -2030,7 +2030,7 @@ fn source_order(kind: vw_api_types_versions::latest::TargetKind) -> u8 {
 }
 
 /// Fetch one artifact into `directory`.
-async fn download(
+pub(crate) async fn download(
     session: &Session,
     target: &Target,
     artifact: &vw_api_types_versions::latest::Artifact,

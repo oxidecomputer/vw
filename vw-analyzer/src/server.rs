@@ -18,6 +18,7 @@ use tracing::{debug, info};
 
 use crate::backend::LanguageBackend;
 use crate::htcl_backend::HtclBackend;
+use crate::prepare::{self, Preparer};
 use crate::variant::{variant_from_settings, VariantSetting};
 
 pub struct Analyzer {
@@ -33,10 +34,24 @@ pub struct Analyzer {
     /// background diagnostic-publish task fired from did_change
     /// can share the counter with the foreground handlers.
     progress_seq: Arc<AtomicU64>,
+    /// Keeps the editor's workspaces' generated Rust inputs current for
+    /// rust-analyzer. See [`crate::prepare`].
+    preparer: Arc<Preparer>,
+    /// Whether to. On unless the editor's settings say `prepare: false`,
+    /// for someone who would rather the editor never start cloud work.
+    prepare_enabled: std::sync::atomic::AtomicBool,
+    /// The editor's workspace roots, from `initialize`, prepared once the
+    /// session is up.
+    roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl Analyzer {
     pub fn new(client: Client) -> Self {
+        Self::with_vw(client, std::path::PathBuf::from("vw"))
+    }
+
+    /// As [`Analyzer::new`], preparing workspaces with the `vw` at `vw`.
+    pub fn with_vw(client: Client, vw: std::path::PathBuf) -> Self {
         let variant = Arc::new(VariantSetting::new(client.clone()));
         let backends: Vec<Arc<dyn LanguageBackend>> = vec![
             Arc::new(HtclBackend::with_variant(variant.clone())),
@@ -46,11 +61,37 @@ impl Analyzer {
             )),
         ];
         Self {
+            preparer: Preparer::new(client.clone(), vw),
             client,
             backends,
             variant,
             progress_seq: Arc::new(AtomicU64::new(0)),
+            prepare_enabled: std::sync::atomic::AtomicBool::new(true),
+            roots: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn preparing(&self) -> bool {
+        self.prepare_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Prepare the workspace holding `path`, if there is one.
+    fn prepare_around(&self, path: &std::path::Path, only_if_new: bool) {
+        if !self.preparing() {
+            return;
+        }
+        let start = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let Some(workspace) = vw_lib::find_workspace_dir(start) else {
+            return;
+        };
+        if only_if_new && self.preparer.seen(&workspace) {
+            return;
+        }
+        self.preparer.request(workspace);
     }
 
     fn backend_for(&self, uri: &Url) -> Option<Arc<dyn LanguageBackend>> {
@@ -204,6 +245,9 @@ impl LanguageServer for Analyzer {
         // file's own workspace still resolves in isolation, which
         // was the pre-fallback behavior).
         let roots = collect_workspace_roots(&params);
+        if let Ok(mut kept) = self.roots.lock() {
+            kept.clone_from(&roots);
+        }
         for backend in &self.backends {
             backend.set_workspace_roots(roots.clone()).await;
         }
@@ -211,6 +255,9 @@ impl LanguageServer for Analyzer {
         // analyzed yet, so no backend needs telling.
         if let Some(opts) = &params.initialization_options {
             self.variant.set(variant_from_settings(opts));
+            if let Some(on) = prepare_from_settings(opts) {
+                self.prepare_enabled.store(on, Ordering::Relaxed);
+            }
         }
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -308,6 +355,12 @@ impl LanguageServer for Analyzer {
                 glob_pattern: GlobPattern::String("**/vw.lock".into()),
                 kind: None,
             },
+            // What a mixed-signal bench's crate is generated from — see
+            // `prepare`.
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/mist.toml".into()),
+                kind: None,
+            },
             FileSystemWatcher {
                 glob_pattern: GlobPattern::String("**/ip/**/*.htcl".into()),
                 kind: None,
@@ -337,6 +390,12 @@ impl LanguageServer for Analyzer {
                  failed ({e}); config reactivity disabled"
             );
         }
+
+        // Get rust-analyzer something to load before anybody asks.
+        let roots = self.roots.lock().map(|r| r.clone()).unwrap_or_default();
+        for root in roots {
+            self.prepare_around(&root, true);
+        }
     }
 
     async fn did_change_watched_files(
@@ -345,6 +404,17 @@ impl LanguageServer for Analyzer {
     ) {
         for backend in &self.backends {
             backend.did_change_watched_files(&params).await;
+        }
+        for change in &params.changes {
+            let Ok(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            let Some(path) = camino::Utf8Path::from_path(&path) else {
+                continue;
+            };
+            if prepare::affects(path, change.typ) {
+                self.prepare_around(path.as_std_path(), false);
+            }
         }
     }
 
@@ -359,6 +429,9 @@ impl LanguageServer for Analyzer {
         // them" nudge, which says nothing about the variant.
         if params.settings.is_null() {
             return;
+        }
+        if let Some(on) = prepare_from_settings(&params.settings) {
+            self.prepare_enabled.store(on, Ordering::Relaxed);
         }
         if !self.variant.set(variant_from_settings(&params.settings)) {
             return;
@@ -398,6 +471,11 @@ impl LanguageServer for Analyzer {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        // A file from a workspace the editor was not started in — another
+        // checkout opened alongside — gets prepared too, once.
+        if let Ok(path) = uri.to_file_path() {
+            self.prepare_around(&path, true);
+        }
         let version = Some(params.text_document.version);
         debug!(%uri, "did_open");
         if let Some(backend) = self.backend_for(&uri) {
@@ -653,6 +731,11 @@ impl LanguageServer for Analyzer {
 /// file with no folder context — in which case we return an
 /// empty vec and each file's own `vw.toml` is the only source
 /// of dep names, matching the pre-fallback behavior.
+/// The editor's `prepare` setting, if it gave one.
+fn prepare_from_settings(settings: &serde_json::Value) -> Option<bool> {
+    settings.get("prepare").and_then(serde_json::Value::as_bool)
+}
+
 fn collect_workspace_roots(
     params: &InitializeParams,
 ) -> Vec<std::path::PathBuf> {

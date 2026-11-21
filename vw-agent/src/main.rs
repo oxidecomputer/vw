@@ -619,6 +619,7 @@ impl VwSyncApi for Agent {
             },
             release: query.release,
             args: query.arguments(),
+            diagnostics: query.diagnostics,
         };
 
         // The anodizer output the driver may be built against, fetched from

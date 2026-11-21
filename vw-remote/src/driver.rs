@@ -114,6 +114,16 @@ pub enum DriverEvent {
     },
     /// The build could not be run at all.
     Fatal { message: String },
+    /// One of rustc's diagnostics, for an editor.
+    ///
+    /// Cargo's `compiler-message` object as cargo wrote it, except that the
+    /// instance's workspace root is replaced by [`WORKSPACE_MARKER`] wherever
+    /// it appears — span file names, package ids, manifest paths — for the
+    /// client to replace with its own. Files outside the workspace, a registry
+    /// crate or the standard library, keep their absolute paths, which name
+    /// nothing on the client and say so honestly. Only sent when
+    /// [`BuildParams::diagnostics`] asked for it.
+    Diagnostic { message: serde_json::Value },
     /// A file formatting changed, as it now reads.
     ///
     /// Sent whole rather than as a diff, for the reason synchronization sends
@@ -282,6 +292,11 @@ pub struct BuildParams {
     /// No cargo flag the driver needs has one, and the alternative is half a
     /// shell's quoting rules in a query parameter.
     pub args: Vec<String>,
+    /// Report diagnostics for an editor: each as cargo's `compiler-message`
+    /// JSON in a [`DriverEvent::Diagnostic`], and every unit run even when
+    /// one before it failed.
+    #[serde(default)]
+    pub diagnostics: bool,
 }
 
 /// Run a build and report as it goes.
@@ -571,20 +586,57 @@ async fn build(
         return Vec::new();
     }
 
+    // Where rustc's relative paths start from, and what to make them
+    // relative to instead. Cargo runs rustc from the cargo workspace's root
+    // for every member, whichever directory cargo itself was started in.
+    let paths = params.diagnostics.then(|| Relocate {
+        cargo_root: root.to_owned(),
+        workspace: root.parent().map(Utf8Path::to_owned).unwrap_or_default(),
+    });
+
     let mut produced = Vec::new();
+    let mut failed = None;
     for unit in units(root, params.command) {
         let _ = events.send(DriverEvent::Building {
             unit: unit.name.clone(),
         });
 
-        match build_one(&unit.directory, params, &env, &events, &members).await
+        match build_one(
+            &unit.directory,
+            params,
+            &env,
+            &events,
+            &members,
+            paths.as_ref(),
+        )
+        .await
         {
-            Some((true, mut artifacts)) => produced.append(&mut artifacts),
-            // Reported already; there is no sense building the kernel module
-            // against a userland that did not compile, and a lint that has
-            // already failed has already said what a developer needs.
-            Some((false, _)) | None => return Vec::new(),
+            Some(Ok(mut artifacts)) => produced.append(&mut artifacts),
+            // Reported already. For a person there is no sense building the
+            // kernel module against a userland that did not compile, and a
+            // lint that has already failed has already said what they need.
+            // An editor is different: it wants every unit's diagnostics, and
+            // the module's errors are no less real for userland's.
+            Some(Err(code)) if params.diagnostics => {
+                failed = failed.or(Some(code));
+            }
+            Some(Err(code)) => {
+                let _ = events.send(DriverEvent::Done {
+                    success: false,
+                    code,
+                });
+                return Vec::new();
+            }
+            None => return Vec::new(),
         }
+    }
+
+    if let Some(code) = failed {
+        let _ = events.send(DriverEvent::Done {
+            success: false,
+            code,
+        });
+        return Vec::new();
     }
 
     if params.command.stores() && !produced.is_empty() {
@@ -797,19 +849,27 @@ fn arguments(params: &BuildParams) -> Vec<String> {
         if params.release {
             args.push("--release".to_owned());
         }
-        // Forced on: cargo turns colour off when its output is not a
-        // terminal, and here it never is — but there is a terminal at the far
-        // end of this, and it is the one that matters.
-        args.extend(["--color", "always"].map(str::to_owned));
-        // Structured, so the exact set of files this produced comes from
-        // cargo rather than from guessing at target directory layout.
-        // Diagnostics still arrive pre-rendered, colour and all, so nothing
-        // about what a developer sees changes. `cargo fmt` has neither flag:
-        // it is rustfmt with a cargo-shaped front, and its diff is the output.
-        args.extend(
-            ["--message-format", "json-diagnostic-rendered-ansi"]
-                .map(str::to_owned),
-        );
+        if params.diagnostics {
+            // For an editor, which renders diagnostics itself from the
+            // structure and shows `rendered` as text: colour codes in it
+            // would be noise.
+            args.extend(["--message-format", "json"].map(str::to_owned));
+        } else {
+            // Forced on: cargo turns colour off when its output is not a
+            // terminal, and here it never is — but there is a terminal at the
+            // far end of this, and it is the one that matters.
+            args.extend(["--color", "always"].map(str::to_owned));
+            // Structured, so the exact set of files this produced comes from
+            // cargo rather than from guessing at target directory layout.
+            // Diagnostics still arrive pre-rendered, colour and all, so
+            // nothing about what a developer sees changes. `cargo fmt` has
+            // neither flag: it is rustfmt with a cargo-shaped front, and its
+            // diff is the output.
+            args.extend(
+                ["--message-format", "json-diagnostic-rendered-ansi"]
+                    .map(str::to_owned),
+            );
+        }
     }
 
     args.extend(params.args.iter().cloned());
@@ -818,15 +878,17 @@ fn arguments(params: &BuildParams) -> Vec<String> {
 
 /// Spawn cargo in one directory and forward everything it says.
 ///
-/// Returns whether it succeeded, or `None` if it could not be run at all — in
-/// which case the failure has already been reported.
+/// Returns what it produced, or cargo's exit status if it failed — which the
+/// caller decides how to report — or `None` if it could not be run at all, in
+/// which case that has already been reported.
 async fn build_one(
     root: &Utf8Path,
     params: &BuildParams,
     env: &[(String, String)],
     events: &tokio::sync::mpsc::UnboundedSender<DriverEvent>,
     members: &std::collections::HashSet<String>,
-) -> Option<(bool, Vec<Utf8PathBuf>)> {
+    paths: Option<&Relocate>,
+) -> Option<Result<Vec<Utf8PathBuf>, Option<i32>>> {
     let mut command = tokio::process::Command::new("cargo");
     command.args(arguments(params));
     command.envs(env.iter().map(|(k, v)| (k, v)));
@@ -855,7 +917,12 @@ async fn build_one(
     // Both are forwarded as they arrive, so the order a developer sees is the
     // order things happened.
     let structured = child.stdout.take().map(|stdout| {
-        tokio::spawn(read_messages(stdout, events.clone(), members.clone()))
+        tokio::spawn(read_messages(
+            stdout,
+            events.clone(),
+            members.clone(),
+            paths.cloned(),
+        ))
     });
     let plain = child
         .stderr
@@ -877,14 +944,8 @@ async fn build_one(
     }
 
     match status {
-        Ok(status) if status.success() => Some((true, artifacts)),
-        Ok(status) => {
-            let _ = events.send(DriverEvent::Done {
-                success: false,
-                code: status.code(),
-            });
-            Some((false, Vec::new()))
-        }
+        Ok(status) if status.success() => Some(Ok(artifacts)),
+        Ok(status) => Some(Err(status.code())),
         Err(e) => {
             let _ = events.send(DriverEvent::Fatal {
                 message: format!("waiting for cargo: {e}"),
@@ -903,6 +964,7 @@ async fn read_messages<R>(
     reader: R,
     events: tokio::sync::mpsc::UnboundedSender<DriverEvent>,
     members: std::collections::HashSet<String>,
+    paths: Option<Relocate>,
 ) -> Vec<Utf8PathBuf>
 where
     R: AsyncRead + Unpin,
@@ -919,6 +981,17 @@ where
         };
 
         match message {
+            CargoMessage::CompilerMessage { .. } if paths.is_some() => {
+                let Ok(mut message) =
+                    serde_json::from_str::<serde_json::Value>(&line)
+                else {
+                    continue;
+                };
+                if let Some(paths) = &paths {
+                    paths.relocate(&mut message);
+                }
+                let _ = events.send(DriverEvent::Diagnostic { message });
+            }
             CargoMessage::CompilerMessage { message } => {
                 if let Some(rendered) = message.rendered {
                     // Already formatted by rustc, so it reads exactly as it
@@ -946,6 +1019,100 @@ where
     produced
 }
 
+/// What a [`DriverEvent::Diagnostic`] says in place of the instance's
+/// workspace root, for the client to replace with its own.
+///
+/// A marker rather than a relative path because the root appears in more
+/// than file names: cargo's package ids are `path+file://` URLs and its
+/// manifest paths are absolute, and an editor matches diagnostics to packages
+/// by them. A marker can be swapped wherever it is; a relative path cannot be
+/// told apart from a relative path that was always there.
+pub const WORKSPACE_MARKER: &str = "{vw-workspace}";
+
+/// How a diagnostic's paths are made to mean something off the instance.
+#[derive(Clone, Debug)]
+struct Relocate {
+    /// What rustc's relative paths are relative to.
+    cargo_root: Utf8PathBuf,
+    /// The prefix [`WORKSPACE_MARKER`] stands in for.
+    workspace: Utf8PathBuf,
+}
+
+impl Relocate {
+    /// Rewrite every path in a cargo message, wherever it is nested — spans,
+    /// the spans of child notes, the expansion chain of a span that came out
+    /// of a macro, and the package it is about.
+    fn relocate(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    if let serde_json::Value::String(text) = value {
+                        if key == "file_name" {
+                            *text = self.absolute(text);
+                        }
+                        *text = self.mark(text);
+                    } else {
+                        self.relocate(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.relocate(item);
+                }
+            }
+            serde_json::Value::String(text) => *text = self.mark(text),
+            _ => {}
+        }
+    }
+
+    /// A span's file, as an absolute path on this instance. rustc names a
+    /// member's files relative to the cargo workspace root, and anything
+    /// else absolutely.
+    fn absolute(&self, name: &str) -> String {
+        // `<macros>`-style names are not files at all.
+        if name.starts_with('<') {
+            return name.to_owned();
+        }
+        let path = Utf8Path::new(name);
+        let absolute = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            self.cargo_root.join(path)
+        };
+        normalize(&absolute).into_string()
+    }
+
+    /// `text` with the workspace root replaced by [`WORKSPACE_MARKER`]
+    /// wherever it starts a path.
+    fn mark(&self, text: &str) -> String {
+        let root = self.workspace.as_str();
+        if root.is_empty() || !text.contains(root) {
+            return text.to_owned();
+        }
+        if text == root {
+            return WORKSPACE_MARKER.to_owned();
+        }
+        text.replace(&format!("{root}/"), &format!("{WORKSPACE_MARKER}/"))
+    }
+}
+
+/// `a/b/../c` as `a/c`, without touching the filesystem — the path may name
+/// something that exists only on the instance, which is the point.
+fn normalize(path: &Utf8Path) -> Utf8PathBuf {
+    let mut out = Utf8PathBuf::new();
+    for part in path.components() {
+        match part {
+            camino::Utf8Component::ParentDir => {
+                out.pop();
+            }
+            camino::Utf8Component::CurDir => {}
+            other => out.push(other.as_str()),
+        }
+    }
+    out
+}
+
 /// Send every line of `reader` as it appears.
 async fn forward<R>(
     reader: R,
@@ -971,6 +1138,7 @@ mod test {
             command: Command::Build,
             release: true,
             args: vec!["-p".to_owned(), "module".to_owned()],
+            diagnostics: false,
         };
 
         // The shape the agent will hand cargo, checked here because getting it
@@ -997,6 +1165,7 @@ mod test {
             command: Command::Clippy,
             release: false,
             args: vec!["--all-targets".to_owned()],
+            diagnostics: false,
         };
 
         assert_eq!(
@@ -1020,6 +1189,7 @@ mod test {
             command: Command::FmtCheck,
             release: true,
             args: Vec::new(),
+            diagnostics: false,
         };
 
         assert_eq!(arguments(&params), ["fmt", "--check"]);
@@ -1260,6 +1430,68 @@ mod test {
                 Some(DriverEvent::Done { success: false, .. })
             ),
             "{all:?}",
+        );
+    }
+
+    #[test]
+    fn an_editor_gets_plain_json_with_no_colour() {
+        let params = BuildParams {
+            command: Command::Check,
+            release: false,
+            args: Vec::new(),
+            diagnostics: true,
+        };
+        assert_eq!(arguments(&params), ["check", "--message-format", "json"]);
+    }
+
+    #[test]
+    fn diagnostic_paths_name_the_workspace_by_marker() {
+        let paths = Relocate {
+            cargo_root: Utf8PathBuf::from("/root/sync/ws/driver"),
+            workspace: Utf8PathBuf::from("/root/sync/ws"),
+        };
+        let mut message = serde_json::json!({
+            "reason": "compiler-message",
+            "package_id": "path+file:///root/sync/ws/driver/rh#0.1.0",
+            "manifest_path": "/root/sync/ws/driver/rh/Cargo.toml",
+            "message": {
+                "spans": [{
+                    // A member, as rustc names it: relative to cargo's root.
+                    "file_name": "module/src/lib.rs",
+                    "expansion": { "span": {
+                        // A path dependency outside the driver.
+                        "file_name": "/root/sync/ws/driver/../common/u/src/lib.rs"
+                    }}
+                }],
+                "children": [{ "spans": [{
+                    // Not the workspace's, so left as it is.
+                    "file_name": "/root/.cargo/registry/src/x/lib.rs"
+                }]}],
+            },
+        });
+
+        paths.relocate(&mut message);
+
+        let span = &message["message"]["spans"][0];
+        assert_eq!(
+            span["file_name"],
+            "{vw-workspace}/driver/module/src/lib.rs"
+        );
+        assert_eq!(
+            span["expansion"]["span"]["file_name"],
+            "{vw-workspace}/common/u/src/lib.rs"
+        );
+        assert_eq!(
+            message["message"]["children"][0]["spans"][0]["file_name"],
+            "/root/.cargo/registry/src/x/lib.rs"
+        );
+        assert_eq!(
+            message["package_id"],
+            "path+file://{vw-workspace}/driver/rh#0.1.0"
+        );
+        assert_eq!(
+            message["manifest_path"],
+            "{vw-workspace}/driver/rh/Cargo.toml"
         );
     }
 

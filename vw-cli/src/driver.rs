@@ -16,6 +16,8 @@ use camino::Utf8Path;
 use colored::*;
 use futures::StreamExt;
 
+use std::io::Write;
+
 use vw_api_types_versions::latest::DriverCommand;
 
 use crate::cloud::{CloudError, Session};
@@ -37,6 +39,11 @@ fn verb(command: DriverCommand) -> &'static str {
 /// Returns whether cargo succeeded, so the caller can decide the exit code; a
 /// failed build or a lint that found something is not an error in the sense
 /// of something having gone wrong with vw.
+///
+/// With `diagnostics`, rustc's diagnostics are written there as cargo's own
+/// JSON, naming this machine's files, for an editor to read — and the instance
+/// runs every part of the build even after one fails, since an editor wants
+/// all of them.
 pub async fn run(
     session: &Session,
     target: &crate::cloud::Target,
@@ -44,8 +51,10 @@ pub async fn run(
     command: DriverCommand,
     release: bool,
     args: &[String],
+    mut diagnostics: Option<&mut dyn std::io::Write>,
 ) -> Result<bool, CloudError> {
     let joined = (!args.is_empty()).then(|| args.join(" "));
+    let editor = diagnostics.is_some();
 
     let upgraded = vw_api_client::retrying(|| {
         session.client.driver_cargo(
@@ -53,6 +62,7 @@ pub async fn run(
             &target.workspace,
             joined.as_deref(),
             &command,
+            Some(editor),
             Some(release),
         )
     })
@@ -155,6 +165,18 @@ pub async fn run(
             vw_remote::DriverEvent::Fatal { message } => {
                 return Err(CloudError::Transport(message));
             }
+            vw_remote::DriverEvent::Diagnostic { mut message } => {
+                if let Some(out) = diagnostics.as_mut() {
+                    localize(&mut message, workspace);
+                    // One line each, which is what an editor reading cargo's
+                    // output expects. A failed write means the editor stopped
+                    // listening; there is nobody left to tell.
+                    if let Ok(line) = serde_json::to_string(&message) {
+                        let _ = writeln!(out, "{line}");
+                        let _ = out.flush();
+                    }
+                }
+            }
             vw_remote::DriverEvent::Formatted {
                 path,
                 before,
@@ -235,6 +257,27 @@ pub async fn run_locally(
         .map_err(|e| CloudError::Transport(format!("running cargo: {e}")))?;
 
     Ok(status.success())
+}
+
+/// Put this machine's workspace where the instance's diagnostic names it.
+fn localize(value: &mut serde_json::Value, workspace: &Utf8Path) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.contains(vw_remote::driver::WORKSPACE_MARKER) {
+                *text = text.replace(
+                    vw_remote::driver::WORKSPACE_MARKER,
+                    workspace.as_str(),
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(|item| localize(item, workspace));
+        }
+        serde_json::Value::Object(map) => {
+            map.values_mut().for_each(|item| localize(item, workspace));
+        }
+        _ => {}
+    }
 }
 
 /// Write a file formatting changed into this machine's driver.
@@ -331,6 +374,27 @@ mod test {
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "fn  f( ){ edited }\n",
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_names_this_machines_files() {
+        let mut message = serde_json::json!({
+            "package_id": "path+file://{vw-workspace}/driver/rh#0.1.0",
+            "message": { "spans": [{
+                "file_name": "{vw-workspace}/driver/rh/src/main.rs"
+            }]},
+        });
+
+        localize(&mut message, Utf8Path::new("/Users/me/ws"));
+
+        assert_eq!(
+            message["package_id"],
+            "path+file:///Users/me/ws/driver/rh#0.1.0"
+        );
+        assert_eq!(
+            message["message"]["spans"][0]["file_name"],
+            "/Users/me/ws/driver/rh/src/main.rs"
         );
     }
 

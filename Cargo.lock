@@ -5840,6 +5840,7 @@ dependencies = [
  "gethostname",
  "glob",
  "indicatif",
+ "libc",
  "notify",
  "petgraph",
  "ratatui",

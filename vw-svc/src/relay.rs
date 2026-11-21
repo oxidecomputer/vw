@@ -410,6 +410,7 @@ impl Agent {
                 query.anodized_bucket.as_deref(),
                 query.args.as_deref(),
                 &query.command,
+                Some(query.diagnostics),
                 Some(query.release),
             )
             .await

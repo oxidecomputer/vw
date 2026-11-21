@@ -43,6 +43,7 @@ glob.workspace = true
 indicatif.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+libc = "0.2"
 ratatui.workspace = true
 crossterm.workspace = true
 # Demangle Rust (v0/legacy) and C++ symbols in captured crash backtraces so

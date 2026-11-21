@@ -12,6 +12,7 @@
 
 mod backend;
 mod htcl_backend;
+mod prepare;
 mod server;
 mod src_complete;
 mod variant;
@@ -32,11 +33,19 @@ use tower_lsp::{LspService, Server};
 
 /// Run the LSP server on stdio. Returns when the editor disconnects.
 ///
-/// Both the standalone `vw-analyzer` binary and the `vw analyzer`
-/// subcommand call this so the editor sees identical behavior either
-/// way.
+/// The standalone `vw-analyzer` binary calls this, and prepares the
+/// editor's workspaces with whatever `vw` is on the path.
 pub async fn run_stdio() {
-    let (service, socket) = LspService::new(Analyzer::new);
+    run_stdio_with(std::path::PathBuf::from("vw")).await
+}
+
+/// Run the LSP server on stdio, preparing the editor's workspaces for
+/// rust-analyzer with `vw` — see [`prepare`](crate::prepare). `vw analyzer`
+/// passes itself, so the editor's language server and the `vw` that prepares
+/// for it are always the same version.
+pub async fn run_stdio_with(vw: std::path::PathBuf) {
+    let (service, socket) =
+        LspService::new(move |client| Analyzer::with_vw(client, vw.clone()));
     let stdout = tokio::io::stdout();
 
     // Splice stdin through `forward_until_exit` instead of handing it

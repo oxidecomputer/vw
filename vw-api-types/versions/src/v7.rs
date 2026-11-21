@@ -79,6 +79,15 @@ pub struct DriverQuery {
     /// [`v1::DriverBuildQuery::args`].
     #[serde(default)]
     pub args: Option<String>,
+    /// Report rustc's diagnostics for an editor rather than for a person.
+    ///
+    /// Each diagnostic arrives as cargo's own `compiler-message` JSON, with
+    /// every file named relative to the workspace when it is inside it, so a
+    /// client can point it at its own copy. And every part of the run is
+    /// carried out even when an earlier one fails: an editor wants the kernel
+    /// module's errors whether or not userland compiled.
+    #[serde(default)]
+    pub diagnostics: bool,
 }
 
 impl From<v1::DriverBuildQuery> for DriverQuery {
@@ -89,6 +98,7 @@ impl From<v1::DriverBuildQuery> for DriverQuery {
             command: DriverCommand::Build,
             release: old.release,
             args: old.args,
+            diagnostics: false,
         }
     }
 }
@@ -107,6 +117,15 @@ pub struct AgentDriverQuery {
     /// Anything else to put on cargo's command line, separated by spaces.
     #[serde(default)]
     pub args: Option<String>,
+    /// Report rustc's diagnostics for an editor rather than for a person.
+    ///
+    /// Each diagnostic arrives as cargo's own `compiler-message` JSON, with
+    /// every file named relative to the workspace when it is inside it, so a
+    /// client can point it at its own copy. And every part of the run is
+    /// carried out even when an earlier one fails: an editor wants the kernel
+    /// module's errors whether or not userland compiled.
+    #[serde(default)]
+    pub diagnostics: bool,
     /// The bucket the vivado instance publishes this workspace's anodizer
     /// output to. See [`v6::AgentDriverBuildQuery::anodized_bucket`].
     #[serde(default)]
@@ -130,6 +149,7 @@ impl From<v6::AgentDriverBuildQuery> for AgentDriverQuery {
             command: DriverCommand::Build,
             release: old.release,
             args: old.args,
+            diagnostics: false,
             anodized_bucket: old.anodized_bucket,
         }
     }

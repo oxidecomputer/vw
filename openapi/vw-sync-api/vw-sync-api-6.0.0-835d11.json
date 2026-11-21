@@ -449,6 +449,14 @@
           },
           {
             "in": "query",
+            "name": "diagnostics",
+            "description": "Report rustc's diagnostics for an editor rather than for a person.\n\nEach diagnostic arrives as cargo's own `compiler-message` JSON, with every file named relative to the workspace when it is inside it, so a client can point it at its own copy. And every part of the run is carried out even when an earlier one fails: an editor wants the kernel module's errors whether or not userland compiled.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
             "name": "release",
             "description": "Compile with optimizations.",
             "schema": {

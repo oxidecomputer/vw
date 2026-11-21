@@ -56,6 +56,46 @@ writes every file rustfmt changed back into this checkout, leaving alone any
 file edited since it was sent; `vw driver fmt --check` rewrites nothing and
 fails if anything would change.
 
+### Rust in an editor
+
+A workspace's Rust leans on things made in the cloud — mixed-signal bench
+crates generated from `mist.toml`, anodizer output, a driver that compiles for
+illumos — so rust-analyzer on a laptop cannot load it as it stands.
+
+The vw analyzer does this on its own: when the editor starts, and whenever a
+`mist.toml`, `vw.toml`, `vw.lock` or a VHDL file tagging `serialize_rust`
+changes, it runs `vw editor prepare` in the background and reports anything
+wrong in the editor. Have the editor start it for Rust files as well as HDL,
+so it is running whichever you are editing; in Helix, with the language
+features left to rust-analyzer:
+
+```toml
+[[language]]
+name = "rust"
+language-servers = [
+  "rust-analyzer",
+  { name = "vw-analyzer", only-features = ["workspace-command"] },
+]
+```
+
+Set `prepare = false` in the analyzer's settings to stop it.
+
+`vw editor prepare` generates the bench crates and fetches current anodizer
+output (anodizing first if the environment's is stale). It writes only what
+synchronization ignores, so nothing it makes reaches a build. It then says
+what in the project still keeps rust-analyzer from reading the output: it has
+to reach the crate through a build script's `OUT_DIR`, and cargo needs
+`VW_ANODIZED_DIR` from an `[env]` entry in `.cargo/config.toml`.
+
+`vw editor check` is for rust-analyzer's `check.overrideCommand`: it checks the
+driver on the helios instance and writes cargo's JSON diagnostics, naming this
+machine's files, to stdout. For Helix:
+
+```toml
+[language-server.rust-analyzer.config.check]
+overrideCommand = ["vw", "editor", "check"]
+```
+
 ### One environment, several workspaces
 
 An environment holds a source tree per workspace rather than one tree, so the

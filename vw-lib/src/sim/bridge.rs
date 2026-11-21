@@ -45,21 +45,8 @@ pub fn generate_scaffold(
     bench_dir: &Path,
     mist_config: &MistConfig,
 ) -> crate::Result<()> {
+    generate_derived(bench_dir, mist_config)?;
     let src_dir = bench_dir.join("src");
-    fs::create_dir_all(&src_dir)?;
-
-    let bench_name = bench_dir
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    // Always regenerated files
-    write_cargo_toml(bench_dir, &bench_name)?;
-    write_build_rs(bench_dir)?;
-    write_file(bench_dir.join("xyce_cinterface.cpp"), XYCE_CINTERFACE_CPP)?;
-    write_file(src_dir.join("xyce.rs"), XYCE_RS)?;
-    write_generated_rs(&src_dir, mist_config)?;
 
     // User-owned files (only if missing)
     let lib_rs = src_dir.join("lib.rs");
@@ -71,6 +58,38 @@ pub fn generate_scaffold(
 
     Ok(())
 }
+
+/// Write only the files derived from `mist.toml` — the ones the bench's
+/// `.gitignore` lists — and nothing a developer owns or commits.
+pub fn generate_derived(
+    bench_dir: &Path,
+    mist_config: &MistConfig,
+) -> crate::Result<()> {
+    let src_dir = bench_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+
+    let bench_name = bench_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    write_cargo_toml(bench_dir, &bench_name)?;
+    write_build_rs(bench_dir)?;
+    write_file(bench_dir.join("xyce_cinterface.cpp"), XYCE_CINTERFACE_CPP)?;
+    write_file(src_dir.join("xyce.rs"), XYCE_RS)?;
+    write_generated_rs(&src_dir, mist_config)?;
+    Ok(())
+}
+
+/// The files [`generate_derived`] writes, relative to the bench directory.
+pub const DERIVED: &[&str] = &[
+    "Cargo.toml",
+    "build.rs",
+    "xyce_cinterface.cpp",
+    "src/xyce.rs",
+    "src/generated.rs",
+];
 
 fn write_gitignore(bench_dir: &Path) -> crate::Result<()> {
     let content = "\
