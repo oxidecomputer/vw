@@ -42,3 +42,7 @@ pub use crate::v5::LEGACY_WORKSPACE;
 pub use crate::v1::DriverBuildQuery;
 pub use crate::v6::AgentDriverBuildQuery;
 pub use crate::v6::AnodizeQuery;
+
+pub use crate::v7::AgentDriverQuery;
+pub use crate::v7::DriverCommand;
+pub use crate::v7::DriverQuery;

@@ -23,6 +23,7 @@ mod cloud;
 mod cloud_config;
 mod cloud_sync;
 mod driver;
+mod editor;
 mod htcl_test;
 mod parallel_load;
 mod part_picker;
@@ -135,13 +136,122 @@ struct Cli {
 }
 
 /// What can be done with the workspace's driver.
+///
+/// The cargo commands a driver is developed with, run where the driver can
+/// actually be compiled: the helios instance, against the anodizer output the
+/// environment holds. Each is the cargo command of the same name.
 #[derive(Subcommand)]
 enum DriverCommand {
     #[command(about = "Build the driver on the helios instance")]
     Build {
+        #[command(flatten)]
+        run: DriverRun,
+        #[arg(long, help = "Build with optimizations")]
+        release: bool,
+    },
+    #[command(about = "Type-check the driver on the helios instance")]
+    Check {
+        #[command(flatten)]
+        run: DriverRun,
+        #[arg(long, help = "Check with the release profile")]
+        release: bool,
+    },
+    #[command(about = "Lint the driver with clippy on the helios instance")]
+    Clippy {
+        #[command(flatten)]
+        run: DriverRun,
+        #[arg(long, help = "Lint with the release profile")]
+        release: bool,
+    },
+    #[command(
+        about = "Run the driver's tests on the helios instance",
+        long_about = "Run the driver's tests on the helios instance.\n\n\
+                      Members whose own .cargo/config.toml selects a build \
+                      target — a kernel module — are compiled for somewhere \
+                      tests cannot run, so only the workspace's default \
+                      members are tested."
+    )]
+    Test {
+        #[command(flatten)]
+        run: DriverRun,
+        #[arg(long, help = "Test with the release profile")]
+        release: bool,
+    },
+    #[command(
+        about = "Format the driver with the toolchain it pins",
+        long_about = "Format the driver with the toolchain it pins.\n\n\
+                      rustfmt runs on the helios instance and every file it \
+                      changes is written back here. A file edited here since \
+                      it was synchronized is left alone and named, so nothing \
+                      typed while this ran is lost. With --check, nothing is \
+                      rewritten: the diff is printed and the command fails if \
+                      there is one."
+    )]
+    Fmt {
+        #[command(flatten)]
+        run: DriverRun,
         #[arg(
             long,
-            help = "Build on this machine instead of in a cloud environment"
+            help = "Report what would change without rewriting anything"
+        )]
+        check: bool,
+    },
+}
+
+impl DriverCommand {
+    /// What every driver command shares, the command as the service names
+    /// it, and whether to compile with optimizations.
+    fn parts(
+        self,
+    ) -> (
+        DriverRun,
+        vw_api_types_versions::latest::DriverCommand,
+        bool,
+    ) {
+        use vw_api_types_versions::latest::DriverCommand as C;
+        match self {
+            DriverCommand::Build { run, release } => (run, C::Build, release),
+            DriverCommand::Check { run, release } => (run, C::Check, release),
+            DriverCommand::Clippy { run, release } => (run, C::Clippy, release),
+            DriverCommand::Test { run, release } => (run, C::Test, release),
+            DriverCommand::Fmt { run, check: false } => (run, C::Fmt, false),
+            DriverCommand::Fmt { run, check: true } => {
+                (run, C::FmtCheck, false)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn env(&self) -> &Option<String> {
+        match self {
+            DriverCommand::Build { run, .. }
+            | DriverCommand::Check { run, .. }
+            | DriverCommand::Clippy { run, .. }
+            | DriverCommand::Test { run, .. }
+            | DriverCommand::Fmt { run, .. } => &run.env,
+        }
+    }
+}
+
+/// What an editor on this machine needs from vw.
+#[derive(Subcommand)]
+enum EditorCommand {
+    #[command(
+        about = "Put generated Rust inputs where rust-analyzer can read them",
+        long_about = "Put generated Rust inputs where rust-analyzer can read \
+                      them.\n\n\
+                      Generates the mixed-signal benches' crates from their \
+                      mist.toml, and fetches the anodizer output the \
+                      environment published (anodizing first if it is not \
+                      current). Both stay out of synchronization: the \
+                      scaffolds are gitignored and the output is under \
+                      target/. Then says what, if anything, in the project's \
+                      own files still keeps rust-analyzer from reading it."
+    )]
+    Prepare {
+        #[arg(
+            long,
+            help = "Anodize on this machine instead of fetching from the cloud"
         )]
         local: bool,
         #[arg(
@@ -149,8 +259,7 @@ enum DriverCommand {
             env = "VW_ENV",
             value_name = "NAME",
             conflicts_with = "local",
-            help = "Cloud environment to build in. Defaults to $VW_ENV, and is only \
-                    needed when that is unset and you have more than one."
+            help = "Cloud environment to fetch from. Defaults to $VW_ENV."
         )]
         env: Option<String>,
         #[arg(
@@ -158,14 +267,77 @@ enum DriverCommand {
             help = "Accept the service's TLS certificate without verifying it"
         )]
         insecure: bool,
-        #[arg(long, help = "Build with optimizations")]
-        release: bool,
+        #[arg(
+            long,
+            help = "Write a one-line JSON summary to stdout, and everything \
+                    else to stderr — for a program running this, such as \
+                    the vw analyzer"
+        )]
+        json: bool,
+    },
+    #[command(
+        about = "Check the driver on the helios instance, for rust-analyzer",
+        long_about = "Check the driver on the helios instance, for \
+                      rust-analyzer.\n\n\
+                      Meant as rust-analyzer's check.overrideCommand. Writes \
+                      cargo's JSON diagnostics, naming this machine's files, \
+                      to stdout, and everything else to stderr. Run from \
+                      anywhere that is not the driver or a crate it depends \
+                      on by path, it checks nothing."
+    )]
+    Check {
+        #[arg(
+            long,
+            env = "VW_ENV",
+            value_name = "NAME",
+            help = "Cloud environment to check in. Defaults to $VW_ENV."
+        )]
+        env: Option<String>,
+        #[arg(
+            long,
+            help = "Accept the service's TLS certificate without verifying it"
+        )]
+        insecure: bool,
+        #[arg(long, help = "Lint with clippy instead of `cargo check`")]
+        clippy: bool,
         #[arg(
             trailing_var_arg = true,
-            help = "Further arguments for cargo, e.g. `-p module`"
+            allow_hyphen_values = true,
+            help = "Further arguments for cargo, e.g. `--all-targets`"
         )]
         args: Vec<String>,
     },
+}
+
+/// Where a driver command runs, and what else to tell cargo.
+#[derive(clap::Args)]
+struct DriverRun {
+    #[arg(
+        long,
+        help = "Run on this machine instead of in a cloud environment"
+    )]
+    local: bool,
+    #[arg(
+        long,
+        env = "VW_ENV",
+        value_name = "NAME",
+        conflicts_with = "local",
+        help = "Cloud environment to run in. Defaults to $VW_ENV, and is only \
+                needed when that is unset and you have more than one."
+    )]
+    env: Option<String>,
+    #[arg(
+        long,
+        help = "Accept the service's TLS certificate without verifying it"
+    )]
+    insecure: bool,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Further arguments for cargo, e.g. `-p module` or \
+                `--all-targets -- -D warnings`"
+    )]
+    args: Vec<String>,
 }
 
 // What can be done with the workspace's testbenches.
@@ -553,6 +725,11 @@ enum Commands {
     Driver {
         #[command(subcommand)]
         command: DriverCommand,
+    },
+    #[command(about = "Make the workspace's Rust legible to an editor")]
+    Editor {
+        #[command(subcommand)]
+        command: EditorCommand,
     },
     #[command(
         about = "Remove build output, on the cloud environment if there is one"
@@ -1203,26 +1380,104 @@ async fn main() {
             }
         }
         Commands::Driver { command } => {
-            let DriverCommand::Build {
-                local,
-                env,
-                insecure,
-                release,
-                args,
-            } = command;
-            match driver_build(
+            let (run, command, release) = command.parts();
+            match driver_cargo(
                 &cwd,
-                local,
-                env.as_deref(),
-                insecure,
+                command,
+                run.local,
+                run.env.as_deref(),
+                run.insecure,
                 release,
-                &args,
+                &run.args,
+                None,
             )
             .await
             {
                 Ok(true) => {}
-                // A build that failed is not a vw failure; the message came
-                // from cargo and has already been printed.
+                // A build or lint that failed is not a vw failure; the
+                // message came from cargo and has already been printed.
+                Ok(false) => process::exit(1),
+                Err(e) => {
+                    report(&*e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Editor {
+            command:
+                EditorCommand::Prepare {
+                    local,
+                    env,
+                    insecure,
+                    json,
+                },
+        } => {
+            // As for `editor check`: claimed before anything can print, so
+            // the summary is the only thing on stdout.
+            let out = if json {
+                match editor::claim_stdout() {
+                    Ok(out) => Some(out),
+                    Err(e) => {
+                        eprintln!(
+                            "cannot set aside stdout for the summary: {e}"
+                        );
+                        process::exit(1);
+                    }
+                }
+            } else {
+                None
+            };
+            match editor::prepare(&cwd, local, env.as_deref(), insecure).await {
+                Ok(summary) => {
+                    let ready = summary.ready();
+                    match out {
+                        Some(mut out) => {
+                            use std::io::Write;
+                            let line = serde_json::to_string(&summary)
+                                .unwrap_or_default();
+                            let _ = writeln!(out, "{line}");
+                        }
+                        None => editor::print_check_hint(),
+                    }
+                    if !ready {
+                        process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    report(&*e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Editor {
+            command:
+                EditorCommand::Check {
+                    env,
+                    insecure,
+                    clippy,
+                    args,
+                },
+        } => {
+            // Before anything can print: from here on stdout is cargo's JSON
+            // and nothing else.
+            let mut out = match editor::claim_stdout() {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("cannot set aside stdout for diagnostics: {e}");
+                    process::exit(1);
+                }
+            };
+            match editor::check(
+                &cwd,
+                env.as_deref(),
+                insecure,
+                clippy,
+                &args,
+                &mut out,
+            )
+            .await
+            {
+                Ok(true) => {}
                 Ok(false) => process::exit(1),
                 Err(e) => {
                     report(&*e);
@@ -1656,7 +1911,11 @@ async fn main() {
         }
         Commands::Analyzer => {
             init_analyzer_logging();
-            vw_analyzer::run_stdio().await;
+            // Itself, so what prepares the editor's workspaces is exactly
+            // this version of vw rather than whichever is on the path.
+            let vw = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("vw"));
+            vw_analyzer::run_stdio_with(vw).await;
         }
         Commands::Repl {
             local,
@@ -4232,21 +4491,32 @@ async fn remote_worker(
     })
 }
 
-/// Build the driver, wherever this workspace builds it.
+/// Run a cargo command over the driver, wherever this workspace builds it.
 ///
 /// Cloud first, like everything else that needs a toolchain the developer's
 /// machine may not have: the driver targets illumos and pins its own compiler,
-/// and the helios instance is where both of those are true.
-async fn driver_build(
+/// and the helios instance is where both of those are true. Linting and
+/// testing are no different from building in that respect — clippy has to
+/// compile what it lints.
+#[allow(clippy::too_many_arguments)]
+async fn driver_cargo(
     cwd: &Utf8Path,
+    command: vw_api_types_versions::latest::DriverCommand,
     local: bool,
     named: Option<&str>,
     insecure: bool,
     release: bool,
     args: &[String],
+    diagnostics: Option<&mut dyn std::io::Write>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let workspace = vw_lib::find_workspace_dir(cwd.as_std_path())
         .ok_or("no vw workspace here; run this from one, or from a directory inside it")?;
+
+    if local && diagnostics.is_some() {
+        return Err("diagnostics for an editor come from the cloud; locally, \
+                    point the editor at cargo itself"
+            .into());
+    }
 
     // A driver that includes anodizer's output is built against it, so it
     // has to be current first. One output for every variant: there is one
@@ -4254,7 +4524,12 @@ async fn driver_build(
     // phase — `vw anodize` — and this runs it when the driver needs it rather
     // than leaving a developer to remember; it costs a fingerprint when
     // nothing has changed.
-    let anodized = driver::needs_anodized(&workspace)?;
+    // Formatting compiles nothing, so it needs nothing generated.
+    let anodized = !matches!(
+        command,
+        vw_api_types_versions::latest::DriverCommand::Fmt
+            | vw_api_types_versions::latest::DriverCommand::FmtCheck
+    ) && driver::needs_anodized(&workspace)?;
     if anodized {
         ensure_workspace_deps(cwd).await;
     }
@@ -4282,14 +4557,23 @@ async fn driver_build(
             }
         }
 
-        return Ok(driver::build(&session, &target, release, args).await?);
+        return Ok(driver::run(
+            &session,
+            &target,
+            &workspace,
+            command,
+            release,
+            args,
+            diagnostics,
+        )
+        .await?);
     }
 
     if anodized {
         vw_lib::ensure_anodized(&workspace, vw_lib::VhdlStandard::Vhdl2019)
             .await?;
     }
-    Ok(driver::build_locally(&workspace, release, args).await?)
+    Ok(driver::run_locally(&workspace, command, release, args).await?)
 }
 
 /// Remove build output, wherever this workspace builds.
@@ -5227,10 +5511,53 @@ mod env_flag_tests {
             Commands::Cosim {
                 command: CosimCommand::Anodize { env, .. },
             } => env,
-            Commands::Driver { command } => match command {
-                DriverCommand::Build { env, .. } => env,
-            },
+            Commands::Driver { command } => command.env().clone(),
             _ => panic!("not a command that takes --env"),
+        }
+    }
+
+    /// What a developer would type after `cargo clippy` reaches cargo
+    /// unchanged, `--` and all, while vw's own flags are still vw's.
+    #[test]
+    fn a_lint_passes_cargo_its_arguments_verbatim() {
+        let cli = Cli::try_parse_from([
+            "vw",
+            "driver",
+            "clippy",
+            "--env",
+            "e",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .expect("should parse");
+        let Commands::Driver { command } = cli.command else {
+            panic!("not a driver command");
+        };
+        let (run, command, release) = command.parts();
+
+        assert_eq!(
+            command,
+            vw_api_types_versions::latest::DriverCommand::Clippy
+        );
+        assert!(!release);
+        assert_eq!(run.env.as_deref(), Some("e"));
+        assert_eq!(run.args, ["--all-targets", "--", "-D", "warnings"]);
+    }
+
+    #[test]
+    fn formatting_rewrites_unless_asked_only_to_check() {
+        use vw_api_types_versions::latest::DriverCommand as C;
+        for (argv, expected) in [
+            (vec!["vw", "driver", "fmt"], C::Fmt),
+            (vec!["vw", "driver", "fmt", "--check"], C::FmtCheck),
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("should parse");
+            let Commands::Driver { command } = cli.command else {
+                panic!("not a driver command");
+            };
+            assert_eq!(command.parts().1, expected, "{argv:?}");
         }
     }
 
@@ -5255,6 +5582,9 @@ mod env_flag_tests {
             vec!["vw", "anodize"],
             vec!["vw", "anodize", "--force"],
             vec!["vw", "driver", "build", "--release"],
+            vec!["vw", "driver", "clippy"],
+            vec!["vw", "driver", "fmt"],
+            vec!["vw", "driver", "fmt", "--check"],
         ] {
             let cli = Cli::try_parse_from(&argv).expect("should parse");
             assert_eq!(

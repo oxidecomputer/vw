@@ -93,6 +93,16 @@ pub fn scaffold(
     bridge::generate_scaffold(bench_dir.as_std_path(), mist_config)
 }
 
+/// Regenerate only the files a mixed-signal bench derives from `mist.toml`,
+/// leaving its `.gitignore` and `src/lib.rs` alone. See
+/// [`crate::ensure_editor_scaffolds`].
+pub fn scaffold_derived(
+    bench_dir: &Utf8Path,
+    mist_config: &MistConfig,
+) -> crate::Result<()> {
+    bridge::generate_derived(bench_dir.as_std_path(), mist_config)
+}
+
 /// Run a mixed-signal co-simulation test.
 pub async fn run_analog_test(
     workspace_dir: &Utf8Path,

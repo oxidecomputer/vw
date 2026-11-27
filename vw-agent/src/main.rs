@@ -28,7 +28,7 @@ use std::{
     sync::Arc,
 };
 use vw_api_types_versions::latest::{
-    CommitResult, Credentials, SyncPlan, TreeManifest,
+    CommitResult, Credentials, DriverCommand, SyncPlan, TreeManifest,
 };
 use vw_sync_api::{
     EnvironmentPathParam, VwSyncApi, WorkspaceBlobPathParam, WorkspacePathParam,
@@ -595,12 +595,10 @@ impl VwSyncApi for Agent {
         }))
     }
 
-    async fn driver_build(
+    async fn driver_cargo(
         rqctx: RequestContext<Self::Context>,
         path_params: dropshot::Path<WorkspacePathParam>,
-        query: dropshot::Query<
-            vw_api_types_versions::latest::AgentDriverBuildQuery,
-        >,
+        query: dropshot::Query<vw_api_types_versions::latest::AgentDriverQuery>,
         websock: dropshot::WebsocketConnection,
     ) -> dropshot::WebsocketChannelResult {
         let ctx = rqctx.context();
@@ -611,8 +609,17 @@ impl VwSyncApi for Agent {
 
         let query = query.into_inner();
         let params = vw_remote::BuildParams {
+            command: match query.command {
+                DriverCommand::Build => vw_remote::driver::Command::Build,
+                DriverCommand::Check => vw_remote::driver::Command::Check,
+                DriverCommand::Clippy => vw_remote::driver::Command::Clippy,
+                DriverCommand::Test => vw_remote::driver::Command::Test,
+                DriverCommand::Fmt => vw_remote::driver::Command::Fmt,
+                DriverCommand::FmtCheck => vw_remote::driver::Command::FmtCheck,
+            },
             release: query.release,
             args: query.arguments(),
+            diagnostics: query.diagnostics,
         };
 
         // The anodizer output the driver may be built against, fetched from
@@ -637,8 +644,9 @@ impl VwSyncApi for Agent {
         // underneath it.
         let driver = ws.root.join(vw_remote::driver::DIRECTORY);
 
-        info!(log, "building the driver";
+        info!(log, "running cargo over the driver";
             "root" => %driver,
+            "command" => %params.command,
             "release" => params.release,
             "args" => params.args.join(" "),
         );
@@ -702,10 +710,10 @@ impl VwSyncApi for Agent {
         .await;
 
         match &result {
-            Ok(produced) => info!(log, "driver build finished";
+            Ok(produced) => info!(log, "driver cargo finished";
                 "artifacts" => produced.len(),
             ),
-            Err(e) => slog::error!(log, "driver build failed";
+            Err(e) => slog::error!(log, "driver cargo failed";
                 InlineErrorChain::new(e),
             ),
         }
